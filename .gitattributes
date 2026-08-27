@@ -1,0 +1,11 @@
+# Normalize line endings so Windows/Linux contributors don't generate noise diffs
+* text=auto eol=lf
+
+# Binary / generated artifacts
+*.png binary
+*.jpg binary
+*.gif binary
+*.bin binary
+*.elf binary
+*.map binary
+*.pdf binary
