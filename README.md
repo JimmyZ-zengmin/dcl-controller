@@ -24,7 +24,7 @@
 | 周期峰峰值 | **±83 ns** | 均值 99.998 μs |
 | 最小稳定周期 | **5.00 μs（200 kHz）** | 见 `docs/DCL_ISR极限压测报告.md` |
 | ISR 执行时间 | 4.86–4.99 μs（43 路由） | 同上 |
-| CPU 频率 | 544 MHz（VOS0 + PLL 超频） | — |
+| CPU 频率 | 480 MHz（VOS0 + PLL，H723 规格内） | 见 `firmware/h723-core0/Src/main.c`（`CLOCK_HZ = 480000000`） |
 | 原语 | 35 个操作码 | PID / LPF / CMP / TIMER / COUNTER / … |
 | 容量 | 路由 1024 / 参数 512 / 状态 256 / WIRE 1024 | DTCM 布局 |
 
@@ -99,7 +99,7 @@ python dcl_compiler.py reactor_control.dcl -o reactor_control.bin
 # 额外：--json 看路由表展开，--c 看 C 等价代码
 ```
 
-### 2. 烧录固件（STM32H723ZG @ 544 MHz，Cortex-M7）
+### 2. 烧录固件（STM32H723ZG @ 480 MHz，Cortex-M7）
 
 ```bash
 cd firmware/h723-core0
