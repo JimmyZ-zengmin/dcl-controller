@@ -91,6 +91,8 @@ dcl-controller/
 
 ## 快速开始
 
+> 📖 **新用户先看 [docs/QUICKSTART.md](docs/QUICKSTART.md)**——15 分钟从零跑到第一个 100µs 程序（含 UART 烧录/部署两种通道）。
+
 ### 1. 编译 DCL 程序
 
 ```bash
