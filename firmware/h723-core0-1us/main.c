@@ -7,7 +7,7 @@
  *   - 抖动直方图 (256 bin, 180万样本/3分钟)
  *
  * 时钟: VOS0 + PLL 544MHz, HPRE=/2, D2PPRE2=/4
- * ISR: 100μs TIM1, DWT CYCCNT 测量 @136MHz (7.4ns 分辨率)
+ * ISR: 1μs 极限验证版 (ARR=135) @136MHz, DWT CYCCNT 测量 (7.4ns 分辨率)
  */
 #include <stdint.h>
 
@@ -184,7 +184,7 @@ enum {
 
 #define MAX_ROUTES         1024
 #define CMP_BLK_SIZE        4096    /* 4KB ITCM for compiled routes */
-#define USE_COMPILED_ISR    1       /* 1=compiled block, 0=interpreter */
+#define USE_COMPILED_ISR    0       /* 0=interpreter (VERIFIED 1us run @136MHz/ARR=135, 8 routes), 1=JIT compiled block (RESEARCH: faults UNDEFINSTR, see docs/h723-research/HANDOVER.md) */
 #define MAX_SENSORS     64
 #define MAX_ACTUATORS   32
 #define MAX_WIRES       1024
