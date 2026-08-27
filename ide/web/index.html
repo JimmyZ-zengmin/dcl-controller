@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DCL IDE</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <!-- Menu Bar -->
+    <div id="menu-bar">
+        <div class="menu-left">
+            <span class="logo">DCL IDE</span>
+            <button id="btn-compile" title="Compile (Ctrl+B)">
+                <span class="icon">&#9654;</span> Compile
+            </button>
+            <button id="btn-deploy" title="Deploy">
+                <span class="icon">&#8674;</span> Deploy
+            </button>
+            <button id="btn-start" title="Start ISR">
+                <span class="icon">&#9654;</span> Start
+            </button>
+            <button id="btn-stop" title="Stop ISR">
+                <span class="icon">&#9632;</span> Stop
+            </button>
+            <button id="btn-reset" title="Reset">
+                <span class="icon">&#8634;</span> Reset
+            </button>
+            <select id="usb-select">
+                <option value="">-- USB Port --</option>
+            </select>
+            <button id="btn-scan-usb" title="Scan USB">Scan</button>
+        </div>
+    </div>
+
+    <!-- Workspace -->
+    <div id="workspace">
+        <!-- Left: Project Tree -->
+        <div id="sidebar">
+            <div class="panel-header">Explorer</div>
+            <div id="project-tree"></div>
+        </div>
+
+        <!-- Center: Editor -->
+        <div id="editor-area">
+            <div id="editor-tabs">
+                <div class="tab active" data-file="main.dcl">main.dcl</div>
+            </div>
+            <div id="monaco-editor"></div>
+        </div>
+
+        <!-- Right: AI Chat -->
+        <div id="ai-panel">
+            <div class="panel-header">AI Assistant</div>
+            <div id="chat-messages"></div>
+            <div id="chat-input-area">
+                <input type="text" id="chat-input" placeholder="Ask AI..." />
+                <button id="chat-send">&#10148;</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom: Monitor Panel -->
+    <div id="monitor-panel">
+        <div class="panel-header">
+            <span>Monitor</span>
+            <div class="monitor-controls">
+                <label>Sample: <select id="sample-rate">
+                    <option value="50">50ms</option>
+                    <option value="100" selected>100ms</option>
+                    <option value="200">200ms</option>
+                    <option value="500">500ms</option>
+                    <option value="1000">1s</option>
+                </select></label>
+                <button id="btn-monitor-toggle">Start</button>
+            </div>
+        </div>
+        <div id="monitor-content">
+            <div id="wire-table-container">
+                <table id="wire-table">
+                    <thead>
+                        <tr>
+                            <th>Signal</th>
+                            <th>Index</th>
+                            <th>Value</th>
+                            <th>FB Type</th>
+                            <th>Force</th>
+                            <th>Wave</th>
+                        </tr>
+                    </thead>
+                    <tbody id="wire-table-body"></tbody>
+                </table>
+            </div>
+            <div id="waveform-container">
+                <canvas id="waveform-canvas"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Status Bar -->
+    <div id="status-bar">
+        <span id="status-usb">USB: Disconnected</span>
+        <span id="status-isr">ISR: Stopped</span>
+        <span id="status-samples">SAMPLES: 0</span>
+        <span id="monitor-engine">ENGINE: -</span>
+        <span id="monitor-jitter">JITTER: -</span>
+        <span id="monitor-samples">MON_S: -</span>
+        <span id="status-compile">Compile: Idle</span>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+    <script src="lib/chart.umd.min.js"></script>
+    <script src="js/usb.js?v=2"></script>
+    <script src="js/editor.js?v=2"></script>
+    <script src="js/monitor.js?v=2"></script>
+    <script src="js/project.js?v=2"></script>
+    <script src="js/ai-chat.js?v=2"></script>
+    <script src="js/main.js?v=2"></script>
+</body>
+</html>

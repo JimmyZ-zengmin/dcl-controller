@@ -1,0 +1,2 @@
+# pyocd 配置: 强制使用 stm32h723xx 目标
+target_override: stm32h723xx

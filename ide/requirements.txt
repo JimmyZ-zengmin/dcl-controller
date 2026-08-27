@@ -1,0 +1,22 @@
+# DCL-IDE dependencies
+
+# Native desktop window (embed web UI)
+pywebview>=4.0
+
+# LSP server
+pygls>=1.0.0
+
+# USB serial communication
+pyserial>=3.5
+
+# WebSocket server
+websockets>=11.0
+
+# HTTP static file server
+aiohttp>=3.8
+
+# AI integration
+anthropic>=0.30
+
+# Packaging
+pyinstaller>=5.0

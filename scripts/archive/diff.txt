@@ -1,0 +1,383 @@
+diff --git a/firmware/h723-core0/Src/main.c b/firmware/h723-core0/Src/main.c
+index 96ee744..6162818 100644
+--- a/firmware/h723-core0/Src/main.c
++++ b/firmware/h723-core0/Src/main.c
+@@ -155,6 +155,7 @@ static uint16_t canopen_hb_period; /* ms */
+ #define CMD_RESET   0x13
+ #define CMD_READ    0x20
+ #define CMD_WRITE   0x21
++#define CMD_READ_ALARMS 0x22
+ #define STS_WIRE_DATA  0x20
+ #define STS_ACK        0x30
+ #define STS_ERROR      0x40
+@@ -198,6 +199,53 @@ static volatile uint8_t engine_running = 1;
+ #define DWT_CYCCNT   (*(volatile uint32_t *)0xE0001004)
+ #define NVIC_ISER0   (*(volatile uint32_t *)0xE000E100)
+ 
++/* ── SEGGER RTT: 非侵入式 SWD 监测 (pyocd rtt) ── */
++#define RTT_CB_ADDR      (DTCM_BASE + 0x8800)
++#define RTT_UP0_BUF      (DTCM_BASE + 0x8900)
++#define RTT_UP0_BUF_SIZE 1024  /* 原来是 256,10ms 上报频率下不够用 */
++#define RTT_DOWN0_BUF    (DTCM_BASE + 0x8A00)
++#define RTT_DOWN0_BUF_SIZE 16
++
++typedef struct {
++    char     acID[16];              // "SEGGER RTT"
++    int      MaxNumUpChannels;      // 1
++    int      MaxNumDownChannels;    // 0
++    struct {
++        const char *sName;          // 通道名指针 (指向字符串常量)
++        char    *pBuffer;           // 环形缓冲区指针
++        unsigned SizeOfBuffer;      // 缓冲区大小
++        unsigned WrOff;             // 写偏移 (目标端)
++        unsigned RdOff;             // 读偏移 (主机端)
++        unsigned Flags;             // 标志
++    } aUp[1];                       // 上行通道 (目标→主机)
++} RTT_CB_t;
++
++/* ── 告警系统 ── */
++#define ALARM_BUF_ADDR   (DTCM_BASE + 0x2000D800)  /* 1KB, 避开 LOG_RING (0xD000) */
++#define ALARM_BUF_SIZE   1024
++#define ALARM_MAX_ENTRIES (ALARM_BUF_SIZE / 8)     /* 128 条 */
++
++/* 告警码 */
++#define ALARM_JITTER_SPIKE   0x01  /* 抖动超阈值 */
++#define ALARM_PERIOD_HIGH    0x02  /* 周期过长 (ISR 执行超时风险) */
++#define ALARM_ROUTES_CHANGED 0x03  /* 路由数异常变化 */
++#define ALARM_ENGINE_STOPPED 0x04  /* engine_running 变 0 */
++#define ALARM_SAMPLES_FROZEN 0x05  /* SAMPLES 停滞 */
++#define ALARM_IWDG_RESET     0x06  /* 看门狗复位（在 main() 首行检测） */
++
++/* 告警阈值 */
++#define ALARM_JITTER_THRESHOLD  500   /* DWT 周期, ~3.7us @136MHz */
++#define ALARM_PERIOD_THRESHOLD  15000 /* DWT 周期, ~110us @136MHz (正常 13600) */
++#define ALARM_FROZEN_THRESHOLD  5     /* 连续 5 次 SAMPLES 不变判定停滞 */
++
++/* 告警条目: 8 bytes */
++typedef struct {
++    uint8_t  code;          /* ALARM_* */
++    uint8_t  reserved;      /* 填充 */
++    uint16_t padding;       /* 填充 */
++    uint32_t samples;       /* 触发时的 SAMPLES 值 (时间戳) */
++} AlarmEntry_t;
++
+ #define TIM1_BASE    0x40010000UL
+ #define TIM1_CR1     (*(volatile uint32_t *)(TIM1_BASE + 0x00))
+ #define TIM1_DIER    (*(volatile uint32_t *)(TIM1_BASE + 0x0C))
+@@ -401,6 +449,100 @@ static uint32_t d2ppre_enc(uint32_t d) {
+     if (d==4) return 5; return 6;
+ }
+ 
++/* ── SEGGER RTT 实现 ── */
++static inline void rtt_init(void) {
++    volatile RTT_CB_t *cb = (volatile RTT_CB_t *)RTT_CB_ADDR;
++    /* 清零控制块 */
++    for (int i = 0; i < (int)sizeof(RTT_CB_t)/4; i++)
++        ((volatile uint32_t *)RTT_CB_ADDR)[i] = 0;
++    /* 填充签名 "SEGGER RTT" */
++    cb->acID[0]='S'; cb->acID[1]='E'; cb->acID[2]='G'; cb->acID[3]='G';
++    cb->acID[4]='E'; cb->acID[5]='R'; cb->acID[6]=' '; cb->acID[7]='R';
++    cb->acID[8]='T'; cb->acID[9]='T'; cb->acID[10]=0; cb->acID[11]=0;
++    cb->MaxNumUpChannels = 1;
++    cb->MaxNumDownChannels = 0;
++    /* 上行通道 0: 状态上报 */
++    cb->aUp[0].sName = "Status";
++    cb->aUp[0].pBuffer = (char *)RTT_UP0_BUF;
++    cb->aUp[0].pBuffer = (char *)RTT_UP0_BUF;
++    cb->aUp[0].SizeOfBuffer = RTT_UP0_BUF_SIZE;
++    cb->aUp[0].WrOff = 0;
++    cb->aUp[0].RdOff = 0;
++    cb->aUp[0].Flags = 2; /* Mode: Skip (缓冲区满时丢弃) */
++}
++
++/* 写数据到上行通道 0, 返回实际写入字节数 */
++static inline unsigned rtt_write0(const char *data, unsigned len) {
++    volatile RTT_CB_t *cb = (volatile RTT_CB_t *)RTT_CB_ADDR;
++    unsigned wrOff = cb->aUp[0].WrOff;
++    unsigned rdOff = cb->aUp[0].RdOff;
++    unsigned cap = cb->aUp[0].SizeOfBuffer;
++    if (cap == 0) return 0;
++    /* 计算可用空间 (留 1 字节区分满/空) */
++    unsigned avail;
++    if (wrOff >= rdOff) {
++        avail = cap - 1 - (wrOff - rdOff);
++    } else {
++        avail = rdOff - wrOff - 1;
++    }
++    if (len > avail) len = avail;
++    if (len == 0) return 0;
++    /* 写入 (可能环绕) */
++    for (unsigned i = 0; i < len; i++) {
++        ((volatile char *)RTT_UP0_BUF)[wrOff] = data[i];
++        wrOff = (wrOff + 1) % cap;
++    }
++    cb->aUp[0].WrOff = wrOff;
++    return len;
++}
++
++/* 轻量 unsigned int → 十进制字符串, 返回写入长度 */
++static inline unsigned u32_to_str(char *buf, uint32_t val) {
++    char tmp[10];
++    int n = 0;
++    if (val == 0) { buf[0] = '0'; return 1; }
++    while (val > 0 && n < 10) {
++        tmp[n++] = '0' + (val % 10);
++        val /= 10;
++    }
++    for (int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
++    return (unsigned)n;
++}
++
++/* 上报引擎状态到 RTT (在 ISR 中定期调用) */
++static inline void rtt_report_status(int32_t gpio_delta) {
++    char buf[64];
++    char *p = buf;
++    *p++ = 'S'; *p++ = '=';
++    p += u32_to_str(p, SAMPLES);
++    *p++ = ' '; *p++ = 'P'; *p++ = '=';
++    p += u32_to_str(p, PERIOD_MIN);
++    *p++ = '.'; *p++ = '.';
++    p += u32_to_str(p, PERIOD_MAX);
++    *p++ = ' '; *p++ = 'R'; *p++ = '=';
++    p += u32_to_str(p, *(volatile uint32_t *)(DTCM_BASE + 0xF0));
++    *p++ = ' '; *p++ = 'E'; *p++ = '=';
++    p += u32_to_str(p, engine_running);
++    /* GPIO 输出延迟: >0=DMA已触发(旧值输出), <0=余量周期数 */
++    *p++ = ' '; *p++ = 'G'; *p++ = '=';
++    if (gpio_delta < 0) { *p++ = '-'; p += u32_to_str(p, (uint32_t)(-gpio_delta)); }
++    else { p += u32_to_str(p, (uint32_t)gpio_delta); }
++    *p++ = '\n';
++    rtt_write0(buf, (unsigned)(p - buf));
++}
++
++/* 写告警到环形缓冲区 (ISR 内调用, 1-2 周期) */
++static inline void alarm_write(uint8_t code) {
++    volatile uint32_t *base = (volatile uint32_t *)ALARM_BUF_ADDR;
++    /* base[0] = write_idx, base[1] = overflow_count */
++    uint32_t idx = base[0];
++    uint32_t entry_ofs = 2 + (idx % ALARM_MAX_ENTRIES) * 2;
++    base[entry_ofs]     = ((uint32_t)code << 24) | (SAMPLES & 0xFFFFFF);
++    base[entry_ofs + 1] = PERIOD_MAX; /* 记录触发时的抖动峰值 */
++    base[0] = (idx + 1) % (ALARM_MAX_ENTRIES * 2); /* wrap 2遍后归零 */
++    if (idx >= ALARM_MAX_ENTRIES * 2) base[1]++; /* overflow 计数 */
++}
++
+ void SystemInit(void) {
+     SCB_CPACR |= (0x0F << 20);
+     __asm__ volatile("dsb; isb");
+@@ -1114,6 +1256,37 @@ static void handle_read(const uint8_t *payload, uint16_t len) {
+     uart_send_status(STS_WIRE_DATA, resp_buf, resp_len);
+ }
+ 
++static void handle_read_alarms(const uint8_t *payload, uint16_t len) {
++    /* 返回告警缓冲区内容: [write_idx:4B] [overflow:4B] [entries...] */
++    volatile uint32_t *base = (volatile uint32_t *)ALARM_BUF_ADDR;
++    uint32_t write_idx = base[0];
++    uint32_t overflow  = base[1];
++
++    uint8_t resp[8 + ALARM_MAX_ENTRIES * 8];
++    resp[0] = write_idx & 0xFF; resp[1] = (write_idx >> 8) & 0xFF;
++    resp[2] = (write_idx >> 16) & 0xFF; resp[3] = (write_idx >> 24) & 0xFF;
++    resp[4] = overflow & 0xFF; resp[5] = (overflow >> 8) & 0xFF;
++    resp[6] = (overflow >> 16) & 0xFF; resp[7] = (overflow >> 24) & 0xFF;
++
++    /* 只返回最新的 32 条 (256 字节), 避免帧过大 */
++    uint32_t n = (write_idx < 32) ? write_idx : 32;
++    for (uint32_t i = 0; i < n; i++) {
++        uint32_t idx = (write_idx - n + i) % ALARM_MAX_ENTRIES;
++        uint32_t e = base[2 + idx * 2];
++        uint32_t v = base[2 + idx * 2 + 1];
++        resp[8 + i * 8 + 0] = e & 0xFF;
++        resp[8 + i * 8 + 1] = (e >> 8) & 0xFF;
++        resp[8 + i * 8 + 2] = (e >> 16) & 0xFF;
++        resp[8 + i * 8 + 3] = (e >> 24) & 0xFF;
++        resp[8 + i * 8 + 4] = v & 0xFF;
++        resp[8 + i * 8 + 5] = (v >> 8) & 0xFF;
++        resp[8 + i * 8 + 6] = (v >> 16) & 0xFF;
++        resp[8 + i * 8 + 7] = (v >> 24) & 0xFF;
++    }
++    uint16_t resp_len = 8 + n * 8;
++    uart_send_status(0x50, resp, resp_len); /* STS_ALARM_DATA = 0x50 */
++}
++
+ static void handle_write(const uint8_t *payload, uint16_t len) {
+     if (len < 6) {
+         const char *e = "WRITE: need idx,value";
+@@ -1148,6 +1321,7 @@ static void uart_handle_command(uint8_t cmd, const uint8_t *payload, uint16_t le
+     case CMD_RESET:  handle_reset(); break;
+     case CMD_READ:   handle_read(payload, len); break;
+     case CMD_WRITE:  handle_write(payload, len); break;
++    case CMD_READ_ALARMS: handle_read_alarms(payload, len); break;
+     default: {
+         const char *e = "UNKNOWN CMD";
+         uart_send_status(STS_ERROR, (const uint8_t *)e, 11);
+@@ -1230,19 +1404,43 @@ void FDCAN1_IT0_IRQHandler(void) {
+     __asm__ volatile("dsb; isb");
+ }
+ 
+-/* ══════════════════════════════════════════════════════════�?
+- * ISR: 核心扫描引擎
+- * ══════════════════════════════════════════════════════════�?*/
++/* ═══════════════════════════════════════════════════════════
++ * DMA Stream5 TCIF: GPIO 输出抖动测量
++ * 每次 DMA 完成 SHADOW→ODR 搬运时记录 DWT 时间戳
++ * ═══════════════════════════════════════════════════════════ */
++#define GPIO_JITTER_BUF_SIZE 256
++static volatile uint32_t gpio_jitter_buf[GPIO_JITTER_BUF_SIZE];
++static volatile uint32_t gpio_jitter_idx = 0;
++static volatile int32_t gpio_jitter_max = 0;
+ 
+ __attribute__((section(".itcm_code")))
+-void TIM1_UP_IRQHandler(void) {
+-    /* ── 抖动测量 ring buffer (一次性,测完可删) ── */
+-    /* 写 DWT 时间戳到 buffer,引擎零开销(仅 1 次 32bit store) */
+-    if (record_enable && record_idx < REC_BUF_SIZE) {
+-        record_buf[record_idx++] = DWT_CYCCNT;
+-        if (record_idx >= REC_BUF_SIZE) record_enable = 0;  /* 满即停 */
++void DMA2_Stream5_IRQHandler(void) {
++    #define DMA2_HIFCR (*(volatile uint32_t *)0x4002040C)
++    DMA2_HIFCR = (1 << 22);  /* CTCIF5 */
++
++    uint32_t now = DWT_CYCCNT;
++    static uint32_t prev = 0;
++    if (prev) {
++        uint32_t period = now - prev;
++        int32_t delta = (int32_t)period - 13600;
++        if (delta < 0) delta = -delta;
++        if (delta > gpio_jitter_max) gpio_jitter_max = delta;
+     }
++    prev = now;
++    gpio_jitter_buf[gpio_jitter_idx % GPIO_JITTER_BUF_SIZE] = now;
++    gpio_jitter_idx++;
++}
++
+ 
++
++
++/* ═══════════════════════════════════════════════════════════
++ * ISR: 核心扫描引擎
++ * ═══════════════════════════════════════════════════════════ */
++
++__attribute__((section(".itcm_code")))
++void TIM1_UP_IRQHandler(void) {
++    static int32_t gpio_output_delta = 0;  /* GPIO 输出延迟测量值, RTT 上报用 */
+     /* 诊断: ISR入口翻转GPIOE bit2 (PE2), 直接写 ODR, 逻辑分析仪可见 */
+     GPIOE_ODR ^= (1 << 2);
+     uint32_t t0 = ccnt();
+@@ -1332,6 +1530,41 @@ void TIM1_UP_IRQHandler(void) {
+     HEARTBEAT++;
+     canopen_ticks++; /* 100us per tick, 10 ticks=1ms */
+ 
++    /* ── 异常检测 ── */
++    if (SAMPLES >= 4) { /* 跳过前几个不稳定周期 */
++        uint32_t period = (t0 >= LAST_ENTRY) ? (t0 - LAST_ENTRY) : 0;
++
++        /* 抖动检测: PERIOD_MAX - PERIOD_MIN 超过阈值 */
++        uint32_t jitter = (PERIOD_MAX > PERIOD_MIN) ? (PERIOD_MAX - PERIOD_MIN) : 0;
++        if (jitter > ALARM_JITTER_THRESHOLD) {
++            alarm_write(ALARM_JITTER_SPIKE);
++        }
++
++        /* 单次周期过长 (可能 ISR 快要超时) */
++        if (period > ALARM_PERIOD_THRESHOLD) {
++            alarm_write(ALARM_PERIOD_HIGH);
++        }
++
++        /* 路由数异常变化 */
++        uint32_t n = *(volatile uint32_t *)(DTCM_BASE + 0xF0);
++        static uint32_t prev_routes = 0;
++        if (prev_routes == 0) prev_routes = n;
++        if (n != prev_routes) {
++            alarm_write(ALARM_ROUTES_CHANGED);
++            prev_routes = n;
++        }
++    }
++
++    /* ── RTT 状态上报: 每 1000 周期 (~100ms) 一次 ── */
++    static uint32_t last_samples_check = 0;
++    if ((SAMPLES % 100) == 0) {  /* 每 10ms 上报一次 */
++        if (!engine_running) alarm_write(ALARM_ENGINE_STOPPED);
++        if (last_samples_check != 0 && SAMPLES == last_samples_check)
++            alarm_write(ALARM_SAMPLES_FROZEN);
++        last_samples_check = SAMPLES;
++        rtt_report_status(gpio_output_delta);
++    }
++
+     /* �?输出映射: ACTUATOR_STATUS �?物理硬件 */
+     /* actuator_idx: 1=TIM1_CH1, 2=TIM1_CH2, 3=TIM1_CH3, 4=TIM1_CH4(ADC触发)
+      *               32+N=GPIO_PE_N (数字输出) */
+@@ -1349,8 +1582,7 @@ void TIM1_UP_IRQHandler(void) {
+             float v = ap[3]; if (v > 100.0f) v = 100.0f;
+             *(volatile uint16_t *)(TIM1_BASE + 0x3C) = (uint16_t)(v * 119.99f);
+         }
+-        /* CH4 保持 ADC 触发设置 (120MHz 计数值) */
+-        *(volatile uint16_t *)(TIM1_BASE + 0x40) = 11839;  /* @120MHz: ~98.7μs, ADC 转化完成 */
++        /* CH4:CCR4 在 main() 已配置,此处无需再写 */
+         /* 数字输出: actuator_idx 32~63 → GPIOE bit0~31 */
+         /* CPU 写 SHADOW,DMA Stream5 在 TIM1_UP 时刻搬到 GPIOE_ODR */
+         uint32_t gpio_bits = 0;
+@@ -1360,6 +1592,9 @@ void TIM1_UP_IRQHandler(void) {
+         /* CPU 写 SHADOW — DMA 在 TIM1_CC4 匹配时搬到 ODR
+          * 输出时刻锁定在周期末尾 (CCR4=11700 @136MHz ≈ 86μs) */
+         SHADOW_GPIO = gpio_bits;
++        /* GPIO 输出延迟: TIM1_CNT - CCR4, >0=已触发(用旧值), <0=有余量 */
++        {   volatile uint16_t *tim1_cnt = (volatile uint16_t *)(TIM1_BASE + 0x24);
++            gpio_output_delta = (int32_t)(uint16_t)*tim1_cnt - 11700; }
+     }
+ 
+     /* ── 调试日志: 每 100 周期记录一次关键状态 (火车模型, 站点之间) ──
+@@ -1452,10 +1687,25 @@ static void iwdg_disable_debug(void) {
+ }
+ 
+ int main(void) {
+-    /* ── IWDG 调试冻结 (main 首行!) ── */
+-    *(volatile uint32_t *)0x20000040 = 0xA1000000;  /* main 入口 */
++    /* ── IWDG 复位检测 (比 IWDG 初始化更早!) ── */
++    /* RCC_CSR bit29 = IWDGRSTF: 上一次复位是否由看门狗触发 */
++    #define RCC_CSR (*(volatile uint32_t *)0x520020D8)
++    if (RCC_CSR & (1u << 29)) {
++        /* 看门狗的 DTCM 没被清零,告警缓冲区内容保留 → 追加一条记录 */
++        volatile uint32_t *a = (volatile uint32_t *)ALARM_BUF_ADDR;
++        uint32_t idx = a[0];
++        uint32_t n = (a[1] > 0) ? (uint32_t)ALARM_MAX_ENTRIES : (idx % (uint32_t)ALARM_MAX_ENTRIES);
++        a[2 + n * 2]     = 0x06 << 24;  /* ALARM_IWDG_RESET */
++        a[2 + n * 2 + 1] = 0;           /* 触发时 SAMPLES 未知(reset了) */
++        a[0] = (n + 1) % (ALARM_MAX_ENTRIES * 2);
++        RCC_CSR |= (1u << 29);  /* 写 1 清标志 */
++    }
++    /* 上一行之后,IWDG 已经被配置且 RDY=1,开始自动喂狗周期 */
++
++    /* ── IWDG 调试冻结 ── */
++    *(volatile uint32_t *)0x20000040 = 0xA1000000;
+     iwdg_disable_debug();
+-    *(volatile uint32_t *)0x20000040 = 0xA2000000;  /* IWDG done */
++    *(volatile uint32_t *)0x20000040 = 0xA2000000;
+ 
+     /* ── DWT ── */
+     DEMCR |= (1 << 24);
+@@ -1905,6 +2155,8 @@ int main(void) {
+                    | (3 << 16);             /* PL=最高 */
+       DMA2_S5CR = cr | 1; }                /* EN=1 */
+ 
++    
++
+     /* ══════════════════════════════════════════════════════�?
+      * TIM1 配置: 100μs周期 + 4路PWM + TRGO(ADC)
+      * ══════════════════════════════════════════════════════�?*/
+@@ -1959,6 +2211,16 @@ int main(void) {
+     /* ── USART2 初始�?(UART 通信) ── */
+     usart2_init();
+ 
++    /* ── RTT 初始化 (非侵入式 SWD 监测) ── */
++    rtt_init();
++
++    /* ── 告警缓冲区初始化 ── */
++    {
++        volatile uint32_t *a = (volatile uint32_t *)ALARM_BUF_ADDR;
++        a[0] = 0; /* write_idx */
++        a[1] = 0; /* overflow_count */
++    }
++
+     /* ── 引擎自检: 硬编码 49 条路由已加载, 直接启动 ISR ── */
+     engine_start();
+ 

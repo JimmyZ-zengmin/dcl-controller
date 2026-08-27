@@ -1,0 +1,1 @@
+﻿    init_route(ri++, SRC_WIRE, 8, DST_WIRE, 9, OP_OR, 5, 0);

@@ -1,0 +1,135 @@
+# ESP32-S3 GPIO 抖动测量 — 测试报告与结论
+
+**日期**: 2026-07-15  
+**状态**: 已放弃 (ESP32-S3 RMT 方案不可靠)  
+**替代方案**: 采用 STM32 内部自测 + IDE 监测
+
+---
+
+## 1. 测试目标
+
+验证 STM32H723 通过 DMA-GPIO 链路输出的数字信号抖动,确认:
+- GPIO 翻转时刻是否严格锁定在设计周期 (~100μs)
+- DMA 搬运链路的确定性
+
+## 2. ESP32-S3 方案演进
+
+### v1: 轮询 + CCOUNT
+
+固件在 CPU 轮询 GPIO 状态,检测边沿时读取 CCOUNT 计算间隔。
+
+**结果**: pk-pk ~1-39ms,噪声大,不可用。
+
+**根因**: FreeRTOS tick 中断(1ms)抢占轮询,错过边沿。
+
+---
+
+### v2: CPU1 独占 + 精简 ISR
+
+将测量任务绑定到 APP CPU (核心1),使用中断而非轮询,降低干扰。
+
+**结果**: 略好于 v 但仍不稳定。
+
+---
+
+### v3: 轮询 + 毛刺滤波
+
+加 40μs 毛刺滤波,尝试稳定测量。
+
+**结果**: 仍存在丢边沿问题。
+
+---
+
+### v4: RMT DMA
+
+采用 ESP32-S3 的 RMT 外设,80MHz 硬件采样,DMA 自动写入 RAM。
+
+**结果**: 配置参数反复被驱动拒绝:
+- `mem_block_symbols=256` → 必须为 48 (硬件限制)
+- `signal_range_max_ns=500000` → 必须 < 409587 ns
+- 修正后配置被接受,但回调从不触发
+
+---
+
+### v5: RMT 配置修正
+
+将 `signal_range_max_ns` 调整为 300000,回调依旧不触发。
+
+**诊断**: GPIO 边沿中断方案证实信号到达引脚且稳定 (~13359 edges/s),问题在 RMT 内部状态机无法处理连续方波。
+
+---
+
+## 3. ESP32-S3 方案失败的根本原因
+
+1. **RMT 外设设计用于 IR 协议解码**,非连续波形采样
+2. ESP32-S3 RMT 在连续方波输入下内部状态机卡死
+3. CPU 轮询方案受 FreeRTOS tick 中断影响,无法稳定抓边沿
+4. ESP32 的 FreeRTOS 架构本身不适合做高精度时序测量
+
+---
+
+## 4. STM32 内部自测方案 (已实施,工作正常)
+
+### 4.1 告警系统 (已在固件中实现)
+
+| 功能 | 实现 |
+|------|------|
+| 告警缓冲 | DTCM 0xD800,1KB,128 条环形缓冲 |
+| ISR 异常检测 | 抖动/周期/路由数变化/引擎停止/样本停滞 |
+| 写入方式 | ISR 内直接写 DTCM,1-2 cycle,零阻塞 |
+| UART 同步 | 新增 CMD 0x22 READ_ALARMS,供 PC 读取告警历史 |
+| IWDG 复位检测 | main() 首行检测 RCC_CSR bit29,记录到告警缓冲 |
+
+### 4.2 RTT 实时上报 (SEGGER Real Time Transfer)
+
+每 100ms 通过 RTT up channel 0 上报一行状态: `S=xxx P=xxx,xxx R=xx E=1`
+
+- PC 端用 `pyocd rtt` 命令读取
+- 零干扰引擎 (SWD 读内存不 halt)
+- 数据留存到 `ide/compiler/monitor_data/YYYY-MM-DD.csv`
+
+### 4.3 IDE 监测组件
+
+| 文件 | 功能 |
+|------|------|
+| `ide/server/monitor_engine.py` | MonitorEngine 类,RTT 采集 + 异常检测 + CSV/JSONL 输出 |
+| `ide/web/js/monitor.js` | 波形图表 (Chart.js) + 信号数值表 |
+| `ide/web/index.html` | 新增 Monitor 面板 |
+| `ide/compiler/dcl_cli.py` | `dcl daemon status` 查看监测状态 |
+
+---
+
+## 5. 监测指标与异常检测规则
+
+| 指标 | 正常范围 | 告警条件 | 级别 |
+|------|---------|---------|------|
+| SAMPLES 增量 | >0 (持续+1000/100ms) | 连续 1s 不变 | CRITICAL |
+| PERIOD 抖动 (MAX-MIN) | <200 周期 (~1.5μs @136MHz) | >500 周期 | WARNING |
+| ROUTE_COUNT | = 49 | 变化 | WARNING |
+| engine_running | = 1 | = 0 | CRITICAL |
+| 采样率 | ~10kHz (±5%) | <9kHz | WARNING |
+| 设计周期偏差 | 0 | 持续偏移 >1% | WARNING |
+
+---
+
+## 6. 结论与后续建议
+
+### 已验证
+- STM32内部 RTT 监测方案稳定可靠,已验证 SAMPLES 持续增长
+- RMT 外设不适合作为测量设备
+- ESP32 架构不适合做 ns 级时序测量
+
+### 后续如果需要外部独立测量
+- **推荐**: 购买入门级逻辑分析仪 (Saleae 兼容,¥30-80) 或示波器
+- **次选**: 使用另一片 STM32 做输入捕获 (有专用硬件,零额外抖动)
+
+### 当前项目重点
+聚焦于:
+1. 完善 RTT 数据留存与异常日志
+2. IDE 监测面板实时显示
+3. 长期运行稳定性验证
+
+---
+
+**测试者**: xiaomi/LongCat-2.0  
+**日期**: 2026-07-15

@@ -1,0 +1,36 @@
+; WinUSB driver for STM32 DFU bootloader
+[Version]
+Signature="$Windows NT$"
+Class=USB
+ClassGuid={36FC9E60-C465-11CF-8056-444553540000}
+Provider=%ManufacturerName%
+CatalogFile=stm32dfu.cat
+DriverVer=01/01/2025,1.0.0.0
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+winusb.sys = 1,,
+
+[DestinationDirs]
+DestDir = 12
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DFU.DeviceDesc%=USB_Install, USB\VID_0483&PID_DF11
+
+[USB_Include]
+Include=winusb.inf
+Needs=WINUSB.NT
+
+[USB_Install]
+Include=winusb.inf
+Needs=WINUSB.NT.Services
+
+[Strings]
+ManufacturerName="STMicroelectronics"
+DiskName="STM32 DFU Driver"
+DFU.DeviceDesc="STM32 DFU (WinUSB)"

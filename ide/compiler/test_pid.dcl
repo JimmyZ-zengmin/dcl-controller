@@ -1,0 +1,5 @@
+# 测试PID控制
+# PID: 比例-积分-微分控制
+SENSOR temp FROM ADC1_CH0 SCALE 0.1 0.0
+PID heater FROM temp SP=60 KP=2.0 KI=0.1 KD=0.05 LIMIT 0 100
+OUTPUT heater TO TIM1_CH1

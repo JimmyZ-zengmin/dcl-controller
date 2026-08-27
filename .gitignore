@@ -1,0 +1,37 @@
+# Build artifacts
+bld/
+build/
+*.o
+*.elf
+*.map
+*.bin
+*.lst
+*.hex
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / editor
+.vscode/
+*.swp
+*.swo
+
+# Runtime / logs / generated data
+*.log
+*.pid
+sessions/
+*.csv
+monitor_data/
+
+# Private AI-tool caches (must never be committed)
+.mimocode/
+.qoder/
+.workbuddy/
+.codebuddy/
+node_modules/
+
+# OS
+Thumbs.db
+.DS_Store
