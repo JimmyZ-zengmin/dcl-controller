@@ -9,3 +9,21 @@
 *.elf binary
 *.map binary
 *.pdf binary
+
+# ---------------------------------------------------------------------------
+# GitHub linguist: language statistics
+#
+# The lwIP subtree ships ~8 MB of auto-generated Doxygen HTML/JS. Those files
+# are machine output, not source, and they out-weigh the hand-written C by 20x,
+# which made linguist report this repo as "HTML". Excluding them restores "C"
+# as the primary language.
+#
+# NOTE: only the *generated docs* are excluded. lwIP's own .c/.h sources stay
+# counted on purpose - they are vendored build inputs, which is normal practice
+# for embedded repos (same as STM32 HAL), and they are real C on this target.
+# ---------------------------------------------------------------------------
+firmware/h723-core0/lib/lwip/doc/** linguist-generated linguist-vendored linguist-documentation
+
+# Minified third-party web libs vendored into the IDE
+ide/web/lib/*.min.js linguist-vendored
+ide/web/lib/** linguist-vendored

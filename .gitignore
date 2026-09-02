@@ -32,6 +32,12 @@ monitor_data/
 .codebuddy/
 node_modules/
 
+# Third-party generated documentation (Doxygen output).
+# Keeps the clone small and the language stats honest.
+# Rebuild locally with: doxygen <lib>/doc/doxyfile
+**/doxygen/output/
+firmware/h723-core0/lib/lwip/doc/doxygen/output/
+
 # OS
 Thumbs.db
 .DS_Store
