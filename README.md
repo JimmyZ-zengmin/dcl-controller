@@ -80,7 +80,8 @@
     补 SHM `0x00-0x3F` 名字与断言、栈哨兵、`SRC_HMI` 显式分支、`cold_start_reset` 单一入口。
   - 空拍外壳：ITCM **44 cyc** vs FLASH **160 cyc**（3.6×）。
   - 单条路由 **56.0 cyc = 140 ns**（对照 S3 的 234 cyc = 975 ns，快 7 倍）。
-- ★ **阶段 3（一）：档桶分档调度完成**（详见 `docs/STAGE3-REPORT.md`）
+- ★ **档桶分档调度完成**（按 MIGRATE 属 **阶段 4 第 1 项**，提前完成；
+  详见 `docs/STAGE3-REPORT.md`）
   —— S3 OA15「治本重构」语义。**同一份 128 条三档程序，只切换扫描方式**：
 
   | 程序 | 全表扫 | **分档** | 效果 |
@@ -205,13 +206,31 @@ python la_tick_freq.py --cpu 400 --ch 4 --rate 16000000 --dur 1.0 --no-reset
 
 ---
 
-## 下一步（阶段 3 后半）
+## 下一步（编号以 `docs/MIGRATE-H723.md` 为准）
 
-1. ✅ ~~桶化分档~~（已完成，见 `docs/STAGE3-REPORT.md`）
+**阶段 3（★ 关键里程碑）— 协议栈 + 回归跑通**　当前 **0 / 4**，是最大空缺
+
+0. 现状提醒：H723 现在**没有任何协议层** —— 所有观测都靠 SWD + 编译期 `BOOT_*`
+   旋钮。也就是说"能被 PC 使用"这件事还没开始。
+1. **UART + 协议帧**（`transport`）：帧格式 / CRC16 / 解析器**逐字沿用 S3**，
+   保证回归脚本零改动。先上命令子集：
+   `0x01 GET_VERSION` · `0x20 READ` · `0x21 WRITE` · `0x38 ENGINE_STATUS`
 2. **deploy 路径**：0x10 写 staging → 热重载 → 生效确认（S3 的
    "ACK=已受理 ≠ 已生效"语义债在 H723 一次到位）。桶表 ST 区已按 S3 偏移预留
    ★ 预算模型必须按 H9 用 **/64** 给 div2 摊薄；deploy 侧还要拦
    `div=3` / `stateful op 无 state 槽` / `src_type==SRC_HMI`（H5 未决）
-3. **USART1 通信域**（Modbus RTU 从站）—— `SRC_HMI` 目前是留位返回 0
-4. **顺序域 Sequencer v0**
-5. 把 `tools/` 的 Python 回归脚本从 S3 平移（协议不变 ⇒ 脚本一行不改）
+3. **persist**（掉电保持；PERSISTENT 语义 = 运行期 0 flash 操作）
+4. **20 套回归平移**，脚本零改动 → 全绿（**这一步过了，"迁移成功"基本成立**）
+
+**阶段 4 剩余（四域补齐）**　当前 1 / 3
+
+1. ✅ ~~桶化分档~~（已完成 —— 见 `docs/STAGE3-REPORT.md`）
+2. **USART1 通信域**（Modbus RTU 从站）—— 让 `SRC_HMI` 落地 + LA 外部逐字节验证
+3. **顺序域 Sequencer v0**
+
+**阶段 5（AI + 确定性实测）**
+
+- ADC 16 位 + DMA → SENSOR · LA 长样本拍抖动对比 S3 · div0 容量实测
+
+> 注意：`g_scan_mode` 现在是**全局开关**；deploy 落地后分档应变成**表自带的属性**
+> （H723 的终态与 S3 一致：永远是分档），届时这个开关只剩回归对照用途。
