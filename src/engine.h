@@ -116,8 +116,30 @@
  *   "吃掉"邻区字节也不会有任何提示 (与 S3 的 OA20 同族 —— 那一族的本质就是
  *   "无人设防的区域迟早出事")。现在把空洞显式命名, 并把尺寸**钉成常量断言**:
  *   谁把邻区改大/改小, 这里立刻编译失败。 */
-#define OFF_RSVD_DSL_DOMAIN     0x3840   /* S3 的 macro/seq 域, H723 部分落地 */
+#define OFF_RSVD_DSL_DOMAIN     0x3840   /* 保留洞: 开头给 SEQ 区, 尾部仍未落地 */
 #define OFF_RSVD_DSL_DOMAIN_SZ  (OFF_ROUTE_BUCKETS - OFF_RSVD_DSL_DOMAIN)   /* 0xC40 */
+
+/* ══════════ W3: 顺序域 SEQ 区 (Sequencer v0) ══════════
+ * 落点 = 上面那个保留洞里的**尾部** (0x4000..0x4480, 与 S3 逐字节同偏移)。
+ *
+ * ★ 为什么偏移与 S3 一字不差: 本项目总目标是 "S3 的回归脚本尽量零改动"。
+ *   S3 的 shared_mem.h 把 SEQ 区定在 0x4000/0x4400 (在其 F1 扩容之后实测定下的),
+ *   而 H723 的洞 [0x3840,0x4480) 恰好能把这一整段装下 ⇒ 直接照抄, 不另起编号。
+ *   ★ 洞内 0x3840..0x4000 (0x7C0 = 1984B) 保持未分配, 但**有名字也有尺寸断言**
+ *     —— 审计 H3/A7 那一族教训: 无人设防的区域迟早出事。
+ *
+ * ★ 语义 (逐字照搬 S3, 一条都不能改):
+ *   · seq **不热重载**: 0x44 写 ACTIVE, 首次 START 才生效 (step_cur 从 0 起)。
+ *     顺序是"程序" —— 改程序 = STOP→下装→RUN, 这是 PLC 标准流程。
+ *   · 运行期引擎**只读**本区; BUSY 拍 (擦写中) 整段跳过, 步号冻结保持
+ *     (与"引擎 STOP 不清执行器"同哲学: 显式状态, 不留歧义)。
+ *   · 步号以 **wire** 形式暴露 → 离散域与连续域通过 wire 握手, 输出译码
+ *     下沉给已有路由网 (CMP 等), 不在 seq 内部开第二个写者 (D1/B1 地基不可拆)。 */
+#define OFF_SEQ_TABLE        0x4000   /* 步条目表: 64 × 16B = 1KB */
+#define OFF_SEQ_CTRL         0x4400   /* 实例控制块: 8 × 16B = 128B */
+#define OFF_SEQ_END          0x4480   /* == OFF_ROUTE_BUCKETS (与桶表精确相接) */
+#define MAX_SEQ_INST         8
+#define MAX_SEQ_STEPS        64
 
 /* ── W2.1: Force 域 (从 EXEC 保留洞里划出来, 落实"无人区迟早出事"的设防) ──
  *
@@ -189,6 +211,47 @@ typedef struct __attribute__((packed, aligned(4))) {
 } StateEntry_t;
 
 _Static_assert(sizeof(StateEntry_t) == 16, "StateEntry_t must be 16 bytes");
+
+/* ══════════ W3: Sequencer 数据结构 (与 S3 逐字节同) ══════════ */
+
+/* ---- 步条目 (16B packed) —— 表序 = 步序, 每实例一段连续槽 ----
+ * ★ 每条 = 一格。停留于某步时, 其转移条件被周期评估 (按实例档位)。
+ * ★ 条件**只有两种** (v0): 阈值转移 / 超时强推, 取先满足者。分支与并行 → v1。 */
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  cond_type;    /* 0=SENSOR 1=WIRE 2=无(仅超时) */
+    uint8_t  cond_idx;     /* 源索引 */
+    uint8_t  flags;        /* bit0=末步loop回卷 bit1=timeout_en bit2=启用(预留) */
+    uint8_t  reserved;     /* 显式命名: 使逐字节比对不依赖填充 */
+    uint16_t param_idx;    /* param.value_a=转移阈值(>); value_b=超时秒 */
+    uint16_t state_offset; /* 保留 0 (v0 计时在实例控制块, 不逐步占 STATE 槽) */
+    uint16_t jump_idx;     /* 0=线性下移 (v1: 分支目标) */
+    uint32_t reserved2;    /* ★ 必须是 u32 —— 4×u8 + 3×u16 + u32 = 16B。
+                            *   (第一版写成 u16 → sizeof=12, 被下面的 _Static_assert
+                            *    当场拦下。这就是断言的用处: 布局错了不能"编译过就算".) */
+} SeqStepEntry_t;
+
+_Static_assert(sizeof(SeqStepEntry_t) == 16, "SeqStepEntry_t must be 16 bytes");
+_Static_assert(_Alignof(SeqStepEntry_t) == 4, "SeqStepEntry_t alignment must be 4");
+
+/* ---- 实例控制块 (16B) —— 仅 0x44 写 + ISR 读写, 不进帧, 布局可重排 ----
+ * ★★ step_tick 必须是 **u32 且放最后** —— 这不是排版偏好, 是 S3 审计 OA5 的修复:
+ *   u16 在快档 (dt=100μs) 下 65535×100μs = 6.55 秒就回卷 → 超过 6.55s 的停留
+ *   会**静默卡步** (step_tick 归零, 超时永远差一点点, 看得像"条件没满足")。
+ *   这个 bug 只在"长停留"场景暴露, 短测试全绿 —— 同族于本项目"判据看起来在报
+ *   固件故障, 其实是量程不够"。⇒ 直接用 u32 (2^32 × 100μs ≈ 5 天, 够)。 */
+typedef struct __attribute__((packed, aligned(4))) {
+    uint16_t step_base;    /* 本实例在 SEQ_TABLE 的起始槽 */
+    uint16_t n_steps;
+    uint16_t step_cur;     /* 当前步号 (0-based 内部; 对外 wire 值 = step_cur+1) */
+    uint16_t out_wire;     /* 步号镜像 wire — B1 登记为本实例唯一生产者 */
+    uint8_t  period;       /* offset 8: div_idx(2bit) + phase(6bit), 同 RouteEntry */
+    uint8_t  run;          /* bit0=启用 (START 置位) */
+    uint16_t reserved;
+    uint32_t step_tick;    /* 本步已停留的**激活拍**数 (×dt = 秒) — 见上面 OA5 说明 */
+} SeqCtrl_t;
+
+_Static_assert(sizeof(SeqCtrl_t) == 16, "SeqCtrl_t must be 16 bytes");
+_Static_assert(_Alignof(SeqCtrl_t) == 4, "SeqCtrl_t alignment must be 4");
 
 /* ---- period 字段位定义 ---- */
 #define PERIOD_DIV_IDX_FAST  0   /* 1×: 每 100μs */
@@ -367,6 +430,15 @@ _Static_assert(OFF_PARAM_STAGING   + MAX_PARAMS    * 16 == OFF_STATE_TABLE,    "
 _Static_assert(OFF_STATE_TABLE     + MAX_STATES    * 16 == OFF_STATE_STAGING,  "SHM STATE_TABLE must abut next region");
 /* 状态 staging 之后是**保留区** (0x3840-0x447F), 所以这里只能断言"不相交" */
 _Static_assert(OFF_STATE_STAGING   + MAX_STATES    * 16 <= OFF_RSVD_DSL_DOMAIN,  "SHM STATE_STAGING overruns reserved hole");
+/* ★ W3: 保留洞 [0x3840,0x4480) 现在**被 SEQ 区分走尾部** —— 所以不能再断言
+ *   "洞的尺寸 == 0xC40 且洞尾 == BUCKET 头"(那条太粗, SEQ 一改也过)。
+ *   改成三段精确相接: [0x3840 .. SEQ 头) 是剩余洞, [SEQ 头 .. SEQ_END) 是 SEQ 区,
+ *   且 SEQ_END 必须**精确等于** BUCKET 头。任何一段尺寸变动立刻编译失败。 */
+_Static_assert(OFF_RSVD_DSL_DOMAIN <= OFF_SEQ_TABLE,                             "SHM SEQ table must start inside the reserved hole");
+_Static_assert(OFF_SEQ_TABLE % 4 == 0,                                          "SHM SEQ table must be 4-byte aligned");
+_Static_assert(OFF_SEQ_TABLE      + MAX_SEQ_STEPS * 16 == OFF_SEQ_CTRL,          "SHM SEQ_TABLE must abut SEQ_CTRL");
+_Static_assert(OFF_SEQ_CTRL       + MAX_SEQ_INST  * 16 == OFF_SEQ_END,           "SHM SEQ_CTRL must abut SEQ_END");
+_Static_assert(OFF_SEQ_END        == OFF_ROUTE_BUCKETS,                          "SHM SEQ region must abut route buckets exactly");
 _Static_assert(OFF_RSVD_DSL_DOMAIN + OFF_RSVD_DSL_DOMAIN_SZ == OFF_ROUTE_BUCKETS, "SHM DSL reserved-hole size mismatch");
 _Static_assert(OFF_ROUTE_BUCKETS   + ROUTE_BUCKET_U16 * 2 == OFF_ROUTE_BUCKETS_ST,  "SHM ROUTE_BUCKETS must abut staging");
 _Static_assert(OFF_ROUTE_BUCKETS_ST + ROUTE_BUCKET_U16 * 2 == OFF_ROUTE_BUCKETS_END, "SHM ROUTE_BUCKETS_ST must abut end");
@@ -445,9 +517,36 @@ uint32_t engine_tick(uint8_t *base, uint32_t tick, engine_scan_fn impl,
  * ★ 放 ITCM (热路径)。 */
 void engine_force_apply(uint8_t *base);
 
+/* ══════════════════ W3: Sequencer (顺序域) ══════════════════
+ * 语义与 S3 逐字相同 (DESIGN-sequencer §7): 每实例按自己的 (div,phase) 档位
+ * 被评估, 停留于某步时判"条件转移 / 超时强推", 满足则步号 +1。
+ * 步号镜像到 out_wire (1.0 起) —— 输出译码**下沉给路由网** (CMP 等),
+ * seq 内部不开第二写者 (B1 地基不可拆)。 */
+
+/** @brief 顺序域扫描段 —— 在**路由扫描之后、计时统计之前**调用, 与路由同拍。
+ *
+ *  ★ 为什么是独立入口而不是并进 engine_tick: 与 engine_force_apply 同族理由 ——
+ *    ISR 有两条扫描路径 (分档 / 全表扫), 且**纯 seq 程序 (n_routes=0) 也必须跑**。
+ *    若塞进 engine_tick, 那么"n_routes=0 的纯顺序机"这一整类程序会静默不推进。
+ *
+ *  ★ 成本 (S3 §7.2): 每实例每**激活拍**读 1 条步条目 + 1 次条件比较 + 至多 1 次
+ *    float 写 ≈ 几十 cyc; 8 实例全挂慢档时均摊每拍 < 2% 预算。
+ *    非激活拍以 (div,phase) 门直接跳过 (一次取模 + 一次比较)。
+ *
+ *  ★ BUSY 拍语义: 由调用方在 BUSY 时不调用 —— 步号**冻结保持**
+ *    (与"引擎 STOP 不清执行器"同哲学: 显式状态, 不留歧义)。
+ *
+ *  ★ 写 out_wire 时受 FORCE_MASK 屏蔽 (与路由写端同一判据) —— 否则"被强制的
+ *    wire"会被 seq 每拍改掉, 强制形同虚设 (OA9 同族)。
+ *
+ *  @param base  SHM 基址
+ *  @param tick  拍号 (与路由扫描同一个 tick, 保证相位一致)
+ *  @return      步号镜像写入次数 (0 = 本拍无实例推进; 供外部核对"真的动过")
+ */
+uint32_t engine_seq_tick(uint8_t *base, uint32_t tick);
+
 /** @brief SHM 静态区 (定义在 engine.c, 链接段 .dtcm_shm / DTCM 0x20000000) */
 extern uint8_t g_shm[SHM_SIZE];
-
 /** @brief 冷启动清零 (.dtcm_shm 是 NOLOAD, 上电内容不确定 → 必须显式清)
  *  ★ 单一入口纪律 (S3 第二十六轮收口): "新增任何域必须在此登记"。
  *    本实现直接整段 memset(SHM_SIZE), 所以天然完整 —— 但**新域若放在 SHM 之外**

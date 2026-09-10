@@ -241,6 +241,52 @@ OBS uint32_t g_persist_loads      = 0;   /* persist_load 调用次数 */
 OBS volatile uint32_t g_persist_req     = 0;   /* 写 1 → 主循环执行一次 persist_save */
 OBS uint32_t          g_persist_req_cnt = 0;   /* 实际受理的请求数 (与 writes 对账) */
 
+/* ★★ 免串口的**协议帧**触发点 (W3 新增, 与 g_persist_req 同族但更通用):
+ *   为什么需要它: seq 的验收核心是"引擎按语义推进并驱动译码路由输出", 而这条
+ *   链路只有**真的走一遍 `proto_dispatch`** 才算被测到 (直写路由表是无效的 ——
+ *   引擎扫的是**桶表**, 而桶表由 deploy 路径里的 engine_build_buckets 产出;
+ *   直写表对引擎不可见, 症状是"表看起来对, 但引擎输出的是上一个程序的值")。
+ *   而 PC 侧串口此刻未接线 (W1 旁路记录) ⇒ 必须给调试器一个能触发**真实命令
+ *   处理路径**的入口。
+ *
+ *   ★★ 设计要点 (为什么不是一个"直接调 h_seq_deploy"的特权入口):
+ *     · 特权入口测的是"h_seq_deploy 这个函数", 测不到"命令怎么被路由进来、
+ *       ACK/NAK 怎么回去"。而 PC 侧真正依赖的是**后两者**。
+ *     · 这里让 pyocd 把**完整的协议帧载荷** (cmd + payload) 写进 SHM 尾部暂存区,
+ *       主循环把它当成"刚从串口收到的一帧"交给 proto_dispatch ⇒ 命令分发、
+ *       校验器、ACK/NAK、观测面计数**全部被真实走到**。
+ *     · 与 g_persist_req 同族: volatile 且被主循环真读, 不会被 gc-sections 回收。
+ *
+ *   ★ 暂存区选 SHM 尾部 (OFF_MB_TAIL = 0x4B20, 24KB 空闲) —— 不与任何已落地域重叠。 */
+#define DEPLOY_REQ_MAX   4096          /* 单帧载荷上限 (0x10 deploy 最大 ~3KB) */
+OBS volatile uint32_t g_cmd_req      = 0;   /* 写 1 → 主循环执行一次暂存帧 */
+OBS volatile uint32_t g_cmd_req_len  = 0;   /* 暂存帧的字节数 (由工具写) */
+OBS uint32_t          g_cmd_req_cnt  = 0;   /* 实际受理的请求数 */
+OBS uint32_t          g_cmd_req_last = 0;   /* 最近一次被处理的命令码 (核对用) */
+
+/* ══════════ W3: Sequencer 的观测面 ══════════
+ * ★ 判据要点: "步号动过"不能只看 wire 的终值 —— 终值可能是别的写者写的。
+ *   必须有 ① 本拍真的推进了几次 ② 累计推进次数 ③ 0x44 受理/拒绝计数。
+ *   这样"顺序域在跑"才是可被外部核对的事实, 而不是"我看到 wire 变了"。 */
+OBS uint32_t g_seq_deploys    = 0;   /* 0x44 成功受理次数 */
+OBS uint32_t g_seq_nak        = 0;   /* 0x44 被拒次数 */
+OBS uint32_t g_seq_steps_sum  = 0;   /* 累计成功推进的步数 (每次 +1) */
+OBS uint32_t g_seq_writes     = 0;   /* 步号镜像写入次数 (受 force 屏蔽影响) */
+OBS uint32_t g_seq_last_cur   = 0;   /* 最近一次推进后的步号 (0-based, 供核对) */
+OBS uint32_t g_seq_ticks      = 0;   /* seq 段被调用的拍数 */
+OBS uint32_t g_seq_wrote_last = 0;   /* 最近一拍写入次数 (engine_seq_tick 返回值) */
+OBS uint32_t g_seq_max_cur    = 0;   /* 历史最大步号 (证明真的走到过末步) */
+/* ★ W3: 累计被 arm 的顺序实例数 (每次 START 对每个实例 +1)。
+ *   用途: ① 证明 START 真的走到过 seq arm 段 (而不是"run 位是别处置的");
+ *        ② 与 g_start_ok 对账: arm 数应 == start_ok × n_seq, 不等就说明
+ *           START 中途改了 N_SEQ (或 arm 段被跳过)。
+ *   ★ 语义修正如实记: 第一版它被当成"是否已 arm 过"的布尔 (用来区分 START 的
+ *     两个分支)。后来对照 S3 发现 S3 的 START 是**无条件**重置全部实例
+ *     (run=1, step_cur=0, step_tick=0, 镜像=1.0) —— 那才是被移植的语义。
+ *     于是删掉了自创的"已 RUN 不清零"分支 (它会让 PC 补发的 0x11 把正在执行的
+ *     顺序程序打回第一步, 与 S3 语义不符), 这个量随之改成纯计数器。 */
+OBS uint32_t g_seq_armed      = 0;
+
 /* ── 引擎扫描: 统计 (CPU 周期) ── */
 OBS uint32_t g_eng_cyc_last = 0;
 OBS uint32_t g_eng_cyc_min  = 0xFFFFFFFFu;
@@ -495,6 +541,39 @@ ISR_PLACE void TIM2_IRQHandler(void)
             if (d == 0u) g_eng_div0++;      /* 防御: "零成本"一定是测量坏了 */
         }
 
+        /* ══════════ W3: 顺序域扫描段 (Sequencer) ══════════
+         * ★★ 位置三条理由 (顺序不能动):
+         *   ① 在**路由扫描之后**: seq 条件读的 wire/SENSOR 是本拍最新值, 且
+         *      "步号 → CMP 译码路由 → 输出"能在**同一拍内**闭合 (输出不晚一拍)。
+         *   ② 在**计时统计之前**: seq 成本天然计入 isr_cyc (无需新开一个统计面),
+         *      于是"seq 把拍撑爆"这件事会被既有的 gate 当场抓住。
+         *   ③ 在 **if (gate && RUN) 门**内: 与路由同门 —— STOP 后 seq 也停,
+         *      步号冻结保持 (不是清零)。"停机时状态可见"是 PLC 的基本要求。
+         *
+         * ★★ 必须在**路由门之外**再判 n_routes: 纯顺序程序 (n_routes=0, 只有
+         *   步进器 + 译码路由) 是合法且常见的一类机器控制程序 —— 上面那个 if
+         *   一旦因为 n_routes=0 而跳过整段, 这类程序会静默不推进。
+         *   本实现把 seq 放在同一个 if 里但**不依赖 n_routes**, 所以两条路都通。 */
+        if (g_engine_gate && g_engine_run_seen) {
+            g_seq_ticks++;
+            uint32_t sw = engine_seq_tick(g_shm, g_tick_count);
+            g_seq_wrote_last = sw;
+            if (sw) {
+                g_seq_writes += sw;
+                /* 累计推进步数 + 记录步号: 步号只在"推进"时变, 所以这里对每个
+                 * 实例读一遍 step_cur 取最大 (实例数 ≤ 8, 成本可忽略)。 */
+                uint32_t nq = *(const volatile uint8_t *)(g_shm + OFF_CTRL_N_SEQ);
+                if (nq > MAX_SEQ_INST) nq = MAX_SEQ_INST;
+                for (uint32_t k = 0; k < nq; k++) {
+                    uint32_t c = *(const volatile uint16_t *)
+                        (g_shm + OFF_SEQ_CTRL + k * 16u + 4u);   /* SeqCtrl_t.step_cur */
+                    if (c > g_seq_max_cur) g_seq_max_cur = c;
+                    g_seq_last_cur = c;
+                }
+                g_seq_steps_sum += sw;
+            }
+        }
+
         uint32_t t1 = DWT_CYCCNT;
         uint32_t di = t1 - t0;
         g_isr_cyc_last = di;
@@ -744,6 +823,167 @@ static void h_deploy(const uint8_t *p, uint32_t n)
     ack(r, 6);
 }
 
+/* ══════════ W3 — 0x44 SEQ_DEPLOY (顺序域 Sequencer v0) ══════════
+ * 帧: [n_seq:u8][n_steps_total:u16]
+ *     [目录 n_seq×6B {n_steps:u8 out_wire:u8 period:u8 pad:u8 step_off:u16 LE}]
+ *     [步表 n_steps_total×16B (SeqStepEntry_t, 按实例连续)]
+ *
+ * ★ 与 S3 的关系: **校验规则逐条搬** (S3 main/main.c:650 h_seq_deploy), 但有三处
+ *   H723 侧必须不同的地方, 不是"简化"而是"本平台的事实":
+ *   ① 落盘触发: S3 在命令内直接 persist_save()(它挂后台任务, flash 操作不占协议线程)。
+ *      H7 裸机没有后台任务, 擦 128KB 扇区 ≈ 1~4s = 拍长的上万倍 —— 在命令里同步
+ *      落盘会**阻塞主循环**并彻底破坏确定性。⇒ 与 0x10 同款: 只标 dirty,
+ *      由 PC 在 STOP 后用 0x43 mode=1 显式触发。**语义更确定, 不是更差**。
+ *   ② Xtensa 的 `memw` → ARM 的 `dsb`。
+ *   ③ 校验错误用本项目逐字同构的 err 字符串 (S3 的 snprintf 动态串也保留一处)。
+ *
+ * ★ 语义定死 (三件"不做", 每条都有理由):
+ *   ① **必须 STOP 态部署**。seq 无 staging (直接写 ACTIVE 表), RUN 态部署 = ISR
+ *      可能读到半写表 → 半新半旧步表 = 任一因果都无法归因。0x13 先停是上位机流程。
+ *   ② **不热重载**: 直接写 ACTIVE + ctrl.run=0, START 时从 step0 开始。
+ *   ③ **不做跨命令 dst 冲突的静态表外校验**——但 **OA3 的 seq↔route 冲突必须查**
+ *      (步号镜像 wire 同时被某条路由写 = 双写者, 镜像被每拍覆盖静默失效)。
+ */
+static void h_seq_deploy(const uint8_t *p, uint32_t n)
+{
+    if (n < 3) { g_seq_nak++; nak("seq: short frame"); return; }
+    uint8_t  n_seq   = p[0];
+    uint16_t n_steps = get16(p + 1);
+    if (n_seq == 0 || n_seq > MAX_SEQ_INST) { g_seq_nak++; nak("seq: bad n_seq"); return; }
+    if (n_steps == 0 || n_steps > MAX_SEQ_STEPS) { g_seq_nak++; nak("seq: bad n_steps"); return; }
+    uint32_t need = 3u + (uint32_t)n_seq * 6u + (uint32_t)n_steps * 16u;
+    if (need != n) { g_seq_nak++; nak("seq: length mismatch"); return; }
+    /* OA7: RUN 态部署 = ISR 可能读半写表。定死必须 STOP 态。 */
+    if (SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN)) { g_seq_nak++; nak("seq: stop engine first"); return; }
+
+    const uint8_t *dir = p + 3;
+    const uint8_t *tbl = dir + (uint32_t)n_seq * 6u;
+
+    /* ── OA3: seq out_wire 是**新的写者类别**, 0x10 的 dst_seen 位图管不到它 ──
+     * seq 的"步号镜像"直接写 WIRE_MAP[out_wire], 与路由的 dst_channel 写同一格。
+     * 若撞槽: 每拍"路由写 → seq 覆盖"(或反之), 谁赢取决于段序 —— 步号镜像静默失效。
+     * 编译期已拦 (DSL 侧), 协议裸用必须兜底。
+     * ★ 只扫**生效条数** (OFF_CTRL_N_ROUTES): 表体在 count 之后是残留内容,
+     *   RESET 只清计数不清表 → 全表扫会把上次的残留条目误判冲突 (S3 T29 实测)。
+     * ★ ACTIVE + STAGING 两表都扫: deploy(0x10) 后 ISR 未及热切的窗口里,
+     *   新路由还在 STAGING —— 只扫 ACTIVE 会漏掉这个时序。 */
+    uint64_t rt_bm[2] = { 0u, 0u };
+    uint64_t sq_bm[2] = { 0u, 0u };
+    uint16_t nr_act = SHM_U16(g_shm, OFF_CTRL_N_ROUTES);
+    if (nr_act > MAX_ROUTES) nr_act = MAX_ROUTES;
+    const uint8_t *rt_tabs[2] = {
+        (const uint8_t *)(g_shm + OFF_ROUTE_TABLE),
+        (const uint8_t *)(g_shm + OFF_ROUTE_STAGING)
+    };
+    for (int t = 0; t < 2; t++) {
+        for (uint16_t i = 0; i < nr_act; i++) {
+            RouteEntry_t r;
+            memcpy(&r, rt_tabs[t] + (uint32_t)i * 16u, 16u);
+            if (!(r.flags & ROUTE_FLAG_ACTIVE)) continue;
+            if (r.dst_channel < MAX_WIRES)
+                rt_bm[r.dst_channel >> 6] |= 1ULL << (r.dst_channel & 63u);
+        }
+    }
+
+    /* ── pass1: 目录校验 (结构边界 + 唯一写者交叉) ── */
+    uint32_t off_sum = 0;
+    for (uint32_t i = 0; i < n_seq; i++) {
+        const uint8_t *d  = dir + i * 6u;
+        uint16_t ns = d[0];
+        uint16_t ow = d[1];
+        uint8_t  pd = d[2];
+        uint16_t off = get16(d + 4);
+        if (ns == 0) { g_seq_nak++; nak("seq: inst n_steps=0"); return; }
+        if (off != off_sum) { g_seq_nak++; nak("seq: step_off not contiguous"); return; }
+        if (ow >= MAX_WIRES) { g_seq_nak++; nak("seq: out_wire OOR"); return; }
+        if (ow == 0) { g_seq_nak++; nak("seq: out_wire 0 reserved"); return; }  /* 哨兵 (OA3) */
+        uint64_t bit = 1ULL << (ow & 63u);
+        if ((rt_bm[ow >> 6] & bit) || (sq_bm[ow >> 6] & bit)) {
+            /* 这条必须报出**具体 wire 号**, 否则 PC 侧只知道"冲突了"却不知道是哪条
+             * (128 条路由里找一个撞槽 = 大海捞针)。
+             * ★ 手工拼十进制, **不用 snprintf** —— 理由两条:
+             *   ① 裸机链接的是 nano.specs, snprintf 会拖进整条格式化链
+             *      (这个工程 FLASH 才 23KB; 引一个 snprintf 就是几百字节 + 栈开销);
+             *   ② 这条 NAK 消息是**协议的一部分**, 手工拼的字节能被 PC 端逐字断言,
+             *      比"依赖 libc 版本"稳定。NAK 串是 const 字面量, 走 s_txbuf 发出。 */
+            char m[48];
+            const char *pre = "seq: out_wire ";
+            uint32_t k = 0;
+            while (pre[k]) { m[k] = pre[k]; k++; }
+            char dig[5]; uint32_t nd = 0;
+            if (ow == 0u) dig[nd++] = '0';
+            uint32_t tmp = ow;
+            while (tmp) { dig[nd++] = (char)('0' + (tmp % 10u)); tmp /= 10u; }
+            while (nd) m[k++] = dig[--nd];
+            const char *suf = " conflicts writer";
+            for (uint32_t j = 0; suf[j]; j++) m[k++] = suf[j];
+            /* NAK 发送靠 NUL 定长, 所以这里必须补终止符 (手工拼字符串的经典坑) */
+            m[k] = '\0';
+            g_seq_nak++; nak(m);
+            return;
+        }
+        sq_bm[ow >> 6] |= bit;
+        if ((pd & PERIOD_DIV_MASK) > PERIOD_DIV_IDX_SLOW) { g_seq_nak++; nak("seq: bad div"); return; }
+        off_sum += ns;
+    }
+    if (off_sum != n_steps) { g_seq_nak++; nak("seq: dir steps mismatch"); return; }
+
+    /* ── pass2: 步表参数校验 (route_validate 哲学: 下载期显式拒绝, 不留给运行期) ── */
+    for (uint32_t i = 0; i < n_steps; i++) {
+        SeqStepEntry_t e;
+        memcpy(&e, tbl + i * 16u, 16u);
+        if (e.param_idx >= MAX_PARAMS) { g_seq_nak++; nak("seq: param_idx OOR"); return; }
+        if (e.cond_type > 2u) { g_seq_nak++; nak("seq: bad cond_type"); return; }
+        /* OA6: cond_type=2 (纯超时步, 无条件源) 若不使能 timeout → 无条件可判 又 无
+         * 超时计数 ⇒ 引擎永远停在这一步 (卡步), 而 PC 侧只看到"程序不动"。
+         * DSL 不会产出这种程序, 协议裸用必须拒。 */
+        if (e.cond_type == 2u && !(e.flags & 2u)) {
+            g_seq_nak++; nak("seq: timeout step needs timeout_en"); return;
+        }
+        if (e.cond_type == 0u && e.cond_idx >= MAX_SENSORS) { g_seq_nak++; nak("seq: cond sensor OOR"); return; }
+        if (e.cond_type == 1u && e.cond_idx >= MAX_WIRES)   { g_seq_nak++; nak("seq: cond wire OOR"); return; }
+        if (e.flags & 2u) {   /* timeout_en: value_b(超时秒) 必须 > 0, 否则超时永不触发 */
+            uint32_t tb;
+            memcpy(&tb, (const uint8_t *)(g_shm + OFF_PARAM_TABLE) + (uint32_t)e.param_idx * 16u + 4u, 4u);
+            if ((tb & 0x7FFFFFFFu) == 0u) { g_seq_nak++; nak("seq: timeout must be >0"); return; }
+        }
+    }
+
+    /* ── 写表 + 控制块 (此时引擎 STOP, 无竞争窗口) ── */
+    memcpy((void *)(g_shm + OFF_SEQ_TABLE), tbl, (uint32_t)n_steps * 16u);
+    uint32_t o2 = 0;
+    uint8_t phase_cnt[3] = { 0u, 0u, 0u };
+    for (uint32_t i = 0; i < n_seq; i++) {
+        const uint8_t *d = dir + i * 6u;
+        uint8_t pd = (uint8_t)(d[2] & PERIOD_DIV_MASK);
+        /* phase = 同 div 组内序号 —— 错开防同拍积压 (与 0x10 的路由相位分配同策略)。
+         * ★ 用 & PERIOD_PHASE_MASK 保护: 同组实例数 < 8 永远进不了这个分支, 但仍
+         *   不能依赖"输入合法"来做移位安全 —— 6 位域一旦被高位污染就是未定义行为。 */
+        uint8_t phase = (uint8_t)(phase_cnt[pd] & PERIOD_PHASE_MASK);
+        phase_cnt[pd]++;
+        uint8_t *c = (uint8_t *)(g_shm + OFF_SEQ_CTRL) + i * 16u;
+        uint16_t ns = d[0];
+        /* 逐字段写 volatile SHM (不用结构体整体赋值: 打包结构体在 volatile 上
+         * 会被展开成逐字节访问, 语义正确但在这里不必要 —— 用定点写更清楚) */
+        *(volatile uint16_t *)(c + 0) = (uint16_t)o2;
+        *(volatile uint16_t *)(c + 2) = ns;
+        *(volatile uint16_t *)(c + 4) = 0u;                 /* step_cur = 0 */
+        *(volatile uint16_t *)(c + 6) = (uint16_t)d[1];     /* out_wire */
+        c[8]  = (uint8_t)(pd | (phase << PERIOD_PHASE_SHIFT));  /* period */
+        c[9]  = 0u;                                         /* run = 0 (START 置位) */
+        *(volatile uint16_t *)(c + 10) = 0u;                /* reserved */
+        *(volatile uint32_t *)(c + 12) = 0u;                /* step_tick (u32, OA5) */
+        o2 += ns;
+    }
+    SHM_U8(g_shm, OFF_CTRL_N_SEQ) = n_seq;
+    __asm__ volatile("dsb" ::: "memory");
+
+    /* 与 0x10 同: 只标 dirty, 不在此处落盘 (理由见函数头 ①) */
+    g_persist_dirty = 1;
+    g_seq_deploys++;
+    ack(NULL, 0);
+}
+
 /* 0x38 ENGINE_STATUS — **前 31 字节与 S3 逐字节同布局** (上位机脚本零改动),
  * 尾部追加 H723 扩展 6B (S3 的"尾部追加保前段兼容"惯例)。
  *
@@ -889,10 +1129,52 @@ static void h_start_w1(void)
     /* ② OA13 幂等: 只在 STOP→RUN 转变时清统计。
      *    已 RUN 再收 START (热重载 deploy 默认补发一条 0x11) 必须**不清零**,
      *    否则 T4 "心跳连续" 判据 (samples 单调增长证明未停机) 被误伤。 */
-    if (!SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN)) {
+    uint8_t was_run = SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN);
+    if (!was_run) {
         stats_reset();
         g_timing_resets++;
     }
+
+    /* ③ ★ W3: 顺序域 arm —— **必须在 ENGINE_RUN=1 之前做完**。
+     *   ★★ 顺序理由 (单核 H723 与 S3 双核的差别, 必须说清):
+     *     S3 是 core0 写 / core1 扫, 靠 `memw` 排序, 顺序是"先置 RUN 再写 ctrl"。
+     *     H723 是**单核**: 主循环置 RUN 的下一拍 ISR 就会扫 seq —— 若先置 RUN,
+     *     ISR 可能在本函数还没写完 ctrl 时就推进了步号, 随后本函数又把
+     *     `step_cur=0` / 镜像 `1.0` 覆盖回去 ⇒ **一次真实的推进被静默吞掉**。
+     *     ⇒ 本平台改为"先把 ctrl 与镜像备好, 最后一步才开 RUN 门", 竞争窗口归零。
+     *     (这是"照搬语义、不照搬时序"——语义逐字同 S3, 时序按单核事实重排。)
+     *
+     *   ★★★ 移植遗漏修正 (对照 S3 main/main.c:914-920 发现的**真缺陷**):
+     *     S3 在这里**还要把步号镜像 wire 写成 1.0**:
+     *         if (sc[i].out_wire < MAX_WIRES) wm[sc[i].out_wire] = 1.0f;
+     *     第一版 H723 移植漏了这句, 后果是: 停在 step0 期间, out_wire 上是
+     *     **上一个程序留下的残值** (实测是 boot profile 的 0.01)。
+     *     危害两层:
+     *       · 语义层: "步号镜像"宣称反映当前步号, 实际显示别的程序的垃圾 ——
+     *         正是本项目"宣称≠实现"铁律要消灭的那类东西;
+     *       · 功能层: 译码路由若写 `CMP(步号 < 1.5)` 或 DIRECT, 会在第一步期间
+     *         读到残值并输出错误的执行器信号 (而 CMP(>1.5) 只是**恰好**正确)。
+     *     ★ 这个缺陷之所以能被抓到, 全靠 T28.B1 的"起点快照"判据 (期望 1.0,
+     *       实测 0.01) —— 如果只测"推进后对不对", 它会一直藏着。 */
+    {
+        uint8_t  nq = SHM_U8(g_shm, OFF_CTRL_N_SEQ);
+        if (nq > MAX_SEQ_INST) nq = MAX_SEQ_INST;
+        volatile float *wm = (volatile float *)(void *)(g_shm + OFF_WIRE_MAP);
+        for (uint8_t k = 0; k < nq; k++) {
+            uint8_t *c = (uint8_t *)(g_shm + OFF_SEQ_CTRL) + (uint32_t)k * 16u;
+            *(volatile uint16_t *)(c + 4) = 0u;     /* step_cur  = 0 (从第 1 步起) */
+            *(volatile uint32_t *)(c + 12) = 0u;    /* step_tick = 0 */
+            c[9] = 1u;                              /* run = 1 */
+            uint16_t ow = *(volatile uint16_t *)(c + 6);
+            if (ow < MAX_WIRES) {
+                /* 镜像语义: 停在 step0 ⇒ 对外值 1.0 (步号 1 起) */
+                uint32_t msk = SHM_U32(g_shm, OFF_FORCE_MASK + ((uint32_t)ow >> 5) * 4u);
+                if (!(msk & (1u << ((uint32_t)ow & 31u)))) wm[ow] = 1.0f;
+            }
+            g_seq_armed++;                          /* 观测: 实际 arm 了几个实例 */
+        }
+    }
+
     SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN) = 1;
     __asm__ volatile("dsb" ::: "memory");
     g_start_ok++;
@@ -903,6 +1185,9 @@ static void h_start_w1(void)
 static void h_stop_w1(void)
 {
     SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN) = 0;
+    /* ★ W3: 步号**冻结保持** (不清零, 不推进) —— 与 ISR 的 `if (gate && RUN)` 门一致。
+     *   PLC 停机时"当前在第几步"必须是可读的现场信息; 清零会把它变成不可恢复的丢失。
+     *   恢复靠下一次 START (那里做 arm: step_cur=0 + 镜像=1.0)。 */
     __asm__ volatile("dsb" ::: "memory");
     g_safe_gpio_mask = SHM_U32(g_shm, OFF_CTRL_GPIO_MASK);
     eng_outputs_safe();
@@ -916,6 +1201,10 @@ static void h_reset_w1(void)
 {
     cold_start_reset();          /* 整段 memset, 天然覆盖 FORCE_MASK/VAL (W2.1) */
     g_force_clears++;            /* ★ 用同一计数证明 RESET 真的清过 force */
+    /* ★ W3: RESET 清空了 N_SEQ 与整张 ctrl 块 → "已 arm"标记必须一起失效,
+     *   否则下一次 START 会走"已 RUN 分支"(不清步号)—— 而步号此刻已经不存在了。
+     *   这是"运行态标记必须与它描述的数据同生命周期"的又一例。 */
+    g_seq_armed = 0;
     /* ★ W2.4: RESET 清空运行表 → 未落盘的快照语义上已失效。
      *   不清会导致"下次 0x43 落盘"把 RESET 之前的旧配置写进 flash 并恢复 ——
      *   (S3 persist_clear_dirty 的同款理由)。Flash 里已有的数据**不动**
@@ -1172,6 +1461,8 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_FORCE:         h_force_w2(p, n); break;
         /* ---- W2.4: persist ---- */
         case CMD_PERSIST:       h_persist_w2(p, n); break;
+        /* ---- W3: 顺序域 ---- */
+        case CMD_SEQ_DEPLOY:    h_seq_deploy(p, n); break;
         /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
          *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
          *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
@@ -1322,6 +1613,15 @@ static void obs_anchor(void)
     sink ^= g_persist_writes;   sink ^= g_persist_dirty;
     sink ^= g_persist_target;   sink ^= g_persist_erase_ok;
     sink ^= g_persist_erase_fail;
+    /* W3 Sequencer 观测面 (不登记必被 --gc-sections 回收 → nm 找不到符号) */
+    sink ^= g_seq_deploys;     sink ^= g_seq_nak;
+    sink ^= g_seq_steps_sum;   sink ^= g_seq_writes;
+    sink ^= g_seq_last_cur;    sink ^= g_seq_ticks;
+    sink ^= g_seq_wrote_last;  sink ^= g_seq_max_cur;
+    sink ^= g_seq_armed;
+    /* W3 免串口协议帧钩子 (不登记会被 --gc-sections 回收) */
+    sink ^= g_cmd_req;         sink ^= g_cmd_req_len;
+    sink ^= g_cmd_req_cnt;     sink ^= g_cmd_req_last;
     (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
 }
 
@@ -1491,6 +1791,24 @@ int main(void)
             if (rc == 1)      g_persist_skip_run++;
             else if (rc == 0) g_persist_saves++;
             else              g_persist_nak++;
+        }
+        /* ★ W3: 免串口**协议帧**请求 (pyocd 直写暂存区 + g_cmd_req)。
+         *   走**真实的 proto_dispatch** (与串口收到的帧完全同一条路径) —— 见
+         *   g_cmd_req 的说明。这样命令分发/校验器/ACK-NAK/观测面计数都被走到,
+         *   而不是"绕过协议直接调函数"。
+         *   ★ 帧格式与串口**一致**: 暂存区里放的是**裸载荷** (不含 FRAME_SYNC/CRC),
+         *     因为那几个字节是**链路层**的职责, 与命令语义无关 (校验器的判据是
+         *     载荷内容, 不是 CRC)。长度由 g_cmd_req_len 给出。 */
+        if (g_cmd_req) {
+            g_cmd_req = 0;
+            uint32_t rl = g_cmd_req_len;
+            if (rl > DEPLOY_REQ_MAX) rl = DEPLOY_REQ_MAX;
+            if (rl >= 1u) {
+                const uint8_t *pl = (const uint8_t *)(g_shm + OFF_MB_TAIL);
+                g_cmd_req_cnt++;
+                g_cmd_req_last = pl[0];
+                proto_dispatch(pl[0], pl + 1u, rl - 1u);
+            }
         }
         /* 重填表: 先关扫描门 (防 ISR 扫到半张表), 填完恢复 */
         if (g_reinit) {

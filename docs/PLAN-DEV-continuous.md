@@ -59,20 +59,24 @@ S3 白名单（main.c:83-104）:
 ### W1.3 `0x11 START` / `0x12 STOP` / `0x13 RESET`
 逐字搬 S3 语义，三处必须保留：
 
-**START**（S3 main.c:895-921）
+**START**（S3 main.c:895-921；H723 时序已按单核重排）
 ```c
 /* ① F11 预算兜底：persist 恢复的毒药表拒 START */
 if (nr && engine_prog_budget(route_table, nr) > EXEC_DEPLOY_BUDGET) → NAK "prog exceeds budget"
 /* ② OA13 幂等：只在 STOP→RUN 转变时 reset 统计（否则 T4"心跳连续"判据被误伤）*/
 if (!ENGINE_RUN) timing_stats_reset();
+/* ③ Seq arm（W3）：step_cur=0 / step_tick=0 / run=1 / **镜像=1.0**
+ *   ★ 必须在 ENGINE_RUN=1 **之前** 做完 —— 单核下先开门会与 ISR 抢 step_cur，
+ *     一次真实推进会被随后写回的 0 静默吞掉。S3 双核靠 memw 排序，这里按事实重排。 */
+for (k < N_SEQ) { /* 无脑重置全部实例（与 S3 一致，不做"已 RUN 不清零"的自创分支）*/ }
 ENGINE_RUN = 1;
-/* ③ Seq 运行态重置（W3 落地后再补；当前 N_SEQ=0 时是空循环）*/
 ```
 
 **STOP**（S3 main.c:925）
 ```c
 ENGINE_RUN = 0;
 outputs_safe();   /* P1-2 安全态：执行器归零 */
+/* Seq: 步号**冻结保持**（不清零）—— 停机时"当前第几步"是必须可读的现场信息 */
 ```
 ★ H723 的 `outputs_safe()`：S3 是 `GPIO_OUT_W1TC_REG` 只清不置。
 H723 用 **BSRR 的高 16 位**（`GPIOx_BSRR = mask << 16`）实现"只清不置"，
@@ -192,33 +196,47 @@ bank1**（读 bank2 的 KEYR2 @0x52002100 得 0），扇区号只能 0..7。选�
 
 ---
 
-## W3: Sequencer（P1，1 条命令）
+## W3: Sequencer（P1，1 条命令）✅ **已完成 (2026-09-11)**
 
-### W3.1 SHM 开 Seq 区
+### W3.1 SHM 开 Seq 区 ✅
 ```
-当前 OFF_RSVD_DSL_DOMAIN = 0x3840, SZ = 0xC40 (3136B)
-改为:
-  OFF_SEQ_CTRL = 0x3840   /* MAX_SEQ_INST × sizeof(SeqCtrl_t) */
-  OFF_MACRO_RUN = ...     /* W5 用 */
-  OFF_DSL_TAIL = ...
-断言: 0x3840 + seq_sz + macro_sz + tail_sz == 0x4480 (OFF_ROUTE_BUCKETS)
+实际落点 (与 S3 逐字节同偏移 —— 洞 [0x3840,0x4480) 恰好装得下):
+  OFF_SEQ_TABLE = 0x4000   /* 64 × 16B = 1KB  步条目表 */
+  OFF_SEQ_CTRL  = 0x4400   /*  8 × 16B = 128B 实例控制块 */
+  OFF_SEQ_END   = 0x4480   /* == OFF_ROUTE_BUCKETS (与桶表精确相接) */
+断言 (全部用 == 而非 <=, 任何尺寸改动只要不与邻区严丝合缝就编译失败):
+  OFF_SEQ_TABLE + 64*16 == OFF_SEQ_CTRL
+  OFF_SEQ_CTRL  +  8*16 == OFF_SEQ_END
+  OFF_SEQ_END            == OFF_ROUTE_BUCKETS
 ```
-先读 `DESIGN-sequencer.md` + S3 `main.c:650` `h_seq_deploy` 确认 `SeqCtrl_t` 字段。
+`SeqStepEntry_t` / `SeqCtrl_t` 各带 `sizeof==16` 与 `_Alignof==4` 断言。
+★ 踩坑: `packed` 结构体里 u32 **不**补齐到 4 的倍数 —— `SeqStepEntry_t` 的
+  `reserved2` 落在 offset **10**（不是 12），只有**结构体总长**被 `aligned(4)`
+  补到 16。Python 侧必须写 `<BBBBHHHIxx`（14B 内容 + 2B 尾填充）。
+  已固化 `tools/_layout_probe.c`：编译期断言证明两侧布局一致。
 
-### W3.2 `0x44 SEQ_DEPLOY` + ISR 侧推进
-S3 语义要点（DESIGN-sequencer.md）：
-- 顺序域与连续域**同拍共存**：Seq 在 ISR 内推进，但**不走分档桶**
-- `step_tick` 计数到 `step_dur` 换步；`run` 位控制启停
-- 步号镜像到 `out_wire`（START 时置 1.0）
-- START = 运行态重置（全部实例回第 1 步），组态保留
+### W3.2 `0x44 SEQ_DEPLOY` + ISR 侧推进 ✅
+- `engine_seq_tick()` (ITCM)：阈值转移 / 超时强推 / 末步 loop / 步号镜像（受 FORCE 屏蔽）
+- ISR 位置：**路由扫描之后**（条件读本拍最新值，译码同拍闭合）、**计时统计之前**
+  （seq 成本天然计入 isr_cyc，被既有预算 gate 抓住）、**gate && RUN 门内**（STOP 后冻结）
+- 不依赖 `n_routes`：纯顺序程序（n_routes=0）是合法且常见的一类
+- `h_start_w1` 补 arm 段（`step_cur=0 / step_tick=0 / run=1 / **镜像=1.0**`），
+  且**在置 ENGINE_RUN 之前**做完（单核竞争窗口归零 —— S3 是双核靠 memw 排序，时序必须重排）
 
-**验收**: `python tools/h723_seq.py`（对照 S3 `verify_seq.py` + `verify_seq8.py`）
-- 部署 3 步序列，步长 10/20/30 拍 → 用 0x20 高频轮询步号，验证换步时刻
-- 8 实例并发（S3 verify_seq8 口径）
-- STOP→START 后全部回第 1 步
-- 步号镜像 wire 值正确
+**验收**: `python tools/h723_seq.py` → **27 PASS / 0 FAIL**
+- T28 灵魂测试 (14)：条件转移 / 阴性对照 / 超时强推 / 末步 loop / 步号镜像 /
+  停机冻结 / 译码路由闭环（改输入 → 等拍 → 读输出）
+- T29 校验器 (13)：帧长 / n_seq 上下界 / out_wire 哨兵 / **OA6 卡步防护** /
+  param_idx / cond_type / div / step_off 连续 / dir-total 一致 / **OA3 撞槽** / **OA7 RUN 态**
 
-**W3 收口**: 能力位加 `SEQ (0x0040)`。
+★ **本批次抓到 1 个真缺陷**（移植遗漏，S3 `main.c:918` 有、H723 第一版没有）：
+  START 时未把步号镜像置 1.0 → 停在 step0 期间 `out_wire` 上是**上一程序的残值**
+  （实测 0.01）。危害：语义层"镜像宣称反映当前步号"是假的；功能层译码路由若写
+  `CMP(步号<1.5)` 或 DIRECT 会读到残值输出错误信号。**由 T28.B1 起点快照判据抓出**。
+
+**W3 收口**: 能力位加 `SEQ (0x0040)` → `DCL_CAP_H723_IMPL = 0x00F7` ✅
+  ★ 同时修正 `tools/h723_proto.py` 的 `EXPECT_CAP`（它停在 0x0033，W2/W2.4/W3
+    三次落地都漏同步 —— 属 A4 同族"两处手工同步必忘一处"）。
 
 ---
 

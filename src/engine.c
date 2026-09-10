@@ -385,10 +385,123 @@ ATTR_ITCM void engine_force_apply(uint8_t *base)
     }
 }
 
+ATTR_ITCM /* ══════════════════ W3 — 顺序域扫描段 (Sequencer v0) ══════════════════
+ *
+ * 位置语义: 由 TIM2_IRQHandler 在**路由扫描之后、计时统计之前**调用。
+ *   · 之后: 本拍路由已跑完, seq 条件读到的 wire/SENSOR 是本拍的最新值
+ *     (拍首 force 覆写 → 路由 → seq, 这个顺序让"步号 → 译码路由 → 输出"在一拍内闭合)
+ *   · 之前: seq 的成本天然计入 isr_cyc (无需新统计), 且被拍长门覆盖
+ *
+ * ★★ 四条件 v0 (与 S3 core0_isr.c:288+ 逐字同):
+ *   ① 条件转移: 步条目的条件源 (SENSOR/WIRE) > param.value_a
+ *   ② 超时强推: flags.timeout_en 且 停留激活拍数 × dt ≥ param.value_b (秒)
+ *   ③ 末步: flags.loop → 回第 1 步; 否则停末步 (完成态, 步号保持不归零)
+ *   ④ 步号镜像: out_wire = step_cur + 1 (1.0 起步, 与"第几步"人眼一致)
+ *
+ * ★ 一次至多推进 1 步 (不是 while 循环): 否则"条件恒真 + loop"会让一个实例在
+ *   单拍内绕完整圈 —— WCET 就随步数增长了, 且外部看不到中间步号。
+ *   一拍一步 ⇒ 成本上界 = 实例数, 与前缀无关 (可预算)。
+ *
+ * ★ 非激活拍: (div,phase) 门在**读步条目之前**就跳过 —— 所以慢档实例在非激活拍
+ *   的成本只有"一次取模 + 一次比较"。这是"8 实例全慢档均摊 <2%"的来源。
+ *
+ * ★ 写端屏蔽 (与路由 DEFINE_ENGINE_SCAN 的 dst 写同一判据, 就地 volatile 读):
+ *   被 force 的 wire 不允许被 seq 改。缺这一半,"强制"只在"seq 不推进"时有效。
+ */
+ATTR_ITCM uint32_t engine_seq_tick(uint8_t *base, uint32_t tick)
+{
+    uint32_t n_seq = (uint32_t)*(const volatile uint8_t *)(base + OFF_CTRL_N_SEQ);
+    if (n_seq == 0u) return 0u;
+    if (n_seq > MAX_SEQ_INST) n_seq = MAX_SEQ_INST;
+
+    const SeqStepEntry_t *stb = (const SeqStepEntry_t *)(const void *)(base + OFF_SEQ_TABLE);
+    const ParamEntry_t   *pm  = (const ParamEntry_t *)(const void *)(base + OFF_PARAM_TABLE);
+    const volatile float *sm  = (const volatile float *)(const void *)(base + OFF_SENSOR_MAP);
+    volatile float       *wm  = (volatile float *)(void *)(base + OFF_WIRE_MAP);
+    /* ★ 0x44 写表时用的就是 void* 直写 (无 staging), 所以这里必须按 volatile 读
+     *   —— 否则编译器可把整条 seq 循环提到"从不改变"的假设下优化掉。 */
+    volatile SeqCtrl_t *scw = (volatile SeqCtrl_t *)(void *)(base + OFF_SEQ_CTRL);
+
+    uint32_t ph1 = tick % (uint32_t)BUCKET_DIV1_PHASES;      /* 10 */
+    uint32_t ph2 = tick % (uint32_t)BUCKET_DIV2_PHASES;      /* 64 */
+    uint32_t wrote = 0u;
+
+    for (uint32_t i = 0; i < n_seq; i++) {
+        uint16_t run      = scw[i].run;
+        uint16_t cur      = scw[i].step_cur;
+        uint16_t nsteps   = scw[i].n_steps;
+        uint16_t sbase    = scw[i].step_base;
+        uint16_t owire    = scw[i].out_wire;
+        uint8_t  period   = scw[i].period;
+        uint32_t sttick   = scw[i].step_tick;
+
+        if (!(run & 1u)) continue;
+        if (nsteps == 0u || cur >= nsteps) continue;         /* 完成态/空实例 */
+
+        /* ---- (div, phase) 门: 与本拍的路由扫描同一套数 (相位对齐) ---- */
+        uint8_t pd = (uint8_t)(period & PERIOD_DIV_MASK);
+        uint8_t ph = (uint8_t)((period >> PERIOD_PHASE_SHIFT) & 0x3Fu);
+        float dt;
+        if (pd == PERIOD_DIV_IDX_FAST)      dt = 0.0001f;
+        else if (pd == PERIOD_DIV_IDX_MID)  { if (ph1 != ph) continue; dt = 0.001f; }
+        else if (pd == PERIOD_DIV_IDX_SLOW) { if (ph2 != ph) continue; dt = 0.01f; }
+        else continue;                                       /* div=3 非法: 不收不推 */
+
+        /* ---- 读本步条目 (越界保护: 表损坏时宁可不动, 不读别人的槽) ---- */
+        uint32_t slot = (uint32_t)sbase + (uint32_t)cur;
+        if (slot >= MAX_SEQ_STEPS) continue;
+        SeqStepEntry_t e = stb[slot];   /* ★ 整体拷贝: 表对 ISR 只读, 但 0x44 会写 */
+
+        uint32_t pidx = (uint32_t)e.param_idx;
+        if (pidx >= MAX_PARAMS) continue;                    /* 越界: 不推进 (校验器本该拦) */
+        const ParamEntry_t *pp = &pm[pidx];
+
+        int adv = 0;
+        /* ---- 条件转移 (阈值): 有限值才比 —— NaN 比较恒假, 会让引擎静默卡步 ---- */
+        if (e.cond_type <= 1u) {
+            float v;
+            if (e.cond_type == 0u) {
+                uint32_t ci = (uint32_t)e.cond_idx;
+                if (ci >= MAX_SENSORS) continue;
+                v = sm[ci];
+            } else {
+                uint32_t ci = (uint32_t)e.cond_idx;
+                if (ci >= MAX_WIRES) continue;
+                v = wm[ci];
+            }
+            union { float f; uint32_t u; } cv; cv.f = v;
+            if (is_finite_bits(cv.u) && cv.f > pp->value_a) adv = 1;
+        }
+        /* ---- 超时强推 ---- */
+        if (!adv && (e.flags & 2u)) {
+            sttick++;
+            scw[i].step_tick = sttick;
+            if ((float)sttick * dt >= pp->value_b) adv = 1;
+        }
+
+        if (adv) {
+            uint16_t ncur = (uint16_t)(cur + 1u);
+            if (ncur >= nsteps)
+                ncur = (e.flags & 1u) ? 0u : (uint16_t)(nsteps - 1u);   /* loop / 完成态 */
+            scw[i].step_cur  = ncur;
+            scw[i].step_tick = 0u;
+            /* 步号镜像 (1.0 起步) —— 写端屏蔽: 被强制的 wire 不改 */
+            if (owire < MAX_WIRES) {
+                uint32_t msk = *(const volatile uint32_t *)
+                    (base + OFF_FORCE_MASK + ((uint32_t)owire >> 5) * 4u);
+                if (!(msk & (1u << ((uint32_t)owire & 31u)))) {
+                    wm[owire] = (float)(ncur + 1u);
+                    wrote++;
+                }
+            }
+        }
+    }
+    return wrote;
+}
+
 ATTR_ITCM uint32_t engine_tick(uint8_t *base, uint32_t tick, engine_scan_fn impl,
                                uint32_t *nrun_out)
-{
-    const uint16_t *bkt  = (const uint16_t *)(base + OFF_ROUTE_BUCKETS);
+{    const uint16_t *bkt  = (const uint16_t *)(base + OFF_ROUTE_BUCKETS);
     const uint16_t *off1 = bkt, *cnt1 = bkt + BUCKET_DIV1_PHASES;
     const uint16_t *off2 = bkt + 20, *cnt2 = bkt + 120;
 
