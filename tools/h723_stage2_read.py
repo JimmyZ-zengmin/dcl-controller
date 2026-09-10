@@ -49,6 +49,7 @@ STAT_SYMS = [
     ("g_table_ck", 1), ("g_active_routes", 1), ("g_guard_ok", 1),
     ("g_bucket_ck", 1), ("g_bucket_zero_slots", 1),
     ("g_eng_routes_last", 1), ("g_eng_routes_total", 2), ("g_eng_ticks", 1),
+    ("g_eng_cyc_first", 1), ("g_isr_cyc_first", 1),      # ★ H5: 首样本留痕
 ]
 TAIL_SYMS = ["g_eng_ck"]
 
@@ -66,6 +67,7 @@ MIXED_OPS = [OP_DIRECT, OP_CMP, OP_CLAMP, OP_SCALE, OP_AND, OP_OR, OP_NOT, OP_MU
              OP_LUT, OP_LPF, OP_PID, OP_HYST, OP_RATE, OP_DEADBAND, OP_EDGE, OP_CNT,
              OP_TIMER, OP_ARITH, OP_SR]
 MAX_ROUTES = 128
+MAX_STATES = 128                 # ★ 与 engine.h 一致 (state_offset 用 1..127, 0 = 无槽)
 STATEFUL_OPS = {OP_LPF, OP_PID, OP_HYST, OP_RATE, OP_DEADBAND, OP_EDGE,
                 OP_CNT, OP_TIMER, OP_SR}
 
@@ -141,8 +143,13 @@ def _route_fields(profile, i):
     else:
         op = OP_DIRECT
     src_type = 0 if i % 3 == 0 else (1 if i % 3 == 1 else 2)
-    state_offset = (i % 128) if op in STATEFUL_OPS else 0
-    return op, src_type, state_offset, 1
+    # ★ A3/H11 后必须与 engine_fill_tables 逐条对齐:
+    #   · state_offset 避开 0 (0 是"无槽"哨兵) → (i % (MAX_STATES-1)) + 1
+    #   · 双输入原语要置 ROUTE_FLAG_WIRE2 (0x02) —— 否则 ISR 的 wire2_valid()
+    #     在 wire2_idx==0 时会判"无第二输入", 与填表意图打架
+    state_offset = ((i % (MAX_STATES - 1)) + 1) if op in STATEFUL_OPS else 0
+    flags = 1 | (0x02 if op in WIRE2_OPS else 0)      # 1 = ROUTE_FLAG_ACTIVE
+    return op, src_type, state_offset, flags
 
 
 DST_WIRE = 2
@@ -437,6 +444,7 @@ def main():
                          imax=st['g_isr_cyc_max'], ilast=st['g_isr_cyc_last'],
                          isum=st['g_isr_cyc_sum'], inum=st['g_isr_n'],
                          sel_used=st['g_eng_sel_used'], n_used=st['g_eng_n_used'],
+                         efirst=st['g_eng_cyc_first'], ifirst=st['g_isr_cyc_first'],
                          pmin=0 if st['g_per_cyc_min'] == 0xFFFFFFFF else st['g_per_cyc_min'],
                          pmax=st['g_per_cyc_max'], plast=st['g_per_cyc_last'],
                          tck=st['g_table_ck'], active=st['g_active_routes'],
@@ -453,14 +461,22 @@ def main():
     print("\n" + "=" * 80)
     print("② 每拍成本 (CPU 周期 @400MHz, 拍预算 40000 cyc = 100μs)")
     print("=" * 80)
-    print("  %-4s %-30s %8s %8s %9s %8s %10s" %
-          ("", "配置", "eng_min", "eng_max", "eng_mean", "isr_min", "最坏占拍"))
+    # ★ H5 口径修正: 本项目的权威数字是 **max** (WCET), 不是 min。
+    #   min 从 0xFFFFFFFF 起算, 所以"上电后第一拍"必然成为 min —— 若 min == first,
+    #   这个 min 只是启动期非稳态样本, 不能当"稳态最小成本"用 (旧报告拿它算净成本,
+    #   报的是最乐观值, 方向与"确定性/WCET"正好相反)。
+    print("  %-4s %-28s %8s %8s %9s %10s %10s" %
+          ("", "配置", "eng_min", "eng_max", "eng_mean", "ISR最坏", "最坏占拍"))
     for r in rows:
         mean = (r['esum'] / float(r['en'])) if r['en'] else 0.0
         ov = " ★超载" if r['imax'] > TICK_CYC else ""
-        print("  %-4s %-30s %8d %8d %9.1f %8d %9.2f%%%s"
-              % (r['code'], r['label'], r['emin'], r['emax'], mean, r['imin'],
+        minsus = "?" if (r['emin'] and r['efirst'] == r['emin']) else " "
+        print("  %-4s %-28s %8d%s %8d %9.1f %10d %9.2f%%%s"
+              % (r['code'], r['label'], r['emin'], minsus, r['emax'], mean, r['imax'],
                  100.0 * r['imax'] / TICK_CYC, ov))
+    if any(r['emin'] and r['efirst'] == r['emin'] for r in rows):
+        print("  ★ eng_min 后带 ? = 该 min **等于首样本** (上电/清统计后的第一拍), "
+              "\n     属非稳态样本, 不能当稳态最小成本; 权威口径请看 eng_max 与 ISR最坏。")
     print("  ★超载 = ISR 最坏耗时 > 40000 cyc → 这一组的**拍周期统计不再是自由运行定时器**,"
           "\n     而是被 ISR 拉长 (见 ⑤); 引擎成本仍有效, 但已越出确定性设计的适用边界。")
 

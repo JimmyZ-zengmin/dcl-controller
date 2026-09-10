@@ -167,6 +167,14 @@ OBS uint32_t g_eng_ck       = 0;     /* 最近一拍的扫描校验和 */
 OBS uint32_t g_eng_sel_used = 0xFFFFFFFFu;  /* 最近一拍实际走的实例 (0/1) */
 OBS uint32_t g_eng_n_used   = 0;     /* 最近一拍实际扫的条数 */
 
+/* ★★ H5: 首样本单独留痕 —— 本项目的权威口径是 **max** (WCET), 而 min 极可能
+ *   只是"上电后第一拍"这种非稳态样本 (stats_reset 后 min 从 0xFFFFFFFF 开始, 第一个
+ *   样本必然成为 min)。旧报告用 `min - overhead` 当"净成本" = 报的是**最乐观值** ——
+ *   对一个主打确定性的项目方向正好反了。留痕之后, 外部工具能判断
+ *   "min == first ⇒ 这个 min 不可当稳态最小值用"。 */
+OBS uint32_t g_eng_cyc_first = 0;   /* 清统计后第一个样本 (0 = 还没有样本) */
+OBS uint32_t g_isr_cyc_first = 0;
+
 /* ── 引擎扫描: 统计 (CPU 周期) ── */
 OBS uint32_t g_eng_cyc_last = 0;
 OBS uint32_t g_eng_cyc_min  = 0xFFFFFFFFu;
@@ -268,7 +276,7 @@ static void tick_timer_init(void)
     TIM_SR(TIM2_BASE)  = 0;
 
     NVIC_IP(IRQ_TIM2)  = 0;                    /* 最高抢占优先级 */
-    NVIC_ISER          = (1u << IRQ_TIM2);
+    nvic_enable_irq(IRQ_TIM2);                 /* ★ 一律走宏: 裸移位在 IRQ≥32 时静默失效 */
 
     TIM_DIER(TIM2_BASE) = TIM_DIER_UIE;
     TIM_CR1(TIM2_BASE)  = TIM_CR1_CEN;
@@ -295,14 +303,16 @@ static void scb_enable_icache(void)
 /* ══════════ 清统计 ══════════ */
 static inline void stats_reset(void)
 {
-    g_eng_cyc_last = 0;
+    g_eng_cyc_last  = 0;
+    g_eng_cyc_first = 0;      /* ★ 0 = "还没有样本", 与"样本恰好为 0"区分开 */
     g_eng_cyc_min  = 0xFFFFFFFFu;
     g_eng_cyc_max  = 0;
     g_eng_cyc_sum  = 0;
     g_eng_n        = 0;
     g_eng_div0     = 0;
 
-    g_isr_cyc_last = 0;
+    g_isr_cyc_last  = 0;
+    g_isr_cyc_first = 0;
     g_isr_cyc_min  = 0xFFFFFFFFu;
     g_isr_cyc_max  = 0;
     g_isr_cyc_sum  = 0;
@@ -394,6 +404,7 @@ ISR_PLACE void TIM2_IRQHandler(void)
 
             uint32_t d = tb - ta;
             g_eng_cyc_last = d;
+            if (!g_eng_cyc_first) g_eng_cyc_first = d;     /* ★ 首样本留痕 (H5) */
             if (d < g_eng_cyc_min) g_eng_cyc_min = d;
             if (d > g_eng_cyc_max) g_eng_cyc_max = d;
             g_eng_cyc_sum += d;
@@ -404,6 +415,7 @@ ISR_PLACE void TIM2_IRQHandler(void)
         uint32_t t1 = DWT_CYCCNT;
         uint32_t di = t1 - t0;
         g_isr_cyc_last = di;
+        if (!g_isr_cyc_first) g_isr_cyc_first = di;    /* ★ 首样本留痕 (H5) */
         if (di < g_isr_cyc_min) g_isr_cyc_min = di;
         if (di > g_isr_cyc_max) g_isr_cyc_max = di;
         g_isr_cyc_sum += di;
@@ -432,6 +444,11 @@ static uint8_t        s_txbuf[FRAME_TOTAL_MAX];
 static volatile uint32_t s_selftest_active = 0;
 
 OBS uint32_t g_uart_brr      = 0;    /* BRR 实测值 (100MHz/115200 → 0x3641) */
+/* ★★ A1 事故的直接判据: USART1 的 NVIC 使能位 (读的是 ISER 位本身, 不是本地缓存)。
+ *   期望恒为 1。若为 0 → 中断从未生效, 上位机发什么都不会被收到 ——
+ *   而 CR1/BRR/GPIO 会全部看起来正确 (这就是上一轮排障被带偏的原因)。
+ *   有了它, A1 这类问题在**上电后第一次读回**就会暴露, 不必等到"串口没反应"。 */
+OBS uint32_t g_uart_irq_en   = 0;
 OBS uint32_t g_uart_rx_bytes = 0;
 OBS uint32_t g_uart_tx_bytes = 0;
 OBS uint32_t g_uart_ore      = 0;    /* 硬件溢出: 非 0 = 主循环排空太慢 (故障信号) */
@@ -442,22 +459,72 @@ OBS uint32_t g_cmd_count     = 0;
 OBS uint32_t g_cmd_last      = 0xFFFFFFFFu;
 OBS uint32_t g_nak_count     = 0;
 OBS uint32_t g_banner_count  = 0;
+/* ★ 组帧自检结果 (1=通过): 用独立实现算出的期望值校验 CRC 覆盖范围。
+ *   "覆盖长度写错"这类 bug 不会崩、不会报警, 只会让**每一帧都被对端判为 CRC 错**
+ *   —— 所以必须有一个能被外部读走的量。详见 frame_build_selftest()。 */
+OBS uint32_t g_frame_selftest = 0;
 OBS uint32_t g_selftest_state  = 3;  /* 0=待跑 1=通过 2=失败 3=未启用 */
 OBS uint32_t g_selftest_frames = 0;
 
-/* 组帧: [0xC1][sts][len:2 LE][payload][crc:2 LE]; CRC 覆盖 [sts][len][payload] */
-static void send_response(uint8_t sts, const uint8_t *p, uint32_t n)
+/* 组帧: [0xC1][sts][len:2 LE][payload][crc:2 LE]
+ * CRC 覆盖 [sts][len_lo][len_hi][payload] = **3 + n** 字节 (与 S3 的
+ * `crc16_ccitt(cb, 3 + n)` 逐字一致, 也与 PC 侧 h723_proto.py 的
+ * `body = frame[1:-2]` 一致)。
+ *
+ * ★★ 这里踩过一个 P1 级 bug (2026-09-10 自查发现, 审计未覆盖):
+ *   原实现写的是 `crc16_ccitt(s_txbuf + 1, 2u + n)` —— **少算了一个字节**:
+ *   它只覆盖到 `payload[n-2]`, **载荷最后一个字节不在 CRC 保护范围内**。
+ *   症状: PC 侧按 7 字节校验 → 每一帧都被判成 CRCBAD → 协议层即使接线正确、
+ *   NVIC 中断已使能, 也**永远收不到一帧合法响应**。
+ *   为什么一直没被发现: ① 无人真正收到过帧 (接线 + NVIC 两重故障先拦住了)
+ *   ② 阶段 3.1 报告里那个"手算好的横幅帧 …D8 AC" 是**按错误假设手算的**,
+ *      从未在线上验证过 —— 属于"宣称 > 实现", 已随本次修复一并纠正。
+ *   防护: 下面 build_frame_into() 把"覆盖长度"收敛成一个常量 FRAME_CRC_COVER(n),
+ *   并配 frame_build_selftest() 用**独立实现算出的期望值** 0xC9C9 做可失败判据。 */
+#define FRAME_CRC_COVER(n)  (3u + (n))    /* [sts][len_lo][len_hi][payload...] */
+
+static uint32_t build_frame_into(uint8_t *out, uint8_t sts, const uint8_t *p, uint32_t n)
 {
     if (n > FRAME_PAYLOAD_MAX) n = FRAME_PAYLOAD_MAX;
     uint32_t pos = 0;
-    s_txbuf[pos++] = FRAME_SYNC_MCU2PC;
-    s_txbuf[pos++] = sts;
-    s_txbuf[pos++] = (uint8_t)(n & 0xFFu);
-    s_txbuf[pos++] = (uint8_t)((n >> 8) & 0xFFu);
-    for (uint32_t i = 0; i < n; i++) s_txbuf[pos++] = p[i];
-    uint16_t crc = crc16_ccitt(s_txbuf + 1, 2u + n);      /* ★ 不含 SYNC */
-    s_txbuf[pos++] = (uint8_t)(crc & 0xFFu);
-    s_txbuf[pos++] = (uint8_t)(crc >> 8);
+    out[pos++] = FRAME_SYNC_MCU2PC;
+    out[pos++] = sts;
+    out[pos++] = (uint8_t)(n & 0xFFu);
+    out[pos++] = (uint8_t)((n >> 8) & 0xFFu);
+    for (uint32_t i = 0; i < n; i++) out[pos++] = p[i];
+    uint16_t crc = crc16_ccitt(out + 1, FRAME_CRC_COVER(n));   /* ★ 不含 SYNC */
+    out[pos++] = (uint8_t)(crc & 0xFFu);
+    out[pos++] = (uint8_t)(crc >> 8);
+    return pos;
+}
+
+/**
+ * @brief 组帧自检: 用**独立实现**(PC 侧 Python CRC16-CCITT)算出的期望值校验组帧。
+ *
+ * 期望值来源 (可手算复核):
+ *   crc16_ccitt([0x00][0x04][0x00][0x00 0x02 0x33 0x00]) = 0xC9C9
+ *   即: sts=ACK, n=4, payload=[fw_lo fw_hi cap_lo cap_hi]=[00 02 33 00]
+ *   ⇒ 帧应为 C1 00 04 00 00 02 33 00 C9 C9
+ *
+ * ★ 这是"覆盖长度写错"的可失败判据: 若有人再写成 `2u + n`(漏最后一个载荷字节),
+ *   帧尾会变成 44 E7 而不是 C9 C9, 本函数立刻返回 0。
+ *   2026-09-10 实测: 修复前 = 44 E7 (对应覆盖 6 字节), 修复后 = C9 C9 ✓
+ */
+static uint32_t frame_build_selftest(void)
+{
+    static const uint8_t pl[4] = {0x00, 0x02, 0x33, 0x00};
+    uint8_t f[16];
+    uint32_t pos = build_frame_into(f, STS_ACK, pl, 4);
+    if (pos != 10) return 0;
+    if (f[0] != FRAME_SYNC_MCU2PC || f[1] != STS_ACK) return 0;
+    if (f[2] != 4 || f[3] != 0) return 0;
+    if (f[4] != 0x00 || f[5] != 0x02 || f[6] != 0x33 || f[7] != 0x00) return 0;
+    return (f[8] == 0xC9u && f[9] == 0xC9u) ? 1u : 0u;
+}
+
+static void send_response(uint8_t sts, const uint8_t *p, uint32_t n)
+{
+    uint32_t pos = build_frame_into(s_txbuf, sts, p, n);
     uart1_write(s_txbuf, pos);
     g_uart_tx_bytes += pos;
 }
@@ -637,6 +704,9 @@ static void ds_build_valid(uint8_t *buf, uint16_t NR, uint16_t NP, uint16_t NS)
         put32(buf + 6 + (size_t)NR * 16u + (size_t)i * 4u, 0x3F800000u);   /* 1.0f */
 }
 
+/* deploy 自检: 用合成载荷驱动**同一个** h_deploy 代码路径 (9 例, 每例都要能失败)。
+ * ★ unused 属性同上: 只在 -DDCL_DEPLOY_SELFTEST=1 时被调用。 */
+__attribute__((unused))
 static void deploy_selftest(void)
 {
     static uint8_t buf[6 + (MAX_ROUTES + 8 + 8) * 16u];    /* 2310 B, 静态区不占栈 */
@@ -739,13 +809,18 @@ static void proto_poll(void)
             g_frame_bad++;
         }
     }
-    g_uart_ore  = uart1_ore_count();
-    g_uart_drop = uart1_drop_count();
+    g_uart_ore    = uart1_ore_count();
+    g_uart_drop   = uart1_drop_count();
+    g_uart_irq_en = uart1_irq_enabled();   /* ★ 中断使能位必须每轮刷新 (A1 判据) */
 }
 
 /* 回环自检 (需 PA9↔PA10 短接): 发一帧 PC→MCU 请求, 看它能不能从 RX 回来并被
  * CRC 校验通过。这是**唯一能证明 RX 通路 + CRC + 解析器真的工作**的内部手段;
- * 配合 LA 抓 TX 波形, 形成"外部确证发出去的字节 + 内部确证收回来的字节"闭环。 */
+ * 配合 LA 抓 TX 波形, 形成"外部确证发出去的字节 + 内部确证收回来的字节"闭环。
+ * ★ unused 属性: 本函数只在 -DDCL_UART_SELFTEST=1 时被调用; 不加属性会在默认构建里
+ *   产生一条 -Wunused-function —— 而"噪声警告"正是把 A1 那条真警告埋掉的原因
+ *   (25 条警告里 20 条是这种无害的), 所以本项目对"条件使用"的函数一律显式标注。 */
+__attribute__((unused))
 static void proto_selftest(void)
 {
     uint8_t req[6];
@@ -806,7 +881,9 @@ static void obs_anchor(void)
     sink ^= g_icache_on;                  sink ^= g_ccr_before;
     sink ^= g_ccr_after;                  sink ^= g_scan_mode;
     sink ^= g_uart_brr;                   sink ^= g_uart_rx_bytes;
-    sink ^= g_uart_tx_bytes;              sink ^= g_uart_ore;
+    sink ^= g_uart_irq_en;                sink ^= g_uart_tx_bytes;
+    sink ^= g_eng_cyc_first;              sink ^= g_isr_cyc_first;
+    sink ^= g_frame_selftest;             sink ^= g_uart_ore;
     sink ^= g_uart_drop;                  sink ^= g_frame_ok;
     sink ^= g_frame_bad;                  sink ^= g_cmd_count;
     sink ^= g_cmd_last;                   sink ^= g_nak_count;
@@ -901,6 +978,9 @@ int main(void)
     uart1_init(UART_PCLK2, UART_BAUD);
     g_uart_brr = uart1_brr();
     g_stage = 10;
+    /* ★ 组帧自检: 必须在**任何一帧发出去之前**跑 —— 若 CRC 覆盖长度写错,
+     *   后面发的每一帧都会被对端丢掉, 而固件这边看起来一切正常。 */
+    g_frame_selftest = frame_build_selftest();
 #if BOOT_BANNER
     proto_banner();
 #endif

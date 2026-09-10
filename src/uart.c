@@ -75,7 +75,10 @@ void uart1_init(uint32_t pclk2_hz, uint32_t baud)
 
     /* ── NVIC: 优先级必须**低于**拍 (数值更大 = 优先级更低) ── */
     NVIC_IPB(IRQ_USART1) = 0x80u;
-    NVIC_ISER = (1u << IRQ_USART1);
+    /* ★★ 必须用 nvic_enable_irq(IRQ), **不能**写 `NVIC_ISER = (1u<<IRQ_USART1)`。
+     *   USART1 = IRQ 37 ≥ 32 ⇒ 裸移位是未定义行为, 中断永远不会被使能,
+     *   而编译器只给一条警告、所有配置寄存器检查全绿 (详见 regs.h 的 A1 事故记录)。 */
+    nvic_enable_irq(IRQ_USART1);
 }
 
 void uart1_write(const uint8_t *p, uint32_t n)
@@ -100,6 +103,9 @@ int uart1_rx_pop(uint8_t *out)
 
 uint32_t uart1_ore_count(void)  { return s_ore_cnt; }
 uint32_t uart1_drop_count(void) { return s_drop_cnt; }
+
+/* ★ 直接读 NVIC 的 ISER 位, 不是本地缓存 —— 这样"写错寄存器"也能被抓到 (A1 事故) */
+uint32_t uart1_irq_enabled(void) { return nvic_is_enabled(IRQ_USART1); }
 
 UART_ISR_PLACE void USART1_IRQHandler(void)
 {

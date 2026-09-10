@@ -23,6 +23,7 @@
  */
 #include <string.h>
 #include "engine.h"
+#include "lsym.h"
 #include "primitives.h"
 
 /* ITCM 段属性 (阶段 3 的分档调度也住在热路径上) */
@@ -120,22 +121,26 @@ uint32_t engine_active_routes(const uint8_t *base)
  *   —— 编译器把整个函数折叠成 `movs r0,#0; bx lr`, 恒返 0。
  *   原因: C 标准保证"不同对象地址不同", GCC 因此可以**在不比较数值的情况下**
  *   断定 `&g_shm != &_shm_start` 恒真 (已在 .tmp/t.c 里最小复现, GCC 7.3.1 -O2)。
- *   教训: **指针相等的自检会被编译器证伪并折叠** —— 自检必须让取值路径
- *   经过 volatile, 或者干脆交给外部工具算 (本项目采用后者作为权威口径,
- *   这里保留一个不能折叠的固件内版本作为第一道闸)。
+ *   ⇒ 这是一**类**问题 (所有 linker symbol 与 C 对象地址比较处), 已固化成
+ *     `LSYM_ADDR()` 宏 (src/lsym.h) —— 本函数走它, 而不是就地手写 volatile 中转。
+ *   ★ 权威比对仍交给**外部工具**: pyocd 读回 g_shm_start_addr/g_shm_end_addr
+ *     与 nm 的符号地址比对 (固件自报永远可能被优化掉, 外部比对不会)。
  */
 int shm_layout_ok(void)
 {
-    g_shm_start_addr = (uint32_t)(uintptr_t)_shm_start;
-    g_shm_end_addr   = (uint32_t)(uintptr_t)_shm_end;
-
+    uint32_t s = (uint32_t)LSYM_ADDR(_shm_start);   /* ← 不可折叠的取址 */
+    uint32_t e = (uint32_t)LSYM_ADDR(_shm_end);
     uint32_t p = (uint32_t)(uintptr_t)g_shm;
-    uint32_t s = g_shm_start_addr;   /* volatile 读: 编译器无法再"证明" p != s */
-    uint32_t e = g_shm_end_addr;
+
+    /* 导出给外部工具做权威比对 (值本身由上面的不可折叠路径取得) */
+    g_shm_start_addr = s;
+    g_shm_end_addr   = e;
 
     if (p != s)                                        return 0;  /* 段首不吻合 */
     if (e != p + SHM_SIZE)                             return 0;  /* 段长不吻合 */
     if (p < 0x20000000u || p + SHM_SIZE > 0x20020000u) return 0;  /* 不在 DTCM 128KB */
+    /* 反向检查: 哨兵区必须落在 SHM 之后而不是与 SHM 重叠 */
+    if (e < p + SHM_SIZE)                              return 0;
     return 1;
 }
 
@@ -208,7 +213,11 @@ ATTR uint32_t FN(uint8_t *base, uint32_t first, uint32_t count)                \
         const ParamEntry_t *p = &pm[r->param_idx & (MAX_PARAMS - 1)];          \
         StateEntry_t *s = (r->state_offset && r->state_offset < MAX_STATES)    \
                           ? &st[r->state_offset] : &s_state_fallback;          \
-        float wb = (r->wire2_idx < MAX_WIRES) ? wm[r->wire2_idx] : 0.0f;       \
+        /* ★ 第二输入判据: **必须走 wire2_valid()** (与 S3 最终形态、与 deploy 校验
+         *   共用同一判据)。旧写法只查 `wire2_idx < MAX_WIRES`, 会把"没接第二输入"
+         *   (wire2_idx==0) 当成"第二输入是 wire[0]" → 静默读错值 (A3 实锤:
+         *   ARITH(CONST 10, 无 WIRE2 标志, wire[0]=7) 输出 17.0, 应为 10.0)。 */ \
+        float wb = wire2_valid(r->flags, r->wire2_idx) ? wm[r->wire2_idx] : 0.0f;  \
         if (!_finite_f(src)) src = 0.0f;                                       \
         if (!_finite_f(wb))  wb  = 0.0f;                                       \
         float res = prim_exec(r->op, src, p, s, wm, lu, wb, dt);               \
@@ -410,17 +419,20 @@ void engine_fill_tables(uint8_t *base, int profile)
         rt[i].dst_type     = DST_WIRE;
         rt[i].dst_channel  = (uint8_t)(i % MAX_WIRES);
         rt[i].op           = op;
-        rt[i].flags        = ROUTE_FLAG_ACTIVE;
+        /* ★ 双输入原语必须**同时**置 ROUTE_FLAG_WIRE2 —— 否则 ISR 的 wire2_valid()
+         *   在 wire2_idx==0 时会判"无第二输入", 与下面赋的 wire2_idx 语义打架。
+         *   (A3 的另一半: 光修 ISR 判据不够, 填表侧也要说清楚"我确实接了第二输入"。) */
+        rt[i].flags        = (uint8_t)(ROUTE_FLAG_ACTIVE |
+                                       (op_needs_wire2(op) ? ROUTE_FLAG_WIRE2 : 0u));
         rt[i].param_idx    = (uint16_t)(i % MAX_PARAMS);
-        /* 有状态原语才挂 state 槽 (无状态原语挂 0 = 兜底槽, 与 S3 同语义) */
-        rt[i].state_offset = (uint16_t)((op == OP_LPF || op == OP_PID || op == OP_HYST ||
-                                         op == OP_RATE || op == OP_DEADBAND || op == OP_EDGE ||
-                                         op == OP_CNT || op == OP_TIMER || op == OP_SR)
-                                        ? (i % MAX_STATES) : 0);
+        /* 有状态原语才挂 state 槽 (无状态原语挂 0 = 兜底槽, 与 S3 同语义)
+         * ★ H11: 槽号必须**避开 0** —— 0 是"无槽"哨兵。旧写法 `i % MAX_STATES`
+         *   在 i=0 时恰好得 0, 于是有状态原语会落到 s_state_fallback 兜底槽,
+         *   与 S3 route_validate 的"有状态原语必须挂状态槽"不一致。
+         *   (当前 profile 下第 0 条恰是 OP_DIRECT 所以没暴露, 属"靠巧合没事"。) */
+        rt[i].state_offset = (uint16_t)(op_is_stateful_h(op) ? ((i % (MAX_STATES - 1)) + 1) : 0);
         rt[i].actuator_idx = 0;
-        rt[i].wire2_idx    = (uint16_t)((op == OP_AND || op == OP_OR || op == OP_ARITH ||
-                                         op == OP_SR  || op == OP_CNT)
-                                        ? ((i + 7) % MAX_WIRES) : 0);
+        rt[i].wire2_idx    = (uint16_t)(op_needs_wire2(op) ? ((i + 7) % MAX_WIRES) : 0);
         rt[i].period       = (uint8_t)(dv | (uint8_t)(ph << PERIOD_PHASE_SHIFT));
         rt[i].reserved     = 0;
     }
@@ -442,13 +454,19 @@ void engine_fill_tables(uint8_t *base, int profile)
  * 实测 2026-09-10, 原始数据 build/op_cost.json。
  *
  * ★ 为什么不照抄 S3 的 op_cost[]: 那是 240MHz/ESP32 上的数, 这里逐步对照 ——
- *     DIRECT 234 → **56** (4.2× 快)      PID 337 → **145** (2.3× 快)
+ *     DIRECT 234 → **50** (4.7× 快)      PID 337 → **140** (2.4× 快)
  *   加速比**不是常数**: PID 相对更贵 (浮点除法/饱和在 M7 上受益不如简单拷贝)。
- *   若把 S3 的表按 DIRECCT 的 4.2× 比例整体缩放, PID 会被低估约 1.8 倍 ——
- *   预算门就会放行会超载的程序。这是"平台换了数就要重测"的实证。 */
+ *   若把 S3 的表按 DIRECT 的 4.7× 比例整体缩放, PID 会被低估 ~1.9 倍 ——
+ *   预算门就会放行会超载的程序。这是"平台换了数就要重测"的实证。
+ *
+ * ★★ 本表在 2026-09-10 晚**重测过一次** (数据 build/op_cost_after_fix.json):
+ *   A3 修复把第二输入判据从"只查 wire2_idx"改成"查显式标志 || 非零索引"后,
+ *   常见路径省掉一次 DTCM 加载与有限性检查 → 全部原语都变便宜约 10%
+ *   (DIRECT 56→50, 全表 ITCM 7225→6476 cyc)。**成本表必须跟着代码走**:
+ *   代码一动就要重测, 否则预算模型用的是"上一版代码"的数。 */
 static const uint16_t k_op_cost_itcm[0x13] = {
     /* DIRECT CMP HYST CLAMP  LPF PID RATE DBN MUX EDGE LUT CNT TMR ARITH SCL AND OR NOT SR */
-        56,  75,  79,  75,   96, 145,  67, 75, 70,  88, 89, 77, 79,  68, 67, 72, 72, 70, 78,
+        50,  70,  74,  68,   91, 140,  62, 70, 64,  82, 83, 78, 75,  68, 61, 71, 72, 65, 79,
 };
 
 /* 源类型附加成本: 本平台 4 种源都是"取址 + 一次掩码", 实测差异落在噪声内 (<2 cyc),
@@ -480,13 +498,8 @@ uint32_t engine_prog_budget(const uint8_t *payload, uint16_t nr)
     return per;
 }
 
-/* 有状态原语: 必须挂 state 槽, 否则 ISR 传 NULL → 写状态就崩 (S3 T22 实证) */
-static inline int op_is_stateful_h(uint8_t op)
-{
-    return (op == OP_LPF || op == OP_PID || op == OP_HYST || op == OP_RATE ||
-            op == OP_DEADBAND || op == OP_EDGE || op == OP_CNT || op == OP_TIMER ||
-            op == OP_SR);
-}
+/* ★ op_is_stateful_h() 已移到 engine.h —— 表填充与 deploy 校验必须共用同一份清单,
+ *   两处各写一份就是"改一处忘另一处"的温床。 */
 
 const char *engine_route_validate(const RouteEntry_t *r)
 {
@@ -517,11 +530,12 @@ const char *engine_route_validate(const RouteEntry_t *r)
         case OP_AND: case OP_OR: case OP_NOT: case OP_SR: break;
         default: return "bad op";
     }
-    /* AND/OR 是双输入原语: 第二输入必须有效 (显式 WIRE2 标志或 wire2_idx≠0),
-     * 否则 wb=0 → 恒假/恒真静默错误 (S3 M1 实证)。 */
-    if ((r->op == OP_AND || r->op == OP_OR) &&
-        !((r->flags & ROUTE_FLAG_WIRE2) || r->wire2_idx))
-        return "AND/OR needs wire2 source";
+    /* 双输入原语 (AND/OR/ARITH/SR/CNT): 第二输入必须有效, 否则 wb 恒 0 →
+       恒假/恒真、src+0、永不复位、只加不减 等**静默语义错误** (S3 M1 实证)。
+       ★ A3: 原实现只拦 AND/OR, 漏了同样消费 wb 的 ARITH/SR/CNT (S3 也漏了)。
+       ★ 判据统一走 wire2_valid() —— 与 ISR 用的是同一个函数, 不可能再"两处不一致"。 */
+    if (op_needs_wire2(r->op) && !wire2_valid(r->flags, r->wire2_idx))
+        return "this op needs wire2 source (set ROUTE_FLAG_WIRE2 or wire2_idx!=0)";
     return NULL;
 }
 

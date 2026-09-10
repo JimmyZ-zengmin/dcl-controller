@@ -75,6 +75,12 @@ def main():
     ap.add_argument("--run", type=float, default=3.0, help="先让固件跑几秒 (累积统计)")
     ap.add_argument("--elf", default=os.path.join(ROOT, "build", "dcl_h723"))
     ap.add_argument("--no-run", action="store_true")
+    # ★ H8: 标定必须有**外部实测值**输入。原实现把 100.0000us 硬编码进源码,
+    #   与固件自报的 40000cyc 相除 —— 恒得 400.00MHz, 是循环论证。
+    #   正确用法: 先 `python la_tick_freq.py --ch 4 --rate 16000000 --dur 1.0`,
+    #   把它的『PA8 周期』值用 --la-us 传进来; 不给则跳过该行并说明原因。
+    ap.add_argument("--la-us", type=float, default=None,
+                    help="LA 实测的拍周期 (us, 来自 la_tick_freq.py); 不给则跳过标定")
     a = ap.parse_args()
 
     mode = src_mode(os.path.join(ROOT, "src", "main.c"))
@@ -160,11 +166,22 @@ def main():
     print("  nop×1000 (volatile 计数, noinline) → %d cyc  ≈ %.2f cyc/迭代" % (c1, c1 / 1000.0))
     print("  读对开销                          → %d cyc" % ov)
     if pmn and pmn != 0xFFFFFFFF:
-        la_us = 100.0000
-        f_dwt = pmn / (la_us * 1e-6)
-        print("  ★权威标定 (内部计数 vs 外部仪器):")
-        print("      拍周期 %d cyc  /  LA 实测 %.4f us  =  %.2f MHz" % (pmn, la_us, f_dwt / 1e6))
-        print("      → CYCCNT 计数频率与外部仪器吻合 → 计数可信")
+        # ★★ H8 修正: 原实现把 la_us 硬编码成 100.0000, 再与固件自报的 40000 cyc 相除
+        #   —— 必然得 400.00MHz, **永远不可能暴露不一致**。这是循环论证, 而 README 却
+        #   把它当作"内部计数被外部仪器独立确认"的证据 (等于零信息量)。
+        #   现在只有在**真给了 LA 实测值**时才算, 并把"值从哪来"写清楚。
+        if a.la_us is not None:
+            la_us = a.la_us
+            f_dwt = pmn / (la_us * 1e-6)
+            print("  ★标定 (内部计数 vs 外部仪器实测值):")
+            print("      拍周期 %d cyc  /  LA 实测 %.4f us  =  %.2f MHz" % (pmn, la_us, f_dwt / 1e6))
+            print("      (LA 实测值来自 --la-us, 由 la_tick_freq.py 测得; 时基精度约 0.1%)")
+        else:
+            print("  标定: ~~已跳过~~ —— 未提供 --la-us。")
+            print("      旧版本在这里硬编码 100.0000us 与自报的 40000cyc 相除, 必然得")
+            print("      400.00MHz (循环论证, 零信息量)。要得到真证据, 请先跑")
+            print("        python la_tick_freq.py --ch 4 --rate 16000000 --dur 1.0")
+            print("      再把它的『PA8 周期』值用 --la-us 传进来。")
     return 0
 
 

@@ -18,7 +18,9 @@
 #include <stdint.h>
 #include "engine.h"
 
-#define AINLINE __attribute__((always_inline)) inline
+/* ★ H10: 必须带 static (S3 是 static inline)。缺 static 时, 一旦某个原语因体积
+ *   无法内联, 报的是 **undefined reference**(而不是重复定义), 排查方向完全相反。 */
+#define AINLINE static __attribute__((always_inline)) inline
 
 /* 位级有限性检查 (不依赖 math.h): exponent 全 1 = ±Inf/NaN */
 AINLINE int _finite_f(float x)

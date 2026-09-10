@@ -1,5 +1,7 @@
 /**
- * clock.c — H723 时钟初始化 (HSE 25MHz → VOS0 → PLL1 → CPU 550MHz)
+ * clock.c — H723 时钟初始化 (HSE 25MHz → VOS0 → PLL1 → CPU 400MHz)
+ * ★ 频率的权威定义在 clock.h 的 CLK_* 宏; 本文件里的 550/275 只作**上限护栏**
+ *   与手册表格引用, 不是当前配置值。
  *
  * 依据: MIGRATE-H723.md §3。每个关键判据都注明来源 (RM0468 章节 / 实测确认)。
  *
@@ -57,10 +59,9 @@ static uint32_t hpre_div(uint32_t code)
     static const uint16_t tab[16] = {1,1,1,1,1,1,1,1, 2,4,8,16,64,128,256,512};
     return tab[code & 0xFu];
 }
-static uint32_t ppre_div(uint32_t code)
-{
-    return (code < 4u) ? 1u : (1u << (code - 3u));
-}
+/* ★ 原有一个 ppre_div() 无人使用 (--Wunused-function 一直报) —— 已删除。
+ *   它的存在让人以为"APB 分频被反推过", 实际 clock_get_hclk_hz 只反推到 HCLK;
+ *   PCLK/TIMxCLK 走 clock.h 的编译期宏。删掉它, 避免"看起来有校验其实没有"。 */
 
 int clock_init(void)
 {
@@ -107,7 +108,7 @@ int clock_init(void)
     /* ── 3) FLASH 等待态 ──
      * RM0468 Table 16 (按 **AXI 时钟** 索引, 不是 CPU 时钟!):
      *   VOS0: ≤70MHz→(0,0), ≤140→(1,1), ≤210→(2,2), ≤275→(3,3)
-     * 我们 AXI=275MHz → LATENCY=3, WRHIGHFREQ=3
+     * 我们 AXI(HCLK)=200MHz → 落在 ≤210 档 → LATENCY=3 (与 ST 官方模板一致)
      * 现在还在 HSI 64MHz, 设高了无害 (等待态多只是慢); 设低了才是致命。 */
     {
         uint32_t want = (CLK_FLASH_WS & 0xFu) | (3u << 4);   /* WRHIGHFREQ 恒 3 (上限) */
@@ -144,8 +145,8 @@ int clock_init(void)
     if (wait_set(&RCC_CR, RCC_CR_PLL1RDY, TO_PLL) != 0) return CLK_ERR_PLL_LOCK;
 
     /* ── 6) 分频器 (仍在 HSI 上执行, 中间频率都很低, 安全) ──
-     * CPU = SYSCLK/1, HCLK(AXI) = CPU/2 = 275MHz, APB = HCLK/2 = 137.5MHz
-     * TIMxCLK = HCLK = 275MHz (APB 预分频 ≤4 时定时器时钟取 HCLK) */
+     * CPU = SYSCLK/1 = 400MHz, HCLK(AXI) = CPU/2 = 200MHz, APB = HCLK/2 = 100MHz
+     * TIMxCLK = 2×PCLK = 200MHz (DxPPRE ≤ 4; 见 clock.h 的同名断言) */
     RCC_D1CFGR = (RCC_D1CFGR & ~0x7FFu)
                | ((uint32_t)CODE_D1CPRE_1 << RCC_D1CFGR_D1CPRE_Pos)
                | ((uint32_t)CLK_HPRE_CODE << RCC_D1CFGR_HPRE_Pos)

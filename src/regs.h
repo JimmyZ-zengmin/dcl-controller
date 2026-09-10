@@ -136,7 +136,8 @@
 #define DEMCR           REG32(0xE000EDFCUL)   /* bit24 = TRCENA (DWT 总开关) */
 #define DEMCR_TRCENA    (1u << 24)
 #define DWT_CTRL        REG32(0xE0001000UL)   /* bit0 = CYCCNTENA */
-#define DWT_CYCCNT      REG32(0xE0001004UL)   /* CPU 周期计数 → 1.82ns 分辨率 @550MHz */
+#define DWT_CYCCNT      REG32(0xE0001004UL)   /* CPU 周期计数 → 2.50ns 分辨率 @400MHz
+                                               * (改主频请同步这句; 权威频率见 clock.h) */
 #define DWT_LAR         REG32(0xE0001FB0UL)   /* 解锁寄存器 (需写 0xC5ACCE55) */
 #define SCB_CPACR       REG32(0xE000ED88UL)   /* FPU 使能: CP10/CP11 全访问 */
 #define SCB_AIRCR       REG32(0xE000ED0CUL)   /* 中断优先级分组 */
@@ -149,7 +150,7 @@
 /* ───────────────────────── TIM (APB1 定时器) ─────────────────────────
  * H7: TIM2=0x40000000 TIM3=+400 TIM4=+800 TIM5=+C00
  *     TIM1=0x40010000 TIM8=+400 TIM6=0x40001000 TIM7=+400
- * TIMxCLK = 275MHz (APB 预分频 ≤4 时取 HCLK; 见 MIGRATE-H723.md §3.3) */
+ * TIMxCLK = 2×PCLK = 200MHz (DxPPRE ≤ 4; 权威定义在 clock.h 的 CLK_TIMXCLK_HZ) */
 #define TIM2_BASE       0x40000000UL
 #define TIM_CR1(t)      REG32((t) + 0x00)
 #define TIM_DIER(t)     REG32((t) + 0x0C)
@@ -211,14 +212,55 @@
 #define USART_ICR_ORECF   (1u << 3)    /* 清溢出标志 */
 #define USART_ICR_TCCF    (1u << 6)    /* 清发送完成标志 */
 
-/* ───────────────────────── NVIC ───────────────────────── */
-#define NVIC_ISER       REG32(0xE000E100UL)
-#define NVIC_ICER       REG32(0xE000E180UL)
-#define NVIC_IPR(n)     REG32(0xE000E400UL + 4UL * ((n) / 4u))
+/* ───────────────────────── NVIC ─────────────────────────
+ * 向量表位置 (与 stm32h723xx.h 一致) */
+#define IRQ_TIM2        28          /* TIM2 global interrupt */
+#define IRQ_USART1      37          /* USART1 global interrupt */
+
+/* ★★ 铁律 (A1 事故 2026-09-10, 代价 = 协议层整整一轮不可用):
+ *   ISER / ICER / ISPR / ICPR 都是**寄存器数组**, 每 32 个 IRQ 占用一个 32 位寄存器。
+ *   IRQ ≥ 32 时写 `NVIC_ISER = (1u << irq)` 是**未定义行为** (移位量 ≥ 位宽),
+ *   而 GCC 只给一条 `-Wshift-count-overflow` 警告, **编译照样通过**。
+ *   本项目 USART1 = IRQ 37 就这样"静默未使能":  CR1/BRR/GPIO 全对、LA 也能看到
+ *   PA9 有真实波形、拍中断一切正常 —— 但上位机发来的**每个字节都不触发中断**,
+ *   环形缓冲永远为空, 协议层功能上不可用 (TIM2 = IRQ 28 < 32 所以拍不受影响,
+ *   症状只剩"串口安静地坏掉", 极难归因)。
+ *   ⇒ 所以本头文件**不提供** `NVIC_ISER` 这类"裸寄存器"名字, 只提供按 IRQ 号索引的
+ *     宏与函数 —— 让"IRQ≥32"这件事在编译层面就不可能写错。 */
+#define NVIC_REG(base, irq)  REG32((base) + 4UL * ((uint32_t)(irq) >> 5u))
+#define NVIC_ISER_W(irq)     NVIC_REG(0xE000E100UL, irq)
+#define NVIC_ICER_W(irq)     NVIC_REG(0xE000E180UL, irq)
+#define NVIC_ISPR_W(irq)     NVIC_REG(0xE000E200UL, irq)
+#define NVIC_ICPR_W(irq)     NVIC_REG(0xE000E280UL, irq)
+#define NVIC_BIT(irq)        (1u << ((uint32_t)(irq) & 31u))
+
+/** @brief 使能一个中断 (自动处理 IRQ≥32 的寄存器索引) */
+static inline void nvic_enable_irq(uint32_t irq)
+{
+    NVIC_ISER_W(irq) = NVIC_BIT(irq);
+    /* 回读确认: 写没生效时立刻可见, 而不是等到"串口没反应"再回头猜 */
+    (void)NVIC_ISER_W(irq);
+}
+/** @brief 关闭一个中断 */
+static inline void nvic_disable_irq(uint32_t irq)
+{
+    NVIC_ICER_W(irq) = NVIC_BIT(irq);
+    (void)NVIC_ICER_W(irq);
+}
+/** @brief 该 IRQ 当前是否使能 (供自检/外部审计断言"中断真的开了") */
+static inline uint32_t nvic_is_enabled(uint32_t irq)
+{
+    return (NVIC_ISER_W(irq) >> ((uint32_t)irq & 31u)) & 1u;
+}
+
+/* ★ 编译期护栏: 本宏只覆盖 IRQ 0..63 (ISER 两个寄存器), 越界立刻断掉。
+ *   将来若引入 IRQ ≥ 64 的外设, 必须显式扩展这里的范围并复核所有调用点。 */
+_Static_assert(IRQ_TIM2   < 64u, "IRQ_TIM2 outside NVIC macro range 0..63");
+_Static_assert(IRQ_USART1 < 64u, "IRQ_USART1 outside NVIC macro range 0..63");
+
 /* ★ 优先级是**按字节**编址的 (IPR0..IPR59 每个 8 位)。用 REG32 写会一次改掉 4 个
- *   中断的优先级 —— 所以这里提供字节访问。主循环/驱动一律用这个。 */
+ *   中断的优先级 —— 所以这里提供字节访问。主循环/驱动一律用这个。
+ *   (原 NVIC_IPR(n) 是个 32 位访问器, 有上述误伤风险且无人使用, 已删除) */
 #define NVIC_IPB(n)     (*(volatile uint8_t *)(0xE000E400UL + (n)))
-#define IRQ_TIM2        28          /* TIM2 global interrupt 在向量表的位置 */
-#define IRQ_USART1      37          /* 与 stm32h723xx.h L98 一致 */
 
 #endif /* DCL_REGS_H */

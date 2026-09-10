@@ -16,7 +16,11 @@
 #   bash sweep_freq.sh 80 90 92 94        # 扫 400 / 450 / 460 / 470 MHz
 #   bash sweep_freq.sh 80 --dur 1.0       # 指定采集时长 (默认 0.5s)
 #
-# ★扫描会修改 src/clock.h 的 CLK_PLL1_DIVN1; 扫完记得改回常用落点(80u = 400MHz)。
+# ★扫描会修改 src/clock.h 的 CLK_PLL1_DIVN1 / CLK_HPRE_CODE。
+#   H9 修正 (2026-09-10): 原版只靠最后一行文字提醒恢复 —— Ctrl-C / 编译失败 /
+#   烧录失败都会把被扫描值留在工作树里 (污染 git status, 且下次构建用的是扫描值,
+#   而人以为还是 400MHz)。现在改成 **备份 + trap 自动恢复**: 无论正常结束、报错还是
+#   被 Ctrl-C, 退出时都会把 clock.h 还原并重新构建默认固件。
 #   N 的取值: CPU = 5MHz × N。建议 N 取 4 的倍数 → CPU/HCLK/APB 全为整数。
 set -u
 
@@ -25,6 +29,24 @@ CMAKE="/c/Espressif/tools/cmake/4.0.3/bin/cmake.exe"
 NINJA="C:/Espressif/tools/ninja/1.12.1/ninja.exe"
 PY="C:/Users/min/.workbuddy/binaries/python/envs/default/Scripts/python.exe"
 CLOCK_H_WIN="$(cygpath -w "$HERE/src/clock.h")"
+CLOCK_H="$HERE/src/clock.h"
+BACKUP="$HERE/build/clock.h.sweepbak"
+
+restore_clock() {
+    if [ -f "$BACKUP" ]; then
+        cp "$BACKUP" "$CLOCK_H"
+        echo
+        echo "── 已还原 src/clock.h (H9: 不再把扫描值留在工作树里) ──"
+        grep -nE "#define CLK_PLL1_DIVN1|#define CLK_HPRE_CODE" "$CLOCK_H" | sed 's/^/   /'
+        # 同步重建默认固件, 避免"下一次构建用的是扫描值"
+        if "$CMAKE" --build "$(cygpath -w "$HERE/build")" >/dev/null 2>&1; then
+            echo "   已按还原后的配置重新构建 (build/dcl_h723.hex 恢复正常落点)"
+        else
+            echo "   ⚠️ 还原后重建失败, 请手动 bash build.sh 检查"
+        fi
+        rm -f "$BACKUP"
+    fi
+}
 
 DUR="0.5"
 NS=()
@@ -45,6 +67,10 @@ if [ ! -f "$HERE/build/CMakeCache.txt" ]; then
     echo "[首次] 配置 CMake…"
     bash "$HERE/build.sh" >/dev/null 2>&1
 fi
+
+# ★ H9: 先把 clock.h 备份好, 再注册恢复钩子 —— 之后任何退出路径都会还原
+cp "$CLOCK_H" "$BACKUP"
+trap 'restore_clock' EXIT INT TERM
 
 set_n() {   # $1=N  $2=HPRE 分频码
     "$PY" - "$1" "$2" "$CLOCK_H_WIN" <<'PYEOF'
@@ -97,5 +123,5 @@ for N in "${NS[@]}"; do
 done
 
 echo
-echo "注意: 扫描改了 src/clock.h 的 CLK_PLL1_DIVN1。"
-echo "      恢复常用落点: 把 CLK_PLL1_DIVN1 改回 80u (400MHz) 再 bash build.sh。"
+echo "说明: src/clock.h 已由 trap 自动还原 (见本脚本开头 H9 说明)。"
+echo "      如需换回常用落点, 直接改 clock.h 的 CLK_PLL1_DIVN1 = 80u 后 bash build.sh。"

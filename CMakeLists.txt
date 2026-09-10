@@ -2,13 +2,14 @@ cmake_minimum_required(VERSION 3.20)
 project(dcl_h723 C ASM)
 
 # ---------------------------------------------------------------------------
-# DCL 引擎 H723 平台 (阶段 0: 工具链 + 时钟基线)
+# DCL 引擎 H723 平台
 #
 # 目标产物: dcl_h723.elf / .bin / .hex, 可直接用 pyocd 烧录:
-#   pyocd flash -t stm32h723xx build/dcl_h723.hex
+#   pyocd flash -t stm32h723xx -O connect_mode=under-reset build/dcl_h723.hex
 #
-# 阶段 0 的验收 = "PLL 锁到 550MHz, MCO 引出来能被逻辑分析仪量到 550MHz"
-#   见 MIGRATE-H723.md §3.5 / §3.6
+# 配置旋钮一律用 `bash build.sh -DDCL_XXX=n` 传 (build.sh 每次显式传全部默认值,
+# 不会受 CMake cache 残留影响 —— 那曾导致"把自检版当交付固件"的事故)。
+# 当前主频/分频的**唯一权威来源**是 src/clock.h 的 CLK_* 宏。
 # ---------------------------------------------------------------------------
 
 set(CMAKE_C_STANDARD 11)
@@ -38,6 +39,13 @@ add_compile_options(
     ${MCU_FLAGS}
     -ffunction-sections -fdata-sections     # 配合 --gc-sections 去死代码
     -Wall -Wextra -Wshadow
+    # ★★ **-Werror**: 警告即失败。
+    #   起因是一次真事故: `uart.c` 里 `NVIC_ISER = (1u << 37)` 位移溢出, GCC 老老实实
+    #   报了 `-Wshift-count-overflow`, 但同一次构建里还有 24 条无害警告
+    #   (newlib 桩的 unused-parameter 等), 这条真警告被淹没, 没人看见 ——
+    #   结果是 USART1 中断从未使能、协议层整轮不可用, 而所有"配置类"检查全绿。
+    #   所以本项目不再接受"无害警告": 噪声清零, 剩下的每一条都必须处置。
+    -Werror
     -O2 -g3
     --specs=nano.specs                      # 精简 newlib
     -DSTM32H723xx
@@ -57,6 +65,12 @@ add_compile_options(
     -DUART_BAUD=${DCL_UART_BAUD}u
     -DDEPLOY_SELFTEST=${DCL_DEPLOY_SELFTEST}
 )
+
+# syscalls.c 是 newlib 桩: 函数签名由 newlib 规定, 参数天然用不上。
+# 单独关掉该文件的 unused-parameter —— 它曾贡献 20 条无害警告, 是"真警告被淹没"
+# 的主要噪声源 (见上面 -Werror 的说明)。**只关这一种, 且只关这一个文件。**
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.c
+    PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter")
 
 add_link_options(
     ${MCU_FLAGS}

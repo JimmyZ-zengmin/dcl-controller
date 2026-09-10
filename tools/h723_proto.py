@@ -61,9 +61,14 @@ CAP_NAMES = [
     (0x0200, "HMI"), (0x0400, "AI"),
 ]
 
-# 本平台「应该」声明什么 (与 src/transport.h 的 DCL_CAP_H723_IMPL 必须一致)
+# 本平台「应该」声明什么 —— ★ 必须与 src/transport.h 的 DCL_CAP_H723_IMPL 逐位一致。
+# (A4 事故: 阶段 3.2 落地了热重载却忘了改 transport.h, 工具也就跟着"期望"了错的数。
+#  两处都是手工同步的, 所以这里写清楚来源, 改一处必须改另一处。)
 EXPECT_FW = 0x0200
-EXPECT_CAP = 0x0001 | 0x0020
+EXPECT_CAP = (0x0001    # MULTICYCLE
+              | 0x0002  # HOTRELOAD  (阶段 3.2 落地)
+              | 0x0010  # WIRE2_FLAG (A3 修复后 ISR 真的按标志办事)
+              | 0x0020)  # VERINFO
 
 
 def crc16(data: bytes) -> int:

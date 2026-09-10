@@ -62,7 +62,11 @@
 #define OFF_TIMING_LAST_PERIOD  0x2C   /* u32 */
 #define OFF_TIMING_LAST_EXEC    0x30   /* u32 */
 #define OFF_CTRL_GPIO_MASK      0x34   /* u32 */
-#define OFF_CTRL_N_SEQ          0x38   /* u8 (0x38-0x3F 空闲, 阶段 5 Sequencer) */
+#define OFF_CTRL_N_SEQ          0x38   /* u8  Sequencer 实例数 (阶段 5) */
+/* 0x39 空闲 (1 字节); 0x3A-0x3F 已被下面的 deploy 生效确认字段占满 ——
+ * ★ A8 修正: 旧注释写"0x38-0x3F 空闲, 阶段 5 Sequencer", 与事实不符
+ *   (0x3A/0x3C/0x3E 已是 DEPLOY_SEQ/APPLIED_SEQ/APPLIED_LAT)。
+ *   阶段 5 落地 Sequencer 时应使用 0x39 与下面的保留区, 不要假设 0x3A-0x3F 可用。 */
 
 #define OFF_SENSOR_MAP       0x0040   /* 64 × f32 */
 #define OFF_ACTUATOR_STATUS  0x0140   /* 64 × f32 */
@@ -107,7 +111,24 @@
 #define BUCKET_DIV1_PHASES     10
 #define BUCKET_DIV2_PHASES     64   /* ★ 与 period 的 6 位 phase 字段严格一致 */
 
-#define OFF_MB_SET           0x4AC0   /* 写区 64 WORD (SRC_HMI 源, 阶段 4 落地) */
+/* ---- 未落地保留区 (显式命名, 不留"无名字的空洞") ----
+ * ★ 审计 H3/A7 指出: 下面两段既没有名字也没有断言, 将来往这里放新域不会报错,
+ *   "吃掉"邻区字节也不会有任何提示 (与 S3 的 OA20 同族 —— 那一族的本质就是
+ *   "无人设防的区域迟早出事")。现在把空洞显式命名, 并把尺寸**钉成常量断言**:
+ *   谁把邻区改大/改小, 这里立刻编译失败。 */
+#define OFF_RSVD_DSL_DOMAIN     0x3840   /* S3 的 macro/force/seq 域, H723 未落地 */
+#define OFF_RSVD_DSL_DOMAIN_SZ  (OFF_ROUTE_BUCKETS - OFF_RSVD_DSL_DOMAIN)   /* 0xC40 */
+#define OFF_RSVD_EXEC_DOMAIN    0x47F0   /* S3 的 exec/force 域, H723 未落地 */
+#define OFF_RSVD_EXEC_DOMAIN_SZ (OFF_MB_SET - OFF_RSVD_EXEC_DOMAIN)         /* 0x2B0 */
+#define OFF_MB_TAIL             0x4B20   /* MB_SET 之后到 SHM 末尾, 备用 */
+#define OFF_MB_TAIL_SZ          (SHM_SIZE - OFF_MB_TAIL)                    /* 0x34E0 */
+
+/* ★★ A7 修正: 原为 0x4AC0, 与 S3 的 0x4AA0 差 32 字节 —— 而本头文件开头写着
+ *   "全部逐字节对齐 esp32-core0", 目标是"S3 的 20 套回归脚本零改动"。
+ *   S3 的 tools/verify_hmi.py (MB_SET_OFF = 0x4AA0) 与 tools/dclc.py 都按 0x4AA0
+ *   读写: 偏移差 32 字节不会报错, 只会**静默读写到错误地址** (写进去也读不出来)。
+ *   这是全表 125 个常量里唯一被改动的一个值 —— 已改回。 */
+#define OFF_MB_SET           0x4AA0   /* 写区 64 WORD (SRC_HMI 源, 阶段 4 落地) */
 #define SHM_SIZE             0x8000   /* 32KB (S3 为 64KB; H723 DTCM 128KB 充裕) */
 
 /* ══════════ 路由条目 (16B packed) —— 与 S3 逐字节相同 ══════════ */
@@ -182,7 +203,7 @@ _Static_assert(sizeof(StateEntry_t) == 16, "StateEntry_t must be 16 bytes");
 
 /* 本平台实测的**最贵原语**成本 (PID, 见 engine.c 的 k_op_cost_itcm)。
  * 改原语表/新增更重的原语时必须同步更新 —— 它参与下面那条绊线断言。 */
-#define OP_COST_MAX_MEASURED   145
+#define OP_COST_MAX_MEASURED   140   /* = 实测最贵原语 PID (2026-09-10 重测) */
 
 /* ══════════════ 绊线断言: 预算门当前"具不具约束力" ══════════════
  * ★★ 这是一个**故意的反向断言**, 语义要说清楚:
@@ -234,7 +255,13 @@ _Static_assert((uint32_t)MAX_ROUTES * OP_COST_MAX_MEASURED <= EXEC_DEPLOY_BUDGET
 #define OP_OR       0x10
 #define OP_NOT      0x11
 #define OP_SR       0x12
-#define OP_MAX      0x12   /* 最高有效操作码 (表填充/校验上界) */
+/* ★ 上界语义必须一眼可辨 (原版 OP_MAX=0x12 恰好**等于**最大值 OP_SR, 而代码里
+ *   是按"含"用 `op <= OP_MAX` —— 极易被后来人写成 `< OP_MAX` 而静默漏掉 SR)。
+ *   两个名字并存: OP_MAX 含上界, OP_MAX_EXCL 排他上界。新增原语时**两个都要改**,
+ *   下面的 _Static_assert 会强制这一点。 */
+#define OP_MAX      0x12   /* 最高有效操作码 (含) */
+#define OP_MAX_EXCL 0x13   /* 排他上界 = OP_MAX+1 (数组尺寸/数量统计用这个) */
+_Static_assert(OP_MAX + 1u == OP_MAX_EXCL, "OP_MAX and OP_MAX_EXCL must be adjacent");
 
 #define OP_ARITH_ADD 0
 #define OP_ARITH_SUB 1
@@ -244,6 +271,53 @@ _Static_assert((uint32_t)MAX_ROUTES * OP_COST_MAX_MEASURED <= EXEC_DEPLOY_BUDGET
 #define OP_ARITH_MIN 5
 #define OP_SR_SET_DOM    0
 #define OP_SR_RESET_DOM  1
+
+/**
+ * @brief 该原语是否需要"第二输入" (从 wire 数组的 wire2_idx 取)
+ *
+ * ★★ 为什么要有这个函数 (A3 / S3 的 M1 族, 2026-09-10):
+ *   第二输入有两条落地路径 —— flags 里的 ROUTE_FLAG_WIRE2 显式标志, 与
+ *   wire2_idx 非 0 的隐式约定。**只查后者会出事**: `wire2_idx == 0` 既是
+ *   "没接第二输入"的默认值, 又是合法索引 wire[0] 本身, 二者无法区分 →
+ *   引擎会静默读 wire[0] 当第二输入 (S3 上花了 M1→F2→N-A→OA1 **四轮**才修掉)。
+ *   审计实测 (H723): ARITH(CONST 10, wb=wire[0]=7) 输出 17.0, 而语义应为 10.0。
+ *   ⇒ ISR 与 deploy 校验**必须共用这一个判据**。
+ *
+ * ★ AND/OR 是布尔双输入; ARITH 的右操作数是 wb; SR 的复位输入是 wb;
+ *   CNT 的减计数/复位输入是 wb。S3 的 route_validate 只拦了 AND/OR,
+ *   ARITH/SR/CNT 三类漏了 —— 这里补齐 (S3 侧也值得回写)。
+ */
+static inline int op_needs_wire2(uint8_t op)
+{
+    return (op == OP_AND || op == OP_OR || op == OP_ARITH || op == OP_SR || op == OP_CNT);
+}
+
+/**
+ * @brief 第二输入判据 (与 S3 最终形态逐字一致) —— ISR 与校验必须共用
+ * @param flags      RouteEntry_t.flags
+ * @param wire2_idx  RouteEntry_t.wire2_idx
+ * @return 1 = 第二输入有效, 可以读 wire[wire2_idx]; 0 = 无第二输入, 用 0.0f
+ */
+static inline int wire2_valid(uint8_t flags, uint16_t wire2_idx)
+{
+    return ((flags & ROUTE_FLAG_WIRE2) || wire2_idx) && (wire2_idx < MAX_WIRES);
+}
+
+/**
+ * @brief 该原语是否**有状态** (需要 state 槽)
+ *
+ * ★ 有状态原语若不挂状态槽, ISR 会把 `&s_state_fallback` 传进去 —— 多个无槽路由
+ *   会**共用同一个兜底槽**, 互相污染 (S3 T22 实证)。deploy 侧必须拒绝
+ *   "有状态原语 + state_offset==0" 的载荷 (见 engine_route_validate)。
+ *   (原在 engine.c 里, 移到此处以供表填充与校验共用同一份清单 —— 两处各写一份
+ *    正是"改一处忘另一处"的温床。)
+ */
+static inline int op_is_stateful_h(uint8_t op)
+{
+    return (op == OP_LPF || op == OP_PID || op == OP_HYST || op == OP_RATE ||
+            op == OP_DEADBAND || op == OP_EDGE || op == OP_CNT || op == OP_TIMER ||
+            op == OP_SR);
+}
 
 /* ---- 源类型 ---- */
 #define SRC_SENSOR  0
@@ -260,26 +334,38 @@ _Static_assert((uint32_t)MAX_ROUTES * OP_COST_MAX_MEASURED <= EXEC_DEPLOY_BUDGET
 #define DT_SLOW  0.01f     /* div2: 10ms */
 
 /* ══════════ 编译期布局断言 (S3 A4 纪律: 任何区域不得重叠) ══════════
- * ★ 覆盖范围必须**无缝**: 从 0x00 一直到 SHM_SIZE, 每一段都要有"下一段的起点
- *   ≥ 本段终点"的断言。第一版从 0x40 才开始, 前 64 字节无人设防 —— 已补。 */
-_Static_assert(OFF_CTRL_N_SEQ    + 8   <= OFF_SENSOR_MAP,      "SHM: 控制块区越界 (0x00-0x3F)");
-_Static_assert(OFF_SENSOR_MAP      + MAX_SENSORS   * 4 <= OFF_ACTUATOR_STATUS, "SHM: SENSOR_MAP 越界");
-_Static_assert(OFF_ACTUATOR_STATUS + MAX_ACTUATORS * 4 <= OFF_WIRE_MAP,        "SHM: ACTUATOR_STATUS 越界");
-_Static_assert(OFF_WIRE_MAP        + MAX_WIRES     * 4 <= OFF_LUT_DATA,        "SHM: WIRE_MAP 越界");
-_Static_assert(OFF_LUT_DATA        + MAX_LUT       * 4 <= OFF_ROUTE_TABLE,     "SHM: LUT_DATA 越界");
-_Static_assert(OFF_ROUTE_TABLE     + MAX_ROUTES    * 16 <= OFF_ROUTE_STAGING,  "SHM: ROUTE_TABLE 越界");
-_Static_assert(OFF_ROUTE_STAGING   + MAX_ROUTES    * 16 <= OFF_PARAM_TABLE,    "SHM: ROUTE_STAGING 越界");
-_Static_assert(OFF_PARAM_TABLE     + MAX_PARAMS    * 16 <= OFF_PARAM_STAGING,  "SHM: PARAM_TABLE 越界");
-_Static_assert(OFF_PARAM_STAGING   + MAX_PARAMS    * 16 <= OFF_STATE_TABLE,    "SHM: STATE_TABLE 越界");
-_Static_assert(OFF_STATE_TABLE     + MAX_STATES    * 16 <= OFF_STATE_STAGING,  "SHM: STATE_TABLE 越界");
-_Static_assert(OFF_STATE_STAGING   + MAX_STATES    * 16 <= OFF_ROUTE_BUCKETS,  "SHM: STATE_STAGING 越界");
-_Static_assert(OFF_ROUTE_BUCKETS   + ROUTE_BUCKET_U16 * 2 <= OFF_ROUTE_BUCKETS_ST, "SHM: 桶表越界");
-_Static_assert(OFF_ROUTE_BUCKETS_ST + ROUTE_BUCKET_U16 * 2 <= OFF_ROUTE_BUCKETS_END, "SHM: 桶表 staging 越界");
-_Static_assert(OFF_ROUTE_BUCKETS_END <= OFF_MB_SET, "SHM: 桶表与 MB_SET 重叠");
-_Static_assert(OFF_MB_SET          + MB_NREG       * 2  <= SHM_SIZE,           "SHM: MB_SET 越界");
+ * ★★ 覆盖范围必须**无缝**, 而且相邻区**必须精确相接** —— 所以下面用 `==` 而不是
+ *   `<=` (第一版用 `<=`, 于是"某区被悄悄改大/改小、留下看不见的空隙"不会报错;
+ *   审计 H3 就是这么发现 [0x3840,0x4480) 与 [0x47F0,0x4AA0) 两段"无人区"的)。
+ *   用 `==` 之后: 任何尺寸改动只要不与邻区严丝合缝, 编译直接失败。 */
+_Static_assert(OFF_CTRL_N_SEQ    + 8   == OFF_SENSOR_MAP,      "SHM ctrl block must end exactly at 0x40");
+_Static_assert(OFF_SENSOR_MAP      + MAX_SENSORS   * 4 == OFF_ACTUATOR_STATUS, "SHM SENSOR_MAP must abut next region");
+_Static_assert(OFF_ACTUATOR_STATUS + MAX_ACTUATORS * 4 == OFF_WIRE_MAP,        "SHM ACTUATOR_STATUS must abut next region");
+_Static_assert(OFF_WIRE_MAP        + MAX_WIRES     * 4 == OFF_LUT_DATA,        "SHM WIRE_MAP must abut next region");
+_Static_assert(OFF_LUT_DATA        + MAX_LUT       * 4 == OFF_ROUTE_TABLE,     "SHM LUT_DATA must abut next region");
+_Static_assert(OFF_ROUTE_TABLE     + MAX_ROUTES    * 16 == OFF_ROUTE_STAGING,  "SHM ROUTE_TABLE must abut next region");
+_Static_assert(OFF_ROUTE_STAGING   + MAX_ROUTES    * 16 == OFF_PARAM_TABLE,    "SHM ROUTE_STAGING must abut next region");
+_Static_assert(OFF_PARAM_TABLE     + MAX_PARAMS    * 16 == OFF_PARAM_STAGING,  "SHM PARAM_TABLE must abut next region");
+_Static_assert(OFF_PARAM_STAGING   + MAX_PARAMS    * 16 == OFF_STATE_TABLE,    "SHM PARAM_STAGING must abut next region");
+_Static_assert(OFF_STATE_TABLE     + MAX_STATES    * 16 == OFF_STATE_STAGING,  "SHM STATE_TABLE must abut next region");
+/* 状态 staging 之后是**保留区** (0x3840-0x447F), 所以这里只能断言"不相交" */
+_Static_assert(OFF_STATE_STAGING   + MAX_STATES    * 16 <= OFF_RSVD_DSL_DOMAIN,  "SHM STATE_STAGING overruns reserved hole");
+_Static_assert(OFF_RSVD_DSL_DOMAIN + OFF_RSVD_DSL_DOMAIN_SZ == OFF_ROUTE_BUCKETS, "SHM DSL reserved-hole size mismatch");
+_Static_assert(OFF_ROUTE_BUCKETS   + ROUTE_BUCKET_U16 * 2 == OFF_ROUTE_BUCKETS_ST,  "SHM ROUTE_BUCKETS must abut staging");
+_Static_assert(OFF_ROUTE_BUCKETS_ST + ROUTE_BUCKET_U16 * 2 == OFF_ROUTE_BUCKETS_END, "SHM ROUTE_BUCKETS_ST must abut end");
+_Static_assert(OFF_ROUTE_BUCKETS_END == OFF_RSVD_EXEC_DOMAIN,                  "SHM EXEC reserved-hole start mismatch");
+_Static_assert(OFF_RSVD_EXEC_DOMAIN + OFF_RSVD_EXEC_DOMAIN_SZ == OFF_MB_SET,   "SHM EXEC reserved-hole size mismatch");
+_Static_assert(OFF_MB_SET          + MB_NREG       * 2 == OFF_MB_TAIL,         "SHM MB_SET must abut MB tail");
+_Static_assert(OFF_MB_TAIL        + OFF_MB_TAIL_SZ == SHM_SIZE,                "SHM MB tail must end exactly at SHM_SIZE");
+/* ★ 保留区尺寸钉成常量: 邻区一改, 这三条立刻失败 (它们就是"无人区"的哨兵) */
+_Static_assert(OFF_RSVD_DSL_DOMAIN_SZ  == 0xC40u, "DSL hole size changed from 0xC40 - did you resize a neighbour?");
+_Static_assert(OFF_RSVD_EXEC_DOMAIN_SZ == 0x2B0u, "EXEC hole size changed from 0x2B0 - did you resize a neighbour?");
+_Static_assert(OFF_MB_TAIL_SZ          == 0x34E0u, "MB tail hole size changed from 0x34E0");
 /* 反向断言: 控制块区的每个字段都必须落在区内 (防止上面某个宏被改大而不自知) */
-_Static_assert(OFF_CTRL_MAGIC + 4 <= OFF_CTRL_N_SEQ + 8, "SHM: 控制块字段溢出 0x40");
-_Static_assert(OFF_TIMING_LAST_EXEC + 4 <= OFF_CTRL_GPIO_MASK + 4, "SHM: 计时区与 GPIO_MASK 重叠");
+_Static_assert(OFF_CTRL_MAGIC + 4 <= OFF_CTRL_N_SEQ + 8, "SHM ctrl field overruns 0x40");
+_Static_assert(OFF_TIMING_LAST_EXEC + 4 <= OFF_CTRL_GPIO_MASK + 4, "SHM timing region overlaps GPIO_MASK");
+/* deploy 生效字段必须落在 0x3A-0x3F 且不越界到 SENSOR_MAP */
+_Static_assert(OFF_CTRL_APPLIED_LAT + 2 == OFF_SENSOR_MAP, "SHM deploy seq fields must exactly fill 0x3A-0x3F");
 
 /* ══════════ 引擎扫描 (两份实例: FLASH 与 ITCM, 见 engine.c) ══════════
  * @param base   SHM 基址 (DTCM 内)

@@ -62,9 +62,62 @@ def find_capture_id(txt):
         return None
 
 
+def _parse_clock_defines(path):
+    """把 src/clock.h 里的 CLK_* 宏解成数值 (逐层代入, 不依赖求值顺序)。
+
+    ★★ 为什么要这一步 (H8 假阳性事故):
+      反推公式 `cpu_actual = cpu_assumed * 100us / period` 成立的**前提**是
+      cpu_assumed **等于固件编译期的假定值** —— 因为 TIM2 的 ARR 也是按那个假定值算的。
+      本脚本原先把默认值写死成 450MHz, 而固件是 400MHz: 用默认参数跑当前固件会
+      测到 100us → 打印"反推 450.00MHz、偏差 +0.000%、时钟树正确且精确" ——
+      **一个看起来完美的假阳性**(真实 400MHz)。所以默认值必须从源码解析,
+      并且把"来源"打印出来。"""
+    import re
+    defs = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            m = re.match(r"\s*#define\s+(CLK_[A-Z0-9_]+)\s+(.+?)\s*(?:/\*.*)?$", line)
+            if not m:
+                continue
+            expr = re.sub(r"\b(\d+)[uUlL]+\b", r"\1", m.group(2).strip())
+            defs[m.group(1)] = expr
+    except OSError:
+        return {}
+    env = {}
+    for _ in range(24):
+        progressed = False
+        for k, v in defs.items():
+            if k in env:
+                continue
+            e = re.sub(r"\b(CLK_[A-Z0-9_]+)\b",
+                       lambda mm: str(env[mm.group(1)]) if mm.group(1) in env else mm.group(0), v)
+            if "CLK_" in e:
+                continue
+            try:
+                env[k] = int(eval(e, {"__builtins__": {}}, {}))
+                progressed = True
+            except Exception:
+                pass
+        if not progressed:
+            break
+    return env
+
+
+def default_cpu_mhz():
+    """返回 (MHz, 来源说明) —— 从 src/clock.h 解析, 解析不出时返回 (None, 原因)"""
+    path = os.path.join(HERE, "src", "clock.h")
+    env = _parse_clock_defines(path)
+    cpu = env.get("CLK_CPU_HZ")
+    if cpu:
+        return cpu / 1e6, "src/clock.h: CLK_CPU_HZ = %d Hz" % cpu
+    return None, "无法从 %s 解析 CLK_CPU_HZ" % path
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cpu",  type=float, default=450.0, help="固件假定的 CPU MHz")
+    _dcpu, _dsrc = default_cpu_mhz()
+    ap.add_argument("--cpu", type=float, default=_dcpu,
+                    help="固件**编译期假定**的 CPU MHz (默认从 src/clock.h 解析)")
     ap.add_argument("--ch",   type=int,   default=4,     help="LA 通道 (PA8 接哪个)")
     ap.add_argument("--rate", type=int,   default=4_000_000, help="采样率 Hz")
     ap.add_argument("--dur",  type=float, default=1.0,   help="采集时长 s")
@@ -72,7 +125,13 @@ def main():
     a = ap.parse_args()
 
     print("=" * 68)
+    if a.cpu is None:
+        print("!! 无法确定固件假定的 CPU 频率 (%s)" % _dsrc)
+        print("   必须显式给 --cpu, 且它**必须等于固件编译时的假定值**, 否则反推无意义。")
+        return 2
     print("H723 拍频率 · LA 外部测量   (假定 CPU = %.0f MHz)" % a.cpu)
+    print("   假定值来源: %s" % (_dsrc if a.cpu == _dcpu else
+          "--cpu 命令行显式指定 (★ 若它与固件编译期假定值不一致, 反推结果无意义)"))
     print("=" * 68)
 
     # ---- 1) 复位板子让固件自由运行 (核心必须 run, 否则 PA8 不翻转) ----
@@ -250,10 +309,18 @@ def main():
 
     print("\n" + "-" * 68)
     err = abs(cpu_actual - a.cpu) / a.cpu
-    if err < 0.01:
-        print("判读: 实测与假定一致 (%.3f%%) → 时钟树正确且精确" % (err * 100))
+    if a.cpu != _dcpu:
+        # ★ H8: 显式指定的假定值与源码不符时, "偏差 0%" 不能当成"时钟树正确"
+        print("判读: ⚠ 假定值是命令行指定的 (%.0f MHz), 与 src/clock.h 的 %.0f MHz 不一致"
+              % (a.cpu, _dcpu or 0))
+        print("      本条只能说明「拍周期/假定值 = %.4f」; 要判『时钟树是否正确』, "
+              % (100.0 / period_us))
+        print("      请用 src/clock.h 里的假定值 (即不带 --cpu) 复跑。")
+    elif err < 0.01:
+        print("判读: 实测与(源码解析出的)假定值一致 (%.3f%%) → 时钟树正确且精确" % (err * 100))
     else:
-        print("判读: ★实测与假定差 %.1f%% → 真实 CPU ≈ %.0f MHz" % (err * 100, cpu_actual))
+        print("判读: ★实测与假定差 %.1f%% → 真实 CPU ≈ %.0f MHz (偏差的成因需单独查)"
+              % (err * 100, cpu_actual))
     print("-" * 68)
     return 0
 
