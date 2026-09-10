@@ -136,6 +136,8 @@ def _route_fields(profile, i):
         op = MIXED_OPS[i % 19]
     elif profile == 2:
         op = OP_PID
+    elif profile >= 100 and 0 <= (profile - 100) <= OP_SR:
+        op = profile - 100            # ★ 单一原语模式 (成本表实测用)
     else:
         op = OP_DIRECT
     src_type = 0 if i % 3 == 0 else (1 if i % 3 == 1 else 2)

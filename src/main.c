@@ -92,6 +92,10 @@
 #define UART_SELFTEST 0      /* 1 = 上电做回环自检 (需 PA9↔PA10 短接);
                               * 证明 RX 通路 + CRC 校验 + 解析器真的工作 */
 #endif
+#ifndef DEPLOY_SELFTEST
+#define DEPLOY_SELFTEST 0    /* 1 = 上电跑 deploy 自检 (9 例合法/非法载荷);
+                              * 结果在 g_dst_case[] (1=符合预期 2=不符) 与 g_dst_done */
+#endif
 #ifndef UART_BAUD
 #define UART_BAUD 115200u
 #endif
@@ -183,6 +187,21 @@ OBS uint32_t g_per_cyc_last = 0;
 OBS uint32_t g_per_cyc_min  = 0xFFFFFFFFu;
 OBS uint32_t g_per_cyc_max  = 0;
 OBS uint32_t g_per_prev     = 0;
+
+/* ── 阶段 3.2: deploy / 热重载 观测量 ──
+ * ★ 必须声明在 ISR **之前** (ISR 里要用) —— 这几个量构成 deploy 的可失败判据:
+ *   受理成功与被拒**分别**计数 (只数成功会让"全部被拒"看起来像"没部署过");
+ *   applied_seq 与 reload_lat 证明"真的生效了", 而不是只"受理了"。 */
+OBS uint32_t g_deploy_ok       = 0;   /* 受理成功的 deploy 次数 */
+OBS uint32_t g_deploy_nak      = 0;   /* 被拒次数 (校验 / 预算门拦下的) */
+OBS uint32_t g_deploy_routes   = 0;   /* 最近一次实际写入 ACTIVE 的路由数 */
+OBS uint32_t g_deploy_budget   = 0;   /* 最近一次预算 (cyc/拍, 对照实测占拍) */
+OBS uint32_t g_deploy_seq      = 0;   /* 固件侧受理序号 (每次成功 deploy +1) */
+OBS uint32_t g_applied_seq     = 0;   /* ★ ISR 已切换生效的序号 (== deploy_seq 即已生效) */
+OBS uint32_t g_reload_count    = 0;   /* ISR 实际执行 ACTIVE 切换的次数 */
+OBS uint32_t g_reload_cyc      = 0;   /* 最近一次热重载本身的耗时 (DWT, cyc) */
+OBS uint32_t g_reload_lat      = 0;   /* 从置 RELOAD 到生效完成跨了几拍 */
+OBS uint32_t g_deploy_set_tick = 0;   /* 置 RELOAD 时的拍号 (供 ISR 算延迟) */
 
 /* ── DWT 标定 ── */
 OBS uint32_t g_dwt_overhead = 0;
@@ -323,6 +342,29 @@ ISR_PLACE void TIM2_IRQHandler(void)
                     (GPIO_ODR(UARTT_PORT) & (1u << UARTT_BIT)) ? 0 : 1);
         }
 
+        /* ---- 热重载 (阶段 3.2): STAGING → ACTIVE ----
+         * ★ 位置在扫描**之前**: 本拍就用新表跑完, 不出现"已受理但这一拍还在用旧表"
+         *   的中间态。切换过程对 ISR 是原子的 (单字节 RELOAD 标志进入这里)。
+         * ★ 代价: 这一拍 ISR 会长出 memcpy 的成本 (实测见 g_reload_cyc)。
+         *   只要总时长仍 < 拍长, 拍周期就完全不受影响 —— 只有 isr_cyc_max 会记下
+         *   这个尖峰。这是"部署瞬间有一拍变长"的**已知且有界**代价, 不是抖动。 */
+        if (SHM_U8(g_shm, OFF_CTRL_RELOAD)) {
+            uint32_t tr0 = DWT_CYCCNT;
+            engine_reload_active(g_shm);
+            g_reload_cyc = DWT_CYCCNT - tr0;
+            g_n_routes   = SHM_U16(g_shm, OFF_CTRL_N_ROUTES);   /* 扫描条数随新表走 */
+            /* ★ 部署的程序**必须走分档调度**: 全表扫会把 div1/div2 路由也每拍跑一遍
+             *   —— 等于静默忽略档位语义 (程序"能跑"但时序全错)。所以这里强制置 1,
+             *   并让它留在 g_scan_mode 这个可观测量里, 而不是藏在暗处。 */
+            g_scan_mode  = 1;
+            g_applied_seq = SHM_U16(g_shm, OFF_CTRL_APPLIED_SEQ);
+            g_reload_lat  = g_tick_count - g_deploy_set_tick;
+            SHM_U16(g_shm, OFF_CTRL_APPLIED_LAT) = (uint16_t)g_reload_lat;
+            SHM_U8(g_shm, OFF_CTRL_RELOAD) = 0;
+            __asm__ volatile("dsb" ::: "memory");   /* ARM: dsb (S3 的 Xtensa `memw` 在 ARM 上不存在) */
+            g_reload_count++;
+        }
+
         /* ---- 引擎扫描 (ta..tb 只包住扫描体本身) ---- */
         if (g_engine_gate) {
             uint32_t ta = DWT_CYCCNT;
@@ -446,12 +488,233 @@ static void h_get_version(void)
  *   ② PC 端连上时能立刻看到"设备还活着" */
 static void proto_banner(void) { h_get_version(); g_banner_count++; }
 
-static void proto_dispatch(uint8_t cmd)
+/* ══════════ 阶段 3.2 — deploy (0x10) 与引擎状态 (0x38) ══════════ */
+
+static inline void put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v); p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static inline uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
+static inline uint32_t get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* 0x10 DEPLOY — 载荷: [nr:u16][np:u16][ns:u16][routes nr×16B][params np×16B][states ns×16B]
+ *
+ * 与 S3 的差异 (都是"把债还掉", 不是"另搞一套"):
+ *  ① ACK **带载荷** [seq:u16][budget:u32] —— S3 的 ACK 是空的, 上位机只能知道
+ *     "受理了"; 现在知道"受理了第几号、预算多少 cyc"。旧上位机读前两个字节之外
+ *     的内容会被忽略, 所以是向后兼容的追加 (S3 自己就用这个惯例: 0x43 从 8B 扩到 11B)。
+ *  ② **生效确认**: seq 会被 ISR 在真正切换完 ACTIVE 表时写进 APPLIED_SEQ,
+ *     0x38 的尾部扩展会把它带回来 ⇒ "已生效"变成可观测, 不再是假设。
+ *  ③ 校验里 SRC_HMI 直接拒 (H723 未实现该源, 放行 = 静默给恒 0 的假信号)。
+ *  ④ 预算模型的除数 div2 用 **64** 而不是 100 (H9)。 */
+static void h_deploy(const uint8_t *p, uint32_t n)
+{
+    if (n < 6) { g_deploy_nak++; nak("short"); return; }
+    uint16_t nr = get16(p), np = get16(p + 2), ns = get16(p + 4);
+    if (nr > MAX_ROUTES || np > MAX_PARAMS || ns > MAX_STATES) {
+        g_deploy_nak++; nak("counts exceed max"); return;
+    }
+    uint32_t need = 6u + ((uint32_t)nr + np + ns) * 16u;
+    if (n < need) { g_deploy_nak++; nak("payload short"); return; }
+    const uint8_t *d = p + 6;
+    const uint8_t *pd = d + (size_t)nr * 16u;
+
+    /* ① 参数有限性: NaN/Inf 会经 DIRECT/SCALE/积分直接传播成 NaN 输出。
+     *    只查每字的高 8 位全 1 (即指数 0xFF) —— 不用浮点比较, 也不依赖 FPU 状态。 */
+    for (uint16_t i = 0; i < (uint16_t)(np * 4u); i++) {
+        if (((get32(pd + (size_t)i * 4u) >> 23) & 0xFFu) == 0xFFu) {
+            g_deploy_nak++; nak("param not finite"); return;
+        }
+    }
+
+    /* ② 逐条校验 + dst 唯一写者 (两条路由写同一个 wire = 结果取决于表序, 非确定性) */
+    uint64_t dst_seen[2] = { 0, 0 };
+    for (uint16_t i = 0; i < nr; i++) {
+        RouteEntry_t r;
+        memcpy(&r, d + (size_t)i * 16u, 16u);
+        if (!(r.flags & ROUTE_FLAG_ACTIVE)) continue;
+        const char *err = engine_route_validate(&r);
+        if (err) { g_deploy_nak++; nak(err); return; }
+        if (r.op == OP_LPF) {                       /* v0.2: LPF 参数是时间常数 τ 秒, 必须 > 0 */
+            uint32_t tb = get32(pd + (size_t)r.param_idx * 16u);
+            if ((tb & 0x7FFFFFFFu) == 0u) { g_deploy_nak++; nak("lpf tau must be >0"); return; }
+        }
+        uint64_t bit = 1ULL << (r.dst_channel & 63u);
+        if (dst_seen[r.dst_channel >> 6] & bit) { g_deploy_nak++; nak("dst conflict"); return; }
+        dst_seen[r.dst_channel >> 6] |= bit;
+    }
+
+    /* ③ 预算门: 条数限制 ≠ 成本限制 —— 128 条 PID 是 128 条, 成本却是 DIRECT 的 2.6 倍。
+     *    Σ ceil((op_cost+src_cost)/div倍率) 必须 ≤ EXEC_DEPLOY_BUDGET,
+     *    否则放行的程序会把拍吃掉 (阶段 2 审计真的踩到过一次 102.9% 超载)。 */
+    uint32_t budget = engine_prog_budget(d, nr);
+    g_deploy_budget = budget;
+    if (budget > EXEC_DEPLOY_BUDGET) { g_deploy_nak++; nak("exec budget exceeded"); return; }
+
+    /* ④ 装载 STAGING (不碰 ACTIVE) → 置 RELOAD 让 ISR 在下一拍原子切换 */
+    uint16_t nw = engine_stage_program(g_shm, d, nr, np, ns);
+    g_deploy_routes = nw;
+    g_deploy_seq++;
+    SHM_U16(g_shm, OFF_CTRL_DEPLOY_SEQ) = (uint16_t)g_deploy_seq;
+    g_deploy_set_tick = g_tick_count;
+    __asm__ volatile("dsb" ::: "memory");   /* ARM: dsb (S3 的 Xtensa `memw` 在 ARM 上不存在) */
+    SHM_U8(g_shm, OFF_CTRL_RELOAD) = 1;             /* 单字节写 = 原子 */
+    __asm__ volatile("dsb" ::: "memory");   /* ARM: dsb (S3 的 Xtensa `memw` 在 ARM 上不存在) */
+    g_deploy_ok++;
+
+    uint8_t r[6];
+    r[0] = (uint8_t)(g_deploy_seq); r[1] = (uint8_t)(g_deploy_seq >> 8);
+    put32(r + 2, budget);
+    ack(r, 6);
+}
+
+/* 0x38 ENGINE_STATUS — **前 31 字节与 S3 逐字节同布局** (上位机脚本零改动),
+ * 尾部追加 H723 扩展 6B (S3 的"尾部追加保前段兼容"惯例)。
+ *
+ * ★ 数据源: 本平台的统计量住在 DTCM 的 C 全局里 (g_*), 不在 SHM 计时区 ——
+ *   所以这里**按需打包**, 而不是让 ISR 每拍去维护第二份 SHM 计时块。
+ *   理由: 每拍多写 8~10 个 SHM 字段会给 ISR 加成本, 而 ISR 成本是阶段 1/2
+ *   基线的一部分, 不该为一个"被轮询才需要"的视图付每拍的代价。 */
+static void h_engine_status(void)
+{
+    uint8_t r[37];
+    uint32_t pn = (g_per_cyc_min == 0xFFFFFFFFu) ? 0u : g_per_cyc_min;
+    uint32_t en = (g_isr_cyc_min == 0xFFFFFFFFu) ? 0u : g_isr_cyc_min;
+    uint16_t nr = (uint16_t)g_active_routes;
+    put32(r + 0,  g_isr_n);      /* samples */
+    put32(r + 4,  pn);           /* period_min */
+    put32(r + 8,  g_per_cyc_max);/* period_max */
+    put32(r + 12, en);           /* exec_min   */
+    put32(r + 16, g_isr_cyc_max);/* exec_max   */
+    r[20] = (uint8_t)(nr); r[21] = (uint8_t)(nr >> 8);
+    r[22] = (uint8_t)g_engine_gate;
+    put32(r + 23, g_shm_addr);   /* SHM 地址 (供上位机发现) */
+    put32(r + 27, 0u);           /* overrun: H723 暂未实现超预算计数 (列未决) */
+    /* ---- H723 尾部扩展: 部署生效确认 ---- */
+    r[31] = (uint8_t)(g_deploy_seq);  r[32] = (uint8_t)(g_deploy_seq >> 8);
+    r[33] = (uint8_t)(g_applied_seq); r[34] = (uint8_t)(g_applied_seq >> 8);
+    r[35] = (uint8_t)(g_reload_lat);  r[36] = (uint8_t)(g_reload_lat >> 8);
+    ack(r, 37);
+}
+
+/* ══════════ deploy 自检 (阶段 3.2) ══════════
+ * 为什么需要它: CH340 还没接线, 无法从 PC 侧验证 deploy。自检把**同一个 h_deploy**
+ * 用合成载荷驱动一遍 —— 验证的是真代码路径, 不是复制一份逻辑出来单独测。
+ * ★ 分工要说清楚: 自检**证不了**"帧能收对"(那是 transport 的事, 已单独验证);
+ *   它证的是"载荷合法时能部署、载荷错误时**逐类**被正确拒绝"。
+ * ★ 判据全部可失败: 每例都对比调用前后的 (ok, nak) 计数器 —— 只数成功会让
+ *   "全部被拒"看起来像"没部署过"; 只数失败会让"全部放行"看起来像"很严格"。 */
+#define DSELFTEST_CASES 9
+OBS uint32_t g_dst_case[DSELFTEST_CASES];   /* 每例: 0=未跑 1=符合预期 2=不符 */
+OBS uint32_t g_dst_done = 0;
+
+static inline void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
+static void put_route(uint8_t *d, uint8_t op, uint8_t st, uint8_t si, uint8_t dch,
+                      uint8_t div, uint16_t pidx, uint16_t soff, uint16_t w2, uint8_t flags)
+{
+    memset(d, 0, 16);
+    d[0] = st;  d[1] = si;  d[2] = DST_WIRE;  d[3] = dch;
+    d[4] = op;  d[5] = flags;
+    put16(d + 6, pidx);  put16(d + 8, soff);  put16(d + 10, 0);  put16(d + 12, w2);
+    d[14] = div;  d[15] = 0;
+}
+
+/* 构造"例 0 的合法载荷": NR 条三档 DIRECT + NP×4 个有限浮点参数。 */
+static void ds_build_valid(uint8_t *buf, uint16_t NR, uint16_t NP, uint16_t NS)
+{
+    memset(buf, 0, 6u + ((size_t)NR + NP + NS) * 16u);
+    put16(buf, NR); put16(buf + 2, NP); put16(buf + 4, NS);
+    for (uint16_t i = 0; i < NR; i++)
+        put_route(buf + 6 + (size_t)i * 16u, OP_DIRECT,
+                  (uint8_t)(i % 3), (uint8_t)(i % 64), (uint8_t)(i % MAX_WIRES),
+                  (uint8_t)(i % 3), (uint16_t)(i % NP), 0, 0, ROUTE_FLAG_ACTIVE);
+    for (int i = 0; i < NP * 4; i++)
+        put32(buf + 6 + (size_t)NR * 16u + (size_t)i * 4u, 0x3F800000u);   /* 1.0f */
+}
+
+static void deploy_selftest(void)
+{
+    static uint8_t buf[6 + (MAX_ROUTES + 8 + 8) * 16u];    /* 2310 B, 静态区不占栈 */
+    const uint16_t NR = MAX_ROUTES, NP = 8, NS = 8;
+    const uint32_t len = 6u + ((uint32_t)NR + NP + NS) * 16u;
+    uint32_t ok0, nak0;
+
+    for (int i = 0; i < DSELFTEST_CASES; i++) g_dst_case[i] = 0;
+
+    /* ---- 例 0: 合法三档程序 → 必须受理 ---- */
+    ds_build_valid(buf, NR, NP, NS);
+    ok0 = g_deploy_ok; nak0 = g_deploy_nak;
+    h_deploy(buf, len);
+    g_dst_case[0] = (g_deploy_ok == ok0 + 1u && g_deploy_nak == nak0) ? 1u : 2u;
+
+    /* ---- 例 1: dst 冲突 (路由1 的 dst_channel 改成与路由0 相同) ----
+     * 两条路由写同一个 wire → 结果取决于表序 = 非确定性, 必须下载期拒绝 */
+    ds_build_valid(buf, NR, NP, NS);
+    buf[6u + 16u + 3u] = buf[6u + 3u];
+    ok0 = g_deploy_ok; nak0 = g_deploy_nak; h_deploy(buf, len);
+    g_dst_case[1] = (g_deploy_nak == nak0 + 1u && g_deploy_ok == ok0) ? 1u : 2u;
+
+    /* ---- 例 2: SRC_HMI → 必须拒 (H723 未实现该源, 放行 = 静默给恒 0 的假信号) ---- */
+    ds_build_valid(buf, NR, NP, NS);
+    buf[6u + 0u] = (uint8_t)SRC_HMI;
+    ok0 = g_deploy_ok; nak0 = g_deploy_nak; h_deploy(buf, len);
+    g_dst_case[2] = (g_deploy_nak == nak0 + 1u && g_deploy_ok == ok0) ? 1u : 2u;
+
+    /* ---- 例 3: PID(stateful) 挂 0 号 state 槽 (= "无槽") → 必须拒 (ISR 会传 NULL) ---- */
+    ds_build_valid(buf, NR, NP, NS);
+    buf[6u + 4u] = (uint8_t)OP_PID;          /* op */
+    put16(buf + 6u + 8u, 0u);                /* state_offset = 0 */
+    ok0 = g_deploy_ok; nak0 = g_deploy_nak; h_deploy(buf, len);
+    g_dst_case[3] = (g_deploy_nak == nak0 + 1u && g_deploy_ok == ok0) ? 1u : 2u;
+
+    /* ---- 例 4: div=3 (掩码外) → 必须拒 ---- */
+    ds_build_valid(buf, NR, NP, NS);
+    buf[6u + 14u] = 3u;
+    ok0 = g_deploy_ok; nak0 = g_deploy_nak; h_deploy(buf, len);
+    g_dst_case[4] = (g_deploy_nak == nak0 + 1u && g_deploy_ok == ok0) ? 1u : 2u;
+
+    /* ---- 例 5: 非法 op (0x1F) → 必须拒 ---- */
+    ds_build_valid(buf, NR, NP, NS);
+    buf[6u + 4u] = 0x1Fu;
+    ok0 = g_deploy_ok; nak0 = g_deploy_nak; h_deploy(buf, len);
+    g_dst_case[5] = (g_deploy_nak == nak0 + 1u && g_deploy_ok == ok0) ? 1u : 2u;
+
+    /* ---- 例 6: 参数非有限 (指数全 1) → 必须拒 (NaN 会经运算传播成坏输出) ---- */
+    ds_build_valid(buf, NR, NP, NS);
+    put32(buf + 6u + (size_t)NR * 16u, 0x7F800000u);   /* +Inf */
+    ok0 = g_deploy_ok; nak0 = g_deploy_nak; h_deploy(buf, len);
+    g_dst_case[6] = (g_deploy_nak == nak0 + 1u && g_deploy_ok == ok0) ? 1u : 2u;
+
+    /* ---- 例 7: 载荷长度不足 (声称 128 条却只给 4 字节) → 必须拒 ---- */
+    ds_build_valid(buf, NR, NP, NS);
+    ok0 = g_deploy_ok; nak0 = g_deploy_nak; h_deploy(buf, 10u);
+    g_dst_case[7] = (g_deploy_nak == nak0 + 1u && g_deploy_ok == ok0) ? 1u : 2u;
+
+    /* ---- 例 8: 全 NONACTIVE → 受理, 但写入 **0 条**
+     *   (边界: "空程序"是合法的 —— 是停止运行的手段, 不该被当成错误) ---- */
+    ds_build_valid(buf, NR, 0u, 0u);
+    for (uint16_t i = 0; i < NR; i++) buf[6u + (size_t)i * 16u + 5u] = 0u;   /* flags 清 ACTIVE */
+    ok0 = g_deploy_ok; nak0 = g_deploy_nak;
+    h_deploy(buf, 6u + (uint32_t)NR * 16u);
+    g_dst_case[8] = (g_deploy_ok == ok0 + 1u && g_deploy_nak == nak0 && g_deploy_routes == 0u)
+                    ? 1u : 2u;
+
+    g_dst_done = 1;
+}
+
+static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
 {
     g_cmd_count++;
     g_cmd_last = cmd;
     switch (cmd) {
-        case CMD_GET_VERSION: h_get_version(); break;
+        case CMD_GET_VERSION:   h_get_version(); break;
+        case CMD_DEPLOY:        h_deploy(p, n); break;
+        case CMD_ENGINE_STATUS: h_engine_status(); break;
         /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
          *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
          *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
@@ -471,7 +734,7 @@ static void proto_poll(void)
             /* 自检期只计数**不分发** —— 否则回环收到的请求会被再次应答,
              * TX→RX 再 TX… 变成回声风暴 */
             if (s_selftest_active) { g_selftest_frames++; continue; }
-            proto_dispatch(s_parser.cmd);
+            proto_dispatch(s_parser.cmd, s_parser.payload, s_parser.payload_len);
         } else if (r < 0) {
             g_frame_bad++;
         }
@@ -549,6 +812,13 @@ static void obs_anchor(void)
     sink ^= g_cmd_last;                   sink ^= g_nak_count;
     sink ^= g_banner_count;               sink ^= g_selftest_state;
     sink ^= g_selftest_frames;
+    sink ^= g_deploy_ok;                  sink ^= g_deploy_nak;
+    sink ^= g_deploy_routes;              sink ^= g_deploy_budget;
+    sink ^= g_deploy_seq;                 sink ^= g_applied_seq;
+    sink ^= g_reload_count;               sink ^= g_reload_cyc;
+    sink ^= g_reload_lat;                 sink ^= g_deploy_set_tick;
+    sink ^= g_dst_case[0];                sink ^= g_dst_case[DSELFTEST_CASES - 1];
+    sink ^= g_dst_done;
     (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
 }
 
@@ -641,6 +911,12 @@ int main(void)
      *   整段回收 (实测: 第一版 g_selftest_state 从符号表消失了 —— 与阶段 2 的
      *   g_isr_itcm 同款陷阱, 属"本项目已知族谱"里的一个)。 */
     g_selftest_state = 3;      /* 未启用 */
+#endif
+    /* 阶段 3.2: deploy 自检 (用合成载荷驱动**同一个** h_deploy 代码路径) */
+#if DEPLOY_SELFTEST
+    deploy_selftest();
+#else
+    g_dst_done = 3;            /* 未启用 (同样必须显式写一次, 否则会被回收) */
 #endif
     g_stage = 11;
 

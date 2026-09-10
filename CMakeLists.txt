@@ -29,6 +29,7 @@ set(DCL_BOOT_BANNER    "1"      CACHE STRING "上电发一帧版本响应 (LA �
 set(DCL_BANNER_PERIOD  "0"      CACHE STRING "横幅重播周期 ms (0=只发一次; >0 仅供 LA 抓取)")
 set(DCL_UART_SELFTEST  "0"      CACHE STRING "上电回环自检 (1 需 PA9↔PA10 短接)")
 set(DCL_UART_BAUD      "115200" CACHE STRING "协议波特率")
+set(DCL_DEPLOY_SELFTEST "0"     CACHE STRING "上电跑 deploy 自检 (9 例)")
 
 # Cortex-M7 + 双精度 FPU + 硬浮点 (与老项目 build.bat 一致)
 set(MCU_FLAGS -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb)
@@ -54,6 +55,7 @@ add_compile_options(
     -DBANNER_PERIOD_MS=${DCL_BANNER_PERIOD}
     -DUART_SELFTEST=${DCL_UART_SELFTEST}
     -DUART_BAUD=${DCL_UART_BAUD}u
+    -DDEPLOY_SELFTEST=${DCL_DEPLOY_SELFTEST}
 )
 
 add_link_options(

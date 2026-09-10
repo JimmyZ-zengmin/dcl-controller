@@ -381,7 +381,16 @@ void engine_fill_tables(uint8_t *base, int profile)
             case 1:  op = k_mixed_ops[i % 19]; break;   /* 19 原语轮转 */
             case 2:  op = OP_PID;              break;   /* 最重档 */
             case 4:  op = k_mixed_ops[i % 19]; break;   /* 三档混合 · 原语轮转 */
-            default: op = OP_DIRECT;           break;   /* 0 与 3 */
+            default:
+                /* ★ profile >= 100 = 「单一原语」模式: op = profile - 100
+                 *   用途: 逐原语测成本, 为 deploy 的预算模型建立**本平台自己的**
+                 *   cost[] 表。
+                 *   ★ 为什么不照抄 S3 的 op_cost[]: 那是 240MHz + ESP32 架构上的实测值
+                 *     (DIRECT = 234 cyc/条), 而 H723 是 400MHz + ITCM (56 cyc/条)。
+                 *     照抄过来就是"宣称≠实现"—— 预算门会用错的数去把关。 */
+                op = (profile >= 100 && (profile - 100) <= OP_MAX)
+                     ? (uint8_t)(profile - 100) : OP_DIRECT;
+                break;
         }
         /* ---- 档位/相位分配 (★ 必须与工具里的 Python 预测逐字对应) ----
          * profile 3/4 = 三档混合: div = i % 3, 约 1/3 落在 div0/1/2;
@@ -420,4 +429,225 @@ void engine_fill_tables(uint8_t *base, int profile)
      *   非三档 profile 也照跑 —— 结果是恒等变换(全 div0), 但保证桶表一定被建立,
      *   不会出现"某档忘了建桶 → 每拍空扫"的静默失效。 */
     engine_build_buckets(base, MAX_ROUTES);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * 阶段 3.2 — deploy 路径 (成本模型 → 校验 → staging → 热重载)
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* ★★ 本平台实测的单条原语成本 (cycles/条, ITCM, 全表扫, 两点法斜率)
+ * 来源: tools/h723_op_sweep.py — 19/19 原语数据可信, 每个原语的**表校验和都与
+ * Python 独立预测逐位吻合** (证明"填进去的确实是这个原语, 不是在测别的东西"),
+ * 两点法 (n=128 与 n=64) 除掉函数调用与 DWT 探针的常数项。
+ * 实测 2026-09-10, 原始数据 build/op_cost.json。
+ *
+ * ★ 为什么不照抄 S3 的 op_cost[]: 那是 240MHz/ESP32 上的数, 这里逐步对照 ——
+ *     DIRECT 234 → **56** (4.2× 快)      PID 337 → **145** (2.3× 快)
+ *   加速比**不是常数**: PID 相对更贵 (浮点除法/饱和在 M7 上受益不如简单拷贝)。
+ *   若把 S3 的表按 DIRECCT 的 4.2× 比例整体缩放, PID 会被低估约 1.8 倍 ——
+ *   预算门就会放行会超载的程序。这是"平台换了数就要重测"的实证。 */
+static const uint16_t k_op_cost_itcm[0x13] = {
+    /* DIRECT CMP HYST CLAMP  LPF PID RATE DBN MUX EDGE LUT CNT TMR ARITH SCL AND OR NOT SR */
+        56,  75,  79,  75,   96, 145,  67, 75, 70,  88, 89, 77, 79,  68, 67, 72, 72, 70, 78,
+};
+
+/* 源类型附加成本: 本平台 4 种源都是"取址 + 一次掩码", 实测差异落在噪声内 (<2 cyc),
+ * 故为 0。S3 给 SRC_HMI 记了 +60 (它要 volatile u16 读 + 整数转浮点 + 浮点除),
+ * 但 H723 上 SRC_HMI **根本不该被放行** —— 引擎侧它是留位返回 0, 放行等于静默
+ * 送一个恒 0 的假信号。所以这里不给成本, 而是在 engine_route_validate 里直接拒。 */
+static const uint16_t k_src_cost[4] = { 0, 0, 0, 0 };
+
+uint16_t engine_op_cost(uint8_t op)
+{
+    /* 越界/未知 → 取实测最贵值的 2 倍作保守兜底: 宁可拦错, 不可放错 */
+    return (op <= OP_MAX) ? k_op_cost_itcm[op] : (uint16_t)(k_op_cost_itcm[OP_PID] * 2u);
+}
+
+uint32_t engine_prog_budget(const uint8_t *payload, uint16_t nr)
+{
+    uint32_t per = 0;
+    for (uint16_t i = 0; i < nr; i++) {
+        RouteEntry_t r;
+        memcpy(&r, payload + (size_t)i * 16u, 16u);
+        if (!(r.flags & ROUTE_FLAG_ACTIVE)) continue;
+        uint8_t dv = r.period & PERIOD_DIV_MASK;
+        uint32_t mult = (dv == PERIOD_DIV_IDX_MID)  ? OP_COST_DIV1
+                      : (dv == PERIOD_DIV_IDX_SLOW) ? OP_COST_DIV2 : OP_COST_DIV0;
+        uint32_t s = (r.src_type < 4u) ? k_src_cost[r.src_type] : SRC_COST_FALLBACK;
+        /* 向上取整: 慢档每条每拍至少也要摊 1 cyc (不能因为除法取整把成本算没了) */
+        per += ((uint32_t)engine_op_cost(r.op) + s + mult - 1u) / mult;
+    }
+    return per;
+}
+
+/* 有状态原语: 必须挂 state 槽, 否则 ISR 传 NULL → 写状态就崩 (S3 T22 实证) */
+static inline int op_is_stateful_h(uint8_t op)
+{
+    return (op == OP_LPF || op == OP_PID || op == OP_HYST || op == OP_RATE ||
+            op == OP_DEADBAND || op == OP_EDGE || op == OP_CNT || op == OP_TIMER ||
+            op == OP_SR);
+}
+
+const char *engine_route_validate(const RouteEntry_t *r)
+{
+    if (r->param_idx    >= MAX_PARAMS) return "param_idx out of range";
+    if (r->state_offset >= MAX_STATES) return "state_offset out of range";
+    if (r->state_offset == 0 && op_is_stateful_h(r->op))
+        return "stateful op needs state_offset";
+    if (r->dst_channel  >= MAX_WIRES)  return "dst_channel out of range";
+    if (r->wire2_idx    >= MAX_WIRES)  return "wire2_idx out of range";
+    if ((r->period & PERIOD_DIV_MASK) > PERIOD_DIV_IDX_SLOW) return "bad div";
+
+    switch (r->src_type) {
+        case SRC_SENSOR: if (r->src_index >= MAX_SENSORS) return "src_index(sensor) out of range"; break;
+        case SRC_WIRE:   if (r->src_index >= MAX_WIRES)   return "src_index(wire) out of range";   break;
+        case SRC_CONST:  if (r->src_index >= MAX_PARAMS)  return "src_index(const) out of range";  break;
+        /* ★★ H5 未决项的正面处理: 引擎侧 read_source 对 SRC_HMI 是**留位返回 0**。
+         *   若放行, 上位机会得到一个"恒 0 的合法信号"—— 程序能跑、不报错、结果全错。
+         *   显式拒绝才是正确行为: 未实现的能力必须在**下载期**失败, 而不是运行时静默。 */
+        case SRC_HMI:    return "SRC_HMI not implemented on H723";
+        default:         return "bad src_type";
+    }
+    if (r->dst_type != DST_WIRE) return "bad dst_type";
+
+    switch (r->op) {
+        case OP_DIRECT: case OP_CMP: case OP_HYST: case OP_CLAMP: case OP_LPF:
+        case OP_PID: case OP_RATE: case OP_DEADBAND: case OP_MUX: case OP_EDGE:
+        case OP_LUT: case OP_CNT: case OP_TIMER: case OP_ARITH: case OP_SCALE:
+        case OP_AND: case OP_OR: case OP_NOT: case OP_SR: break;
+        default: return "bad op";
+    }
+    /* AND/OR 是双输入原语: 第二输入必须有效 (显式 WIRE2 标志或 wire2_idx≠0),
+     * 否则 wb=0 → 恒假/恒真静默错误 (S3 M1 实证)。 */
+    if ((r->op == OP_AND || r->op == OP_OR) &&
+        !((r->flags & ROUTE_FLAG_WIRE2) || r->wire2_idx))
+        return "AND/OR needs wire2 source";
+    return NULL;
+}
+
+uint16_t engine_stage_program(uint8_t *base, const uint8_t *payload,
+                              uint16_t nr, uint16_t np, uint16_t ns)
+{
+    uint8_t  *dst  = base + OFF_ROUTE_STAGING;
+    uint16_t *bkt  = (uint16_t *)(void *)(base + OFF_ROUTE_BUCKETS_ST);
+    uint16_t *off1 = bkt,      *cnt1 = bkt + 10;
+    uint16_t *off2 = bkt + 20, *cnt2 = bkt + 120;
+
+    /* 桶表先清零: 保证 64..99 槽恒 0 (H9 的判据), 且重填不同程序时不残留旧桶 */
+    memset(bkt, 0, (size_t)ROUTE_BUCKET_U16 * 2u);
+    memset(dst, 0, (size_t)MAX_ROUTES * 16u);
+
+    uint16_t n0 = 0, n1 = 0, n2 = 0;
+    for (uint16_t i = 0; i < nr; i++) {
+        RouteEntry_t r;
+        memcpy(&r, payload + (size_t)i * 16u, 16u);
+        if (!(r.flags & ROUTE_FLAG_ACTIVE)) continue;
+        uint8_t dv = r.period & PERIOD_DIV_MASK;
+        if      (dv == PERIOD_DIV_IDX_FAST) n0++;
+        else if (dv == PERIOD_DIV_IDX_MID)  n1++;
+        else if (dv == PERIOD_DIV_IDX_SLOW) n2++;
+    }
+
+    {   /* 数每相位桶条数: 档内到达序 % 相位数 (与 S3 同语义: "同档错相") */
+        uint16_t s1 = 0, s2 = 0;
+        for (uint16_t i = 0; i < nr; i++) {
+            RouteEntry_t r;
+            memcpy(&r, payload + (size_t)i * 16u, 16u);
+            if (!(r.flags & ROUTE_FLAG_ACTIVE)) continue;
+            uint8_t dv = r.period & PERIOD_DIV_MASK;
+            if      (dv == PERIOD_DIV_IDX_MID)  cnt1[s1++ % BUCKET_DIV1_PHASES]++;
+            else if (dv == PERIOD_DIV_IDX_SLOW) cnt2[s2++ % BUCKET_DIV2_PHASES]++;
+        }
+    }
+
+    /* 前缀和定桶起点: div0 段在最前 (每拍全跑), 故 off1[0] 从 n0 开始 */
+    uint16_t acc = n0;
+    for (int p = 0; p < BUCKET_DIV1_PHASES; p++) { off1[p] = acc; acc = (uint16_t)(acc + cnt1[p]); }
+    uint16_t acc2 = (uint16_t)(n0 + n1);
+    for (int p = 0; p < BUCKET_DIV2_PHASES; p++) { off2[p] = acc2; acc2 = (uint16_t)(acc2 + cnt2[p]); }
+
+    uint16_t cur1[BUCKET_DIV1_PHASES], cur2[BUCKET_DIV2_PHASES];
+    for (int p = 0; p < BUCKET_DIV1_PHASES; p++) cur1[p] = off1[p];
+    for (int p = 0; p < BUCKET_DIV2_PHASES; p++) cur2[p] = off2[p];
+
+    uint16_t cur0 = 0, q1 = 0, q2 = 0;
+    for (uint16_t i = 0; i < nr; i++) {
+        RouteEntry_t r;
+        memcpy(&r, payload + (size_t)i * 16u, 16u);
+        if (!(r.flags & ROUTE_FLAG_ACTIVE)) continue;
+        uint8_t dv = r.period & PERIOD_DIV_MASK, ph = 0;
+        uint16_t slot = 0;
+        if      (dv == PERIOD_DIV_IDX_FAST) { slot = cur0++; }
+        else if (dv == PERIOD_DIV_IDX_MID)  { ph = (uint8_t)(q1++ % BUCKET_DIV1_PHASES); slot = cur1[ph]++; }
+        else                                { ph = (uint8_t)(q2++ % BUCKET_DIV2_PHASES); slot = cur2[ph]++; }
+        r.period   = (uint8_t)(dv | (uint8_t)(ph << PERIOD_PHASE_SHIFT));
+        r.reserved = 0;                       /* 显式写 0: 填充字节不参与语义, 但参与逐字节校验和 */
+        memcpy(dst + (size_t)slot * 16u, &r, 16u);
+    }
+
+    if (np) memcpy(base + OFF_PARAM_STAGING, payload + (size_t)nr * 16u,        (size_t)np * 16u);
+    if (ns) memcpy(base + OFF_STATE_STAGING, payload + (size_t)(nr + np) * 16u, (size_t)ns * 16u);
+
+    uint16_t nw = (uint16_t)(n0 + n1 + n2);
+    SHM_U16(base, OFF_CTRL_N_ROUTES) = nw;
+    SHM_U16(base, OFF_CTRL_N_PARAMS) = np;
+    SHM_U16(base, OFF_CTRL_N_STATES) = ns;
+    return nw;
+}
+
+/* 字拷贝 / 字清零 —— **刻意不用 memcpy/memset**
+ *
+ * ★★ 这是被测出来的教训 (2026-09-10, deploy 自检第一版):
+ *   第一版直接调 memcpy/memset (newlib nano), 实测热重载 **71241 cyc = 178 μs**,
+ *   比 100 μs 的拍还长 → 那一次拍周期被拉到 196 μs, 而且下次定时器事件已经到期,
+ *   返回后立刻又进一次 ISR (实测拍周期 min 掉到 1360 cyc = 3.4 μs)。
+ *   折算下来 memcpy 约 **14.8 cyc/字节** —— 原因是它按字节拷 + 从 flash 取指
+ *   (I-cache 复位默认关闭)。
+ *   换成 ITCM 里的字拷贝循环后, 同样的数据量只要 ~1/30 的时间 (见 g_reload_cyc)。
+ *   ⇒ 结论: **热路径上的内存搬运不能交给 libc**, 尤其是"默认关 cache"的 H7。 */
+static inline void itcm_wcopy(uint32_t *d, const uint32_t *s, uint32_t words)
+{
+    volatile uint32_t *dv = d;
+    const volatile uint32_t *sv = s;
+    for (uint32_t i = 0; i < words; i++) dv[i] = sv[i];
+}
+
+static inline void itcm_wzero(uint32_t *d, uint32_t words)
+{
+    volatile uint32_t *dv = d;
+    for (uint32_t i = 0; i < words; i++) dv[i] = 0u;
+}
+
+/* ★ 放 ITCM: 这是"部署瞬间"最热的一段代码, 且它的时长直接决定那一拍会不会超拍长 */
+__attribute__((section(".itcm_text"), noinline, used))
+void engine_reload_active(uint8_t *base)
+{
+    uint16_t nr = SHM_U16(base, OFF_CTRL_N_ROUTES);
+    uint16_t np = SHM_U16(base, OFF_CTRL_N_PARAMS);
+    uint16_t ns = SHM_U16(base, OFF_CTRL_N_STATES);
+    if (nr > MAX_ROUTES) nr = MAX_ROUTES;
+    if (np > MAX_PARAMS) np = MAX_PARAMS;
+    if (ns > MAX_STATES) ns = MAX_STATES;
+
+    /* 顺序: 路由 → 桶 → 参数 → 状态。桶必须与路由**同一拍**切换, 否则 ISR
+     * 会用旧桶扫新表 → 前后半张表错乱 (S3 OA15 的连带缺陷)。 */
+    if (nr) itcm_wcopy((uint32_t *)(void *)(base + OFF_ROUTE_TABLE),
+                       (const uint32_t *)(const void *)(base + OFF_ROUTE_STAGING),
+                       (uint32_t)nr * 4u);
+    itcm_wcopy((uint32_t *)(void *)(base + OFF_ROUTE_BUCKETS),
+               (const uint32_t *)(const void *)(base + OFF_ROUTE_BUCKETS_ST),
+               (uint32_t)ROUTE_BUCKET_U16 / 2u);
+    if (np) itcm_wcopy((uint32_t *)(void *)(base + OFF_PARAM_TABLE),
+                       (const uint32_t *)(const void *)(base + OFF_PARAM_STAGING),
+                       (uint32_t)np * 4u);
+    /* M2: 状态表先全清再拷 — 新程序绝不继承旧程序的运行状态
+     * (饱和积分残留 → 上电/换程序瞬间的满功率冲击) */
+    itcm_wzero((uint32_t *)(void *)(base + OFF_STATE_TABLE), (uint32_t)MAX_STATES * 4u);
+    if (ns) itcm_wcopy((uint32_t *)(void *)(base + OFF_STATE_TABLE),
+                       (const uint32_t *)(const void *)(base + OFF_STATE_STAGING),
+                       (uint32_t)ns * 4u);
+
+    SHM_U32(base, OFF_CTRL_PROG_MAGIC) = 0x44434C31u;   /* 'DCL1' */
+    /* ★ 生效确认: 把"已切换"这件事写成可观测的量 (S3 的 ACK≠已生效 语义债) */
+    SHM_U16(base, OFF_CTRL_APPLIED_SEQ) = SHM_U16(base, OFF_CTRL_DEPLOY_SEQ);
 }

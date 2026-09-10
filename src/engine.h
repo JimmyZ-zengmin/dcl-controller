@@ -37,6 +37,14 @@
  *
  *   控制块区 (0x00-0x3F) 本阶段**只占位不实现** (deploy/热重载属阶段 3),
  *   但偏移先按不变量钉死 —— 偏移一改, S3 的 20 套回归与 14 章审计记录全失效。 */
+/* ---- SHM 定址助手 (与 S3 同名同语义, 迁移期少一次心智换算) ----
+ * ★ 一律带 base 参数: 本项目所有引擎函数都以 base 为唯一入口 (不用隐藏的 g_shm),
+ *   这样"表在哪"永远由调用方显式给出, 便于将来第二块表区/自检。 */
+#define SHM_U8(b, off)   (*(volatile uint8_t  *)((b) + (off)))
+#define SHM_U16(b, off)  (*(volatile uint16_t *)((b) + (off)))
+#define SHM_U32(b, off)  (*(volatile uint32_t *)((b) + (off)))
+#define SHM_PTR(b, off)  (void *)((b) + (off))
+
 #define OFF_CTRL_MAGIC       0x00   /* u32 */
 #define OFF_CTRL_VERSION     0x04   /* u32 */
 #define OFF_CTRL_HEARTBEAT   0x08   /* u32 */
@@ -147,9 +155,59 @@ _Static_assert(sizeof(StateEntry_t) == 16, "StateEntry_t must be 16 bytes");
 /* ---- period 字段位定义 ---- */
 #define PERIOD_DIV_IDX_FAST  0   /* 1×: 每 100μs */
 #define PERIOD_DIV_IDX_MID   1   /* 10×: 每 1ms */
-#define PERIOD_DIV_IDX_SLOW  2   /* 100×: 每 10ms */
+#define PERIOD_DIV_IDX_SLOW  2   /* ★ H9 修正后是 **64×** (6.4ms), 不是 100× ——
+                                  *   `period` 的 phase 字段只有 6 位, 相位数只能是 64。
+                                  *   S3 声称 100 却只有 64 个可达相位 (见 AUDIT §12)。 */
 #define PERIOD_DIV_MASK      0x03
 #define PERIOD_PHASE_SHIFT   2
+
+/* ══════════ deploy 预算模型 (阶段 3.2) ══════════
+ * 条数限制 ≠ 成本限制: 128 条 PID 是 128 条, 但成本是 DIRECT 的 2.6 倍。
+ * 门的作用是保证**任何可部署程序**每拍执行都在确定性预算内。
+ *
+ * ★ 除数: div1 摊 ÷10 / **div2 摊 ÷64** (S3 用 100 是 H9 缺陷的一部分, 不许抄)。
+ * ★ 预算来源: `k_op_cost_itcm[]` 全部是**本平台实测值**
+ *   (tools/h723_op_sweep.py 两点法, 19/19 原语, 表校验和逐 op 与 Python 预测吻合)。
+ *   S3 那张表是 240MHz 上的数 (DIRECT=234), 照抄就是"宣称≠实现"。 */
+#define OP_COST_DIV0         1
+#define OP_COST_DIV1         10
+#define OP_COST_DIV2         64   /* ★ 不是 100 (H9) */
+#define SRC_COST_FALLBACK    20   /* 未实测源类型的保守兜底 (cycles/条) */
+
+/* 部署门: 引擎扫描每拍 ≤ 此值。拍长 40000 cyc (100μs @400MHz)。
+ * 余下 14000 cyc (35μs) 留给: 骨架 ISR (~45) + 热重载那一拍 (~3000) +
+ * 通信域/顺序域/传感域 (阶段 4) + 安全余量。
+ * 依据: S3 的同名门是 16000/24000 = 67%; 这里 26000/40000 = 65%, 口径一致。 */
+#define EXEC_DEPLOY_BUDGET   26000
+
+/* 本平台实测的**最贵原语**成本 (PID, 见 engine.c 的 k_op_cost_itcm)。
+ * 改原语表/新增更重的原语时必须同步更新 —— 它参与下面那条绊线断言。 */
+#define OP_COST_MAX_MEASURED   145
+
+/* ══════════════ 绊线断言: 预算门当前"具不具约束力" ══════════════
+ * ★★ 这是一个**故意的反向断言**, 语义要说清楚:
+ *   128 条上限 × 最贵原语 145 cyc = 18560 cyc = 拍长的 **46%** —— 也就是说
+ *   **在 MAX_ROUTES=128 的前提下, 任何合法程序都不可能把拍吃满**, 预算门
+ *   当前**永远不会触发**。它是一条"未来的门"。
+ *   为什么仍然保留它: ① 引擎成本模型必须在扩容前就位 (S3 的 OA12→OA22 就是
+ *   成本模型漏维度反复返工); ② DTCM 能放 ~2000 条路由 —— **一旦扩容, 这个门
+ *   立刻变成真门**, 到那时它就必须被实测验证"真的拦得住超载"。
+ *   ⇒ 这条断言的作用是**在扩容/加重量级原语的那一刻失败**, 逼人回来重新评估:
+ *     届时必须做一次超载实验 (构造 >门 的程序, 确认 NAK + 确认拍没被拉长),
+ *     而不是相信一个从没被触发过的判据。
+ *   断言通过 = "门还不具约束力, 无需动作"; 断言失败 = "门现在是真的了, 去验证它"。*/
+_Static_assert((uint32_t)MAX_ROUTES * OP_COST_MAX_MEASURED <= EXEC_DEPLOY_BUDGET,
+               "★ 预算门开始具约束力: 必须实测验证它能拦住超载 (见本断言上方注释)");
+
+/* ══════════ H723 扩展: deploy 生效确认字段 (S3 的 0x39-0x3F 当时空闲) ══════════
+ * ★ 这是对 S3 那笔语义债的偿还点: S3 的 "ACK = 已受理 ≠ 已生效" —— 上位机收到 ACK
+ *   之后无法知道配置**什么时候**开始生效, 只能假设"大概很快"。
+ *   H723 让"已生效"变成一个**可观测的量**: 每次受理 deploy 递增一个序号并回给 PC,
+ *   ISR 真正切换完 ACTIVE 表后把这个序号写进 APPLIED_SEQ;
+ *   PC 轮询 APPLIED_SEQ == 自己的序号 ⇒ 生效**被证明**, 而不是被假设。 */
+#define OFF_CTRL_DEPLOY_SEQ   0x3A   /* u16: 固件受理的部署序号 (每次 deploy 递增) */
+#define OFF_CTRL_APPLIED_SEQ  0x3C   /* u16: ISR 已切换生效的序号 (= DEPLOY_SEQ 即已生效) */
+#define OFF_CTRL_APPLIED_LAT  0x3E   /* u16: 从置 RELOAD 到 ACTIVE 切换完成, 跨了几拍 */
 #define PERIOD_PHASE_MASK    0x3F
 
 /* ---- flags 位定义 ---- */
@@ -291,6 +349,36 @@ uint32_t engine_table_checksum(const uint8_t *base);
 
 /** @brief 表内 ACTIVE 路由条数 (期望 = 装了几条就是几条) */
 uint32_t engine_active_routes(const uint8_t *base);
+
+/* ══════════════════ 阶段 3.2 — deploy 路径 ══════════════════ */
+
+/** @brief 单条路由合法性校验。返回 NULL = 合法, 否则返回**可直接回给 PC 的原因文本**。
+ *  原则 (与 S3 一致): 错误配置在**下载时显式失败**, 而不是等到运行时静默越界。
+ *  H723 适配: 去掉了 S3 的 force/GPIO 安全掩码判据 (本阶段没有这两个域),
+ *  但**保留了 SRC_HMI 的拦截** —— 引擎侧 read_source 对 SRC_HMI 是留位返回 0,
+ *  若放行就会得到"恒 0 的假信号"而不是报错 (H5 未决项的正面处理)。*/
+const char *engine_route_validate(const RouteEntry_t *r);
+
+/** @brief 计算程序每拍均摊执行成本 (Σ ceil((op_cost+src_cost)/div倍率)), 过滤 ACTIVE。
+ *  @param payload deploy 载荷起点 (**注意不是整个帧**, 是 [nr][np][ns] 之后的第一个路由)
+ *  @param nr      载荷里的路由条数 */
+uint32_t engine_prog_budget(const uint8_t *payload, uint16_t nr);
+
+/** @brief 本平台实测的单条原语成本 (cycles/条, ITCM, 全表扫)。
+ *  @param op 操作码; 越界返回保守值。 */
+uint16_t engine_op_cost(uint8_t op);
+
+/** @brief 热重载: STAGING → ACTIVE (路由 + 桶表 + 参数 + 状态)。
+ *  ★ 必须在**关掉扫描**的前提下调用, 否则 ISR 可能扫到半张表。
+ *  调用方负责把 SHM 控制块的 RELOAD 标志清掉。 */
+void engine_reload_active(uint8_t *base);
+
+/** @brief deploy 的 STAGING 装载 + 归组重排 + 桶表生成 (校验**之前**不要调)。
+ *  @param payload [nr][np][ns] 之后的第一个路由
+ *  @param nr/np/ns 条数 (调用方已校验 ≤ MAX_*)
+ *  @return 实际写入 ACTIVE 的路由条数 (非 ACTIVE 的不写 → 与 nr 可能不同) */
+uint16_t engine_stage_program(uint8_t *base, const uint8_t *payload,
+                              uint16_t nr, uint16_t np, uint16_t ns);
 
 /** @brief 栈边界哨兵: 在 _shm_end 之上铺 128 字节魔术字, 被踩返回 0
  *  ★ 设防缺口修正: SHM 与栈之间原本**没有任何保护**, 栈溢出会静默踩表

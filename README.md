@@ -152,14 +152,15 @@ ld/         链接脚本（.itcm_text VMA 0 / .dtcm_shm NOLOAD + 溢出断言）
 startup/    ST 启动文件（BSD-3 厂商模板，含 ITCM 拷贝循环）
 cmake/      工具链文件
 tools/      h723_proto.py（★协议层 PC 侧 6 用例，含异常路径）
+            h723_op_sweep.py（★逐原语成本实测 → deploy 预算模型的数据来源）
             h723_stage1_read.py（阶段 1：读回 DWT 空拍测量）
             h723_stage2_read.py（阶段 2：单会话 A/B 测量 + 落位/前提验证 + 守卫）
             h723_pad_sweep.py（落位扫描）· h723_ports.py（串口自检）
   legacy/   clock_probe.sh / ws_scan.sh（早期 SWD 探测，已被证伪，留档）
 docs/       迁移方案 + 时钟依据 + 频率天花板 + 阶段1/2报告
             + STAGE3-REPORT.md（档桶分档）+ STAGE3-1-REPORT.md（★协议层）
-            + AUDIT-H723-stage2.md（审计报告）+ REF-flash-placement.md（落位机制）
-            + 硬件接线
+            + STAGE3-2-REPORT.md（★deploy 路径）+ AUDIT-H723-stage2.md（审计报告）
+            + REF-flash-placement.md（落位机制）+ 硬件接线
 ```
 
 ---
@@ -192,6 +193,10 @@ bash build.sh -DDCL_BANNER_PERIOD=20     # 每 20ms 重播一帧 (LA 抓取用; 
 bash build.sh -DDCL_BOOT_BANNER=0        # 零 UART 流量 (拍抖动对照组)
 bash build.sh -DDCL_UART_SELFTEST=1      # 上电回环自检 (需 H1 的 6↔5 脚短接)
 bash build.sh -DDCL_PA9_MODE=0           # 回退到阶段 1 的 PA9 方波 (线路验证可复跑)
+
+# ★ 阶段 3.2 deploy 专用
+python tools/h723_op_sweep.py --dur 0.3 --json build/op_cost.json   # 逐原语成本 (约 30s)
+bash build.sh -DDCL_DEPLOY_SELFTEST=1    # 上电跑 deploy 自检 (9 例, 用 SWD 读结果)
 ```
 
 ### 串口接线（PC 直连）
@@ -261,7 +266,7 @@ bash build.sh -DDCL_PA9_MODE=0           # 回退到阶段 1 的 PA9 方波 (线
 
 ## 下一步（编号以 `docs/MIGRATE-H723.md` 为准）
 
-**阶段 3（★ 关键里程碑）— 协议栈 + 回归跑通**　当前 **1 / 4**
+**阶段 3（★ 关键里程碑）— 协议栈 + 回归跑通**　当前 **2 / 4**
 
 1. ✅ ~~UART + 协议帧~~（已完成：`transport.c` 逐字沿用 S3 + USART1 驱动 +
    `GET_VERSION` + PC 侧 6 用例脚本。见 `docs/STAGE3-1-REPORT.md`）
@@ -271,11 +276,16 @@ bash build.sh -DDCL_PA9_MODE=0           # 回退到阶段 1 的 PA9 方波 (线
    - **LA CH1 → H1 第 6 脚**（外部波形复核；目前 CH1 抓到的不是 UART 信号）
    - 快速自证：把 H1 的 **6 脚与 5 脚短接** + `-DDCL_UART_SELFTEST=1`
      → 固件上电自环，不需 PC 即可证明「RX 通路 + CRC + 解析器」
-2. **deploy 路径**：0x10 写 staging → 热重载 → 生效确认（S3 的
-   "ACK=已受理 ≠ 已生效"语义债在 H723 一次到位）。桶表 ST 区已按 S3 偏移预留
-   ★ 预算模型必须按 H9 用 **/64** 给 div2 摊薄；deploy 侧还要拦
-   `div=3` / `stateful op 无 state 槽` / `src_type==SRC_HMI`（H5 未决）
-   ★ deploy 的 6 KB 帧**必须把发送改 DMA/中断驱动** —— 现在的轮询发送会占满主循环
+2. ✅ ~~deploy 路径~~（已完成：**逐原语实测成本表** → 下载期逐类校验 → STAGING
+   归组重排 → ISR 原子热重载 → **"已生效"可观测**。自检 9/9。
+   见 `docs/STAGE3-2-REPORT.md`）
+   - ★ **成本表必须本平台实测**：S3 的 DIRECT=234 → H723 **56**（4.2×），
+     但 PID 337 → **145** 只有 **2.3×** —— 按 4.2× 缩放会把 PID 低估 1.8 倍
+   - ★★ **热重载不能用 libc `memcpy`**：第一版 178 μs **比拍还长**，把拍周期
+     打崩（1360~78640）；改 ITCM 字拷贝后 **3.6 μs**（50×），拍周期回到 40000
+   - ★ **预算门当前不具约束力**（128×145=18560 < 门 26000）——
+     已用一条**绊线断言**标注：扩容路由数或加重量级原语时会失败，逼人回来实测验证它
+   - ⏳ 协议级 deploy 联调要等 CH340 接线；`persist` 落盘属下一子项
 3. **persist**（掉电保持；PERSISTENT 语义 = 运行期 0 flash 操作）
 4. **20 套回归平移**，脚本零改动 → 全绿（**这一步过了，"迁移成功"基本成立**）
 
