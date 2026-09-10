@@ -144,15 +144,21 @@ S3 旧版 13/13 全绿是因为测试全用 `val=0.0`，bug 与期望重合（**
 - 强制 idx=999 → NAK
 - deploy 后 force 被清（回读 MASK == 0）
 
-### W2.4 persist（裸 Flash 双扇区）
+### W2.4 persist（裸 Flash 双扇区）✅ **已完成 (2026-09-11, 提交 66f46f5)**
 S3 用 NVS，H723 改用 **Flash 扇区 A/B 双副本**：
 ```
-扇区 15 (0x080E0000, 128KB) = 副本 A
-扇区 14 (0x080C0000, 128KB) = 副本 B
-每份: [magic:u32][seq:u32][len:u32][payload][crc32]
-写入: 擦目标扇区 → 写 → 更新 seq → 校验回读
-加载: 比较 A/B 的 seq 取大者，校验 CRC 失败则回退另一份
+扇区 6 (0x080C0000, 128KB) = 副本 A
+扇区 7 (0x080E0000, 128KB) = 副本 B
+每份: [header 32B: magic|version|seq|crc32|n_routes|n_params|n_states|rsv|prog_magic|rsv2]
+      [payload: route表 | param表 | state表, 各 n×16B][补 0xFF 到 32B 边界]
+写入: 擦"seq 较小的那份" → 写 → 回读逐字节校验 (命令返回 != 写对)
+加载: 比较 A/B 的 seq 取大者, CRC 不过则回退; 两份都坏 = 空配置 (不是错误)
 ```
+★ **为什么是扇区 6/7 而不是本文档早先写的 14/15**：14/15 那组编号是照
+**2MB 双 bank H743** 抄的（bank2 从 sector 8 起编号）。**H723ZGT6 实测只有
+bank1**（读 bank2 的 KEYR2 @0x52002100 得 0），扇区号只能 0..7。选末尾两个：
+固件 bin 目前 18KB（占 sector 0），扇区 6/7 远离代码区。
+★ **本文档早先那行 "扇区 15=副本A / 扇区 14=副本B" 是错的**，已按实测修正。
 内容 = 整套 route/param/state 表 + N_ROUTES/N_PARAMS/N_STATES + PROG_MAGIC。
 
 ★ H723 Flash 擦写要点：
@@ -161,11 +167,25 @@ S3 用 NVS，H723 改用 **Flash 扇区 A/B 双副本**：
 - 写前 `FLASH_ACR` 不用改（我们跑在 VOS0 400MHz，ST 要求写 Flash 时 HCLK 有限制 —— 需查 RM0468 §3.3.5，可能要临时降频或用 `FLASH_CR.BKER`）
 - **A/B 双副本的意义**：擦除中掉电不丢旧数据 → 这才是"掉电保持"的真判据
 
+**验收**: `python tools/h723_persist.py` ✅ **26 PASS / 0 FAIL**
+- T0 起点两份副本均为擦除态（可判定起点）
+- T1a 阳性对照：触发落盘前 SHM 里确有配置（同链内读回，排除"跨会话 reset 清空"）
+- T1/T2/T3 落盘成功、恰好一份被写、header 自洽
+- T4 **独立重算 CRC == header.crc**（内容真的对，不是只看头）
+- T5~T9 掉电重启自动恢复、条数/魔术字一致、**引擎保持 STOP**、路由真进 ACTIVE 表
+- T10~T12 两份副本都有效、**第二次写另一份**（轮换）、seq 单调递增
+- T13~T17 **★★真掉电判据**：擦除中复位 → 目标扇区被擦(0x00000000) 而**保护副本完好**，
+  重启后仍加载成功（配置没丢，只回退一版）—— 这是 A/B 相对"单副本+CRC"的结构性优势
+- T18~T21 PERSISTENT 语义门：RUN=1 时落盘被**跳过**且计数（不是静默行为）、保持 dirty
+- T22~T24 超贵程序（128 条 PID）也能存/恢复；**T24 如实标注 F11 兜底在本平台当前不具
+  约束力**（128×140=17920 <= 26000，engine.h 绊线断言已声明）—— 不假装测到
+- T25 收尾清持久化，板子回到 bench 默认
+
+★ **跑既有回归前必须先 `python tools/h723_persist.py --wipe`**：flash 里有有效 persist
+配置时上电不再走 `BOOT_PROFILE`（`g_table_profile=0xFF`、`ENGINE_RUN=0`），
+否则 `h723_stage2_read.py` 等脚本会看到"从第一组起全 0"这类假故障。
+
 **验收**: `python tools/h723_persist.py`
-- deploy 一个程序 → 0x43 save → 断电（pyocd reset）→ 上电自动加载 → 表校验和一致
-- 双副本 seq 递增验证
-- 擦除中复位（pyocd reset 打断）→ 上电仍能加载旧副本（**这才是真掉电判据**）
-- persist 恢复超预算程序 → START 被 NAK（与 W1.3 的 F11 兜底联动）
 
 **W2 收口**: 能力位加 `PERSISTENT (0x0004)` + `FORCE (0x0080)`；
 `DCL_CAP_H723_NOTYET` 同步减两项。`_Static_assert((IMPL & NOTYET) == 0u)` 必须是绿的。
