@@ -9,13 +9,23 @@ h723_proto.py — H723 协议层 PC 侧验证 (阶段 3.1)
   只测"发一条合法请求、收到合法响应"是无法说明协议层是对的 ——
   因为一个"永远回固定字节"的假固件也能过。
   所以每个用例都要求**可失败**:
+    T0 链路活性      → GET_VERSION 必须回 ACK (以下所有"无响应"类判据的前提)
     T1 正常协商      → 必须回 ACK + 正确 fw/cap
     T2 未知命令      → 必须回 NAK 且载荷是 "bad cmd" (证明命令分发真的在跑)
-    T3 CRC 故意写错  → 必须**无响应** (证明 CRC 真的在查, 不是照单全收)
-    T4 长度超上限    → 必须**无响应** (证明解析器会丢弃非法长度)
+    T3 CRC 故意写错  → 必须**无响应** (证明 CRC 真的在查, 不是照单全收) + 阳性对照
+    T4 长度超上限    → 必须**无响应** (证明解析器会丢弃非法长度) + 阳性对照
     T5 逐字节慢发    → 仍能正确解析 (证明是流式状态机, 不是整包赌运气)
     T6 连发两帧      → 必须**收到两帧** (证明帧间状态机复位正确
                                        —— 只收第一帧是经典缺陷)
+
+★★ 为什么需要 T0 与"阳性对照" (第一版缺这个, 是个真缺陷):
+  "无响应" 这个判据在**链路根本不通**时也成立 —— 拔掉 USB 线, T3/T4 会全绿。
+  即判据恒真 (与固件侧 OA23 同族: 只有"能失败"的判据才是证据)。
+  修法两条:
+    ① T0 先证明链路活; 链路不活则后续全部记 SKIP (不计 PASS, 退出码 2)
+    ② T3/T4 的"无响应"之后各加一次**阳性对照**: 再发合法帧必须回 ACK
+       —— 证明那阵沉默是"故意丢弃"而不是"链路已经死了"
+
 用法:
     python tools/h723_proto.py                     # 自动找 CH340
     python tools/h723_proto.py --port COM14
@@ -154,21 +164,47 @@ def main():
     ser = serial.Serial(port, a.baud, timeout=0.05)
     time.sleep(0.2)
     link = Link(ser, verbose=a.raw)
-    results = []
+    results = []          # (name, state, detail)  state ∈ {PASS, FAIL, SKIP}
 
-    def check(name, cond, detail=""):
-        results.append((name, bool(cond), detail))
-        print("  [%s] %-34s %s" % ("PASS" if cond else "FAIL", name, detail))
+    def check(name, cond, detail="", skip=False):
+        state = "SKIP" if skip else ("PASS" if cond else "FAIL")
+        results.append((name, state, detail))
+        print("  [%s] %-38s %s" % (state, name, detail))
+        return state == "PASS"
+
+    def probe(timeout=None):
+        """阳性对照: 发一条合法 GET_VERSION, 返回 (sts, payload) 或 None"""
+        link.send(build_frame(CMD_GET_VERSION))
+        return link.recv_frame(timeout or a.timeout)
 
     # 先排掉上电横幅 (可能已经在缓冲里)
     ser.reset_input_buffer()
 
-    # ── T1 版本/能力协商 ──
-    link.send(build_frame(CMD_GET_VERSION))
-    r = link.recv_frame(a.timeout)
+    # ══ T0 链路活性 —— 后续所有「无响应」类判据的前提 ══
+    r = probe()
     if r is None:
-        check("T1 GET_VERSION 有响应", False, "超时无响应")
+        check("T0 链路活性 (GET_VERSION→ACK)", False,
+              "超时。检查: ① H1 的 6/5 脚是否对调 ② GND 是否共地 ③ 固件是否在跑")
     else:
+        check("T0 链路活性 (GET_VERSION→ACK)", r[0] == STS_ACK,
+              "sts=%s payload=%s" % (r[0] if isinstance(r[0], int) else r[0],
+                                     hexdump(r[1]) if isinstance(r[1], bytes) else r[1]))
+
+    if not results[-1][1] == "PASS":
+        # ★ 链路不活: 后面全部 SKIP —— 绝不让「无响应」在链路死时变成 PASS
+        for nm in ["T1.1 状态为 ACK", "T1.2 载荷 4 字节",
+                   "T1.3 fw=0x%04X" % EXPECT_FW, "T1.4 cap=0x%04X (宣称=实现)" % EXPECT_CAP,
+                   "T2 未知命令 → NAK 'bad cmd'",
+                   "T3 CRC 错 → 无响应", "T3b 阳性对照: 之后仍能响应",
+                   "T4 长度超限 → 无响应", "T4b 阳性对照: 之后仍能响应",
+                   "T5 分片慢发 → 仍解析成功", "T6 连发两帧 → 收到两帧"]:
+            check(nm, False, "链路不活, 未测", skip=True)
+        ser.close()
+        print("\n结果: 链路不活 —— 全部用例记 SKIP (不是 PASS)。")
+        return 2
+
+    # ── T1 版本/能力协商 (复用 T0 已读到的响应) ──
+    if r is not None:
         sts, pl = r
         fw = pl[0] | (pl[1] << 8) if len(pl) >= 4 else None
         cap = pl[2] | (pl[3] << 8) if len(pl) >= 4 else None
@@ -178,8 +214,8 @@ def main():
         check("T1.4 cap=0x%04X (宣称=实现)" % EXPECT_CAP, cap == EXPECT_CAP,
               "实际 0x%04X" % (cap or 0))
         if cap is not None:
-            print("        声明的能力: %s" % ", ".join(
-                n for bit, n in CAP_NAMES if cap & bit) or "(无)")
+            print("        声明的能力: %s" % (", ".join(
+                n for bit, n in CAP_NAMES if cap & bit) or "(无)"))
             print("        未声明:     %s" % ", ".join(
                 n for bit, n in CAP_NAMES if not cap & bit))
 
@@ -190,16 +226,23 @@ def main():
     check("T2 未知命令 → NAK 'bad cmd'", ok,
           "sts=%s payload=%r" % (r[0] if r else None, r[1] if r else None))
 
-    # ── T3 CRC 错必须被丢弃 (无响应) ──
+    # ── T3 CRC 错必须被丢弃 (无响应) + 阳性对照 ──
     link.send(build_frame(CMD_GET_VERSION, corrupt_crc=True))
     r = link.recv_frame(a.timeout)
     check("T3 CRC 错 → 无响应", r is None,
           "响应=%r (CRC 校验没生效!)" % (r,))
+    r2 = probe()
+    check("T3b 阳性对照: 之后仍能响应", r2 is not None and r2[0] == STS_ACK,
+          "sts=%s  ← 证明 T3 的沉默是「故意丢弃」而非链路死了"
+          % (r2[0] if r2 else None))
 
-    # ── T4 长度超上限必须被丢弃 ──
+    # ── T4 长度超上限必须被丢弃 + 阳性对照 ──
     link.send(build_frame(CMD_GET_VERSION, b"\x00" * 8, force_len=0x1FFF))
     r = link.recv_frame(a.timeout)
     check("T4 长度超限 → 无响应", r is None, "响应=%r" % (r,))
+    r2 = probe()
+    check("T4b 阳性对照: 之后仍能响应", r2 is not None and r2[0] == STS_ACK,
+          "sts=%s" % (r2[0] if r2 else None))
 
     # ── T5 逐字节慢发仍能解析 (流式状态机) ──
     ser.reset_input_buffer()
@@ -226,10 +269,13 @@ def main():
 
     ser.close()
 
-    npass = sum(1 for _, ok, _ in results if ok)
-    print("\n结果: %d/%d PASS%s" % (npass, len(results),
-                                    "  (本地 CRC 校验失败 %d 次)" % link.bad if link.bad else ""))
-    return 0 if npass == len(results) else 1
+    npass = sum(1 for _, s, _ in results if s == "PASS")
+    nfail = sum(1 for _, s, _ in results if s == "FAIL")
+    nskip = sum(1 for _, s, _ in results if s == "SKIP")
+    print("\n结果: %d PASS / %d FAIL / %d SKIP  (共 %d 项)%s"
+          % (npass, nfail, nskip, len(results),
+             "  本地 CRC 校验失败 %d 次" % link.bad if link.bad else ""))
+    return 0 if (nfail == 0 and nskip == 0) else 1
 
 
 if __name__ == "__main__":
