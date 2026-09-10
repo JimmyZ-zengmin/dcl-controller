@@ -44,6 +44,22 @@
 #define ISR_ITCM 1
 #endif
 
+/* ══════════ 启动默认配置 (bench 用, 编译期) ══════════
+ * ★ 为什么需要它 (审计途中发现): 运行期选择器再方便, 也**只在 pyocd 会话内有效** ——
+ *   实测 pyocd 断开后目标核心被 HALT, 且 `connect_mode=under-reset` 的每次连接
+ *   都会**复位目标** (工位经验: 会话内写、会话内读才可靠)。
+ *   所以"要用外部仪器(LA)测某个非默认配置"就必须把它**编进固件**。
+ * 默认 (0/0/1) = 骨架态 (不开扫描门) —— 上电即安全, 不跑引擎。 */
+#ifndef BOOT_PROFILE
+#define BOOT_PROFILE 0
+#endif
+#ifndef BOOT_GATE
+#define BOOT_GATE    0
+#endif
+#ifndef BOOT_SEL
+#define BOOT_SEL     1
+#endif
+
 /* ══════════ 输出脚 ══════════ */
 #define TICK_PORT       0u
 #define TICK_BIT        8u          /* PA8: 拍输出 */
@@ -90,7 +106,10 @@ OBS uint32_t g_reinit         = 0;   /* 写 1 → 主循环重填表 */
 OBS uint32_t g_stat_reset     = 0;   /* 写 1 → ISR 清统计 */
 OBS uint32_t g_pa9_enable     = 0;
 OBS uint32_t g_reinit_done    = 0;   /* 证据: 重填表真的发生了几次 */
-OBS uint32_t g_table_ck       = 0;   /* 填表后路由[0]的 op (查表确实变了) */
+OBS uint32_t g_table_ck       = 0;   /* ★整表校验和 (工具在 Python 里独立重算比对) */
+OBS uint32_t g_active_routes  = 0;   /* 表内 ACTIVE 条数 (期望 = n_routes) */
+OBS uint32_t g_guard_ok       = 0;   /* 栈哨兵: 1 = SHM 顶上的魔术字完好 */
+OBS uint32_t g_guard_bad_off  = 0xFFFFFFFFu;  /* 被踩的第几个字 (诊断用) */
 
 /* ── 引擎扫描: 执行证据 ── */
 OBS uint32_t g_eng_ck       = 0;     /* 最近一拍的扫描校验和 */
@@ -339,10 +358,18 @@ int main(void)
     g_scan_flash_addr  = (uint32_t)(uintptr_t)&engine_scan_flash;
     g_stage = 4;
 
-    /* ③ 表装载: 冷启动清零 → 填 profile 0 */
+    /* ③ 表装载: 冷启动清零(单一入口) → 铺栈哨兵 → 填 profile 0
+     *    ★ 哨兵必须铺在"第一次大量用栈"之前 —— 否则铺的时候已经踩过一遍了 */
     cold_start_reset();
-    engine_fill_tables(g_shm, 0);
-    g_table_ck = (uint32_t)((RouteEntry_t *)(g_shm + OFF_ROUTE_TABLE))[0].op;
+    shm_guard_paint();
+    engine_fill_tables(g_shm, BOOT_PROFILE);
+    g_table_ck      = engine_table_checksum(g_shm);
+    g_active_routes = engine_active_routes(g_shm);
+    g_guard_ok      = (uint32_t)shm_guard_ok();
+    g_table_profile = BOOT_PROFILE;   /* 让工具看到"当前配置", 而不是"假定配置" */
+    g_engine_sel    = BOOT_SEL;
+    g_n_routes      = MAX_ROUTES;
+    g_engine_gate   = BOOT_GATE;
     g_stage = 5;
 
     /* ④ DWT 标定 */
@@ -367,10 +394,13 @@ int main(void)
             uint32_t sv = g_engine_gate;
             g_engine_gate = 0;
             engine_fill_tables(g_shm, (int)g_table_profile);
-            g_table_ck = (uint32_t)((RouteEntry_t *)(g_shm + OFF_ROUTE_TABLE))[0].op;
+            g_table_ck      = engine_table_checksum(g_shm);
+            g_active_routes = engine_active_routes(g_shm);
             g_engine_gate = sv;
             g_reinit_done++;
         }
+        /* 栈哨兵周期巡检 (廉价: 32 个字, 主循环有 100μs 一次的机会) */
+        g_guard_ok = (uint32_t)shm_guard_ok();
         g_stage = 9;
         __asm__ volatile("wfi");
     }

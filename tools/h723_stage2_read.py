@@ -35,7 +35,7 @@ HDR_SYMS = [
     "g_isr_itcm", "g_shm_ok", "g_shm_addr",
     "g_shm_start_addr", "g_shm_end_addr",
     "g_scan_itcm_addr", "g_scan_flash_addr",
-    "g_reinit_done", "g_table_ck", "g_dwt_overhead", "g_cal_n1000",
+    "g_reinit_done", "g_dwt_overhead", "g_cal_n1000",
     "g_icache_on", "g_ccr_before", "g_ccr_after",
 ]
 # (符号, word 数) —— 顺序 = 读回顺序
@@ -46,8 +46,41 @@ STAT_SYMS = [
     ("g_isr_cyc_sum", 2), ("g_isr_n", 1),
     ("g_eng_sel_used", 1), ("g_eng_n_used", 1),
     ("g_per_cyc_min", 1), ("g_per_cyc_max", 1), ("g_per_cyc_last", 1),
+    ("g_table_ck", 1), ("g_active_routes", 1), ("g_guard_ok", 1),
 ]
 TAIL_SYMS = ["g_eng_ck"]
+
+# ═══════════════════════════════════════════════════════════════════════
+# 表内容独立预测 (审计修正, 对照 S3 第二十七轮 OA23 "判据必须可失败")
+#   固件里 g_table_ck 是 FNV-1a 校验和; 这里**按 fill_tables 的逻辑独立重算**,
+#   拿预测值与实测值比对 —— 这才是"表被正确装载"的正向证据。
+#   旧版哨兵 (route[0].op) 在 profile 0 与 profile 1 上都是 0 → 判据恒真。
+# ═══════════════════════════════════════════════════════════════════════
+OP_DIRECT, OP_CMP, OP_HYST, OP_CLAMP, OP_LPF = 0x00, 0x01, 0x02, 0x03, 0x04
+OP_PID, OP_RATE, OP_DEADBAND, OP_MUX, OP_EDGE = 0x05, 0x06, 0x07, 0x08, 0x09
+OP_LUT, OP_CNT, OP_TIMER, OP_ARITH, OP_SCALE = 0x0A, 0x0B, 0x0C, 0x0D, 0x0E
+OP_AND, OP_OR, OP_NOT, OP_SR = 0x0F, 0x10, 0x11, 0x12
+MIXED_OPS = [OP_DIRECT, OP_CMP, OP_CLAMP, OP_SCALE, OP_AND, OP_OR, OP_NOT, OP_MUX,
+             OP_LUT, OP_LPF, OP_PID, OP_HYST, OP_RATE, OP_DEADBAND, OP_EDGE, OP_CNT,
+             OP_TIMER, OP_ARITH, OP_SR]
+MAX_ROUTES = 128
+STATEFUL_OPS = {OP_LPF, OP_PID, OP_HYST, OP_RATE, OP_DEADBAND, OP_EDGE,
+                OP_CNT, OP_TIMER, OP_SR}
+
+
+def predict_table(profile):
+    """返回 (FNV-1a 校验和, ACTIVE 条数) —— 复刻 engine.c:engine_fill_tables"""
+    h, active = 0x811C9DC5, 0
+    for i in range(MAX_ROUTES):
+        op = MIXED_OPS[i % 19] if profile == 1 else (OP_PID if profile == 2 else OP_DIRECT)
+        src_type = 0 if i % 3 == 0 else (1 if i % 3 == 1 else 2)
+        state_offset = (i % 128) if op in STATEFUL_OPS else 0
+        flags = 1                                     # ROUTE_FLAG_ACTIVE
+        v = (op & 0xFF) | ((flags & 0xFF) << 8) | ((src_type & 0xFF) << 16) \
+            | ((state_offset & 0xFFFF) << 20)
+        h = ((h ^ v) * 16777619) & 0xFFFFFFFF
+        active += 1
+    return h, active
 ITCM_VERIFY_WORDS = 64      # 每次比对 256 字节
 
 # 配置矩阵: (代号, 标签, gate, sel, profile, n, icache)
@@ -244,7 +277,11 @@ def main():
           % (N, s_itcm, N,
              "✓ 两份实现逐字相同 (差异只可能来自取指路径)"
              if s_itcm == N else "✗ 两份实现不同 → A/B 不成立"))
-    print("  reinit_done=%d   table_ck(路由[0].op)=%d" % (hdr['g_reinit_done'], hdr['g_table_ck']))
+    print("  reinit_done=%d" % hdr['g_reinit_done'])
+    print("  ★表内容独立预测 (Python 复刻 fill_tables, 用于逐组比对):")
+    for p in (0, 1, 2):
+        ck, ac = predict_table(p)
+        print("      profile %d → 预测校验和 0x%08X, ACTIVE %d 条" % (p, ck, ac))
     print("  DWT 读对开销=%d cyc   nop×1000=%d cyc (%.2f cyc/迭代)"
           % (hdr['g_dwt_overhead'], hdr['g_cal_n1000'], hdr['g_cal_n1000'] / 1000.0))
     print("  L1 I-cache: on=%d  CCR: 0x%08X → 0x%08X   (I-cache 位 = %s)"
@@ -270,7 +307,9 @@ def main():
                          isum=st['g_isr_cyc_sum'], inum=st['g_isr_n'],
                          sel_used=st['g_eng_sel_used'], n_used=st['g_eng_n_used'],
                          pmin=0 if st['g_per_cyc_min'] == 0xFFFFFFFF else st['g_per_cyc_min'],
-                         pmax=st['g_per_cyc_max'], plast=st['g_per_cyc_last']))
+                         pmax=st['g_per_cyc_max'], plast=st['g_per_cyc_last'],
+                         tck=st['g_table_ck'], active=st['g_active_routes'],
+                         guard=st['g_guard_ok']))
     tail = {n: next(it) for n in TAIL_SYMS}
     d = {r['code']: r for r in rows}
 
@@ -280,13 +319,16 @@ def main():
     print("\n" + "=" * 80)
     print("② 每拍成本 (CPU 周期 @400MHz, 拍预算 40000 cyc = 100μs)")
     print("=" * 80)
-    print("  %-4s %-32s %8s %8s %9s %8s %8s" %
+    print("  %-4s %-30s %8s %8s %9s %8s %10s" %
           ("", "配置", "eng_min", "eng_max", "eng_mean", "isr_min", "最坏占拍"))
     for r in rows:
         mean = (r['esum'] / float(r['en'])) if r['en'] else 0.0
-        print("  %-4s %-32s %8d %8d %9.1f %8d %7.2f%%"
+        ov = " ★超载" if r['imax'] > TICK_CYC else ""
+        print("  %-4s %-30s %8d %8d %9.1f %8d %9.2f%%%s"
               % (r['code'], r['label'], r['emin'], r['emax'], mean, r['imin'],
-                 100.0 * r['imax'] / TICK_CYC))
+                 100.0 * r['imax'] / TICK_CYC, ov))
+    print("  ★超载 = ISR 最坏耗时 > 40000 cyc → 这一组的**拍周期统计不再是自由运行定时器**,"
+          "\n     而是被 ISR 拉长 (见 ⑤); 引擎成本仍有效, 但已越出确定性设计的适用边界。")
 
     print("\n" + "=" * 80)
     print("③ 单条路由成本 — 两点法 (128条 − 64条, 除掉调用/循环常数)")
@@ -353,29 +395,61 @@ def main():
               % (per(d["B2"]), per(d["B2"]) / CPU_HZ * 1e9))
 
     print("\n" + "=" * 80)
-    print("⑤ 拍周期 (硬件定时器自由运行 —— 引擎负载不该影响它, 这是确定性的根)")
+    print("⑤ 拍周期 (硬件定时器自由运行 —— **前提是 ISR 在拍内跑完**)")
     print("=" * 80)
-    print("  %-4s %-32s %8s %8s %8s %10s" % ("", "配置", "周期min", "周期max", "极差", "极差(ns)"))
+    print("  %-4s %-30s %8s %8s %8s %10s  %s" %
+          ("", "配置", "周期min", "周期max", "极差", "极差(ns)", "判定"))
+    n_over = 0
     for r in rows:
         if r['pmin']:
-            print("  %-4s %-32s %8d %8d %8d %10.1f"
+            over = r['pmax'] > TICK_CYC + 1
+            if over:
+                n_over += 1
+            print("  %-4s %-30s %8d %8d %8d %10.1f  %s"
                   % (r['code'], r['label'], r['pmin'], r['pmax'],
-                     r['pmax'] - r['pmin'], (r['pmax'] - r['pmin']) / CPU_HZ * 1e9))
-    print("  → 极差 0 = 引擎跑到 98%% 拍占用, 拍周期仍是 40000 cyc 整 (硬拍与负载解耦)")
+                     r['pmax'] - r['pmin'], (r['pmax'] - r['pmin']) / CPU_HZ * 1e9,
+                     "★超载: 拍被 ISR 拉长" if over else "拍内 (40000 整)"))
+    print()
+    if n_over == 0:
+        print("  → 全部组极差 0、周期恒 40000 ⇒ 拍周期与引擎负载解耦 (在拍内跑完的前提下)")
+    else:
+        print("  → %d 组出现拍被拉长 ⇒ **不能再说「硬拍与负载完全解耦」**:"
+              "\n     解耦成立的前提是 ISR 在拍内跑完; 一旦超载, 拍周期改由 ISR 时长决定,"
+              "\n     而且不再确定 (实测极差 %d cyc)。这反转了本报告的旧口径。"
+              % (n_over, max((r['pmax'] - r['pmin']) for r in rows if r['pmin'])))
+    print("  注: 骨架/ITCM 组一律 40000 整 —— ITCM 的成本与负载无关, 不参与超载。")
 
     print("\n" + "=" * 80)
     print("⑥ 守卫 (必须全 ✓, 否则本组数据不可信)")
     print("=" * 80)
     for r in rows:
+        exp_ck, exp_ac = predict_table(r['prof'])
+        ck_ok = (r['tck'] == exp_ck)          # ★表内容与独立预测一致
+        ac_ok = (r['active'] == exp_ac)       # ★ACTIVE 条数与预测一致
+        gd_ok = (r['guard'] == 1)             # ★栈没踩到表
         if r['gate']:
             ok = (r['ediv0'] == 0 and r['en'] > 0 and r['sel_used'] == r['sel']
-                  and r['n_used'] == r['n'])
-            why = "div0=%d n=%d sel_used=%d n_used=%d" % (
-                r['ediv0'], r['en'], r['sel_used'], r['n_used'])
+                  and r['n_used'] == r['n'] and ck_ok and ac_ok and gd_ok)
+            why = "div0=%d n=%d sel=%d/%d 表ck=%s ACTIVE=%d/%d 哨兵=%s" % (
+                r['ediv0'], r['en'], r['sel_used'], r['n'],
+                "✓" if ck_ok else "✗0x%08X≠0x%08X" % (r['tck'], exp_ck),
+                r['active'], exp_ac, "✓" if gd_ok else "✗被踩")
         else:
-            ok = (r['en'] == 0)          # 骨架组: 扫描统计必须是 0 (没跑过)
-            why = "eng_n=%d (骨架组必须 0)" % r['en']
-        print("  %-4s %-32s %-46s %s" % (r['code'], r['label'], why, "✓" if ok else "✗"))
+            ok = (r['en'] == 0)
+            why = "eng_n=%d (骨架组必须 0)  表ck=%s 哨兵=%s" % (
+                r['en'], "✓" if ck_ok else "✗", "✓" if gd_ok else "✗")
+        print("  %-4s %-30s %-56s %s" % (r['code'], r['label'], why, "✓" if ok else "✗"))
+
+    print("\n  ★行为证据 (对照旧版「判据恒真」缺陷):")
+    seen = {}
+    for r in rows:
+        seen.setdefault(r['tck'], []).append(r['code'])
+    for ck, codes in sorted(seen.items()):
+        print("      校验和 0x%08X  ← %s" % (ck, "/".join(codes)))
+    if len(seen) < 3:
+        print("      !! 只有 %d 种校验和 —— 三种 profile 应当给出三个**互不相同**的值" % len(seen))
+    else:
+        print("      ✓ 三种 profile 的校验和互不相同 → 哨兵具备可失败性")
     return 0
 
 

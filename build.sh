@@ -29,7 +29,7 @@ fi
 
 "$CMAKE" -S "$WIN_HERE" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$WIN_HERE/cmake/arm-none-eabi.cmake" \
-    -DCMAKE_MAKE_PROGRAM="$NINJA"
+    -DCMAKE_MAKE_PROGRAM="$NINJA" "$@"
 
 "$CMAKE" --build "$BUILD"
 

@@ -27,7 +27,35 @@
 #define MAX_LUT       256
 #define MB_NREG       64    /* 通信域每区寄存器数 (阶段 2 只用于 SRC_HMI 的留位) */
 
-/* ══════════ SHM 偏移 (逐字节对齐 esp32-core0 shared_mem.h) ══════════ */
+/* ══════════ SHM 偏移 (逐字节对齐 esp32-core0 shared_mem.h) ══════════
+ *
+ * ★ 审计修正 (对照 esp32-core0 第二十七轮 OA20 同族):
+ *   第一版这里**只**从 OFF_SENSOR_MAP(0x40) 开始定义, 0x00-0x3F 是一段
+ *   "无名字、无断言"的 64 字节空洞。S3 的 OA20 正是这么来的 —— MB 区
+ *   当时**一条断言都没有**, 于是控制块从 32B 扩到 40B 踩进 RX 缓冲无人发觉。
+ *   现在把控制块区/计时区按 S3 的原偏移**显式命名并断言**, 空洞消失。
+ *
+ *   控制块区 (0x00-0x3F) 本阶段**只占位不实现** (deploy/热重载属阶段 3),
+ *   但偏移先按不变量钉死 —— 偏移一改, S3 的 20 套回归与 14 章审计记录全失效。 */
+#define OFF_CTRL_MAGIC       0x00   /* u32 */
+#define OFF_CTRL_VERSION     0x04   /* u32 */
+#define OFF_CTRL_HEARTBEAT   0x08   /* u32 */
+#define OFF_CTRL_RELOAD      0x0C   /* u8  */
+#define OFF_CTRL_ENGINE_RUN  0x0D   /* u8  */
+#define OFF_CTRL_N_ROUTES    0x0E   /* u16 */
+#define OFF_CTRL_N_PARAMS    0x10   /* u16 */
+#define OFF_CTRL_N_STATES    0x12   /* u16 */
+#define OFF_CTRL_PROG_MAGIC  0x14   /* u32 */
+#define OFF_TIMING_SAMPLES      0x18   /* u32 */
+#define OFF_TIMING_PERIOD_MIN   0x1C   /* u32 */
+#define OFF_TIMING_PERIOD_MAX   0x20   /* u32 */
+#define OFF_TIMING_EXEC_MIN     0x24   /* u32 */
+#define OFF_TIMING_EXEC_MAX     0x28   /* u32 */
+#define OFF_TIMING_LAST_PERIOD  0x2C   /* u32 */
+#define OFF_TIMING_LAST_EXEC    0x30   /* u32 */
+#define OFF_CTRL_GPIO_MASK      0x34   /* u32 */
+#define OFF_CTRL_N_SEQ          0x38   /* u8 (0x38-0x3F 空闲, 阶段 5 Sequencer) */
+
 #define OFF_SENSOR_MAP       0x0040   /* 64 × f32 */
 #define OFF_ACTUATOR_STATUS  0x0140   /* 64 × f32 */
 #define OFF_WIRE_MAP         0x0240   /* 128 × f32 */
@@ -136,7 +164,10 @@ _Static_assert(sizeof(StateEntry_t) == 16, "StateEntry_t must be 16 bytes");
 #define DT_MID   0.001f    /* div1: 1ms  */
 #define DT_SLOW  0.01f     /* div2: 10ms */
 
-/* ══════════ 编译期布局断言 (S3 A4 纪律: 任何区域不得重叠) ══════════ */
+/* ══════════ 编译期布局断言 (S3 A4 纪律: 任何区域不得重叠) ══════════
+ * ★ 覆盖范围必须**无缝**: 从 0x00 一直到 SHM_SIZE, 每一段都要有"下一段的起点
+ *   ≥ 本段终点"的断言。第一版从 0x40 才开始, 前 64 字节无人设防 —— 已补。 */
+_Static_assert(OFF_CTRL_N_SEQ    + 8   <= OFF_SENSOR_MAP,      "SHM: 控制块区越界 (0x00-0x3F)");
 _Static_assert(OFF_SENSOR_MAP      + MAX_SENSORS   * 4 <= OFF_ACTUATOR_STATUS, "SHM: SENSOR_MAP 越界");
 _Static_assert(OFF_ACTUATOR_STATUS + MAX_ACTUATORS * 4 <= OFF_WIRE_MAP,        "SHM: ACTUATOR_STATUS 越界");
 _Static_assert(OFF_WIRE_MAP        + MAX_WIRES     * 4 <= OFF_LUT_DATA,        "SHM: WIRE_MAP 越界");
@@ -148,6 +179,9 @@ _Static_assert(OFF_PARAM_STAGING   + MAX_PARAMS    * 16 <= OFF_STATE_TABLE,    "
 _Static_assert(OFF_STATE_TABLE     + MAX_STATES    * 16 <= OFF_STATE_STAGING,  "SHM: STATE_TABLE 越界");
 _Static_assert(OFF_STATE_STAGING   + MAX_STATES    * 16 <= OFF_MB_SET,         "SHM: STATE_STAGING 越界");
 _Static_assert(OFF_MB_SET          + MB_NREG       * 2  <= SHM_SIZE,           "SHM: MB_SET 越界");
+/* 反向断言: 控制块区的每个字段都必须落在区内 (防止上面某个宏被改大而不自知) */
+_Static_assert(OFF_CTRL_MAGIC + 4 <= OFF_CTRL_N_SEQ + 8, "SHM: 控制块字段溢出 0x40");
+_Static_assert(OFF_TIMING_LAST_EXEC + 4 <= OFF_CTRL_GPIO_MASK + 4, "SHM: 计时区与 GPIO_MASK 重叠");
 
 /* ══════════ 引擎扫描 (两份实例: FLASH 与 ITCM, 见 engine.c) ══════════
  * @param base  SHM 基址 (DTCM 内)
@@ -168,10 +202,31 @@ void engine_fill_tables(uint8_t *base, int profile);
 /** @brief SHM 静态区 (定义在 engine.c, 链接段 .dtcm_shm / DTCM 0x20000000) */
 extern uint8_t g_shm[SHM_SIZE];
 
-/** @brief 冷启动清零 (.dtcm_shm 是 NOLOAD, 上电内容不确定 → 必须显式清) */
+/** @brief 冷启动清零 (.dtcm_shm 是 NOLOAD, 上电内容不确定 → 必须显式清)
+ *  ★ 单一入口纪律 (S3 第二十六轮收口): "新增任何域必须在此登记"。
+ *    本实现直接整段 memset(SHM_SIZE), 所以天然完整 —— 但**新域若放在 SHM 之外**
+ *    必须回到这里显式登记。engine_fill_tables() 也走这个入口, 不允许自带 memset。 */
 void cold_start_reset(void);
 
 /** @brief 落位自检: 1 = 声明位置与 .dtcm_shm 段首吻合且落在 DTCM 域内 */
 int shm_layout_ok(void);
+
+/** @brief 路由表校验和 (FNV-1a, 覆盖 op/flags/src_type/state_offset)
+ *  ★ 审计修正 (对照 S3 第二十七轮 OA23 "判据恒真"):
+ *    第一版用 `路由[0].op` 当"表换成功了吗"的哨兵 —— 但 profile 0(全DIRECT) 与
+ *    profile 1(19原语轮转, 首元素恰好也是 DIRECT) 的 route[0].op **都是 0**,
+ *    哨兵在混合程序组上恒等 → 判据**不具备可失败性**。
+ *    改成整表校验和后, 工具可以在 Python 里**独立重算**期望值再比对 ——
+ *    这同时给出"表内容正确"的正向证据 (不只是"表变了")。 */
+uint32_t engine_table_checksum(const uint8_t *base);
+
+/** @brief 表内 ACTIVE 路由条数 (期望 = 装了几条就是几条) */
+uint32_t engine_active_routes(const uint8_t *base);
+
+/** @brief 栈边界哨兵: 在 _shm_end 之上铺 128 字节魔术字, 被踩返回 0
+ *  ★ 设防缺口修正: SHM 与栈之间原本**没有任何保护**, 栈溢出会静默踩表
+ *    (同 OA20 族: "无人设防的区域迟早出事")。 */
+void shm_guard_paint(void);
+int  shm_guard_ok(void);
 
 #endif /* DCL_ENGINE_H */

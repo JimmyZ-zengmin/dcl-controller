@@ -46,10 +46,65 @@ static StateEntry_t s_state_fallback;
 /**
  * @brief 冷启动清零 —— S3 纪律: .dtcm_shm 是 NOLOAD, 上电内容不确定,
  *        由固件显式清零 (而不是"恰好为 0")。
+ * ★ 单一入口 (S3 第二十六轮收口纪律): engine_fill_tables() 必须先调本函数,
+ *   不允许各自 memset —— 否则"新增域登记到哪"会分裂成两个答案。
  */
 void cold_start_reset(void)
 {
     memset(g_shm, 0, sizeof(g_shm));
+}
+
+/* ══════════ 栈边界哨兵 (设防) ══════════
+ * 在 _shm_end 之上铺 128 字节魔术字。栈从 DTCM 顶端向下生长, 一旦越过
+ * _shm_end 就说明快踩到表了 —— 这是 SHM 与栈之间唯一的一道堤。
+ * 位置选在 _shm_end 而不是 _estack 附近: 那是"表被踩"的**第一现场**。 */
+#define SHM_GUARD_WORDS 32
+#define SHM_GUARD_MAGIC 0xC0DEAD42u
+static uint32_t *guard_words(void)
+{
+    return (uint32_t *)(uintptr_t)_shm_end;
+}
+
+/** @brief 铺哨兵 (必须在任何可能大量用栈的代码之前调用) */
+void shm_guard_paint(void)
+{
+    uint32_t *p = guard_words();
+    for (int i = 0; i < SHM_GUARD_WORDS; i++) p[i] = SHM_GUARD_MAGIC;
+}
+
+/** @brief 1 = 哨兵完好 (栈没踩到表) */
+int shm_guard_ok(void)
+{
+    uint32_t *p = guard_words();
+    for (int i = 0; i < SHM_GUARD_WORDS; i++) {
+        if (p[i] != SHM_GUARD_MAGIC) return 0;
+    }
+    return 1;
+}
+
+/* ══════════ 路由表校验和 (独立可预测 → 可失败) ══════════ */
+uint32_t engine_table_checksum(const uint8_t *base)
+{
+    const RouteEntry_t *rt = (const RouteEntry_t *)(base + OFF_ROUTE_TABLE);
+    uint32_t h = 0x811C9DC5u;                        /* FNV-1a 偏移基数 */
+    for (int i = 0; i < MAX_ROUTES; i++) {
+        uint32_t v = (uint32_t)rt[i].op
+                   | ((uint32_t)rt[i].flags        << 8)
+                   | ((uint32_t)rt[i].src_type     << 16)
+                   | ((uint32_t)rt[i].state_offset << 20);
+        h = (h ^ v) * 16777619u;                     /* FNV-1a 素数 (u32 自然回绕) */
+    }
+    return h;
+}
+
+uint32_t engine_active_routes(const uint8_t *base)
+{
+    const RouteEntry_t *rt = (const RouteEntry_t *)(base + OFF_ROUTE_TABLE);
+    uint32_t n = 0;
+    for (int i = 0; i < MAX_ROUTES; i++) {
+        if (rt[i].flags & ROUTE_FLAG_ACTIVE) n++;
+    }
+    return n;
 }
 
 /** @brief 落位自检: 声明位置必须真的落在 .dtcm_shm 段内且在 DTCM 地址域
@@ -87,10 +142,17 @@ AINLINE float read_source(uint8_t st, uint8_t si, const float *sm, const float *
     switch (st) {
         case SRC_SENSOR: return sm[si & (MAX_SENSORS - 1)];
         case SRC_WIRE:   return wm[si & (MAX_WIRES - 1)];
+        /* ★ 注意: CONST 源的常量值用 **src_index** 索引参数表, 不是 route.param_idx
+         *   —— 这是 S3 第二十五轮踩过的坑 (脚本误用 param_idx → 所有路由都取
+         *   param[0], LA 解出 00fa00fa...)。移植时刻意逐字保留同一语义。 */
         case SRC_CONST:  return ((const ParamEntry_t *)(base + OFF_PARAM_TABLE
                                     + ((si & (MAX_PARAMS - 1)) * 16)))->value_a;
-        /* SRC_HMI: 通信域写区 —— 阶段 4 落地 (当前返回 0, 不假装实现) */
-        default: return 0.0f;
+        /* ★ 未实现源 —— **显式列出**而不是让它掉进 default 被"静默吞掉":
+         *   静默返回 0 会让"引用了未实现源"伪装成"这条路由恒为 0"
+         *   (同 S3 审计 M1 族: 静默恒假的语义错误最难发现)。
+         *   阶段 4 落地前, deploy 校验必须在源头拒绝 src_type == SRC_HMI。 */
+        case SRC_HMI:    return 0.0f;
+        default:         return 0.0f;
     }
 }
 
@@ -151,7 +213,10 @@ static const uint8_t k_mixed_ops[19] = {
 
 void engine_fill_tables(uint8_t *base, int profile)
 {
-    memset(base, 0, SHM_SIZE);
+    /* ★ 先走单一入口清零 (不允许这里自带 memset —— 见 cold_start_reset 注释)。
+     *   约定: base 必须是 g_shm 本身 (表的唯一归属地是 .dtcm_shm)。
+     *   若将来真需要第二块表区, 必须回 cold_start_reset 登记, 而不是绕过它。 */
+    cold_start_reset();
 
     float *sm = (float *)(base + OFF_SENSOR_MAP);
     float *wm = (float *)(base + OFF_WIRE_MAP);

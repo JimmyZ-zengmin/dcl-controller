@@ -16,6 +16,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 set(TARGET dcl_h723)
 
+# ---- bench 启动默认配置 (外部仪器测非默认配置时必须编进固件, 见 main.c 注释) ----
+set(DCL_BOOT_PROFILE "0" CACHE STRING "启动默认 table_profile (0 全DIRECT / 1 混合 / 2 全PID)")
+set(DCL_BOOT_GATE    "0" CACHE STRING "启动默认 engine_gate (0 骨架 / 1 开扫描)")
+set(DCL_BOOT_SEL     "1" CACHE STRING "启动默认 engine_sel  (0 走FLASH / 1 走ITCM)")
+
 # Cortex-M7 + 双精度 FPU + 硬浮点 (与老项目 build.bat 一致)
 set(MCU_FLAGS -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb)
 
@@ -30,6 +35,9 @@ add_compile_options(
     #   GCC 的 IPA-ICF 会把"内容相同的函数"折叠成一个 → 只剩一份 → A/B 实验作废。
     #   (实测: 打开时 nm 里只剩 engine_scan_flash 或只剩 itcm 之一)
     -fno-ipa-icf
+    -DBOOT_PROFILE=${DCL_BOOT_PROFILE}
+    -DBOOT_GATE=${DCL_BOOT_GATE}
+    -DBOOT_SEL=${DCL_BOOT_SEL}
 )
 
 add_link_options(
