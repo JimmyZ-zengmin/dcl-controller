@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+h723_stage2_read.py — 阶段 2 单会话 A/B 测量 (ITCM vs FLASH)
+
+为什么必须"单会话":
+  两次上电 = 两个物理状态 (温度/电压/cache 预取历史)。要证明"差异来自取指
+  路径而非环境", 最干净的做法是**一次上电、一条 pyocd 命令链**, 在同一个
+  固件里切换运行期选择器 —— 两组数据出自同一个 CPU 状态。
+
+★ 前提已静态验证: 两份扫描实现**逐指令相同**
+  (engine.c 一个宏实例化两次; 已用 build/dcl_h723.bin 逐字节比对 = 2136B 全同)
+  所以任何周期数差异只能归因于 ① 取指路径 (ITCM 零等待 vs flash+L1 cache)
+  ② 长跳转 veneer (ITCM→FLASH 超过 BL 的 ±16MB 范围, 需要跳板)。
+
+用法:
+  python tools/h723_stage2_read.py                # 完整 8 组
+  python tools/h723_stage2_read.py --quick        # 4 组核心对比
+  python tools/h723_stage2_read.py --dur 0.5      # 每组采样时长
+"""
+import os, re, sys, argparse, subprocess
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+NM = ("C:/ST/STM32CubeIDE_1.5.1/STM32CubeIDE/plugins/"
+      "com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.7-2018-q2-update"
+      ".win32_1.5.0.202011040924/tools/bin/arm-none-eabi-nm.exe")
+
+CPU_HZ = 400_000_000
+TICK_CYC = 40000            # 100μs @400MHz
+S3_BASELINE_DIRECT = 234    # esp32-core0 实测: CONST→DIRECT 路由 234 cyc @240MHz
+
+HDR_SYMS = [
+    "g_boot_status", "g_stage", "g_tick_count", "g_clock_hclk",
+    "g_isr_itcm", "g_shm_ok", "g_shm_addr",
+    "g_shm_start_addr", "g_shm_end_addr",
+    "g_scan_itcm_addr", "g_scan_flash_addr",
+    "g_reinit_done", "g_table_ck", "g_dwt_overhead", "g_cal_n1000",
+    "g_icache_on", "g_ccr_before", "g_ccr_after",
+]
+# (符号, word 数) —— 顺序 = 读回顺序
+STAT_SYMS = [
+    ("g_eng_cyc_min", 1), ("g_eng_cyc_max", 1), ("g_eng_cyc_last", 1),
+    ("g_eng_cyc_sum", 2), ("g_eng_n", 1), ("g_eng_div0", 1),
+    ("g_isr_cyc_min", 1), ("g_isr_cyc_max", 1), ("g_isr_cyc_last", 1),
+    ("g_isr_cyc_sum", 2), ("g_isr_n", 1),
+    ("g_eng_sel_used", 1), ("g_eng_n_used", 1),
+    ("g_per_cyc_min", 1), ("g_per_cyc_max", 1), ("g_per_cyc_last", 1),
+]
+TAIL_SYMS = ["g_eng_ck"]
+ITCM_VERIFY_WORDS = 64      # 每次比对 256 字节
+
+# 配置矩阵: (代号, 标签, gate, sel, profile, n, icache)
+#   ★ icache 只能从 0→1 单向切换, 所以所有 icache=0 的组必须排在前面
+#   ★ 代号必须显式带上 —— 之前用列表下标映射代号, --quick 子集下全部错位
+CONFIGS_FULL = [
+    ("A",  "骨架 (gate=0 不扫描)          ", 0, 0, 0, 128, 0),
+    ("B1", "FLASH 全表128·全DIRECT ·IC关  ", 1, 0, 0, 128, 0),
+    ("B2", "ITCM  全表128·全DIRECT ·IC关  ", 1, 1, 0, 128, 0),
+    ("C1", "FLASH 全表128·19原语轮转·IC关 ", 1, 0, 1, 128, 0),
+    ("C2", "ITCM  全表128·19原语轮转·IC关 ", 1, 1, 1, 128, 0),
+    ("D1", "FLASH 半表 64·全DIRECT ·IC关  ", 1, 0, 0, 64, 0),
+    ("D2", "ITCM  半表 64·全DIRECT ·IC关  ", 1, 1, 0, 64, 0),
+    ("E",  "ITCM  全表128·全PID    ·IC关  ", 1, 1, 2, 128, 0),
+    ("F1", "FLASH 全表128·全DIRECT ·IC开★ ", 1, 0, 0, 128, 1),
+    ("F2", "ITCM  全表128·全DIRECT ·IC开★ ", 1, 1, 0, 128, 1),
+    ("F3", "FLASH 半表 64·全DIRECT ·IC开★ ", 1, 0, 0, 64, 1),
+]
+_QM = {"A", "B1", "B2", "F1", "F2"}
+CONFIGS_QUICK = [c for c in CONFIGS_FULL if c[0] in _QM]
+
+
+def s32(x):
+    return x - (1 << 32) if x & 0x80000000 else x
+
+
+def symbols(elf):
+    out = subprocess.run([NM, "-S", elf], capture_output=True, text=True, timeout=60)
+    addr, size = {}, {}
+    for line in out.stdout.splitlines():
+        p = line.split()
+        if len(p) == 3:
+            addr[p[2]] = int(p[0], 16)
+        elif len(p) == 4:
+            addr[p[3]] = int(p[0], 16)
+            size[p[3]] = int(p[1], 16)
+    return addr, size
+
+
+def rd(addr):
+    return "read32 0x%08X" % addr
+
+
+def run(sym, configs, dur):
+    cmd = ["reset", "sleep 300"]
+
+    # ---- [0] 落位自检 + ITCM 复制验证 ----
+    for n in HDR_SYMS:
+        cmd.append(rd(sym[n]))
+    N = ITCM_VERIFY_WORDS
+    if ("_sitcm" in sym) and ("_siitcm" in sym):
+        cmd.append("read32 0x%08X %d" % (sym["_sitcm"], N * 4))
+        cmd.append("read32 0x%08X %d" % (sym["_siitcm"], N * 4))
+    cmd.append("read32 0x%08X %d" % (sym["engine_scan_itcm"], N * 4))
+    cmd.append("read32 0x%08X %d" % (sym["engine_scan_flash"], N * 4))
+
+    # ---- 逐组 ----
+    # ★ 命令顺序很关键 (第一版踩过):
+    #   先 gate=0 → 换表 → 设 sel/n → **先开/关好 gate** → 再清统计 → 再采样。
+    #   若先清统计再写 gate, 两条 SWD 写之间会夹进若干拍 (100μs/拍), 这些
+    #   "gate 还是旧值"的拍会把 isr_min 污染成骨架值 (实测差 ~26000 cyc)。
+    cur_profile = 0
+    icache_on = False
+    for (code, label, gate, sel, prof, n, ic) in configs:
+        if ic != (1 if icache_on else 0):
+            if ic == 1:
+                cmd.append("write32 0x%08X 1" % sym["g_icache_req"])
+                cmd.append("sleep 200")
+                icache_on = True
+        cmd.append("write32 0x%08X 0" % sym["g_engine_gate"])          # 先停扫描
+        if prof != cur_profile:
+            cmd.append("write32 0x%08X %d" % (sym["g_table_profile"], prof))
+            cmd.append("write32 0x%08X 1" % sym["g_reinit"])          # 请求重填表
+            cmd.append("sleep 300")
+            cur_profile = prof
+        cmd.append("write32 0x%08X %d" % (sym["g_engine_sel"], sel))
+        cmd.append("write32 0x%08X %d" % (sym["g_n_routes"], n))
+        cmd.append("write32 0x%08X %d" % (sym["g_engine_gate"], gate))  # ★ 先定 gate
+        cmd.append("sleep 30")                                         # 让两组状态分离
+        cmd.append("write32 0x%08X 1" % sym["g_stat_reset"])          # ★ 再清统计
+        cmd.append("sleep %d" % int(dur * 1000))
+        for nm, w in STAT_SYMS:
+            # ★ 多字变量 (u64 sum) 必须逐字读 —— 少读一个字会让整条解析链错位
+            for k in range(w):
+                cmd.append(rd(sym[nm] + 4 * k))
+        cmd.append(rd(sym["g_stage"]))                                # 守卫
+    for n in TAIL_SYMS:
+        cmd.append(rd(sym[n]))
+
+    args = ["pyocd", "cmd", "-t", "stm32h723xx",
+            "-O", "connect_mode=under-reset"]
+    for c in cmd:
+        args += ["-c", c]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=900)
+    log = os.path.join(ROOT, "build", "stage2_raw.txt")
+    try:
+        open(log, "w", encoding="utf-8").write(r.stdout + "\n===== STDERR =====\n" + r.stderr)
+    except Exception:
+        pass
+    vals = parse_reads(r.stdout)
+    return vals, r.stdout + r.stderr, cmd
+
+
+def parse_reads(stdout):
+    """pyocd read32 行格式: '20000008:  0000002b          |...+|'
+    ★ 必须剥掉尾部的 ASCII 转储列 —— 带 $ 行尾锚点的旧正则会一行都匹配不到
+      (阶段 1 的脚本用 re.match 无锚点所以没事; 这里加过锚点, 踩了一次)。"""
+    vals = []
+    for line in stdout.splitlines():
+        m = re.match(r"^\s*([0-9a-f]{8}):(.*)$", line)
+        if not m:
+            continue
+        body = m.group(2)
+        if "|" in body:                 # 去掉 ASCII 转储列
+            body = body.split("|")[0]
+        vals += [int(x, 16) for x in re.findall(r"\b[0-9a-f]{8}\b", body)]
+    return vals
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dur", type=float, default=0.6, help="每组采样时长 (秒)")
+    ap.add_argument("--elf", default=os.path.join(ROOT, "build", "dcl_h723"))
+    ap.add_argument("--quick", action="store_true")
+    a = ap.parse_args()
+
+    sym, size = symbols(a.elf)
+    if not sym:
+        print("!! nm 解析不到符号 (检查 ELF 路径)"); return 2
+
+    configs = CONFIGS_QUICK if a.quick else CONFIGS_FULL
+    n_stats = sum(w for _, w in STAT_SYMS)
+    n_verify = ITCM_VERIFY_WORDS * (4 if ("_sitcm" in sym) else 2)
+    expect = len(HDR_SYMS) + n_verify + len(configs) * (n_stats + 1) + len(TAIL_SYMS)
+
+    print("=" * 80)
+    print("阶段 2 单会话 A/B 测量  (dur=%.2fs/组, %d 组)" % (a.dur, len(configs)))
+    print("=" * 80)
+
+    ai, af = sym.get("engine_scan_itcm", 0), sym.get("engine_scan_flash", 0)
+    si, sf = size.get("engine_scan_itcm", 0), size.get("engine_scan_flash", 0)
+    print("[静态] engine_scan_itcm  @ 0x%08X  size=%d" % (ai, si))
+    print("[静态] engine_scan_flash @ 0x%08X  size=%d" % (af, sf))
+    if si != sf:
+        print("       !! 两份尺寸不同 → 实例化被优化掉, A/B 无效")
+    h = sym.get("TIM2_IRQHandler", 0)
+    print("[静态] TIM2_IRQHandler   @ 0x%08X  (%s)"
+          % (h, "ITCM" if h < 0x10000 else "FLASH"))
+
+    vals, raw, _cmd = run(sym, configs, a.dur)
+    if len(vals) != expect:
+        print("!! 读回 %d 个, 期望 %d 个 —— 解析可能不完整" % (len(vals), expect))
+        print(raw[-1500:])
+        if len(vals) < expect:
+            return 2
+    it = iter(vals)
+    hdr = {n: next(it) for n in HDR_SYMS}
+    N = ITCM_VERIFY_WORDS
+    itcm_w = lma_w = None
+    if ("_sitcm" in sym) and ("_siitcm" in sym):
+        itcm_w = [next(it) for _ in range(N)]
+        lma_w = [next(it) for _ in range(N)]
+    scan_itcm_w = [next(it) for _ in range(N)]
+    scan_flash_w = [next(it) for _ in range(N)]
+
+    print("\n" + "─" * 80)
+    print("① 落位自检")
+    print("─" * 80)
+    print("  boot_status=%d (0=OK)  stage=%d (9=主循环)  tick=%d  HCLK=%d Hz"
+          % (s32(hdr['g_boot_status']), hdr['g_stage'], hdr['g_tick_count'], hdr['g_clock_hclk']))
+    print("  ISR_ITCM(编译期)=%d   g_shm @ 0x%08X   shm_layout_ok=%d (需 1)"
+          % (hdr['g_isr_itcm'], hdr['g_shm_addr'], hdr['g_shm_ok']))
+    print("  ★外部权威比对 (不采信固件自报):")
+    print("      g_shm        = 0x%08X" % hdr['g_shm_addr'])
+    print("      _shm_start   = 0x%08X   (ELF 符号 = 0x%08X)  %s"
+          % (hdr['g_shm_start_addr'], sym.get('_shm_start', 0),
+             "✓" if hdr['g_shm_start_addr'] == sym.get('_shm_start') == hdr['g_shm_addr']
+             else "✗"))
+    print("      _shm_end     = 0x%08X   (ELF 符号 = 0x%08X)  %s"
+          % (hdr['g_shm_end_addr'], sym.get('_shm_end', 0),
+             "✓" if hdr['g_shm_end_addr'] == sym.get('_shm_end') else "✗"))
+    print("      段长 = 0x%X (期望 0x8000)  DTCM 域 0x20000000-0x20020000  %s"
+          % (hdr['g_shm_end_addr'] - hdr['g_shm_start_addr'],
+             "✓" if (0x20000000 <= hdr['g_shm_addr']
+                     < hdr['g_shm_addr'] + 0x8000 <= 0x20020000) else "✗"))
+    print("  engine_scan_itcm  @ 0x%08X (需 <0x10000) / flash @ 0x%08X (需 ≥0x08000000)"
+          % (hdr['g_scan_itcm_addr'], hdr['g_scan_flash_addr']))
+    if itcm_w is not None:
+        same = sum(1 for x, y in zip(itcm_w, lma_w) if x == y)
+        print("  ★ITCM 复制验证: .itcm_text 前 %d 字 vs flash 装载映像 相同 %d/%d  %s"
+              % (N, same, N, "✓ 启动拷贝已生效" if same == N else "✗ 拷贝没跑"))
+    s_itcm = sum(1 for x, y in zip(scan_itcm_w, scan_flash_w) if x == y)
+    print("  ★A/B 前提验证: engine_scan_itcm vs engine_scan_flash 前 %d 字 相同 %d/%d  %s"
+          % (N, s_itcm, N,
+             "✓ 两份实现逐字相同 (差异只可能来自取指路径)"
+             if s_itcm == N else "✗ 两份实现不同 → A/B 不成立"))
+    print("  reinit_done=%d   table_ck(路由[0].op)=%d" % (hdr['g_reinit_done'], hdr['g_table_ck']))
+    print("  DWT 读对开销=%d cyc   nop×1000=%d cyc (%.2f cyc/迭代)"
+          % (hdr['g_dwt_overhead'], hdr['g_cal_n1000'], hdr['g_cal_n1000'] / 1000.0))
+    print("  L1 I-cache: on=%d  CCR: 0x%08X → 0x%08X   (I-cache 位 = %s)"
+          % (hdr['g_icache_on'], hdr['g_ccr_before'], hdr['g_ccr_after'],
+             "置位" if (hdr['g_ccr_after'] >> 17) & 1 else "未置位"))
+
+    rows = []
+    for (code, label, gate, sel, prof, n, ic) in configs:
+        st = {}
+        for nm, w in STAT_SYMS:
+            v = 0
+            for k in range(w):
+                v |= next(it) << (32 * k)
+            st[nm] = v
+        next(it)  # guard (g_stage)
+        rows.append(dict(code=code, label=label.strip(),
+                         gate=gate, sel=sel, prof=prof, n=n, ic=ic,
+                         emin=0 if st['g_eng_cyc_min'] == 0xFFFFFFFF else st['g_eng_cyc_min'],
+                         emax=st['g_eng_cyc_max'], elast=st['g_eng_cyc_last'],
+                         esum=st['g_eng_cyc_sum'], en=st['g_eng_n'], ediv0=st['g_eng_div0'],
+                         imin=0 if st['g_isr_cyc_min'] == 0xFFFFFFFF else st['g_isr_cyc_min'],
+                         imax=st['g_isr_cyc_max'], ilast=st['g_isr_cyc_last'],
+                         isum=st['g_isr_cyc_sum'], inum=st['g_isr_n'],
+                         sel_used=st['g_eng_sel_used'], n_used=st['g_eng_n_used'],
+                         pmin=0 if st['g_per_cyc_min'] == 0xFFFFFFFF else st['g_per_cyc_min'],
+                         pmax=st['g_per_cyc_max'], plast=st['g_per_cyc_last']))
+    tail = {n: next(it) for n in TAIL_SYMS}
+    d = {r['code']: r for r in rows}
+
+    def per(r):
+        return (r['emin'] / float(r['n'])) if r['n'] else 0.0
+
+    print("\n" + "=" * 80)
+    print("② 每拍成本 (CPU 周期 @400MHz, 拍预算 40000 cyc = 100μs)")
+    print("=" * 80)
+    print("  %-4s %-32s %8s %8s %9s %8s %8s" %
+          ("", "配置", "eng_min", "eng_max", "eng_mean", "isr_min", "最坏占拍"))
+    for r in rows:
+        mean = (r['esum'] / float(r['en'])) if r['en'] else 0.0
+        print("  %-4s %-32s %8d %8d %9.1f %8d %7.2f%%"
+              % (r['code'], r['label'], r['emin'], r['emax'], mean, r['imin'],
+                 100.0 * r['imax'] / TICK_CYC))
+
+    print("\n" + "=" * 80)
+    print("③ 单条路由成本 — 两点法 (128条 − 64条, 除掉调用/循环常数)")
+    print("=" * 80)
+
+    def slope(c128, c64):
+        if c128 in d and c64 in d:
+            a, b = d[c128], d[c64]
+            return (a['emin'] - b['emin']) / float(a['n'] - b['n'])
+        return None
+
+    print("  %-8s %10s %10s %12s" % ("取指", "128条(cyc)", "64条(cyc)", "cyc/条"))
+    for tag, c1, c2 in (("FLASH·IC关", "B1", "D1"), ("ITCM ·IC关", "B2", "D2"),
+                        ("FLASH·IC开", "F1", "F3")):
+        s = slope(c1, c2)
+        if s is not None:
+            print("  %-8s %10d %10d %12.2f"
+                  % (tag, d[c1]['emin'], d[c2]['emin'], s))
+
+    print("\n  ★ 取指路径的代价 (128 条全表 · 全DIRECT):")
+    if "B1" in d and "B2" in d:
+        f, i = d["B1"], d["B2"]
+        print("      FLASH %d cyc (%d%% 拍)  vs  ITCM %d cyc (%d%% 拍)"
+              % (f['emin'], round(100.0 * f['emin'] / TICK_CYC),
+                 i['emin'], round(100.0 * i['emin'] / TICK_CYC)))
+        print("      → 差 %d cyc = %.1f μs,  ITCM 快 %.1f 倍"
+              % (f['emin'] - i['emin'], (f['emin'] - i['emin']) / CPU_HZ * 1e6,
+                 f['emin'] / float(i['emin'])))
+        print("      → 单条: FLASH %.1f cyc  vs  ITCM %.1f cyc"
+              % (per(f), per(i)))
+
+    if "F1" in d and "F2" in d:
+        f, i = d["F1"], d["F2"]
+        print("\n  ★ 打开 L1 I-cache 之后:")
+        print("      FLASH %d cyc (%d%% 拍)  vs  ITCM %d cyc (%d%% 拍)"
+              % (f['emin'], round(100.0 * f['emin'] / TICK_CYC),
+                 i['emin'], round(100.0 * i['emin'] / TICK_CYC)))
+        if "B1" in d:
+            print("      FLASH: IC关 %d → IC开 %d cyc  (加速 %.1f 倍)"
+                  % (d["B1"]['emin'], f['emin'], d["B1"]['emin'] / float(f['emin'])))
+        if "B2" in d:
+            print("      ITCM : IC关 %d → IC开 %d cyc  (变化 %.1f%% — ITCM 不经 cache, 理应不变)"
+                  % (d["B2"]['emin'], i['emin'],
+                     100.0 * (i['emin'] - d["B2"]['emin']) / d["B2"]['emin']))
+        if "B1" in d:
+            print("      ★ 且 FLASH 版开着 cache 才 %.1f cyc/条, 仍高于 ITCM 的 %.1f"
+                  % (per(f), per(i)))
+        b1, f1 = d.get("B1"), d.get("F1")
+        if b1 and f1:
+            print("      ★ 抖动看极差: FLASH·IC关 %d cyc, FLASH·IC开 %d cyc, ITCM·IC关 %d cyc"
+                  % (b1['emax'] - b1['emin'], f1['emax'] - f1['emin'],
+                     d["B2"]['emax'] - d["B2"]['emin']))
+
+    print("\n  ★ 混合程序 (19 原语轮转) / 最重档 (全 PID):")
+    for c, name in (("C2", "混合·ITCM"), ("C1", "混合·FLASH"), ("E", "全PID·ITCM")):
+        if c in d:
+            print("      %-12s eng_min=%6d cyc → %6.2f cyc/条   (最坏占拍 %.1f%%)"
+                  % (name, d[c]['emin'], per(d[c]), 100.0 * d[c]['imax'] / TICK_CYC))
+
+    print("\n  对照 esp32-core0 (@240MHz): CONST→DIRECT 单条 = %d cyc = %.0f ns"
+          % (S3_BASELINE_DIRECT, S3_BASELINE_DIRECT / 240e6 * 1e9))
+    if "B2" in d:
+        print("      H723 ITCM 单条 ≈ %.1f cyc @400MHz = %.0f ns  (含调用+探针+循环常数)"
+              % (per(d["B2"]), per(d["B2"]) / CPU_HZ * 1e9))
+
+    print("\n" + "=" * 80)
+    print("⑤ 拍周期 (硬件定时器自由运行 —— 引擎负载不该影响它, 这是确定性的根)")
+    print("=" * 80)
+    print("  %-4s %-32s %8s %8s %8s %10s" % ("", "配置", "周期min", "周期max", "极差", "极差(ns)"))
+    for r in rows:
+        if r['pmin']:
+            print("  %-4s %-32s %8d %8d %8d %10.1f"
+                  % (r['code'], r['label'], r['pmin'], r['pmax'],
+                     r['pmax'] - r['pmin'], (r['pmax'] - r['pmin']) / CPU_HZ * 1e9))
+    print("  → 极差 0 = 引擎跑到 98%% 拍占用, 拍周期仍是 40000 cyc 整 (硬拍与负载解耦)")
+
+    print("\n" + "=" * 80)
+    print("⑥ 守卫 (必须全 ✓, 否则本组数据不可信)")
+    print("=" * 80)
+    for r in rows:
+        if r['gate']:
+            ok = (r['ediv0'] == 0 and r['en'] > 0 and r['sel_used'] == r['sel']
+                  and r['n_used'] == r['n'])
+            why = "div0=%d n=%d sel_used=%d n_used=%d" % (
+                r['ediv0'], r['en'], r['sel_used'], r['n_used'])
+        else:
+            ok = (r['en'] == 0)          # 骨架组: 扫描统计必须是 0 (没跑过)
+            why = "eng_n=%d (骨架组必须 0)" % r['en']
+        print("  %-4s %-32s %-46s %s" % (r['code'], r['label'], why, "✓" if ok else "✗"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

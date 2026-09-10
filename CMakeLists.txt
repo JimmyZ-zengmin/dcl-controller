@@ -26,6 +26,10 @@ add_compile_options(
     -O2 -g3
     --specs=nano.specs                      # 精简 newlib
     -DSTM32H723xx
+    # ★ 必须关 IPA-ICF: 引擎扫描体有两份**逐指令相同**的实例 (FLASH / ITCM),
+    #   GCC 的 IPA-ICF 会把"内容相同的函数"折叠成一个 → 只剩一份 → A/B 实验作废。
+    #   (实测: 打开时 nm 里只剩 engine_scan_flash 或只剩 itcm 之一)
+    -fno-ipa-icf
 )
 
 add_link_options(
@@ -45,6 +49,7 @@ set_source_files_properties(${STARTUP} PROPERTIES
 
 set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/engine.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/clock.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sysmem.c

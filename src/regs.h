@@ -140,6 +140,11 @@
 #define DWT_LAR         REG32(0xE0001FB0UL)   /* 解锁寄存器 (需写 0xC5ACCE55) */
 #define SCB_CPACR       REG32(0xE000ED88UL)   /* FPU 使能: CP10/CP11 全访问 */
 #define SCB_AIRCR       REG32(0xE000ED0CUL)   /* 中断优先级分组 */
+#define SCB_CCR         REG32(0xE000ED14UL)   /* bit16 = D-cache, bit17 = I-cache */
+#define SCB_CCR_IC      (1u << 17)
+#define SCB_CCR_DC      (1u << 16)
+#define SCB_ICIALLU     REG32(0xE000EF50UL)   /* I-cache 全清 (写任意值即无效化) */
+#define SCB_DCIMVAC     REG32(0xE000EF5CUL)   /* D-cache 按地址无效化 */
 
 /* ───────────────────────── TIM (APB1 定时器) ─────────────────────────
  * H7: TIM2=0x40000000 TIM3=+400 TIM4=+800 TIM5=+C00

@@ -36,9 +36,35 @@
   **拍周期抖动 = 0 个 CPU 周期**（min = max = 40000 cyc，即 <2.5ns，比 LA 的 62.5ns 更细）；
   DWT 经外部仪器标定：40000 cyc ÷ LA 实测 100.0000μs = **400.00 MHz**
   · 对照 S3：空拍 49 cyc @240MHz = 204ns；本平台 95 cyc @400MHz = 237ns
-- ★ **阶段 1 关键发现**：flash 常驻 ISR 的成本被**代码布局 / 取指**主导 ——
+- ★ **阶段 2 完成**（详见 `docs/STAGE2-REPORT.md`）：ITCM/DTCM 落位 + 路由扫描移植
+  + **同镜像 A/B 实验**。一句话结论：
+  > 同一份机器码（2136 B 逐字节相同，已双向验证），
+  > FLASH 里跑 **203.6 cyc/路由**，ITCM 里跑 **56.0 cyc/路由**。
+  > 128 条全表扫：FLASH 26229 cyc（占拍 **65.8%**）vs ITCM 7225 cyc（**18.3%**）。
+  > 换成 19 原语混合程序，FLASH 版冲到 **98.9% 拍占用**（几乎锁死），ITCM 版只用 29.0%。
+
+  | 组 | 配置 | eng_min | 占拍 |
+  |---|---|---|---|
+  | A | 骨架（不扫描）| — | isr **44 cyc** |
+  | B1 | FLASH 全表128·全DIRECT·IC关 | 26229 | 65.84% |
+  | B2 | **ITCM 全表128·全DIRECT·IC关** | **7225** | **18.34%** |
+  | C1 | FLASH 全表128·19原语·IC关 | 38923 | **98.86%** |
+  | C2 | ITCM 全表128·19原语·IC关 | 11419 | 28.98% |
+  | E | ITCM 全表128·全PID·IC关 | 15275 | 44.78% |
+  | F1 | FLASH 全表128·全DIRECT·**IC开** | 8164 | 20.70% |
+  | F2 | ITCM 全表128·全DIRECT·**IC开** | **7225** | 18.34% |
+
+  - **I-cache 对照（决定性）**：开 I-cache 后 FLASH 26229→8164（3.2×），
+    而 ITCM **7225→7225（逐位相同）** ⇒ ITCM 的成本与 cache 状态无关，
+    FLASH 的成本取决于一个引擎不控制的状态变量。即使开着 cache，
+    FLASH 仍要 62.69 cyc/条 > ITCM 的 56.02。
+  - **同一 flash 函数换个地址（+0x250 B）成本变 5%**（26229 ↔ 24986）
+    ⇒ flash 常驻热代码的 WCET 无法预算，这正面证实了阶段 1 的假设。
+  - **拍周期 11 组全部极差 0**（含占拍 98.9% 的那组）⇒ 硬拍与负载完全解耦。
+  - 空拍外壳：ITCM **44 cyc** vs FLASH **160 cyc**（3.6×）。
+  - 单条路由 **56.0 cyc = 140 ns**（对照 S3 的 234 cyc = 975 ns，快 7 倍）。
+- ★ **阶段 1 关键发现**（已被阶段 2 证实）：flash 常驻 ISR 的成本被**代码布局 / 取指**主导 ——
   同一份 ISR 因构建不同给出 **86 / 95 / 98 cyc**，而且**删掉 10 条指令反而更慢**。
-  ⇒ 阶段 2 把 ISR 搬 ITCM 是**必要**（不是优化）：否则 WCET 在 ±10% 量级上不可预测。
 - ℹ️ **线上毛刺**：PA8 约 0.01~0.12% 的边沿间隔异常短（几十~几百 ns），
   疑为跳线串扰或 LA 采样；**不影响拍周期**（众数稳定 100.0000μs）。
   测频工具已按"异常项单独计数"处理，不用 min/max 下结论。
@@ -56,14 +82,21 @@
 src/        平台与引擎代码
   clock.c/h   时钟树（改 CLK_PLL1_DIVN1 即换主频）
   regs.h      H723 寄存器定义（自写，不依赖 CMSIS）
-  main.c      时钟引导 + 100μs 拍 + PA8/PA9 输出 + DWT 拍开销测量 (ISR_MODE 可切形态)
+  engine.h    表结构 / SHM 偏移 / OP·SRC 码（与 esp32-core0 逐字节同构 + 布局断言）
+  primitives.h 19 原语移植（算法逐字保留）
+  engine.c    SHM(DTCM) + 冷启动清零 + 落位自检 + 读源 + 分发
+              + ★一个宏实例化两份扫描（FLASH / ITCM）+ 表填充
+  main.c      时钟引导 + 100μs 拍 + 中断外壳(ISR_ITCM 可切) + 运行期选择器
+              + 分组统计 + I-cache 对照开关 + PA8/PA9 输出
   syscalls/sysmem.c  newlib 桩
-ld/         链接脚本（含 DTCM + ITCM 段 —— 迁移的核心价值）
-startup/    ST 启动文件（BSD-3 厂商模板）
+ld/         链接脚本（.itcm_text VMA 0 / .dtcm_shm NOLOAD + 溢出断言）
+startup/    ST 启动文件（BSD-3 厂商模板，含 ITCM 拷贝循环）
 cmake/      工具链文件
-tools/      h723_ports.py（串口自检）· h723_stage1_read.py（读回 DWT 测量）
+tools/      h723_ports.py（串口自检）
+            h723_stage1_read.py（阶段 1：读回 DWT 空拍测量）
+            h723_stage2_read.py（阶段 2：单会话 11 组 A/B 测量 + 落位/前提验证 + 守卫）
   legacy/   clock_probe.sh / ws_scan.sh（早期 SWD 探测，已被证伪，留档）
-docs/       迁移方案 + 时钟依据 + 频率天花板 + 阶段1报告 + 硬件接线
+docs/       迁移方案 + 时钟依据 + 频率天花板 + 阶段1报告 + 阶段2报告 + 硬件接线
 ```
 
 ---
@@ -79,7 +112,9 @@ pyocd flash -t stm32h723xx -O connect_mode=under-reset build/dcl_h723.hex
 python la_tick_freq.py --cpu 400 --ch 4                     # LA 外部测拍频率
 python la_tick_freq.py --cpu 400 --ch 4 --rate 16000000      # 看抖动
 
-python tools/h723_stage1_read.py --run 3         # 读回 DWT 测量 (空拍成本/抖动/标定)
+python tools/h723_stage1_read.py --run 3         # 阶段1: 读回 DWT 空拍测量
+python tools/h723_stage2_read.py --dur 0.7       # 阶段2: 完整 11 组 A/B (约 40s)
+python tools/h723_stage2_read.py --quick         # 阶段2: 5 组核心对比
 python la_tick_freq.py --cpu 156 --ch 1 --rate 1000000 --dur 2.0   # 验证 CH1←PA9 线路
 
 bash sweep_freq.sh 80 90 92 94                   # 频率天花板扫描 (N → 400/450/460/470MHz)
@@ -101,8 +136,15 @@ bash sweep_freq.sh 80 90 92 94                   # 频率天花板扫描 (N → 
 6. 读**运行态**统计必须**单会话**完成（连接 → reset → sleep → 读）：
    默认 halt 连接在目标调试态异常时会报 `No cores were discovered`，
    用 `connect_mode=under-reset` 恢复
-7. `--gc-sections` 会回收**无人读**的全局（`volatile` 也保不住）→ 观测变量必须真被读
-   否则它会从符号表消失（`g_isr_mode` 就这么没了）
+7. `--gc-sections` 会回收**无人读**的全局（`volatile` 也保不住，
+   `__attribute__((used))` 只挡 GCC 层、挡不住链接器）→ 观测变量必须在代码里**真读或真写**
+   一次，否则它会从符号表消失（`g_isr_mode` / `g_isr_itcm` 都这么没的）
+8. ★ **自检必须"可失败"，否则会被编译器折叠掉** —— 用指针相等做落位自检时，
+   GCC 可依据"不同对象地址不同"把整个判断折成常量（实测恒返 0）。
+   自检的取值路径必须过 `volatile`，或把权威比对交给外部工具
+9. 凡"带长度的读"（`read32 ADDR LEN`）先反测定标语义 —— pyocd 的 LEN 是**字节**
+10. 切换测量配置的命令顺序：**先把被测状态设定好 → 再清统计 → 再采样**。
+    清统计与设定之间夹进的拍会把 `min` 污染成另一个配置的值
 
 ---
 
@@ -115,9 +157,12 @@ bash sweep_freq.sh 80 90 92 94                   # 频率天花板扫描 (N → 
 
 ---
 
-## 下一步（阶段 2 — 内存分区 + 表扫描）
+## 下一步（阶段 3）
 
-1. 链接脚本分 ITCM / DTCM：**ISR 搬 ITCM** → 复测空拍成本
-   （检验阶段 1 的假设：预期抖动收窄到 0~2 cyc、成本降到接近真实指令数）
-2. 引擎表搬 **DTCM**，移植路由扫描（先全表扫，不做分档）
-3. DWT 测「单条路由」周期数（对照 S3 的 234 cyc）
+1. **桶化分档**（div/phase 三档 + 桶表）—— 现在是"全表扫、不分档"；
+   把每拍遍历从 O(全表) 降到 O(本拍激活子集)
+2. **deploy 路径**：0x10 写 staging → 热重载 → 生效确认（S3 的
+   "ACK=已受理 ≠ 已生效"语义债在 H723 一次到位）
+3. **USART1 通信域**（Modbus RTU 从站）—— `SRC_HMI` 目前是留位返回 0
+4. **顺序域 Sequencer v0**
+5. 把 `tools/` 的 Python 回归脚本从 S3 平移（协议不变 ⇒ 脚本一行不改）
