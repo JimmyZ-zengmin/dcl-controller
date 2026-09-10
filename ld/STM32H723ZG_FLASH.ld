@@ -62,6 +62,31 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
+  /* ---- ★ 落位敏感实验用的两个专区 (AUDIT-H723-stage2.md H8) ----
+   * 目的: 让"engine_scan_flash 的落位"成为**唯一变量**。
+   *   .scan_pad   编译期填充 (SCAN_FLASH_PAD 字节) —— 只挪地址, 不改指令
+   *   .scan_flash FLASH 版扫描体独占一段, 紧跟在填充之后
+   * 两者都能被 -DSCAN_FLASH_PAD=N 平移, 而 ITCM 版扫描体 (VMA 固定 0x0)
+   * 完全不受影响 —— 后者就是"控制组必须纹丝不动"的对照。
+   * 没有这个旋钮, "flash 落位敏感"就只能是相关性 (见审计报告 §8)。 */
+  .scan_pad : ALIGN(4)
+  {
+    . = ALIGN(4);
+    _scan_pad_start = .;
+    KEEP(*(.scan_pad))
+    . = ALIGN(4);
+    _scan_pad_end = .;
+  } >FLASH
+
+  .scan_flash : ALIGN(4)
+  {
+    . = ALIGN(4);
+    _scan_flash_start = .;
+    KEEP(*(.scan_flash))
+    . = ALIGN(4);
+    _scan_flash_end = .;
+  } >FLASH
+
   .ARM.extab : ALIGN(4)
   {
     *(.ARM.extab* .gnu.linkonce.armextab.*)

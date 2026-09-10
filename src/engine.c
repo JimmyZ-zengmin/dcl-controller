@@ -157,6 +157,23 @@ AINLINE float read_source(uint8_t st, uint8_t si, const float *sm, const float *
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ * ★ 落位敏感实验的填充区 (AUDIT-H723-stage2.md H8)
+ *   在 FLASH 版扫描体之前插入 SCAN_FLASH_PAD 字节 —— 只挪地址, 不改指令。
+ *   配合链接脚本的 .scan_pad / .scan_flash 两个专区, 让"落位"成为唯一变量;
+ *   ITCM 版 (VMA 固定 0x0) 不受影响, 作为"必须纹丝不动"的控制组。
+ *   ★ 必须 KEEP/used: 否则 --gc-sections 会把这段"没人引用"的常量回收掉,
+ *     落位实验会静默失效 (本项目的经典坑, 见 README 纪律 7)。
+ * ══════════════════════════════════════════════════════════════════ */
+#ifndef SCAN_FLASH_PAD
+#define SCAN_FLASH_PAD 0
+#endif
+
+#if SCAN_FLASH_PAD > 0
+__attribute__((used, section(".scan_pad")))
+const uint8_t g_scan_pad[SCAN_FLASH_PAD] = { 0x5A };
+#endif
+
+/* ══════════════════════════════════════════════════════════════════
  * ★ 扫描体: 一份源码 → 两份实例 (FLASH / ITCM)
  * ══════════════════════════════════════════════════════════════════ */
 #define DEFINE_ENGINE_SCAN(FN, ATTR)                                           \
@@ -196,8 +213,8 @@ ATTR uint32_t FN(uint8_t *base, uint32_t n)                                    \
     return acc;                                                                \
 }
 
-/* FLASH 版 (经 L1 I-cache + AXI/flash 取指) */
-DEFINE_ENGINE_SCAN(engine_scan_flash, __attribute__((noinline)))
+/* FLASH 版 (经 L1 I-cache + AXI/flash 取指) —— 独占 .scan_flash 段, 便于落位实验 */
+DEFINE_ENGINE_SCAN(engine_scan_flash, __attribute__((section(".scan_flash"), noinline)))
 
 /* ITCM 版 (0x00000000, 零等待, 无 cache, 不经 AXI) */
 DEFINE_ENGINE_SCAN(engine_scan_itcm,  __attribute__((section(".itcm_text"), noinline)))

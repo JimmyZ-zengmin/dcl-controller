@@ -20,6 +20,7 @@ set(TARGET dcl_h723)
 set(DCL_BOOT_PROFILE "0" CACHE STRING "启动默认 table_profile (0 全DIRECT / 1 混合 / 2 全PID)")
 set(DCL_BOOT_GATE    "0" CACHE STRING "启动默认 engine_gate (0 骨架 / 1 开扫描)")
 set(DCL_BOOT_SEL     "1" CACHE STRING "启动默认 engine_sel  (0 走FLASH / 1 走ITCM)")
+set(SCAN_FLASH_PAD   "0" CACHE STRING "engine_scan_flash 之前的填充字节数 (落位敏感实验)")
 
 # Cortex-M7 + 双精度 FPU + 硬浮点 (与老项目 build.bat 一致)
 set(MCU_FLAGS -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb)
@@ -38,6 +39,7 @@ add_compile_options(
     -DBOOT_PROFILE=${DCL_BOOT_PROFILE}
     -DBOOT_GATE=${DCL_BOOT_GATE}
     -DBOOT_SEL=${DCL_BOOT_SEL}
+    -DSCAN_FLASH_PAD=${SCAN_FLASH_PAD}
 )
 
 add_link_options(

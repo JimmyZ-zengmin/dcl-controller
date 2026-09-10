@@ -101,6 +101,9 @@ CONFIGS_FULL = [
 ]
 _QM = {"A", "B1", "B2", "F1", "F2"}
 CONFIGS_QUICK = [c for c in CONFIGS_FULL if c[0] in _QM]
+# 落位敏感扫描用: 只要 骨架 / FLASH / ITCM 三条 + 混合组, 单次跑 ~3s
+_SW = {"A", "B1", "B2", "C1"}
+CONFIGS_SWEEP = [c for c in CONFIGS_FULL if c[0] in _SW]
 
 
 def s32(x):
@@ -205,13 +208,19 @@ def main():
     ap.add_argument("--dur", type=float, default=0.6, help="每组采样时长 (秒)")
     ap.add_argument("--elf", default=os.path.join(ROOT, "build", "dcl_h723"))
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--sweep", action="store_true",
+                    help="只跑 骨架/FLASH/ITCM/混合 4 组 (落位扫描用, ~3s)")
+    ap.add_argument("--json", default="", help="把关键数字写成 JSON (供批量脚本汇总)")
     a = ap.parse_args()
 
     sym, size = symbols(a.elf)
     if not sym:
         print("!! nm 解析不到符号 (检查 ELF 路径)"); return 2
 
-    configs = CONFIGS_QUICK if a.quick else CONFIGS_FULL
+    if a.sweep:
+        configs = CONFIGS_SWEEP
+    else:
+        configs = CONFIGS_QUICK if a.quick else CONFIGS_FULL
     n_stats = sum(w for _, w in STAT_SYMS)
     n_verify = ITCM_VERIFY_WORDS * (4 if ("_sitcm" in sym) else 2)
     expect = len(HDR_SYMS) + n_verify + len(configs) * (n_stats + 1) + len(TAIL_SYMS)
@@ -402,21 +411,26 @@ def main():
     n_over = 0
     for r in rows:
         if r['pmin']:
-            over = r['pmax'] > TICK_CYC + 1
+            # ★ 超载的判据是"ISR 装不下" (isr_max > 拍长), **不是** 周期 max 略大于 40000。
+            #   后者会把"某个 tick 的入口延迟了几十 ns"误报成超载 (实测踩过: 40012 被误判)。
+            #   真正的超载会让周期涨到 ISR 时长量级 (数千 cyc), 判据必须能区分这两种。
+            over = r['imax'] > TICK_CYC
             if over:
                 n_over += 1
             print("  %-4s %-30s %8d %8d %8d %10.1f  %s"
                   % (r['code'], r['label'], r['pmin'], r['pmax'],
                      r['pmax'] - r['pmin'], (r['pmax'] - r['pmin']) / CPU_HZ * 1e9,
-                     "★超载: 拍被 ISR 拉长" if over else "拍内 (40000 整)"))
+                     "★超载: 拍被 ISR 拉长" if over
+                     else "拍内 (isr_max %d < 40000)" % r['imax']))
     print()
     if n_over == 0:
-        print("  → 全部组极差 0、周期恒 40000 ⇒ 拍周期与引擎负载解耦 (在拍内跑完的前提下)")
+        print("  → ISR 全部装得进拍 ⇒ 拍周期恒 40000 (在拍内跑完的前提下)")
     else:
-        print("  → %d 组出现拍被拉长 ⇒ **不能再说「硬拍与负载完全解耦」**:"
+        print("  → %d 组 ISR 装不进拍 ⇒ **不能再说「硬拍与负载完全解耦」**:"
               "\n     解耦成立的前提是 ISR 在拍内跑完; 一旦超载, 拍周期改由 ISR 时长决定,"
               "\n     而且不再确定 (实测极差 %d cyc)。这反转了本报告的旧口径。"
-              % (n_over, max((r['pmax'] - r['pmin']) for r in rows if r['pmin'])))
+              % (n_over, max((r['pmax'] - r['pmin']) for r in rows
+                             if r['pmin'] and r['imax'] > TICK_CYC)))
     print("  注: 骨架/ITCM 组一律 40000 整 —— ITCM 的成本与负载无关, 不参与超载。")
 
     print("\n" + "=" * 80)
@@ -450,6 +464,30 @@ def main():
         print("      !! 只有 %d 种校验和 —— 三种 profile 应当给出三个**互不相同**的值" % len(seen))
     else:
         print("      ✓ 三种 profile 的校验和互不相同 → 哨兵具备可失败性")
+
+    if a.json:
+        import json as _json
+        out = {
+            "scan_flash_addr": sym.get("engine_scan_flash", 0),
+            "scan_itcm_addr": sym.get("engine_scan_itcm", 0),
+            "scan_size": size.get("engine_scan_flash", 0),
+            "isr_addr": sym.get("TIM2_IRQHandler", 0),
+            "pad_start": sym.get("_scan_pad_start", 0),
+            "pad_end": sym.get("_scan_pad_end", 0),
+            "tick_cyc": TICK_CYC,
+            "runs": {r['code']: {"eng_min": r['emin'], "eng_max": r['emax'],
+                                 "isr_min": r['imin'], "isr_max": r['imax'],
+                                 "per_min": r['pmin'], "per_max": r['pmax'],
+                                 "sel": r['sel'], "n": r['n'], "prof": r['prof'],
+                                 "gate": r['gate'], "tck": r['tck'],
+                                 "active": r['active'], "guard": r['guard']}
+                     for r in rows},
+        }
+        try:
+            open(a.json, "w", encoding="utf-8").write(_json.dumps(out))
+            print("\n  [json] 已写 %s" % a.json)
+        except Exception as e:
+            print("\n  [json] 写失败: %s" % e)
     return 0
 
 
