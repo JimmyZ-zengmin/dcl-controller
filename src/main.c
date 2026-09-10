@@ -49,6 +49,8 @@
 #include "engine.h"
 #include "transport.h"
 #include "uart.h"
+#include "flash.h"
+#include "persist.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -208,6 +210,36 @@ OBS uint32_t g_force_nak     = 0;   /* 被拒次数 (idx OOR / bad mode / non-fi
 OBS uint32_t g_force_last_idx = 0;  /* 最近一次成功强制的 wire 号 (0xFFFFFFFF = 无) */
 OBS uint32_t g_force_last_val = 0;  /* 最近一次成功强制的值 (f32 位模式, 工具断言非零) */
 OBS uint32_t g_force_clears  = 0;   /* eng_force_clear 被调用次数 (deploy/RESET 联动) */
+
+/* ══════════ W2.4: persist (裸 Flash 双副本) 的观测面 ══════════
+ * ★ 判据要点: 不能只看"save 返回 0"。要让工具能读到
+ *   ① 到底写了哪份 (A/B), ② 序号, ③ 擦除/写/回读各步的结果 —— 这样"掉电判据"
+ *   才能成立 (工具要知道"上一份"在哪, 才能断言"新的一笔没毁掉它")。
+ * ★ 这些量**必须**被 obs_anchor 读到一次, 否则被 --gc-sections 回收。 */
+OBS uint32_t g_persist_cmds       = 0;   /* 0x43 被调用次数 */
+OBS uint32_t g_persist_saves      = 0;   /* 受理的 save 请求数 (含因 RUN 跳过) */
+OBS uint32_t g_persist_skip_run   = 0;   /* 因引擎 RUN 而跳过落盘 (PERSISTENT 语义门) */
+OBS uint32_t g_persist_nak        = 0;   /* 0x43/落盘相关拒绝次数 */
+OBS uint32_t g_persist_ab_valid   = 0;   /* 最近一次探测: A/B 有效位图 (1=A 2=B 3=both) */
+OBS uint32_t g_persist_seq_a      = 0;   /* 副本 A 序号 */
+OBS uint32_t g_persist_seq_b      = 0;   /* 副本 B 序号 */
+OBS uint32_t g_persist_crc_a      = 0;   /* 副本 A 实测 CRC32 (0=无效) */
+OBS uint32_t g_persist_crc_b      = 0;
+OBS uint32_t g_persist_loaded_n   = 0;   /* 上电恢复了多少条 (0 = 空配置) */
+OBS uint32_t g_persist_loaded_sec = 0xFFFFFFFFu;  /* 从哪个扇区恢复 (6=A/7=B) */
+OBS uint32_t g_persist_loads      = 0;   /* persist_load 调用次数 */
+
+/* ★★ 免串口的落盘触发点 (测试专用, 但在发布固件里也保留):
+ *   为什么需要它: persist 的**核心判据是"擦除中掉电也不丢配置"** —— 而"在擦除
+ *   进行中打断"这件事, 只有外部调试器能做到 (串口命令做不到: 命令本身要先被
+ *   主循环收完, 而主循环正在阻塞等擦除)。所以固件必须提供一个**pyocd 可直接
+ *   写、主循环会轮询**的落盘请求标志。
+ *   ★ 这与"宣称=实现"的关系: 若只在工具里假装触发, 测的就是工具自己;
+ *     这个标志让**固件的真实落盘路径** (persist_save → flash_erase/write) 被走到。
+ *   ★ 副作用纪律: 它是 volatile 且被主循环真读 —— 不会被 --gc-sections 回收,
+ *     也不依赖 obs_anchor (但保险起见仍登记)。 */
+OBS volatile uint32_t g_persist_req     = 0;   /* 写 1 → 主循环执行一次 persist_save */
+OBS uint32_t          g_persist_req_cnt = 0;   /* 实际受理的请求数 (与 writes 对账) */
 
 /* ── 引擎扫描: 统计 (CPU 周期) ── */
 OBS uint32_t g_eng_cyc_last = 0;
@@ -695,6 +727,15 @@ static void h_deploy(const uint8_t *p, uint32_t n)
     __asm__ volatile("dsb" ::: "memory");   /* ARM: dsb (S3 的 Xtensa `memw` 在 ARM 上不存在) */
     SHM_U8(g_shm, OFF_CTRL_RELOAD) = 1;             /* 单字节写 = 原子 */
     __asm__ volatile("dsb" ::: "memory");   /* ARM: dsb (S3 的 Xtensa `memw` 在 ARM 上不存在) */
+
+    /* ★ W2.4: 标 dirty —— **不在 deploy 里落盘**。理由两条:
+     *   ① deploy 通常发生在引擎 RUN 时; 擦一个扇区 1~4 秒 = 拍长的上万倍,
+     *      会彻底破坏确定性 (S3 的 PERSISTENT 语义门同款: 运行期 0 flash 操作)
+     *   ② 裸机上"什么时候能阻塞 1~4 秒"只有 PC 知道 —— 它才发 0x12 STOP。
+     *      deploy 只登记, 由 PC 在 STOP 后用 0x43 mode=1 显式触发落盘。
+     *   (S3 用后台 persist_task 异步 flush; 裸机没有后台任务, 所以变成显式请求。
+     *    这不是简化, 是"让停顿的时刻可被上位机控制"—— 更确定, 不是更差。) */
+    g_persist_dirty = 1;
     g_deploy_ok++;
 
     uint8_t r[6];
@@ -752,6 +793,7 @@ static void h_engine_status(void)
 #define NAKRH_FIDX     7u   /* force: wire 号越界 */
 #define NAKRH_FMODE    8u   /* force: mode 不是 0/1 */
 #define NAKRH_FFIN     9u   /* force: 强制值为 NaN/Inf */
+#define NAKRH_PMODE   10u   /* persist: mode 不是 0/1 */
 
 /* 0x20 READ [addr:u32] → ACK [val:u32] */
 static void h_read_w1(const uint8_t *p, uint32_t n)
@@ -874,6 +916,11 @@ static void h_reset_w1(void)
 {
     cold_start_reset();          /* 整段 memset, 天然覆盖 FORCE_MASK/VAL (W2.1) */
     g_force_clears++;            /* ★ 用同一计数证明 RESET 真的清过 force */
+    /* ★ W2.4: RESET 清空运行表 → 未落盘的快照语义上已失效。
+     *   不清会导致"下次 0x43 落盘"把 RESET 之前的旧配置写进 flash 并恢复 ——
+     *   (S3 persist_clear_dirty 的同款理由)。Flash 里已有的数据**不动**
+     *   (RESET 是运行态复位, 不是擦除持久化配置; 要清持久化得显式重新 deploy 空程序)。 */
+    g_persist_dirty = 0;
     g_reset_ok++;
     ack(NULL, 0);
 }
@@ -919,6 +966,80 @@ static void h_force_w2(const uint8_t *p, uint32_t n)
     }
     __asm__ volatile("dsb" ::: "memory");
     ack(NULL, 0);
+}
+
+/* ══════════ W2.4 — 0x43 PERSIST_STATUS (查询/落盘) ══════════
+ * 载荷: 空 = 只查询; [mode:u8] mode=1 = 查询并**尝试落盘当前表**
+ *
+ * ★ 与 S3 的 0x43 差异 (必须说清楚, 否则"逐字沿用"是假的):
+ *   S3 的 0x43 是纯查询 —— 因为 S3 的落盘是**后台任务**(N1: deploy 登记 dirty,
+ *   persist_task 异步 flush)。H723 是裸机单循环, 没有后台任务, 所以:
+ *     · 查询语义保留 (前 8 字节布局也保留: ok / nr / np / ns / flags)
+ *     · **落盘变成显式请求** (载荷带 mode=1) —— 由 PC 在引擎 STOP 后主动触发。
+ *   这不是偷懒: 裸机上"什么时候可以阻塞 1~4 秒"只有 PC 知道 (它才是发 0x12 STOP
+ *   的那一方)。让固件自己找窗口反而会引入"什么时候会停顿"的不确定性。
+ *
+ * 响应布局 (前 8B 与 S3 同, 尾部按 H723 需要追加):
+ *   [0]    ok        (1 = 至少一份副本有效)
+ *   [1:2]  n_routes  (u16)
+ *   [3:4]  n_params  (u16)
+ *   [5:6]  n_states  (u16)
+ *   [7]    flags     (bit0 = dirty 有未落盘配置 / bit1 = 本次尝试落盘成功)
+ *   [8:11] seq       (u32: 当前有效副本的最大序号)
+ *   [12]   ab_valid  (位图 1=A 2=B)
+ *   [13]   active    (0=下次写 A / 1=下次写 B)
+ *   [14:15] last_err (u16: persist/flash 错误码, 0=无)
+ *   [16:19] crc      (u32: 当前有效副本的 CRC32; 供工具与独立计算比对)
+ *   [20:23] writes   (u32: 累计成功落盘次数)
+ *   = 24 字节
+ * ★ 载荷 [0] 的位置放 mode 而不是 ok: 查询用空载荷, 老 PC 不会误触落盘。 */
+static void h_persist_w2(const uint8_t *p, uint32_t n)
+{
+    g_persist_cmds++;
+    uint8_t mode = (n >= 1u) ? p[0] : 0u;
+    int save_rc = 2;   /* 2 = 本次未请求落盘 */
+
+    if (mode == 1) {
+        g_persist_saves++;
+        save_rc = persist_save(g_shm);
+        if (save_rc == 1) g_persist_skip_run++;      /* 因 RUN 跳过 (非错误) */
+        else if (save_rc < 0) g_persist_nak++;
+    } else if (mode > 1u) {
+        g_persist_nak++;
+        g_nak_last = NAKRH_PMODE;
+        nak("persist: bad mode");
+        return;
+    }
+
+    PersistInfo_t info;
+    persist_probe(&info);
+    g_persist_ab_valid = info.ab_valid;
+    g_persist_seq_a = info.seq_a;
+    g_persist_seq_b = info.seq_b;
+    g_persist_crc_a = info.crc_a;
+    g_persist_crc_b = info.crc_b;
+
+    uint32_t seq = (info.seq_a > info.seq_b) ? info.seq_a : info.seq_b;
+    uint32_t crc = (info.seq_a >= info.seq_b) ? info.crc_a : info.crc_b;
+
+    uint8_t r[24];
+    memset(r, 0, sizeof(r));
+    r[0] = (info.ab_valid != PERSIST_AB_NONE) ? 1u : 0u;
+    r[1] = (uint8_t)(g_active_routes & 0xFFu);
+    r[2] = (uint8_t)((g_active_routes >> 8) & 0xFFu);
+    uint16_t np = SHM_U16(g_shm, OFF_CTRL_N_PARAMS);
+    uint16_t ns = SHM_U16(g_shm, OFF_CTRL_N_STATES);
+    r[3] = (uint8_t)np; r[4] = (uint8_t)(np >> 8);
+    r[5] = (uint8_t)ns; r[6] = (uint8_t)(ns >> 8);
+    r[7] = (uint8_t)((g_persist_dirty ? 1u : 0u) | (save_rc == 0 ? 2u : 0u));
+    put32(r + 8,  seq);
+    r[12] = info.ab_valid;
+    r[13] = (uint8_t)info.active;
+    r[14] = (uint8_t)(g_persist_last_err & 0xFFu);
+    r[15] = (uint8_t)((g_persist_last_err >> 8) & 0xFFu);
+    put32(r + 16, crc);
+    put32(r + 20, g_persist_writes);
+    ack(r, 24);
 }
 
 /* ══════════ deploy 自检 (阶段 3.2) ══════════
@@ -1049,6 +1170,8 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_WRITE_BURST:   h_write_burst_w1(p, n); break;
         /* ---- W2: Force ---- */
         case CMD_FORCE:         h_force_w2(p, n); break;
+        /* ---- W2.4: persist ---- */
+        case CMD_PERSIST:       h_persist_w2(p, n); break;
         /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
          *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
          *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
@@ -1182,6 +1305,23 @@ static void obs_anchor(void)
     sink ^= g_force_set;   sink ^= g_force_rel;
     sink ^= g_force_nak;   sink ^= g_force_last_idx;
     sink ^= g_force_last_val; sink ^= g_force_clears;
+    /* W2.4 persist 观测面 (main.c 侧) */
+    sink ^= g_persist_cmds;    sink ^= g_persist_saves;
+    sink ^= g_persist_skip_run; sink ^= g_persist_nak;
+    sink ^= g_persist_ab_valid; sink ^= g_persist_seq_a; sink ^= g_persist_seq_b;
+    sink ^= g_persist_crc_a;   sink ^= g_persist_crc_b;
+    sink ^= g_persist_loaded_n; sink ^= g_persist_loaded_sec;
+    sink ^= g_persist_loads;
+    sink ^= g_persist_req;      sink ^= g_persist_req_cnt;
+    sink ^= g_fl_err_stage;     sink ^= g_fl_err_sr1;
+    sink ^= g_fl_err_cr1;       sink ^= g_fl_err_cnt;
+    /* W2.4 persist 观测面 (persist.c 侧 —— 这些是 extern, 不读会被 gc-sections 回收) */
+    sink ^= g_persist_save_ok;  sink ^= g_persist_save_fail;
+    sink ^= g_persist_load_ok;  sink ^= g_persist_load_fail;
+    sink ^= g_persist_load_seq; sink ^= g_persist_last_err;
+    sink ^= g_persist_writes;   sink ^= g_persist_dirty;
+    sink ^= g_persist_target;   sink ^= g_persist_erase_ok;
+    sink ^= g_persist_erase_fail;
     (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
 }
 
@@ -1232,24 +1372,52 @@ int main(void)
     g_scan_flash_addr  = (uint32_t)(uintptr_t)&engine_scan_flash;
     g_stage = 4;
 
-    /* ③ 表装载: 冷启动清零(单一入口) → 铺栈哨兵 → 填 profile 0
-     *    ★ 哨兵必须铺在"第一次大量用栈"之前 —— 否则铺的时候已经踩过一遍了 */
+    /* ③ 表装载: 冷启动清零(单一入口) → 铺栈哨兵 → **先试持久化恢复** → 回退 profile
+     *    ★ 哨兵必须铺在"第一次大量用栈"之前 —— 否则铺的时候已经踩过一遍了
+     *    ★★ W2.4: 顺序很关键。persist_load 必须在 engine_fill_tables **之前**
+     *       (有持久化配置时不该白填一遍 profile 表), 且必须在 ENGINE_RUN=1
+     *       **之前** (恢复要写 ACTIVE 表, 此刻无 ISR 扫描 = 无撕裂风险)。 */
     cold_start_reset();
     shm_guard_paint();
-    engine_fill_tables(g_shm, BOOT_PROFILE);
+    g_persist_loads++;
+    int restored = persist_load(g_shm);
+
+    /* ★ BOOT_PROFILE 的行为在 W2.4 之后分两种, 必须说清楚 (否则"上电为什么不是
+     *   我编的那个 profile"会成为一个排障陷阱):
+     *     · 有有效持久化配置 → **恢复它**, 引擎保持 STOP (安全语义, 与 S3 一致),
+     *       profile 不回填; 工具的判据是 g_persist_loaded_n > 0。
+     *     · 无有效配置       → 回退 BOOT_PROFILE 填表 + 引擎 RUN (bench 默认行为,
+     *       保持阶段 1/2/3 的所有既有判据不变)。
+     *   ★ 这意味着"烧了 -DBOOT_PROFILE=1 却读回 profile 0 的表"是**正常**的 ——
+     *     因为 flash 里有上一轮 persist 的数据。要拿回 bench 默认行为, 先擦扇区 6/7
+     *     (tools/h723_persist.py --wipe) 或发一次空程序 deploy。 */
+    if (restored > 0) {
+        g_persist_loaded_n = (uint32_t)restored;
+        PersistInfo_t _pi; persist_probe(&_pi);
+        g_persist_loaded_sec = (_pi.seq_a >= _pi.seq_b) ? PERSIST_SECTOR_A : PERSIST_SECTOR_B;
+        g_persist_ab_valid = _pi.ab_valid;
+        g_persist_seq_a = _pi.seq_a; g_persist_seq_b = _pi.seq_b;
+        g_persist_crc_a = _pi.crc_a; g_persist_crc_b = _pi.crc_b;
+        g_table_profile = 0xFFu;    /* 哨兵值: "不是 profile, 是恢复的配置" */
+    } else {
+        engine_fill_tables(g_shm, BOOT_PROFILE);
+        g_table_profile = BOOT_PROFILE;
+        g_persist_loaded_sec = 0xFFFFFFFFu;
+    }
     g_table_ck      = engine_table_checksum(g_shm);
     g_bucket_ck     = engine_bucket_checksum(g_shm);
     g_bucket_zero_slots = engine_bucket_dead_slots(g_shm);
     g_active_routes = engine_active_routes(g_shm);
     g_guard_ok      = (uint32_t)shm_guard_ok();
-    g_table_profile = BOOT_PROFILE;   /* 让工具看到"当前配置", 而不是"假定配置" */
     g_engine_sel    = BOOT_SEL;
     g_scan_mode     = BOOT_SCAN_MODE;
     g_n_routes      = MAX_ROUTES;
     g_engine_gate   = BOOT_GATE;
-    /* ★ W1: 上电即置 ENGINE_RUN —— 与 S3 行为对齐 (S3 上电引擎空转, 等 PC deploy)。
-     *   写在表格装载**之后**: 配置就绪前让 ISR 别扫半张表。 */
-    SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN) = 1;
+    /* ★ W1: ENGINE_RUN 的上电值 —— 但 W2.4 起必须区分两种情况:
+     *     · 恢复的持久化配置 → **保持 STOP** (安全语义: 执行器绝不无人监督上电即动,
+     *       与 S3 persist.h 头注释一致)。PC 需显式 0x11 START。
+     *     · 无持久化配置 (bench) → RUN, 保持阶段 1/2/3 既有判据不变。 */
+    SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN) = (restored > 0) ? 0u : 1u;
     __asm__ volatile("dsb" ::: "memory");
     g_stage = 5;
 
@@ -1310,6 +1478,19 @@ int main(void)
             g_icache_req = 0;
             scb_enable_icache();
             g_icache_on = 1;
+        }
+        /* ★ W2.4: 免串口落盘请求 (pyocd 直写 g_persist_req)。
+         *   与 0x43 走**同一条** persist_save 路径, 所以 PERSISTENT 语义门也一样生效:
+         *   引擎 RUN 时返回 1 (跳过) → dirty 保持 1, 稍后可重试。
+         *   ★ 必须在 proto_poll 之后: 若同一轮里既有串口命令又有本标志, 命令优先
+         *     (PC 的显式请求比调试器的暗写更有权威)。 */
+        if (g_persist_req) {
+            g_persist_req = 0;
+            g_persist_req_cnt++;
+            int rc = persist_save(g_shm);
+            if (rc == 1)      g_persist_skip_run++;
+            else if (rc == 0) g_persist_saves++;
+            else              g_persist_nak++;
         }
         /* 重填表: 先关扫描门 (防 ISR 扫到半张表), 填完恢复 */
         if (g_reinit) {

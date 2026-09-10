@@ -108,6 +108,8 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/engine.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/clock.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/flash.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/persist.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/uart.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.c

@@ -109,11 +109,80 @@
 #define PWR_CSR1_ACTVOS_Msk (3u << 14)
 #define PWR_CSR1_ACTVOSRDY  (1u << 13)
 
-/* ───────────────────────── FLASH (0x52002000) ───────────────────────── */
+/* ───────────────────────── FLASH (0x52002000) ─────────────────────────
+ * ★★ 权威来源: 板商参考工程自带的 ST 官方 CMSIS 设备头
+ *   `D:/STM/tools/lxb_ref/1.LED闪烁/Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h723xx.h`
+ *   依据 (行号来自上面那个头文件):
+ *     FLASH_TypeDef 结构 (L962-984):
+ *       ACR 0x00, KEYR1 0x04, OPTKEYR 0x08, CR1 0x0C, SR1 0x10, CCR1 0x14,
+ *       OPTCR 0x18, OPTSR_CUR 0x1C, OPTSR_PRG 0x20, OPTCCR 0x24,
+ *       PRAR_CUR1 0x28, PRAR_PRG1 0x2C, SCAR_CUR1 0x30, SCAR_PRG1 0x34,
+ *       WPSN_CUR1 0x38, WPSN_PRG1 0x3C, BOOT_CUR 0x40, BOOT_PRG 0x44,
+ *       CRCCR1 0x50, CRCSADD1 0x54, CRCEADD1 0x58, CRCDATA 0x5C, ECC_FA1 0x60,
+ *       OPTSR2_CUR 0x70, OPTSR2_PRG 0x74
+ *     FLASH_SECTOR_TOTAL = 8 / FLASH_SECTOR_SIZE = 0x20000 (L10806/L10811)
+ *
+ * ★★ 命名教训 (W2.4 落地时亲历, 与 2026-09-10 的 DIVP1EN 同族):
+ *   网上大量示例 (含 CSDN 的"STM32H723 flash 读写详细")把 H7 的 KEYR/CR/SR 写成
+ *   0x0C/0x14/0x18 —— 那是 **bank2 的**偏移, 或者是把 H743 双 bank 的
+ *   `FLASH_KEYR`(=KEYR1) 与 `FLASH_CR2`(=CR2, 在 0x100 段) 记混了。
+ *   照抄会**静默操作到 OPTCR/SR1 上**: 写 CR 变成改选项字节, 读 SR 变成读 SR1 之外
+ *   的东西 —— 症状是"解锁后 PG 位怎么都不生效", 排查极难。
+ *   ⇒ 本项目纪律: 外设寄存器偏移**必须**以 CMSIS 设备头为准, 不许抄博客。 */
 #define FLASH_BASE      0x52002000UL
-#define FLASH_ACR       REG32(FLASH_BASE + 0x00)
+#define FLASH_ACR       REG32(FLASH_BASE + 0x00)   /* 访问控制 (LATENCY|WRHIGHFREQ) */
+#define FLASH_KEYR1     REG32(FLASH_BASE + 0x04)   /* ★ bank1 解锁密钥寄存器 */
+#define FLASH_OPTKEYR   REG32(FLASH_BASE + 0x08)
+#define FLASH_CR1       REG32(FLASH_BASE + 0x0C)   /* ★ bank1 控制寄存器 */
+#define FLASH_SR1       REG32(FLASH_BASE + 0x10)   /* ★ bank1 状态寄存器 */
+#define FLASH_CCR1      REG32(FLASH_BASE + 0x14)   /* ★ bank1 清标志寄存器 (写 1 清) */
+#define FLASH_OPTCR     REG32(FLASH_BASE + 0x18)
+#define FLASH_OPTSR_CUR REG32(FLASH_BASE + 0x1C)
+
 /* ACR: LATENCY[3:0] = 等待态数, WRHIGHFREQ[5:4] = 编程延时
  * RM0468 Table 16 (按 AXI 时钟索引, VOS0): ≤70M→0, ≤140M→1, ≤210M→2, ≤275M→3 */
+
+/* ---- 解锁密钥 (RM0468 §4.3.10 / OpenOCD stm32h7x.c: KEY1/KEY2 常量) ----
+ * ★ 密钥是**整个 STM32 家族统一**的 (F1/L4/H7 全一样), 不是 per-chip 值。 */
+#define FLASH_KEY1      0x45670123UL
+#define FLASH_KEY2      0xCDEF89ABUL
+
+/* ---- CR1 位 (CMSIS L10844-10872, 逐位核对) ---- */
+#define FLASH_CR_LOCK     (1u << 0)    /* 1 = 锁定, 写密钥后自动清 0 */
+#define FLASH_CR_PG       (1u << 1)    /* 编程使能 */
+#define FLASH_CR_SER      (1u << 2)    /* 扇区擦除使能 */
+#define FLASH_CR_BER      (1u << 3)    /* 整 bank 擦除 (危险, 本项目不用) */
+#define FLASH_CR_PSIZE_Pos 4
+#define FLASH_CR_PSIZE_Msk (3u << 4)   /* 00=8bit 01=16bit 10=32bit 11=64bit */
+#define FLASH_CR_PSIZE_64  (3u << 4)   /* ★ VDD>2.7V 时用 64-bit 并行度 */
+#define FLASH_CR_FW       (1u << 6)    /* Force Write (跳过写缓冲预取) */
+#define FLASH_CR_START    (1u << 7)    /* 启动擦除 */
+#define FLASH_CR_SNB_Pos  8            /* ★ H72x/H73x 的扇区号在 bit11:8 */
+#define FLASH_CR_SNB_Msk  (0xFu << 8)
+
+/* ---- SR1 位 (CMSIS L10914-10981) ---- */
+#define FLASH_SR_BSY      (1u << 0)    /* 擦/写进行中 */
+#define FLASH_SR_WBNE     (1u << 1)    /* 写缓冲非空 */
+#define FLASH_SR_QW       (1u << 2)    /* ★ 操作队列忙 —— H7 的"真正完成"判据 */
+#define FLASH_SR_CRC_BUSY (1u << 3)
+#define FLASH_SR_EOP      (1u << 16)   /* 编程结束 (写 1 清) */
+#define FLASH_SR_WRPERR   (1u << 17)   /* 写保护错 */
+#define FLASH_SR_PGSERR   (1u << 18)   /* 编程时序错 */
+#define FLASH_SR_STRBERR  (1u << 19)   /* 写选通错 */
+#define FLASH_SR_INCERR   (1u << 21)   /* 不一致错 */
+#define FLASH_SR_OPERR    (1u << 22)   /* 操作错 */
+
+/* 全部错误位 (用于"一键清除 + 判定是否出错") */
+#define FLASH_SR_ERR_Msk  (FLASH_SR_WRPERR | FLASH_SR_PGSERR | FLASH_SR_STRBERR | \
+                           FLASH_SR_INCERR | FLASH_SR_OPERR)
+
+/* ---- 扇区几何 (来自 CMSIS L10806/L10811, 非推测) ---- */
+#define FLASH_SECTOR_TOTAL   8u
+#define FLASH_SECTOR_SIZE    0x20000u        /* 128 KB */
+#define FLASH_BANK1_BASE     0x08000000UL
+/* ★ 断言: 8 × 128KB 必须正好等于链接脚本声明的 1MB (ld/STM32H723ZG_FLASH.ld) */
+_Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
+               "flash sector geometry must tile exactly 1MB (see ld/STM32H723ZG_FLASH.ld)");
 
 /* ───────────────────────── SYSCFG (0x58000400) ───────────────────────── */
 #define SYSCFG_BASE     0x58000400UL

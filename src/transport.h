@@ -39,6 +39,7 @@
 #define CMD_WRITE_BURST     0x23
 #define CMD_FORCE           0x24   /* P2: 强制/释放 wire — [idx:u16][mode:u8][val:f32] */
 #define CMD_ENGINE_STATUS   0x38
+#define CMD_PERSIST         0x43   /* W2.4: 掉电保持查询/落盘 — 空=查询, [mode:u8]=1 落盘 */
 #define CMD_SEQ_DEPLOY      0x44   /* Sequencer v0: 部署顺序域 (设计 D6: 独立命令
                                       不往 0x10 塞 — 3078B 压线教训) */
 #define CMD_MACRO           0x40
@@ -110,32 +111,37 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
 #define DCL_FW_VERSION_H723   0x0200u
 
 /* ---- 逐条列出**未声明**的能力与原因 (防止日后"顺手"把它报上去) ----
- *   DCL_CAP_PERSISTENT(0x0004) — 掉电保持: W2.4 未完成 (裸 Flash 双副本)
- *   DCL_CAP_STATE_COLD(0x0008) — RESET(0x13) 命令不存在, 故不声明
- *   DCL_CAP_SEQ       (0x0040) — Sequencer 未移植
- *   DCL_CAP_COMM      (0x0100) — Modbus RTU 从站未移植
+ *   DCL_CAP_STATE_COLD(0x0008) — RESET(0x13) 命令**已存在**, 但"状态冷启动"语义
+ *                                (deploy 时清 state 表) 由 engine_reload_active 的
+ *                                M2 清零实现 —— 待 W2 收口时与 S3 口径核对后决定是否声明
+ *   DCL_CAP_SEQ       (0x0040) — Sequencer 未移植 (W3)
+ *   DCL_CAP_COMM      (0x0100) — Modbus RTU 从站未移植 (W4)
  *   DCL_CAP_HMI       (0x0200) — SRC_HMI 是**留位**(engine.c 显式 case, 恒返 0)
- *   DCL_CAP_AI        (0x0400) — ADC 未接
+ *   DCL_CAP_AI        (0x0400) — ADC 未接 (W5)
  * ★ 这份清单同时是**上线检查表的雏形**: 每落地一项就在这里删一行、在上面的
  *   宏里加一位 —— 两处必须同步, 否则就是"报了个没实现的"或"实现了却不报"。
  *   ★ A4 事故 (2026-09-10): 阶段 3.2 落地了热重载, 却忘了改这里 —— 正是
  *     "实现了却不报"。评审提醒: 这类漏改**没有任何编译期保护**, 只能靠纪律 +
  *     上面的清单与下面的宏**在同一屏内可见**(所以刻意放在一起)。 */
 #define DCL_CAP_H723_IMPL   (DCL_CAP_MULTICYCLE | DCL_CAP_HOTRELOAD | \
-                             DCL_CAP_WIRE2_FLAG | DCL_CAP_VERINFO | \
-                             DCL_CAP_FORCE)                          /* = 0x00B3 */
+                             DCL_CAP_PERSISTENT | DCL_CAP_WIRE2_FLAG | \
+                             DCL_CAP_VERINFO | DCL_CAP_FORCE)        /* = 0x00B7 */
 
 /* ★ 上线的各项说明 (写清楚"为什么现在可以报"):
  *   DCL_CAP_HOTRELOAD (0x0002) — 阶段 3.2: engine_reload_active() 在 ITCM 内
  *     切换 ACTIVE 表, 且 APPLIED_SEQ 回读确认 (0x10 ACK 带 seq/budget,
  *     0x38 尾部带 deploy_seq/applied_seq/applied_lat)。自检 9/9。
+ *   DCL_CAP_PERSISTENT(0x0004) — W2.4: 裸 Flash 双副本 A/B (扇区 6/7),
+ *     CMD_PERSIST(0x43) 可查询/落盘。★ 声明它的含义包含"运行期 0 flash 操作":
+ *     persist_save() 在 ENGINE_RUN=1 时**直接跳过**(g_persist_skip_run 可证),
+ *     擦写只发生在 STOP 窗口。掉电判据: 擦除中复位仍能加载旧副本 (双副本结构性保证)。
  *   DCL_CAP_WIRE2_FLAG(0x0010) — A3 修复后, ISR 的第二输入判据改为
  *     `wire2_valid(flags, wire2_idx)` = (显式标志 || 非 0 索引) && 索引合法,
  *     即**真的按 ROUTE_FLAG_WIRE2 标志办事**了 (此前标志被定义但从未被引用)。
  *   DCL_CAP_FORCE     (0x0080) — W2: CMD_FORCE(0x24) 落地, 拍首覆写 + 写端屏蔽
  *     两半都在 (engine_tick / DEFINE_ENGINE_SCAN), 且 FORCE_VAL 列入 float 区。
  *     ★ 验收证据必须是**非零强制值** (OA9 事故的判据盲区修正)。 */
-#define DCL_CAP_H723_NOTYET (DCL_CAP_PERSISTENT | DCL_CAP_STATE_COLD | DCL_CAP_SEQ | \
+#define DCL_CAP_H723_NOTYET (DCL_CAP_STATE_COLD | DCL_CAP_SEQ | \
                              DCL_CAP_COMM | DCL_CAP_HMI | DCL_CAP_AI)
 _Static_assert((DCL_CAP_H723_IMPL & DCL_CAP_H723_NOTYET) == 0u,
                "cap bitmap contradiction: bit present in BOTH impl and not-yet lists");
