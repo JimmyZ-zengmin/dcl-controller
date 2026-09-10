@@ -1,0 +1,126 @@
+/**
+ * transport.h — DCL 上位机↔控制器二进制帧协议
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * ★ 协议部分**逐字沿用** esp32-core0/components/transport/uart_protocol.h
+ * ══════════════════════════════════════════════════════════════════
+ * 为什么必须逐字: MIGRATE-H723.md 阶段 3 的验收标准写的是
+ *   「20 套回归全绿, **脚本零改动**」
+ * —— 上位机脚本是既有资产, 协议一变它们全部失效。所以帧格式、命令码、
+ *    CRC 多项式、长度上限一个字节都不能动。
+ *
+ * 唯一新增的是文件末尾的 **H723 平台段**(版本号与能力位图) —— 那不属"协议",
+ * 属"设备自述"。
+ *
+ * 帧格式: [SYNC:1B][CMD:1B][LEN:2B LE][PAYLOAD:LEN][CRC16:2B LE]
+ *   · SYNC: PC→MCU = 0xC0, MCU→PC = 0xC1
+ *   · CRC16-CCITT (poly 0x1021, init 0xFFFF), 覆盖 [CMD][LEN_LO][LEN_HI][PAYLOAD]
+ *     —— **不含 SYNC**, 因为两个方向的 CRC 算法要一致
+ */
+#ifndef DCL_TRANSPORT_H
+#define DCL_TRANSPORT_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define FRAME_SYNC_PC2MCU   0xC0
+#define FRAME_SYNC_MCU2PC   0xC1
+
+/* 0x00-0x0F 保留给系统/协商类命令 */
+#define CMD_GET_VERSION     0x01   /* 版本/能力协商 (审计 F4): 无载荷 → ACK 4B
+                                      [fw_ver:u16][cap:u16], 见 DCL_CAP_* */
+#define CMD_DEPLOY          0x10
+#define CMD_START           0x11
+#define CMD_STOP            0x12
+#define CMD_RESET           0x13
+#define CMD_READ            0x20
+#define CMD_WRITE           0x21
+#define CMD_READ_BURST      0x22
+#define CMD_WRITE_BURST     0x23
+#define CMD_FORCE           0x24   /* P2: 强制/释放 wire — [idx:u16][mode:u8][val:f32] */
+#define CMD_ENGINE_STATUS   0x38
+#define CMD_SEQ_DEPLOY      0x44   /* Sequencer v0: 部署顺序域 (设计 D6: 独立命令
+                                      不往 0x10 塞 — 3078B 压线教训) */
+#define CMD_MACRO           0x40
+#define CMD_DISPLAY_INIT    0x51   /* 固件原生 — ST7735 初始化 */
+#define CMD_DISPLAY_FILL    0x52   /* 固件原生 — 填充矩形 */
+#define CMD_DISPLAY_TEXT    0x53   /* 固件原生 — 绘制文字 */
+/* 通信域 COMM (Modbus RTU 从站) — 隧道模式: 零硬件验证协议栈。
+ * 字节源切换为 UART1 FIFO 后这两个命令仍保留 (调试/回归用) */
+#define CMD_MB_INJECT       0x60   /* 注入一帧 Modbus RTU 请求 → ISR 状态机消费 */
+#define CMD_MB_RESP         0x61   /* 读回响应帧 + 通信域状态 */
+#define CMD_MB_CFG          0x62   /* 配置通信域: [src u8][tx_uart u8][budget u8]
+                                    * (tx_uart=1: 响应从 UART1 物理口发 → LA 可抓) */
+
+#define STS_ACK             0x00
+#define STS_NAK             0xFF
+
+/* ---- 固件版本 (FW_VERSION) 与能力位图 (审计 F4) ----
+ * GET_VERSION 返回 [fw_ver:u16][cap:u16]; 上位机据此判断能力分支,
+ * 不再靠"NAK 文本"猜 (旧 PC 连新固件 / 新 PC 连旧固件都能优雅降级) */
+#define DCL_FW_VERSION      0x0107   /* (S3 线) v1.7: + SRC_HMI 设定值源 + AI 模拟量输入 */
+#define DCL_CAP_MULTICYCLE  0x0001   /* 多周期 div 档 (100μs/1ms/10ms) */
+#define DCL_CAP_HOTRELOAD   0x0002   /* deploy 热重载 (staging→ACTIVE ≤1 拍) */
+#define DCL_CAP_PERSISTENT  0x0004   /* 掉电保持 (运行期 0 flash 操作) */
+#define DCL_CAP_STATE_COLD  0x0008   /* RESET/deploy 状态冷启动 (审计 M2) */
+#define DCL_CAP_WIRE2_FLAG  0x0010   /* wire2_valid 显式标志 (审计 F2) */
+#define DCL_CAP_VERINFO     0x0020   /* GET_VERSION 命令可用 */
+#define DCL_CAP_SEQ         0x0040   /* 顺序域 Sequencer (0x44 SEQ_DEPLOY, 审计 OA4) */
+#define DCL_CAP_FORCE       0x0080   /* wire 强制/释放 (0x24, P2) */
+#define DCL_CAP_COMM        0x0100   /* 通信域 Modbus RTU 从站 (0x60/0x61/0x62) */
+#define DCL_CAP_HMI         0x0200   /* SRC_HMI 设定值源 (DSL 引用 40065+, OA21/v1.7) */
+#define DCL_CAP_AI          0x0400   /* AI 模拟量输入组件 (SENSOR[8..10], v1.7) */
+
+/* N2 (外部审计): 原 1024 使 WRITE_BURST count=255/256 的请求帧 (6+count×4 > 1024)
+ * 在解析层被静默丢弃 (TIMEOUT 无 NAK), 与 READ_BURST 响应 1030B 不对称。
+ * 提到 1030: 请求 payload 上限 = WRITE_BURST 256 字 (6+1024), 读写对称 256 字 */
+/* F1 (审计九): 扩容 64→128 后三表满 = 384 条目 (128 route + 128 param + 128 state)
+ * payload = 6 + 384×16 = 6150B, 单帧满表部署. FrameParser_t.payload 静态 RAM 增
+ * ~3KB (g_parser 全局). fp_feed CRC 已改分块计算 — 不再有栈上大缓冲.
+ * N7 历史注: 原 3078 = 6 + 192×16 (64+64+64) 的设计容量单帧下发修复. */
+#define FRAME_PAYLOAD_MAX   6150
+#define FRAME_TOTAL_MAX     (FRAME_PAYLOAD_MAX + 6)
+
+uint16_t crc16_ccitt(const uint8_t *data, size_t len);
+uint16_t crc16_ccitt_seg(uint16_t crc, const uint8_t *data, size_t len);
+
+typedef struct {
+    uint8_t  state;     /* 0=WAIT_SYNC 1=CMD 2=LEN_LO 3=LEN_HI 4=PAYLOAD 5=CRC_LO 6=CRC_HI */
+    uint8_t  cmd;
+    uint16_t payload_len;
+    uint16_t payload_idx;
+    uint8_t  payload[FRAME_PAYLOAD_MAX];
+    uint8_t  crc_lo;
+} FrameParser_t;
+
+void fp_init(FrameParser_t *fp);
+int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
+
+/* ═══════════════ H723 平台段 (新增; 上面的协议定义逐字未改) ═══════════════
+ *
+ * ★★ 项目第一铁律「宣称 = 实现」在这里的落点:
+ *    能力位图只声明**真的跑通了**的能力。
+ *    S3 报 cap = 0x07FF (11 项全有); H723 阶段 3.1 只有「分档调度」和
+ *    「版本协商」两项落地, 所以**只报 2 位**。
+ *    旧上位机据此优雅降级 —— 不会去调不存在的命令、然后拿到 TIMEOUT 而误判
+ *    "固件挂了"(这正是 F4 协商惯例存在的理由)。
+ *
+ * 版本号取 0x0200 而不是接着 S3 的 0x0107: 平台换了, 版本谱系另起。
+ * 上位机凭 fw_ver 高位即可判断"这是 H723 线", 从而选择不同的行为。 */
+#define DCL_FW_VERSION_H723   0x0200u
+
+/* ---- 逐条列出**未声明**的能力与原因 (防止日后"顺手"把它报上去) ----
+ *   DCL_CAP_HOTRELOAD (0x0002) — deploy staging→ACTIVE 热重载: 未实现 (阶段 3.2)
+ *   DCL_CAP_PERSISTENT(0x0004) — 掉电保持: 未实现 (阶段 3.3)
+ *   DCL_CAP_STATE_COLD(0x0008) — RESET(0x13) 命令不存在, 故不声明
+ *   DCL_CAP_WIRE2_FLAG(0x0010) — wire2_valid 显式标志尚未落位
+ *   DCL_CAP_SEQ       (0x0040) — Sequencer 未移植
+ *   DCL_CAP_FORCE     (0x0080) — CMD_FORCE(0x24) 未实现
+ *   DCL_CAP_COMM      (0x0100) — Modbus RTU 从站未移植
+ *   DCL_CAP_HMI       (0x0200) — SRC_HMI 是**留位**(engine.c 显式 case, 恒返 0)
+ *   DCL_CAP_AI        (0x0400) — ADC 未接
+ * ★ 这份清单同时是**上线检查表的雏形**: 每落地一项就在这里删一行、在上面的
+ *   宏里加一位 —— 两处必须同步, 否则就是"报了个没实现的"或"实现了却不报"。 */
+#define DCL_CAP_H723_IMPL   (DCL_CAP_MULTICYCLE | DCL_CAP_VERINFO)
+
+#endif /* DCL_TRANSPORT_H */

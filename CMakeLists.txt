@@ -23,6 +23,13 @@ set(DCL_BOOT_SEL     "1" CACHE STRING "启动默认 engine_sel  (0 走FLASH / 1 
 set(SCAN_FLASH_PAD   "0" CACHE STRING "engine_scan_flash 之前的填充字节数 (落位敏感实验)")
 set(DCL_BOOT_SCAN_MODE "0" CACHE STRING "启动默认 scan_mode (0 全表扫 / 1 分档调度)")
 
+# ---- 阶段 3.1 协议层开关 ----
+set(DCL_PA9_MODE       "1"      CACHE STRING "PA9 用途 (0 GPIO方波 / 1 USART1_TX)")
+set(DCL_BOOT_BANNER    "1"      CACHE STRING "上电发一帧版本响应 (LA 免 PC 验协议)")
+set(DCL_BANNER_PERIOD  "0"      CACHE STRING "横幅重播周期 ms (0=只发一次; >0 仅供 LA 抓取)")
+set(DCL_UART_SELFTEST  "0"      CACHE STRING "上电回环自检 (1 需 PA9↔PA10 短接)")
+set(DCL_UART_BAUD      "115200" CACHE STRING "协议波特率")
+
 # Cortex-M7 + 双精度 FPU + 硬浮点 (与老项目 build.bat 一致)
 set(MCU_FLAGS -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb)
 
@@ -42,6 +49,11 @@ add_compile_options(
     -DBOOT_SEL=${DCL_BOOT_SEL}
     -DSCAN_FLASH_PAD=${SCAN_FLASH_PAD}
     -DBOOT_SCAN_MODE=${DCL_BOOT_SCAN_MODE}
+    -DPA9_MODE=${DCL_PA9_MODE}
+    -DBOOT_BANNER=${DCL_BOOT_BANNER}
+    -DBANNER_PERIOD_MS=${DCL_BANNER_PERIOD}
+    -DUART_SELFTEST=${DCL_UART_SELFTEST}
+    -DUART_BAUD=${DCL_UART_BAUD}u
 )
 
 add_link_options(
@@ -63,6 +75,8 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/engine.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/clock.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/transport.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/uart.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sysmem.c
     ${STARTUP}

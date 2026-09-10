@@ -27,18 +27,28 @@
  *   g_table_profile  0=全DIRECT 1=19原语轮转 2=全PID
  *   g_reinit         写 1 → 主循环重填表 (填表期间自动关 gate, 防撕裂)
  *   g_stat_reset     写 1 → ISR 清空统计 (切配置时用)
- *   g_pa9_enable     1=PA9 每 32 拍翻转 (CH1 线路验证)
+ *   g_pa9_enable     1=PA9 每 32 拍翻转 (CH1 线路验证; ★仅 PA9_MODE=0 时有效 ——
+ *                      阶段 3.1 起 PA9 默认归 USART1_TX, 见下)
  *
  * ── 编译期开关 ──
  *   ISR_ITCM  0=中断外壳留在 FLASH  1=外壳也进 ITCM (默认)
+ *   PA9_MODE  0=PA9 方波(阶段1线路验证) 1=PA9=USART1_TX (默认, 阶段 3.1 起)
  *   (扫描体两份实例**总是同时存在** —— 那是运行期 A/B 的前提)
  *
- * 接线: LA CH4 ← PA8 (拍输出 5kHz) / LA CH1 ← PA9 (g_pa9_enable=1 时)
+ * 接线: LA CH4 ← PA8 (拍输出 5kHz) / LA CH1 ← PA9
+ *       (PA9_MODE=0 时是 3.2ms 方波; =1 时是 115200 的协议 UART 波形)
+ *
+ * ── 阶段 3.1 新增: 协议层 (transport 帧 + USART1) ──
+ *   帧格式逐字沿用 esp32-core0; 能力位图只声明**真跑通了**的位 (见 transport.h)。
+ *   UART 中断优先级 0x80 < 拍(0) —— 外设永远不许抢拍。
  */
 #include <stdint.h>
+#include <string.h>
 #include "regs.h"
 #include "clock.h"
 #include "engine.h"
+#include "transport.h"
+#include "uart.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -61,6 +71,32 @@
 #endif
 #ifndef BOOT_SCAN_MODE
 #define BOOT_SCAN_MODE 0     /* 0 = 全表扫 / 1 = 分档调度 (阶段 3) */
+#endif
+
+/* ── 阶段 3.1 协议层开关 ── */
+#ifndef PA9_MODE
+#define PA9_MODE 1           /* 0 = PA9 作 GPIO 方波 (阶段 1 线路验证, 保留可复跑)
+                              * 1 = PA9 作 USART1_TX (协议; 默认)
+                              * ★ 只能是编译期: 引脚复用不是运行期可切的状态,
+                              *   做成运行期旋钮就会变成"宣称能做到其实做不到"。 */
+#endif
+#ifndef BOOT_BANNER
+#define BOOT_BANNER 1        /* 上电主动发一帧版本响应 —— 让 LA **不需要 PC 接线**
+                              * 就能拿到协议级外部证据 (PA9 上真实波形) */
+#endif
+#ifndef BANNER_PERIOD_MS
+#define BANNER_PERIOD_MS 0   /* >0: 每 N 毫秒重播一次横幅 (LA 抓取用);
+                              * 生产固件为 0 —— 持续占总线会干扰 PC 通信 */
+#endif
+#ifndef UART_SELFTEST
+#define UART_SELFTEST 0      /* 1 = 上电做回环自检 (需 PA9↔PA10 短接);
+                              * 证明 RX 通路 + CRC 校验 + 解析器真的工作 */
+#endif
+#ifndef UART_BAUD
+#define UART_BAUD 115200u
+#endif
+#ifndef UART_PCLK2
+#define UART_PCLK2 100000000u   /* APB2 = HCLK(200MHz)/2; 见 clock.h CLK_PCLK_HZ */
 #endif
 
 /* ══════════ 输出脚 ══════════ */
@@ -341,6 +377,181 @@ ISR_PLACE void TIM2_IRQHandler(void)
     }
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ * 阶段 3.1 — 协议层 (transport 帧 + USART1)
+ * ══════════════════════════════════════════════════════════════════
+ * 分工严格:
+ *   USART1 IRQ  → 只把字节塞进环形缓冲 (uart.c)
+ *   主循环      → proto_poll() 排空缓冲 → fp_feed 解析 → 分发命令
+ * 这样 ISR 时长与"帧有多长"无关, 拍周期不受 PC 通信影响。
+ */
+static FrameParser_t  s_parser;
+static uint8_t        s_txbuf[FRAME_TOTAL_MAX];
+static volatile uint32_t s_selftest_active = 0;
+
+OBS uint32_t g_uart_brr      = 0;    /* BRR 实测值 (100MHz/115200 → 0x3641) */
+OBS uint32_t g_uart_rx_bytes = 0;
+OBS uint32_t g_uart_tx_bytes = 0;
+OBS uint32_t g_uart_ore      = 0;    /* 硬件溢出: 非 0 = 主循环排空太慢 (故障信号) */
+OBS uint32_t g_uart_drop     = 0;    /* 环形缓冲写满丢弃 */
+OBS uint32_t g_frame_ok      = 0;    /* CRC 通过的完整帧数 —— 解析链路的正向证据 */
+OBS uint32_t g_frame_bad     = 0;    /* 超长 / CRC 不符 */
+OBS uint32_t g_cmd_count     = 0;
+OBS uint32_t g_cmd_last      = 0xFFFFFFFFu;
+OBS uint32_t g_nak_count     = 0;
+OBS uint32_t g_banner_count  = 0;
+OBS uint32_t g_selftest_state  = 3;  /* 0=待跑 1=通过 2=失败 3=未启用 */
+OBS uint32_t g_selftest_frames = 0;
+
+/* 组帧: [0xC1][sts][len:2 LE][payload][crc:2 LE]; CRC 覆盖 [sts][len][payload] */
+static void send_response(uint8_t sts, const uint8_t *p, uint32_t n)
+{
+    if (n > FRAME_PAYLOAD_MAX) n = FRAME_PAYLOAD_MAX;
+    uint32_t pos = 0;
+    s_txbuf[pos++] = FRAME_SYNC_MCU2PC;
+    s_txbuf[pos++] = sts;
+    s_txbuf[pos++] = (uint8_t)(n & 0xFFu);
+    s_txbuf[pos++] = (uint8_t)((n >> 8) & 0xFFu);
+    for (uint32_t i = 0; i < n; i++) s_txbuf[pos++] = p[i];
+    uint16_t crc = crc16_ccitt(s_txbuf + 1, 2u + n);      /* ★ 不含 SYNC */
+    s_txbuf[pos++] = (uint8_t)(crc & 0xFFu);
+    s_txbuf[pos++] = (uint8_t)(crc >> 8);
+    uart1_write(s_txbuf, pos);
+    g_uart_tx_bytes += pos;
+}
+
+static void ack(const uint8_t *p, uint32_t n) { send_response(STS_ACK, p, n); }
+
+static void nak(const char *m)
+{
+    uint32_t n = 0;
+    while (m && m[n]) n++;
+    g_nak_count++;
+    send_response(STS_NAK, (const uint8_t *)m, n);
+}
+
+/* 版本/能力协商: 载荷 [fw:u16 LE][cap:u16 LE] —— 与 S3 逐字节同构 */
+static void h_get_version(void)
+{
+    uint8_t r[4];
+    uint16_t v = DCL_FW_VERSION_H723;
+    uint16_t c = DCL_CAP_H723_IMPL;
+    r[0] = (uint8_t)(v & 0xFFu); r[1] = (uint8_t)(v >> 8);
+    r[2] = (uint8_t)(c & 0xFFu); r[3] = (uint8_t)(c >> 8);
+    ack(r, 4);
+}
+
+/* 上电横幅: 主动发一帧版本响应。两个作用:
+ *   ① LA 端**不需要 PC 接线**就能抓到真实协议波形 → 外部证据
+ *   ② PC 端连上时能立刻看到"设备还活着" */
+static void proto_banner(void) { h_get_version(); g_banner_count++; }
+
+static void proto_dispatch(uint8_t cmd)
+{
+    g_cmd_count++;
+    g_cmd_last = cmd;
+    switch (cmd) {
+        case CMD_GET_VERSION: h_get_version(); break;
+        /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
+         *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
+         *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
+        default: nak("bad cmd"); break;
+    }
+}
+
+/* 主循环调用: 排空串口 → 喂解析器 → 完整帧则分发 */
+static void proto_poll(void)
+{
+    uint8_t b;
+    while (uart1_rx_pop(&b)) {
+        g_uart_rx_bytes++;
+        int r = fp_feed(&s_parser, b);
+        if (r == 1) {
+            g_frame_ok++;
+            /* 自检期只计数**不分发** —— 否则回环收到的请求会被再次应答,
+             * TX→RX 再 TX… 变成回声风暴 */
+            if (s_selftest_active) { g_selftest_frames++; continue; }
+            proto_dispatch(s_parser.cmd);
+        } else if (r < 0) {
+            g_frame_bad++;
+        }
+    }
+    g_uart_ore  = uart1_ore_count();
+    g_uart_drop = uart1_drop_count();
+}
+
+/* 回环自检 (需 PA9↔PA10 短接): 发一帧 PC→MCU 请求, 看它能不能从 RX 回来并被
+ * CRC 校验通过。这是**唯一能证明 RX 通路 + CRC + 解析器真的工作**的内部手段;
+ * 配合 LA 抓 TX 波形, 形成"外部确证发出去的字节 + 内部确证收回来的字节"闭环。 */
+static void proto_selftest(void)
+{
+    uint8_t req[6];
+    req[0] = FRAME_SYNC_PC2MCU;
+    req[1] = CMD_GET_VERSION;
+    req[2] = 0; req[3] = 0;                        /* 无载荷 */
+    uint16_t crc = crc16_ccitt(req + 1, 3);
+    req[4] = (uint8_t)(crc & 0xFFu);
+    req[5] = (uint8_t)(crc >> 8);
+
+    s_selftest_active = 1;
+    uart1_write(req, 6);
+    uint32_t t0 = g_tick_count;                    /* 6B@115200 ≈ 0.52ms → 3ms 上限足够 */
+    while ((g_tick_count - t0) < 30u) {
+        proto_poll();
+        if (g_selftest_frames) break;
+    }
+    s_selftest_active = 0;
+    g_selftest_state = g_selftest_frames ? 1u : 2u;
+}
+
+/* ══════════ 观测变量锚定 —— 结构性防"被回收" ══════════
+ * ★ 已踩过**三次**的同一个坑: 只被静态初始化、代码里无人读也无人写的全局,
+ *   会被 -fdata-sections + --gc-sections 整段回收 → 从符号表消失 → 外部读不到。
+ *     ① 阶段 2: g_isr_itcm     (第一版只在声明处初始化)
+ *     ② 阶段 3.1: g_selftest_state (UART_SELFTEST=0 时无人写)
+ *     ③ 阶段 3.1: g_banner_count   (BOOT_BANNER=0 && 周期=0 时无人写)
+ *   逐个人工绕不可持续 —— 这里做**一次统一锚定**: 把每个观测变量读一遍。
+ *   读操作是 volatile 的, 链接器看得见引用, 于是一个都不会被回收。
+ *   ★ 纪律: **新增观测变量必须在这里加一行**, 否则它可能悄悄从符号表消失。 */
+static void obs_anchor(void)
+{
+    volatile uint32_t sink = 0;
+    sink ^= (uint32_t)g_boot_status;      sink ^= (uint32_t)g_stage;
+    sink ^= g_tick_count;                 sink ^= g_clock_hclk;
+    sink ^= g_isr_itcm;                   sink ^= g_shm_ok;
+    sink ^= g_shm_addr;                   sink ^= g_scan_itcm_addr;
+    sink ^= g_scan_flash_addr;            sink ^= g_reinit_done;
+    sink ^= g_table_ck;                   sink ^= g_active_routes;
+    sink ^= g_guard_ok;                   sink ^= g_guard_bad_off;
+    sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
+    sink ^= g_engine_gate;                sink ^= g_engine_sel;
+    sink ^= g_n_routes;                   sink ^= g_table_profile;
+    sink ^= g_reinit;                     sink ^= g_stat_reset;
+    sink ^= g_pa9_enable;                 sink ^= g_pa9_div;
+    sink ^= g_eng_ck;                     sink ^= g_eng_sel_used;
+    sink ^= g_eng_n_used;                 sink ^= g_eng_cyc_last;
+    sink ^= g_eng_cyc_min;                sink ^= g_eng_cyc_max;
+    sink ^= (uint32_t)g_eng_cyc_sum;      sink ^= g_eng_n;
+    sink ^= g_eng_div0;                   sink ^= g_eng_routes_last;
+    sink ^= (uint32_t)g_eng_routes_total; sink ^= g_eng_ticks;
+    sink ^= g_isr_cyc_last;               sink ^= g_isr_cyc_min;
+    sink ^= g_isr_cyc_max;                sink ^= (uint32_t)g_isr_cyc_sum;
+    sink ^= g_isr_n;                      sink ^= g_per_cyc_last;
+    sink ^= g_per_cyc_min;                sink ^= g_per_cyc_max;
+    sink ^= g_per_prev;                   sink ^= g_dwt_overhead;
+    sink ^= g_cal_n1000;                  sink ^= g_icache_req;
+    sink ^= g_icache_on;                  sink ^= g_ccr_before;
+    sink ^= g_ccr_after;                  sink ^= g_scan_mode;
+    sink ^= g_uart_brr;                   sink ^= g_uart_rx_bytes;
+    sink ^= g_uart_tx_bytes;              sink ^= g_uart_ore;
+    sink ^= g_uart_drop;                  sink ^= g_frame_ok;
+    sink ^= g_frame_bad;                  sink ^= g_cmd_count;
+    sink ^= g_cmd_last;                   sink ^= g_nak_count;
+    sink ^= g_banner_count;               sink ^= g_selftest_state;
+    sink ^= g_selftest_frames;
+    (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
+}
+
 /* ══════════ 失败指示 ══════════ */
 static void blink_error(int err)
 {
@@ -366,7 +577,9 @@ void SystemInit(void)
 int main(void)
 {
     pin_out_init(TICK_PORT, TICK_BIT);
+#if PA9_MODE == 0
     pin_out_init(UARTT_PORT, UARTT_BIT);
+#endif
     g_isr_itcm = ISR_ITCM;      /* ★ 在代码里写一次, 否则会被 --gc-sections 回收 */
     g_stage = 1;
 
@@ -412,7 +625,40 @@ int main(void)
     tick_timer_init();
     g_stage = 8;
 
+    /* ⑥ 协议层 (阶段 3.1): USART1 + 帧解析
+     *    ★ 放在拍之后: 横幅/自检要能观察到 g_tick_count 在走 (证明拍没被串口拖死) */
+    fp_init(&s_parser);
+    uart1_init(UART_PCLK2, UART_BAUD);
+    g_uart_brr = uart1_brr();
+    g_stage = 10;
+#if BOOT_BANNER
+    proto_banner();
+#endif
+#if UART_SELFTEST
+    proto_selftest();          /* 内部会置 1(通过) / 2(失败) */
+#else
+    /* ★ 显式写一次: 只有静态初值、代码里无人读也无人写的全局会被 --gc-sections
+     *   整段回收 (实测: 第一版 g_selftest_state 从符号表消失了 —— 与阶段 2 的
+     *   g_isr_itcm 同款陷阱, 属"本项目已知族谱"里的一个)。 */
+    g_selftest_state = 3;      /* 未启用 */
+#endif
+    g_stage = 11;
+
+    /* ⑦ 统一锚定全部观测变量 (防 --gc-sections 回收; 见 obs_anchor 注释) */
+    obs_anchor();
+
     for (;;) {
+        /* 协议轮询: 排空串口 → 解析 → 分发 (命令执行在主循环, 不在中断里) */
+        proto_poll();
+#if BANNER_PERIOD_MS > 0
+        {
+            static uint32_t last = 0;
+            if ((g_tick_count - last) >= (BANNER_PERIOD_MS * 10u)) {   /* 100μs/拍 */
+                last = g_tick_count;
+                proto_banner();
+            }
+        }
+#endif
         /* L1 I-cache 使能 (实验用, 单向) */
         if (g_icache_req && !g_icache_on) {
             g_icache_req = 0;

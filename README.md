@@ -80,6 +80,25 @@
     补 SHM `0x00-0x3F` 名字与断言、栈哨兵、`SRC_HMI` 显式分支、`cold_start_reset` 单一入口。
   - 空拍外壳：ITCM **44 cyc** vs FLASH **160 cyc**（3.6×）。
   - 单条路由 **56.0 cyc = 140 ns**（对照 S3 的 234 cyc = 975 ns，快 7 倍）。
+- ★ **协议层落地（阶段 3 第 1 子项）**（详见 `docs/STAGE3-1-REPORT.md`）
+  —— H723 从「只能用 SWD 看」变成「有协议、能被外部连」：
+
+  | 项 | 结果 |
+  |---|---|
+  | 帧格式 / CRC16 / 解析器 | **逐字沿用** esp32-core0（52 行状态机，一字未改）|
+  | USART1 | PA9=TX / PA10=RX（AF7，就在板上调试口 H1）、115200 8N1 |
+  | BRR | `0x3641`（100 MHz/115200，误差 **0.0008%**）|
+  | 命令 | `0x01 GET_VERSION` 应答；**未实现命令显式 NAK `bad cmd`** |
+  | 能力位图 | 只报 **2 位**（`0x0021`）—— `transport.h` 逐条列出未声明的 9 项及原因 |
+  | UART 中断优先级 | `0x80` < 拍 `0` ⇒ **外设永不抢拍** |
+
+  - ★ **拍抖动（唯一需诚实标注项）**：阶段 1/2 的「极差 0」在加协议层后变成
+    **稳态 ≤4 cyc（10 ns）**、**含启动累计 22 cyc（55 ns）**、**零流量仍为 0**。
+    偏差出现在上电那一次阻塞发送的窗口内；**机制未直接测量**（分段统计列为未决）。
+    量级 0.055%，仍优于验收线「100 µs ± <0.1 µs」。
+  - ★ **第三次撞到 `--gc-sections` 吃掉观测变量**（`g_isr_itcm` / `g_selftest_state` /
+    `g_banner_count`）→ 这次做**结构性修复**：`obs_anchor()` 统一读一遍全部 64 个观测
+    变量，新增变量必须在此加一行。
 - ★ **档桶分档调度完成**（按 MIGRATE 属 **阶段 4 第 1 项**，提前完成；
   详见 `docs/STAGE3-REPORT.md`）
   —— S3 OA15「治本重构」语义。**同一份 128 条三档程序，只切换扫描方式**：
@@ -124,17 +143,23 @@ src/        平台与引擎代码
   engine.c    SHM(DTCM) + 冷启动清零 + 落位自检 + 读源 + 分发
               + ★一个宏实例化两份扫描（FLASH / ITCM）+ 表填充
   main.c      时钟引导 + 100μs 拍 + 中断外壳(ISR_ITCM 可切) + 运行期选择器
-              + 分组统计 + I-cache 对照开关 + PA8/PA9 输出
+              + 分组统计 + I-cache 对照开关 + PA8 输出
+              + ★协议分发(GET_VERSION/NAK) + 上电横幅 + 回环自检 + obs_anchor()
+  transport.c/h  帧协议（逐字沿用 esp32-core0）+ H723 平台段(版本/能力位图)
+  uart.c/h   USART1 驱动（PA9=TX/PA10=RX，AF7；RXNE 中断 + 环形缓冲；轮询发送等 TC）
   syscalls/sysmem.c  newlib 桩
 ld/         链接脚本（.itcm_text VMA 0 / .dtcm_shm NOLOAD + 溢出断言）
 startup/    ST 启动文件（BSD-3 厂商模板，含 ITCM 拷贝循环）
 cmake/      工具链文件
-tools/      h723_ports.py（串口自检）
+tools/      h723_proto.py（★协议层 PC 侧 6 用例，含异常路径）
             h723_stage1_read.py（阶段 1：读回 DWT 空拍测量）
-            h723_stage2_read.py（阶段 2：单会话 11 组 A/B 测量 + 落位/前提验证 + 守卫）
+            h723_stage2_read.py（阶段 2：单会话 A/B 测量 + 落位/前提验证 + 守卫）
+            h723_pad_sweep.py（落位扫描）· h723_ports.py（串口自检）
   legacy/   clock_probe.sh / ws_scan.sh（早期 SWD 探测，已被证伪，留档）
-docs/       迁移方案 + 时钟依据 + 频率天花板 + 阶段1报告 + 阶段2报告
-            + AUDIT-H723-stage2.md（审计报告）+ REF-flash-placement.md（落位机制）\n            + STAGE3-REPORT.md（档桶分档）+ 硬件接线
+docs/       迁移方案 + 时钟依据 + 频率天花板 + 阶段1/2报告
+            + STAGE3-REPORT.md（档桶分档）+ STAGE3-1-REPORT.md（★协议层）
+            + AUDIT-H723-stage2.md（审计报告）+ REF-flash-placement.md（落位机制）
+            + 硬件接线
 ```
 
 ---
@@ -151,16 +176,33 @@ python la_tick_freq.py --cpu 400 --ch 4                     # LA 外部测拍频
 python la_tick_freq.py --cpu 400 --ch 4 --rate 16000000      # 看抖动
 
 python tools/h723_stage1_read.py --run 3         # 阶段1: 读回 DWT 空拍测量
-python tools/h723_stage2_read.py --dur 0.7       # 阶段2: 完整 11 组 A/B (约 40s)
-python tools/h723_stage2_read.py --quick         # 阶段2: 5 组核心对比
-python la_tick_freq.py --cpu 156 --ch 1 --rate 1000000 --dur 2.0   # 验证 CH1←PA9 线路
+python tools/h723_stage2_read.py --dur 0.7       # 阶段2: 完整 A/B 矩阵 (约 40s)
+python tools/h723_stage2_read.py --quick         # 阶段2: 核心 5 组对比
+
+python tools/h723_proto.py                       # ★阶段3.1: 协议层 6 用例 (需 CH340 接线)
 
 bash sweep_freq.sh 80 90 92 94                   # 频率天花板扫描 (N → 400/450/460/470MHz)
 
 # ★ 用外部仪器测"非默认配置"时: 把配置编进固件 (调试器不参与)
 bash build.sh -DDCL_BOOT_PROFILE=1 -DDCL_BOOT_GATE=1 -DDCL_BOOT_SEL=0
 python la_tick_freq.py --cpu 400 --ch 4 --rate 16000000 --dur 1.0 --no-reset
+
+# ★ 阶段 3.1 协议层专用
+bash build.sh -DDCL_BANNER_PERIOD=20     # 每 20ms 重播一帧 (LA 抓取用; 生产为 0)
+bash build.sh -DDCL_BOOT_BANNER=0        # 零 UART 流量 (拍抖动对照组)
+bash build.sh -DDCL_UART_SELFTEST=1      # 上电回环自检 (需 H1 的 6↔5 脚短接)
+bash build.sh -DDCL_PA9_MODE=0           # 回退到阶段 1 的 PA9 方波 (线路验证可复跑)
 ```
+
+### 串口接线（PC 直连）
+
+| CH340 | 板子 H1 脚 | 信号 |
+|---|---|---|
+| RXD | **6** | PA9 = USART1_TX |
+| TXD | **5** | PA10 = USART1_RX |
+| GND | 任一 GND | 共地（必接）|
+
+接好后 `python tools/h723_proto.py` 应输出 **6/6 PASS**。
 
 **失败指示**：时钟初始化失败时固件会在 PA8 上闪 `|错误码|` 次（错误码见 `src/clock.h` 的 `CLK_ERR_*`），
 然后用 LA 一抓就知道卡在哪一步 —— 不依赖 SWD。
@@ -194,6 +236,17 @@ python la_tick_freq.py --cpu 400 --ch 4 --rate 16000000 --dur 1.0 --no-reset
     否则仪器测的是骨架态（本项目为此白跑了三次抓取）
 13. ★ **pyocd 会话结束后核心被 HALT**，运行期写入的配置不跨会话 ⇒
     要用外部仪器测非默认配置，就把它**编进固件**（`-DBOOT_PROFILE/-DBOOT_GATE/-DBOOT_SEL`）
+14. ★ **不要让采样时刻与周期性事件共振**。排查协议层时两次读到 `PA9 IDR=0`（空闲应为高），
+    一度怀疑"引脚被外部拉低"。真因是两次会话都用了 `sleep 400`，
+    而横幅周期恰好 20 ms —— `400 ms = 20 × 20 ms`，采样点每次都落在发送窗口起点。
+    **"确定性"会反过来咬人**：固定延时采样会与固定周期事件长期同相。
+    换个非整数倍的延时，或改用触发式采集。
+15. ★ **同一文件上的多个编辑必须串行**。并行发起对同一文件的多次编辑会出现
+    read-modify-write 竞争 —— 表现为"工具报成功但改动没落盘"（本轮 `main.c` 的 include
+    与 `CMakeLists.txt` 的 `set()` 各丢过一次，直到编译报错才暴露）。
+    想判断"编辑是否真的生效"，别信工具回执，`grep` 一次文件。
+16. ★ **`connect_mode=under-reset` 不带 `-c reset` 会读回垃圾**（不只是"陈旧 SRAM"）：
+    本轮读 GPIO 寄存器时全部返回同一个 `0xABFFFFFF`。加 `-c reset -c "sleep 300"` 后正常。
 
 ---
 
@@ -208,17 +261,21 @@ python la_tick_freq.py --cpu 400 --ch 4 --rate 16000000 --dur 1.0 --no-reset
 
 ## 下一步（编号以 `docs/MIGRATE-H723.md` 为准）
 
-**阶段 3（★ 关键里程碑）— 协议栈 + 回归跑通**　当前 **0 / 4**，是最大空缺
+**阶段 3（★ 关键里程碑）— 协议栈 + 回归跑通**　当前 **1 / 4**
 
-0. 现状提醒：H723 现在**没有任何协议层** —— 所有观测都靠 SWD + 编译期 `BOOT_*`
-   旋钮。也就是说"能被 PC 使用"这件事还没开始。
-1. **UART + 协议帧**（`transport`）：帧格式 / CRC16 / 解析器**逐字沿用 S3**，
-   保证回归脚本零改动。先上命令子集：
-   `0x01 GET_VERSION` · `0x20 READ` · `0x21 WRITE` · `0x38 ENGINE_STATUS`
+1. ✅ ~~UART + 协议帧~~（已完成：`transport.c` 逐字沿用 S3 + USART1 驱动 +
+   `GET_VERSION` + PC 侧 6 用例脚本。见 `docs/STAGE3-1-REPORT.md`）
+   ⏳ **待接线才能收口**：
+   - **CH340 ↔ 板子 H1**：RXD→**6**(PA9=TX) / TXD→**5**(PA10=RX) / GND 共地
+     → 然后 `python tools/h723_proto.py`（6 个可失败用例，T1~T6）
+   - **LA CH1 → H1 第 6 脚**（外部波形复核；目前 CH1 抓到的不是 UART 信号）
+   - 快速自证：把 H1 的 **6 脚与 5 脚短接** + `-DDCL_UART_SELFTEST=1`
+     → 固件上电自环，不需 PC 即可证明「RX 通路 + CRC + 解析器」
 2. **deploy 路径**：0x10 写 staging → 热重载 → 生效确认（S3 的
    "ACK=已受理 ≠ 已生效"语义债在 H723 一次到位）。桶表 ST 区已按 S3 偏移预留
    ★ 预算模型必须按 H9 用 **/64** 给 div2 摊薄；deploy 侧还要拦
    `div=3` / `stateful op 无 state 槽` / `src_type==SRC_HMI`（H5 未决）
+   ★ deploy 的 6 KB 帧**必须把发送改 DMA/中断驱动** —— 现在的轮询发送会占满主循环
 3. **persist**（掉电保持；PERSISTENT 语义 = 运行期 0 flash 操作）
 4. **20 套回归平移**，脚本零改动 → 全绿（**这一步过了，"迁移成功"基本成立**）
 

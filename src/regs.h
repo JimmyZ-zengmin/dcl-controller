@@ -164,11 +164,61 @@
 #define TIM_SR_UIF      (1u << 0)
 #define TIM_EGR_UG      (1u << 0)   /* 立即产生更新事件 (把 PSC 立刻装载) */
 
+/* ───────────────────────── USART1 (D2/APB2, 0x40011000) ─────────────────────────
+ * ★ 权威来源: 板商参考工程自带的 ST 官方 CMSIS 设备头
+ *   `D:/STM/tools/lxb_ref/1.LED闪烁/Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h723xx.h`
+ *   (本项目纪律: 寄存器定义必须查权威来源, 不许猜 —— 见 2026-09-10 的 DIVP1EN 教训)
+ *   导出的依据 (行号来自上面那个头文件):
+ *     PERIPH_BASE            = 0x40000000                          (L2070)
+ *     D2_APB2PERIPH_BASE     = PERIPH_BASE + 0x00010000            (L2088)
+ *     USART1_BASE            = D2_APB2PERIPH_BASE + 0x1000         (L2230)  → 0x40011000
+ *     USART_TypeDef 偏移: CR1 0x00 CR2 0x04 CR3 0x08 BRR 0x0C GTPR 0x10
+ *                         RTOR 0x14 RQR 0x18 ISR 0x1C ICR 0x20 RDR 0x24
+ *                         TDR 0x28 PRESC 0x2C                      (L1596-1608)
+ *     RCC_APB2ENR_USART1EN   = bit4                                (L15492)
+ *     USART1_IRQn            = 37                                  (L98)
+ *     GPIO_AFRH_AFSEL9_Pos   = 4 / AFSEL10_Pos = 8                 (L12447 起)
+ * ★ 注意 USART 的 RDR(0x24) 与 TDR(0x28) 是**两个独立地址**, 不是 F1 时代的 DR。
+ *   读 RDR 才清 RXNE; 写 TDR 才发送。 */
+#define RCC_APB2ENR     REG32(RCC_BASE + 0x0F0)   /* APB2 时钟使能 (USART1/SPI1/TIM1...) */
+#define RCC_APB2ENR_USART1EN  (1u << 4)
+
+#define USART1_BASE     0x40011000UL
+#define USART_CR1(u)    REG32((u) + 0x00)
+#define USART_CR2(u)    REG32((u) + 0x04)
+#define USART_CR3(u)    REG32((u) + 0x08)
+#define USART_BRR(u)    REG32((u) + 0x0C)
+#define USART_ISR(u)    REG32((u) + 0x1C)
+#define USART_ICR(u)    REG32((u) + 0x20)
+#define USART_RDR(u)    REG32((u) + 0x24)
+#define USART_TDR(u)    REG32((u) + 0x28)
+#define USART_PRESC(u)  REG32((u) + 0x2C)
+
+/* CR1 (L20896 起) */
+#define USART_CR1_UE      (1u << 0)    /* 使能 USART */
+#define USART_CR1_RE      (1u << 2)    /* 接收使能 */
+#define USART_CR1_TE      (1u << 3)    /* 发送使能 */
+#define USART_CR1_RXNEIE  (1u << 5)    /* RXNE/RXFNE 中断使能 */
+#define USART_CR1_OVER8   (1u << 15)   /* 8 倍过采样 (本项目用 16 倍 → 必须 0) */
+
+/* ISR (L21188 起) */
+#define USART_ISR_ORE     (1u << 3)    /* 溢出错误 */
+#define USART_ISR_RXNE    (1u << 5)    /* 收到数据 (读 RDR 清除) */
+#define USART_ISR_TC      (1u << 6)    /* 发送完成 */
+#define USART_ISR_TXE     (1u << 7)    /* 发送数据寄存器空 */
+
+/* ICR (L21274 起) */
+#define USART_ICR_ORECF   (1u << 3)    /* 清溢出标志 */
+#define USART_ICR_TCCF    (1u << 6)    /* 清发送完成标志 */
+
 /* ───────────────────────── NVIC ───────────────────────── */
 #define NVIC_ISER       REG32(0xE000E100UL)
 #define NVIC_ICER       REG32(0xE000E180UL)
 #define NVIC_IPR(n)     REG32(0xE000E400UL + 4UL * ((n) / 4u))
+/* ★ 优先级是**按字节**编址的 (IPR0..IPR59 每个 8 位)。用 REG32 写会一次改掉 4 个
+ *   中断的优先级 —— 所以这里提供字节访问。主循环/驱动一律用这个。 */
+#define NVIC_IPB(n)     (*(volatile uint8_t *)(0xE000E400UL + (n)))
 #define IRQ_TIM2        28          /* TIM2 global interrupt 在向量表的位置 */
-#define IRQ_USART1      37
+#define IRQ_USART1      37          /* 与 stm32h723xx.h L98 一致 */
 
 #endif /* DCL_REGS_H */
