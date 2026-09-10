@@ -66,6 +66,39 @@
 #define OFF_PARAM_STAGING    0x2040   /* 128 × 16B */
 #define OFF_STATE_TABLE      0x2840   /* 128 × 16B */
 #define OFF_STATE_STAGING    0x3040   /* 128 × 16B */
+/* ---- 档桶索引区 (阶段 3, S3 OA15 治本; 起址与 S3 一致) ----
+ * 路由表按 (div, phase) 归组: div0 全部在前, 其后 div1 (phase 0..9 各成桶),
+ * 再其后 div2 (phase 0..63 各成桶)。桶表记录每桶的 [起始, 条数], 使 ISR 每拍
+ * 只扫本拍激活的桶而非全表:
+ *   [off1[10]][cnt1[10]][off2[100]][cnt2[100]] = 220 × u16 = 440B
+ *   div0 段 = [0, off1[0]) —— off1[0] 即 div0 条数 (每拍全跑);
+ *   div1 段 = [off1[m10], off1[m10]+cnt1[m10])      (m10  = tick%10)
+ *   div2 段 = [off2[m100], off2[m100]+cnt2[m100])   (m100 = tick%64)
+ *
+ * ★★ 移植期发现并修正了 S3 的一个**宣称≠实现**缺陷 (详见 AUDIT-H723-stage2.md H9):
+ *   S3 把 div2 相位声明为 **100 个**(桶表 100 槽, 注释写 "phase 0-99", 归组用
+ *   `ph = q2 % 100`), 但 `period` 的 phase 字段只有 **6 位**
+ *   (PERIOD_PHASE_MASK = 0x3F)。deploy 侧 `(uint8_t)(dv | (ph << 2))` 会把 ph≥64
+ *   的高位直接截掉 → 实际存下的是 `ph & 0x3F`:
+ *       · 槽 64..99 **恒空** (ISR 侧 `ph = (period>>2) & 0x3F` 只可能 0..63)
+ *       · q2 = 0 与 q2 = 64 落到**同一个相位** → div2 > 64 条时相位重叠,
+ *         每拍最坏 div2 条数 ≈ n/64 而非预算模型假设的 n/100 (低估最坏拍成本)
+ *   `tools/verify_capacity.py` 的"慢档 PID×128 满表"正好压在这个点上,
+ *   但该用例只看 emax 是否超预算(量级差太远), 所以从未暴露。
+ *
+ *   H723 的修法: **让宣称等于实现** —— div2 相位严格取 64 个
+ *   (BUCKET_DIV2_PHASES = 64, 与 6 位字段一一对应)。
+ *   桶表仍按 S3 的 220 × u16 保留 100 槽, 以维持 SHM 偏移不变, 但
+ *   **槽 64..99 恒为 0 是被断言的** (由 engine_bucket_checksum 与外部独立预测比对证明)。
+ *   副产品: 未来 deploy 预算模型对 div2 的摊薄系数必须**除以 64, 而不是 100**
+ *   (div2 每条每拍成本从 ceil(cost/100) 升到 ceil(cost/64), +56%)。 */
+#define ROUTE_BUCKET_U16       220
+#define OFF_ROUTE_BUCKETS      0x4480
+#define OFF_ROUTE_BUCKETS_ST   0x4638
+#define OFF_ROUTE_BUCKETS_END  0x47F0
+#define BUCKET_DIV1_PHASES     10
+#define BUCKET_DIV2_PHASES     64   /* ★ 与 period 的 6 位 phase 字段严格一致 */
+
 #define OFF_MB_SET           0x4AC0   /* 写区 64 WORD (SRC_HMI 源, 阶段 4 落地) */
 #define SHM_SIZE             0x8000   /* 32KB (S3 为 64KB; H723 DTCM 128KB 充裕) */
 
@@ -81,7 +114,11 @@ typedef struct __attribute__((packed, aligned(4))) {
     uint16_t state_offset;
     uint16_t actuator_idx;
     uint16_t wire2_idx;
-    uint8_t  period;   /* div_idx(2bit) + phase(6bit) */
+    uint8_t  period;   /* offset 14: div_idx(2bit) + phase(6bit) */
+    uint8_t  reserved; /* offset 15: S3 里这是编译器的**尾部填充字节** (15 个字段
+                        * + aligned(4) → sizeof 补齐到 16)。这里显式命名, 使
+                        * 逐字节校验和**不依赖填充内容** —— 否则任何"逐字段赋值"
+                        * 的改动都会让填充变脏, 校验和随之漂移 (实测被这一步绊到过)。 */
 } RouteEntry_t;
 
 _Static_assert(sizeof(RouteEntry_t) == 16, "RouteEntry_t must be 16 bytes");
@@ -177,27 +214,59 @@ _Static_assert(OFF_ROUTE_STAGING   + MAX_ROUTES    * 16 <= OFF_PARAM_TABLE,    "
 _Static_assert(OFF_PARAM_TABLE     + MAX_PARAMS    * 16 <= OFF_PARAM_STAGING,  "SHM: PARAM_TABLE 越界");
 _Static_assert(OFF_PARAM_STAGING   + MAX_PARAMS    * 16 <= OFF_STATE_TABLE,    "SHM: STATE_TABLE 越界");
 _Static_assert(OFF_STATE_TABLE     + MAX_STATES    * 16 <= OFF_STATE_STAGING,  "SHM: STATE_TABLE 越界");
-_Static_assert(OFF_STATE_STAGING   + MAX_STATES    * 16 <= OFF_MB_SET,         "SHM: STATE_STAGING 越界");
+_Static_assert(OFF_STATE_STAGING   + MAX_STATES    * 16 <= OFF_ROUTE_BUCKETS,  "SHM: STATE_STAGING 越界");
+_Static_assert(OFF_ROUTE_BUCKETS   + ROUTE_BUCKET_U16 * 2 <= OFF_ROUTE_BUCKETS_ST, "SHM: 桶表越界");
+_Static_assert(OFF_ROUTE_BUCKETS_ST + ROUTE_BUCKET_U16 * 2 <= OFF_ROUTE_BUCKETS_END, "SHM: 桶表 staging 越界");
+_Static_assert(OFF_ROUTE_BUCKETS_END <= OFF_MB_SET, "SHM: 桶表与 MB_SET 重叠");
 _Static_assert(OFF_MB_SET          + MB_NREG       * 2  <= SHM_SIZE,           "SHM: MB_SET 越界");
 /* 反向断言: 控制块区的每个字段都必须落在区内 (防止上面某个宏被改大而不自知) */
 _Static_assert(OFF_CTRL_MAGIC + 4 <= OFF_CTRL_N_SEQ + 8, "SHM: 控制块字段溢出 0x40");
 _Static_assert(OFF_TIMING_LAST_EXEC + 4 <= OFF_CTRL_GPIO_MASK + 4, "SHM: 计时区与 GPIO_MASK 重叠");
 
 /* ══════════ 引擎扫描 (两份实例: FLASH 与 ITCM, 见 engine.c) ══════════
- * @param base  SHM 基址 (DTCM 内)
- * @param n     本拍扫描的路由条数 (0..MAX_ROUTES)
- * @return      校验和 (证明"真的算过" —— 防死代码消除 + 提供运行证据)
+ * @param base   SHM 基址 (DTCM 内)
+ * @param first  起始路由下标 (档桶调度会传桶起点)
+ * @param count  扫描条数 (0 起)
+ * @return       校验和 (证明"真的算过" —— 防死代码消除 + 提供运行证据)
  */
-typedef uint32_t (*engine_scan_fn)(uint8_t *base, uint32_t n);
+typedef uint32_t (*engine_scan_fn)(uint8_t *base, uint32_t first, uint32_t count);
 
-extern uint32_t engine_scan_flash(uint8_t *base, uint32_t n);
-extern uint32_t engine_scan_itcm (uint8_t *base, uint32_t n);
+extern uint32_t engine_scan_flash(uint8_t *base, uint32_t first, uint32_t count);
+extern uint32_t engine_scan_itcm (uint8_t *base, uint32_t first, uint32_t count);
 
 /** @brief 按 profile 填充参数表/状态表/路由表 (冷启动与重配置共用)
  *  profile: 0 = 全 DIRECT (对照 S3 的 234 cyc 基线)
  *           1 = 19 原语轮转 (混合程序, 真实成本谱)
- *           2 = 全 PID (最重档, 探预算上界) */
+ *           2 = 全 PID (最重档, 探预算上界)
+ *           3 = **三档混合** · 全 DIRECT  (div 0/1/2 各约占 1/3)
+ *           4 = **三档混合** · 19 原语轮转 */
 void engine_fill_tables(uint8_t *base, int profile);
+
+/* ══════════ 阶段 3: 档桶调度 (S3 OA15 治本语义) ══════════ */
+
+/** @brief 按 (div, phase) 归组重排路由表 + 生成桶索引
+ *  ★ 幂等: 对已归组的表再跑一次结果不变 (对源表按序扫描再落桶 = 稳定排序)。
+ *  ★ 用 OFF_ROUTE_STAGING 当暂存 (它就是为"重排/热重载"预留的 2KB)。
+ *  @return 归组后的条数 (应 == nr) */
+uint32_t engine_build_buckets(uint8_t *base, uint32_t nr);
+
+/** @brief 桶表校验和 (FNV-1a over 220 × u16) —— 供外部独立预测比对 */
+uint32_t engine_bucket_checksum(const uint8_t *base);
+
+/** @brief H9 断言: 桶表里"不可达槽" (div2 相位 64..99) 的非零个数, 期望恒为 0
+ *  —— 这是"div2 相位数 = 6 位字段能表达的 64 个"这一修正的**可失败判据**:
+ *     若哪天有人把相位数改回 100 而不改字段宽度, 这里立刻不为 0。 */
+uint32_t engine_bucket_dead_slots(const uint8_t *base);
+
+/** @brief ★ 分档调度: 本拍只跑
+ *         [div0 全部] + [div1 桶 tick%10] + [div2 桶 tick%100]
+ *  @param tick      拍号 (调用方保证单调递增)
+ *  @param impl      用哪份实例 (FLASH / ITCM)
+ *  @param nrun_out  可选: 本拍**实际执行**的路由条数 (正向证据: 与外部预测比对)
+ *  @return          三段校验和的异或
+ */
+uint32_t engine_tick(uint8_t *base, uint32_t tick, engine_scan_fn impl,
+                     uint32_t *nrun_out);
 
 /** @brief SHM 静态区 (定义在 engine.c, 链接段 .dtcm_shm / DTCM 0x20000000) */
 extern uint8_t g_shm[SHM_SIZE];

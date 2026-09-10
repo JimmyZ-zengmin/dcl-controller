@@ -59,6 +59,9 @@
 #ifndef BOOT_SEL
 #define BOOT_SEL     1
 #endif
+#ifndef BOOT_SCAN_MODE
+#define BOOT_SCAN_MODE 0     /* 0 = 全表扫 / 1 = 分档调度 (阶段 3) */
+#endif
 
 /* ══════════ 输出脚 ══════════ */
 #define TICK_PORT       0u
@@ -107,9 +110,17 @@ OBS uint32_t g_stat_reset     = 0;   /* 写 1 → ISR 清统计 */
 OBS uint32_t g_pa9_enable     = 0;
 OBS uint32_t g_reinit_done    = 0;   /* 证据: 重填表真的发生了几次 */
 OBS uint32_t g_table_ck       = 0;   /* ★整表校验和 (工具在 Python 里独立重算比对) */
+OBS uint32_t g_bucket_ck      = 0;   /* ★桶表校验和 (同上, 覆盖 220×u16) */
 OBS uint32_t g_active_routes  = 0;   /* 表内 ACTIVE 条数 (期望 = n_routes) */
 OBS uint32_t g_guard_ok       = 0;   /* 栈哨兵: 1 = SHM 顶上的魔术字完好 */
 OBS uint32_t g_guard_bad_off  = 0xFFFFFFFFu;  /* 被踩的第几个字 (诊断用) */
+
+/* ── 阶段 3: 档桶调度 ── */
+OBS uint32_t g_scan_mode      = 0;   /* 0 = 全表扫 (阶段 2 基线) / 1 = 分档调度 */
+OBS uint32_t g_eng_routes_last = 0;  /* 本拍**实际执行**的路由条数 (正向证据) */
+OBS uint64_t g_eng_routes_total = 0; /* 累计执行条数 (与外部预测求和比对) */
+OBS uint32_t g_eng_ticks      = 0;   /* 参与累计的拍数 */
+OBS uint32_t g_bucket_zero_slots = 0;/* 桶表 64..99 槽非零个数 (期望 0; H9 断言) */
 
 /* ── 引擎扫描: 执行证据 ── */
 OBS uint32_t g_eng_ck       = 0;     /* 最近一拍的扫描校验和 */
@@ -242,6 +253,10 @@ static inline void stats_reset(void)
     g_isr_cyc_sum  = 0;
     g_isr_n        = 0;
 
+    g_eng_routes_last  = 0;
+    g_eng_routes_total = 0;
+    g_eng_ticks        = 0;
+
     /* 拍周期也复位 (★ 保留 g_per_prev —— 它保证复位后第一个样本仍然有效) */
     g_per_cyc_last = 0;
     g_per_cyc_min  = 0xFFFFFFFFu;
@@ -276,15 +291,28 @@ ISR_PLACE void TIM2_IRQHandler(void)
         if (g_engine_gate) {
             uint32_t ta = DWT_CYCCNT;
             uint32_t sel = g_engine_sel;
-            uint32_t n   = g_n_routes;
-            if (n > MAX_ROUTES) n = MAX_ROUTES;
-            uint32_t ck = sel ? engine_scan_itcm(g_shm, n)
-                              : engine_scan_flash(g_shm, n);
+            uint32_t ck;
+            uint32_t nrun = 0;
+            if (g_scan_mode) {
+                /* 阶段 3: 分档调度 —— 本拍只跑 [div0]+[div1 本拍桶]+[div2 本拍桶] */
+                ck = engine_tick(g_shm, g_tick_count, sel ? engine_scan_itcm
+                                                          : engine_scan_flash, &nrun);
+            } else {
+                /* 阶段 2 基线: 全表扫 (n = g_n_routes) */
+                uint32_t n = g_n_routes;
+                if (n > MAX_ROUTES) n = MAX_ROUTES;
+                ck = sel ? engine_scan_itcm(g_shm, 0, n)
+                         : engine_scan_flash(g_shm, 0, n);
+                nrun = n;
+            }
             uint32_t tb = DWT_CYCCNT;
 
             g_eng_sel_used = sel;
-            g_eng_n_used   = n;
+            g_eng_n_used   = g_n_routes;
             g_eng_ck       = ck;
+            g_eng_routes_last = nrun;
+            g_eng_routes_total += nrun;
+            g_eng_ticks++;
 
             uint32_t d = tb - ta;
             g_eng_cyc_last = d;
@@ -364,10 +392,13 @@ int main(void)
     shm_guard_paint();
     engine_fill_tables(g_shm, BOOT_PROFILE);
     g_table_ck      = engine_table_checksum(g_shm);
+    g_bucket_ck     = engine_bucket_checksum(g_shm);
+    g_bucket_zero_slots = engine_bucket_dead_slots(g_shm);
     g_active_routes = engine_active_routes(g_shm);
     g_guard_ok      = (uint32_t)shm_guard_ok();
     g_table_profile = BOOT_PROFILE;   /* 让工具看到"当前配置", 而不是"假定配置" */
     g_engine_sel    = BOOT_SEL;
+    g_scan_mode     = BOOT_SCAN_MODE;
     g_n_routes      = MAX_ROUTES;
     g_engine_gate   = BOOT_GATE;
     g_stage = 5;
@@ -395,6 +426,8 @@ int main(void)
             g_engine_gate = 0;
             engine_fill_tables(g_shm, (int)g_table_profile);
             g_table_ck      = engine_table_checksum(g_shm);
+            g_bucket_ck     = engine_bucket_checksum(g_shm);
+            g_bucket_zero_slots = engine_bucket_dead_slots(g_shm);
             g_active_routes = engine_active_routes(g_shm);
             g_engine_gate = sv;
             g_reinit_done++;

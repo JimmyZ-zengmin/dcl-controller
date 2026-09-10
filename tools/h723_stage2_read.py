@@ -47,6 +47,8 @@ STAT_SYMS = [
     ("g_eng_sel_used", 1), ("g_eng_n_used", 1),
     ("g_per_cyc_min", 1), ("g_per_cyc_max", 1), ("g_per_cyc_last", 1),
     ("g_table_ck", 1), ("g_active_routes", 1), ("g_guard_ok", 1),
+    ("g_bucket_ck", 1), ("g_bucket_zero_slots", 1),
+    ("g_eng_routes_last", 1), ("g_eng_routes_total", 2), ("g_eng_ticks", 1),
 ]
 TAIL_SYMS = ["g_eng_ck"]
 
@@ -68,41 +70,158 @@ STATEFUL_OPS = {OP_LPF, OP_PID, OP_HYST, OP_RATE, OP_DEADBAND, OP_EDGE,
                 OP_CNT, OP_TIMER, OP_SR}
 
 
-def predict_table(profile):
-    """返回 (FNV-1a 校验和, ACTIVE 条数) —— 复刻 engine.c:engine_fill_tables"""
-    h, active = 0x811C9DC5, 0
+# ═══════════════════════════════════════════════════════════════════════
+# 阶段 3: 桶表 + 每拍执行条数的独立预测 (复刻 engine_build_buckets / engine_tick)
+#   与 g_bucket_ck / g_eng_routes_last 逐组比对 —— 让"分档调度真的只跑本拍桶"
+#   成为**可失败**的判据 (若退回全表扫, rlast 会等于 128, 不在可行值集合里)。
+# ═══════════════════════════════════════════════════════════════════════
+BUCKET_DIV1_PHASES = 10
+BUCKET_DIV2_PHASES = 64          # ★ 与固件一致 (6 位 phase 字段)
+ROUTE_BUCKET_U16 = 220
+
+
+def _route_divphase(profile, i):
+    """复刻 engine_fill_tables 的档位/相位分配"""
+    dv, ph = 0, 0
+    if profile in (3, 4):
+        g, m = i // 3, i % 3
+        if m == 1:
+            dv, ph = 1, g % BUCKET_DIV1_PHASES
+        elif m == 2:
+            dv, ph = 2, g % BUCKET_DIV2_PHASES
+    return dv, ph
+
+
+def predict_buckets(profile):
+    """返回 (FNV 校验和, 不可达槽非零个数, off1, cnt1, off2, cnt2)"""
+    n0 = 0
+    cnt1 = [0] * BUCKET_DIV1_PHASES
+    cnt2 = [0] * BUCKET_DIV2_PHASES
     for i in range(MAX_ROUTES):
-        op = MIXED_OPS[i % 19] if profile == 1 else (OP_PID if profile == 2 else OP_DIRECT)
-        src_type = 0 if i % 3 == 0 else (1 if i % 3 == 1 else 2)
-        state_offset = (i % 128) if op in STATEFUL_OPS else 0
-        flags = 1                                     # ROUTE_FLAG_ACTIVE
-        v = (op & 0xFF) | ((flags & 0xFF) << 8) | ((src_type & 0xFF) << 16) \
-            | ((state_offset & 0xFFFF) << 20)
-        h = ((h ^ v) * 16777619) & 0xFFFFFFFF
+        dv, ph = _route_divphase(profile, i)
+        if dv == 0:
+            n0 += 1
+        elif dv == 1:
+            cnt1[ph] += 1
+        else:
+            cnt2[ph] += 1
+    off1, acc = [0] * BUCKET_DIV1_PHASES, n0
+    for p in range(BUCKET_DIV1_PHASES):
+        off1[p] = acc
+        acc += cnt1[p]
+    off2 = [0] * BUCKET_DIV2_PHASES
+    for p in range(BUCKET_DIV2_PHASES):
+        off2[p] = acc
+        acc += cnt2[p]
+    # 桶表 = 220 u16: [off1[10]][cnt1[10]][off2[100]][cnt2[100]]
+    #   ★ 固件只填 off2/cnt2 的 0..63, 64..99 恒 0 (H9)
+    table = off1 + cnt1 + off2 + [0] * (100 - BUCKET_DIV2_PHASES) \
+            + cnt2 + [0] * (100 - BUCKET_DIV2_PHASES)
+    assert len(table) == ROUTE_BUCKET_U16, len(table)
+    h = 0x811C9DC5
+    for v in table:
+        h = ((h ^ (v & 0xFFFF)) * 16777619) & 0xFFFFFFFF
+    return h, 0, off1, cnt1, off2, cnt2
+
+
+def predict_routes_at(profile, tick):
+    """本拍应执行的路由条数 = div0 全部 + div1 桶 + div2 桶"""
+    _h, _d, off1, cnt1, off2, cnt2 = predict_buckets(profile)
+    return off1[0] + cnt1[tick % BUCKET_DIV1_PHASES] + cnt2[tick % BUCKET_DIV2_PHASES]
+
+
+def _route_fields(profile, i):
+    """复刻 engine_fill_tables 单条路由的 op/src_type/state_offset/flags"""
+    if profile == 1 or profile == 4:
+        op = MIXED_OPS[i % 19]
+    elif profile == 2:
+        op = OP_PID
+    else:
+        op = OP_DIRECT
+    src_type = 0 if i % 3 == 0 else (1 if i % 3 == 1 else 2)
+    state_offset = (i % 128) if op in STATEFUL_OPS else 0
+    return op, src_type, state_offset, 1
+
+
+DST_WIRE = 2
+STATE_OFF_MAX = 128
+WIRE2_OPS = {OP_AND, OP_OR, OP_ARITH, OP_SR, OP_CNT}
+
+
+def _route_bytes(profile, i):
+    """复刻 engine_fill_tables 单条路由的 **16 字节** 打包 (RouteEntry_t, packed LE)"""
+    op, src_type, state_offset, flags = _route_fields(profile, i)
+    dv, ph = _route_divphase(profile, i)
+    b = bytearray(16)
+    b[0] = src_type
+    b[1] = i % 64                      # src_index
+    b[2] = DST_WIRE                    # dst_type
+    b[3] = i % 128                     # dst_channel
+    b[4] = op
+    b[5] = flags
+    b[6:8] = (i % 128).to_bytes(2, "little")            # param_idx
+    b[8:10] = state_offset.to_bytes(2, "little")
+    b[10:12] = (0).to_bytes(2, "little")                # actuator_idx
+    b[12:14] = ((i + 7) % 128 if op in WIRE2_OPS else 0).to_bytes(2, "little")
+    b[14] = (dv | (ph << 2)) & 0xFF                     # period  ← offset 14, 不是 15!
+    b[15] = 0                                           # reserved (S3 的尾部填充)
+    return bytes(b)
+
+
+def _bucket_order(profile):
+    """复刻 engine_build_buckets: [div0 (源序)][div1 phase0..9][div2 phase0..63]
+    —— 桶内保持源序 (稳定排序), 所以对整个表再跑一次是恒等变换 (幂等)。"""
+    items = []
+    for i in range(MAX_ROUTES):
+        dv, ph = _route_divphase(profile, i)
+        items.append((dv, ph, _route_bytes(profile, i)))
+    out = [it for it in items if it[0] == 0]
+    for p in range(BUCKET_DIV1_PHASES):
+        out += [it for it in items if it[0] == 1 and it[1] == p]
+    for p in range(BUCKET_DIV2_PHASES):
+        out += [it for it in items if it[0] == 2 and it[1] == p]
+    return out
+
+
+def predict_table(profile):
+    """返回 (FNV-1a 校验和, ACTIVE 条数) —— 复刻 engine_fill_tables
+    ★ 逐字节哈希整个 16B 条目, 覆盖全部字段 (含 period) 与归组后的表序"""
+    h, active = 0x811C9DC5, 0
+    for (_dv, _ph, raw) in _bucket_order(profile):
+        for byte in raw:
+            h = ((h ^ byte) * 16777619) & 0xFFFFFFFF
         active += 1
     return h, active
 ITCM_VERIFY_WORDS = 64      # 每次比对 256 字节
 
-# 配置矩阵: (代号, 标签, gate, sel, profile, n, icache)
+# 配置矩阵: (代号, 标签, gate, sel, profile, n, icache, scan_mode)
+#   scan_mode: 0 = 全表扫 (阶段 2 基线) / 1 = 分档调度 (阶段 3)
 #   ★ icache 只能从 0→1 单向切换, 所以所有 icache=0 的组必须排在前面
 #   ★ 代号必须显式带上 —— 之前用列表下标映射代号, --quick 子集下全部错位
 CONFIGS_FULL = [
-    ("A",  "骨架 (gate=0 不扫描)          ", 0, 0, 0, 128, 0),
-    ("B1", "FLASH 全表128·全DIRECT ·IC关  ", 1, 0, 0, 128, 0),
-    ("B2", "ITCM  全表128·全DIRECT ·IC关  ", 1, 1, 0, 128, 0),
-    ("C1", "FLASH 全表128·19原语轮转·IC关 ", 1, 0, 1, 128, 0),
-    ("C2", "ITCM  全表128·19原语轮转·IC关 ", 1, 1, 1, 128, 0),
-    ("D1", "FLASH 半表 64·全DIRECT ·IC关  ", 1, 0, 0, 64, 0),
-    ("D2", "ITCM  半表 64·全DIRECT ·IC关  ", 1, 1, 0, 64, 0),
-    ("E",  "ITCM  全表128·全PID    ·IC关  ", 1, 1, 2, 128, 0),
-    ("F1", "FLASH 全表128·全DIRECT ·IC开★ ", 1, 0, 0, 128, 1),
-    ("F2", "ITCM  全表128·全DIRECT ·IC开★ ", 1, 1, 0, 128, 1),
-    ("F3", "FLASH 半表 64·全DIRECT ·IC开★ ", 1, 0, 0, 64, 1),
+    ("A", "骨架 (gate=0 不扫描)          ", 0, 0, 0, 128, 0, 0),
+    ("B1", "FLASH 全表128·全DIRECT ·IC关  ", 1, 0, 0, 128, 0, 0),
+    ("B2", "ITCM  全表128·全DIRECT ·IC关  ", 1, 1, 0, 128, 0, 0),
+    ("C1", "FLASH 全表128·19原语轮转·IC关 ", 1, 0, 1, 128, 0, 0),
+    ("C2", "ITCM  全表128·19原语轮转·IC关 ", 1, 1, 1, 128, 0, 0),
+    ("D1", "FLASH 半表 64·全DIRECT ·IC关  ", 1, 0, 0, 64, 0, 0),
+    ("D2", "ITCM  半表 64·全DIRECT ·IC关  ", 1, 1, 0, 64, 0, 0),
+    ("E", "ITCM  全表128·全PID    ·IC关  ", 1, 1, 2, 128, 0, 0),
+    ("F1", "FLASH 全表128·全DIRECT ·IC开★ ", 1, 0, 0, 128, 1, 0),
+    ("F2", "ITCM  全表128·全DIRECT ·IC开★ ", 1, 1, 0, 128, 1, 0),
+    ("F3", "FLASH 半表 64·全DIRECT ·IC开★ ", 1, 0, 0, 64, 1, 0),
 ]
 _QM = {"A", "B1", "B2", "F1", "F2"}
 CONFIGS_QUICK = [c for c in CONFIGS_FULL if c[0] in _QM]
 # 落位敏感扫描用: 只要 骨架 / FLASH / ITCM 三条 + 混合组, 单次跑 ~3s
 _SW = {"A", "B1", "B2", "C1"}
+# 阶段 3: 分档调度 —— 同一份三档程序, 分档 vs 全表 直接对照
+CONFIGS_FULL += [
+    ("G1", "ITCM 分档·三档DIRECT(prof3)", 1, 1, 3, 128, 0, 1),
+    ("G2", "ITCM 全表·三档DIRECT(prof3)", 1, 1, 3, 128, 0, 0),
+    ("G3", "ITCM 分档·三档混合(prof4)  ", 1, 1, 4, 128, 0, 1),
+    ("G4", "ITCM 全表·三档混合(prof4)  ", 1, 1, 4, 128, 0, 0),
+]
 CONFIGS_SWEEP = [c for c in CONFIGS_FULL if c[0] in _SW]
 
 
@@ -147,7 +266,7 @@ def run(sym, configs, dur):
     #   "gate 还是旧值"的拍会把 isr_min 污染成骨架值 (实测差 ~26000 cyc)。
     cur_profile = 0
     icache_on = False
-    for (code, label, gate, sel, prof, n, ic) in configs:
+    for (code, label, gate, sel, prof, n, ic, mode) in configs:
         if ic != (1 if icache_on else 0):
             if ic == 1:
                 cmd.append("write32 0x%08X 1" % sym["g_icache_req"])
@@ -160,6 +279,7 @@ def run(sym, configs, dur):
             cmd.append("sleep 300")
             cur_profile = prof
         cmd.append("write32 0x%08X %d" % (sym["g_engine_sel"], sel))
+        cmd.append("write32 0x%08X %d" % (sym["g_scan_mode"], mode))
         cmd.append("write32 0x%08X %d" % (sym["g_n_routes"], n))
         cmd.append("write32 0x%08X %d" % (sym["g_engine_gate"], gate))  # ★ 先定 gate
         cmd.append("sleep 30")                                         # 让两组状态分离
@@ -298,7 +418,7 @@ def main():
              "置位" if (hdr['g_ccr_after'] >> 17) & 1 else "未置位"))
 
     rows = []
-    for (code, label, gate, sel, prof, n, ic) in configs:
+    for (code, label, gate, sel, prof, n, ic, mode) in configs:
         st = {}
         for nm, w in STAT_SYMS:
             v = 0
@@ -307,7 +427,7 @@ def main():
             st[nm] = v
         next(it)  # guard (g_stage)
         rows.append(dict(code=code, label=label.strip(),
-                         gate=gate, sel=sel, prof=prof, n=n, ic=ic,
+                         gate=gate, sel=sel, prof=prof, n=n, ic=ic, mode=mode,
                          emin=0 if st['g_eng_cyc_min'] == 0xFFFFFFFF else st['g_eng_cyc_min'],
                          emax=st['g_eng_cyc_max'], elast=st['g_eng_cyc_last'],
                          esum=st['g_eng_cyc_sum'], en=st['g_eng_n'], ediv0=st['g_eng_div0'],
@@ -318,7 +438,10 @@ def main():
                          pmin=0 if st['g_per_cyc_min'] == 0xFFFFFFFF else st['g_per_cyc_min'],
                          pmax=st['g_per_cyc_max'], plast=st['g_per_cyc_last'],
                          tck=st['g_table_ck'], active=st['g_active_routes'],
-                         guard=st['g_guard_ok']))
+                         guard=st['g_guard_ok'],
+                         bck=st['g_bucket_ck'], bdead=st['g_bucket_zero_slots'],
+                         rlast=st['g_eng_routes_last'], rtot=st['g_eng_routes_total'],
+                         rtick=st['g_eng_ticks']))
     tail = {n: next(it) for n in TAIL_SYMS}
     d = {r['code']: r for r in rows}
 
@@ -434,20 +557,62 @@ def main():
     print("  注: 骨架/ITCM 组一律 40000 整 —— ITCM 的成本与负载无关, 不参与超载。")
 
     print("\n" + "=" * 80)
-    print("⑥ 守卫 (必须全 ✓, 否则本组数据不可信)")
+    print("⑥ 阶段 3: 分档调度 vs 全表扫 (同一份三档程序, 只切换扫描方式)")
+    print("=" * 80)
+    for ca, cb, nm in (("G1", "G2", "三档·全DIRECT"), ("G3", "G4", "三档·19原语混合")):
+        if ca in d and cb in d:
+            ra, rb = d[ca], d[cb]
+            _, _, o1, c1, o2, c2 = predict_buckets(ra['prof'])
+            print("  %-16s  分档 eng_min=%6d (本拍%2d 条, 最坏占拍 %5.2f%%)"
+                  % (nm, ra['emin'], ra['rlast'], 100.0 * ra['imax'] / TICK_CYC))
+            print("  %-16s  全表 eng_min=%6d (本拍%2d 条, 最坏占拍 %5.2f%%)"
+                  % ("", rb['emin'], rb['rlast'], 100.0 * rb['imax'] / TICK_CYC))
+            if ra['emin']:
+                print("  %-16s  条数比 %.2f×   成本比 %.2f×   ← 两者应一致"
+                      % ("", rb['rlast'] / float(max(ra['rlast'], 1)),
+                         rb['emin'] / float(ra['emin'])))
+            print()
+    if "G1" in d:
+        _, _, o1, c1, o2, c2 = predict_buckets(3)
+        print("  桶表 (profile 3): div0 每拍 %d 条 | div1 桶 %s | div2 共 %d 条分布在 %d 个相位"
+              % (o1[0], c1, sum(c2), BUCKET_DIV2_PHASES))
+
+    print("\n" + "=" * 80)
+    print("⑦ 守卫 (必须全 ✓, 否则本组数据不可信)")
     print("=" * 80)
     for r in rows:
         exp_ck, exp_ac = predict_table(r['prof'])
+        exp_bck, exp_dead, _o1, _c1, _o2, _c2 = predict_buckets(r['prof'])
+        feas = set(predict_routes_at(r['prof'], t) for t in range(320))
         ck_ok = (r['tck'] == exp_ck)          # ★表内容与独立预测一致
         ac_ok = (r['active'] == exp_ac)       # ★ACTIVE 条数与预测一致
         gd_ok = (r['guard'] == 1)             # ★栈没踩到表
+        bk_ok = (r['bck'] == exp_bck and r['bdead'] == exp_dead)   # ★桶表与独立预测一致
+        # ★行为判据 (可失败):
+        #   分档 → 本拍条数必须在桶表允许的**可行值集合**里, 且均值也落在区间内。
+        #          若退回全表扫, rlast 会是 128, 不在 {47,48,49} 里 → 立刻暴露。
+        #   全表 → 本拍条数必须恰好等于 n。
+        rl_ok = True
+        if r['gate']:
+            if r['mode']:
+                rl_ok = (r['rlast'] in feas)
+                if r['rtick']:
+                    avg = r['rtot'] / float(r['rtick'])
+                    rl_ok = rl_ok and (min(feas) - 0.01 <= avg <= max(feas) + 0.01)
+            else:
+                rl_ok = (r['rlast'] == r['n'])
         if r['gate']:
             ok = (r['ediv0'] == 0 and r['en'] > 0 and r['sel_used'] == r['sel']
-                  and r['n_used'] == r['n'] and ck_ok and ac_ok and gd_ok)
-            why = "div0=%d n=%d sel=%d/%d 表ck=%s ACTIVE=%d/%d 哨兵=%s" % (
-                r['ediv0'], r['en'], r['sel_used'], r['n'],
-                "✓" if ck_ok else "✗0x%08X≠0x%08X" % (r['tck'], exp_ck),
-                r['active'], exp_ac, "✓" if gd_ok else "✗被踩")
+                  and ck_ok and ac_ok and gd_ok and bk_ok and rl_ok)
+            why = "表ck=%s 桶ck=%s/%s 槽64-99=%d 本拍条数=%d%s%s%s%s" % (
+                "✓" if ck_ok else "✗",
+                "✓" if r['bck'] == exp_bck else "✗0x%08X≠0x%08X" % (r['bck'], exp_bck),
+                "分档" if r['mode'] else "全表",
+                r['bdead'], r['rlast'],
+                " 可行值%s" % sorted(feas) if r['mode'] else " (应=%d)" % r['n'],
+                "" if rl_ok else " ✗条数不在可行集!",
+                "" if ac_ok else " ✗ACTIVE=%d≠%d" % (r['active'], exp_ac),
+                "" if gd_ok else " ✗哨兵被踩")
         else:
             ok = (r['en'] == 0)
             why = "eng_n=%d (骨架组必须 0)  表ck=%s 哨兵=%s" % (
@@ -460,10 +625,10 @@ def main():
         seen.setdefault(r['tck'], []).append(r['code'])
     for ck, codes in sorted(seen.items()):
         print("      校验和 0x%08X  ← %s" % (ck, "/".join(codes)))
-    if len(seen) < 3:
-        print("      !! 只有 %d 种校验和 —— 三种 profile 应当给出三个**互不相同**的值" % len(seen))
+    if len(seen) < 4:
+        print("      !! 只有 %d 种校验和 —— 各 profile/模式应给出互不相同的值" % len(seen))
     else:
-        print("      ✓ 三种 profile 的校验和互不相同 → 哨兵具备可失败性")
+        print("      ✓ %d 种配置的校验和互不相同 → 哨兵具备可失败性" % len(seen))
 
     if a.json:
         import json as _json

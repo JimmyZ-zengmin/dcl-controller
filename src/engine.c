@@ -25,6 +25,9 @@
 #include "engine.h"
 #include "primitives.h"
 
+/* ITCM 段属性 (阶段 3 的分档调度也住在热路径上) */
+#define ATTR_ITCM __attribute__((section(".itcm_text"), noinline))
+
 /* ══════════════════════════════════════════════════════════════════
  * SHM: 静态 DTCM 区 (S3 是运行期 heap_caps 分配, 这里是链接期落位)
  * ══════════════════════════════════════════════════════════════════ */
@@ -85,14 +88,17 @@ int shm_guard_ok(void)
 /* ══════════ 路由表校验和 (独立可预测 → 可失败) ══════════ */
 uint32_t engine_table_checksum(const uint8_t *base)
 {
-    const RouteEntry_t *rt = (const RouteEntry_t *)(base + OFF_ROUTE_TABLE);
-    uint32_t h = 0x811C9DC5u;                        /* FNV-1a 偏移基数 */
-    for (int i = 0; i < MAX_ROUTES; i++) {
-        uint32_t v = (uint32_t)rt[i].op
-                   | ((uint32_t)rt[i].flags        << 8)
-                   | ((uint32_t)rt[i].src_type     << 16)
-                   | ((uint32_t)rt[i].state_offset << 20);
-        h = (h ^ v) * 16777619u;                     /* FNV-1a 素数 (u32 自然回绕) */
+    /* ★ 对**整个 16 字节条目**逐字节做 FNV-1a, 而不是对拼好的字段做。
+     *   第一版是"字段位拼装"版, 有两个毛病:
+     *     ① `state_offset << 20` 与 `src_type << 16` 在 bit 20-23 **重叠** —— 
+     *        (src_type, state_offset) 的不同组合可能撞同一个 v;
+     *     ② **完全没覆盖 `period`** —— 也就是档位/相位分配不在校验范围内。
+     *   逐字节版没有重叠, 且天然覆盖全部字段 (含 period), 因此也顺带覆盖了
+     *   engine_build_buckets 的**归组重排** (字节序参与哈希)。 */
+    const uint8_t *rt = base + OFF_ROUTE_TABLE;
+    uint32_t h = 0x811C9DC5u;
+    for (uint32_t i = 0; i < (uint32_t)MAX_ROUTES * 16u; i++) {
+        h = (h ^ (uint32_t)rt[i]) * 16777619u;
     }
     return h;
 }
@@ -177,9 +183,11 @@ const uint8_t g_scan_pad[SCAN_FLASH_PAD] = { 0x5A };
  * ★ 扫描体: 一份源码 → 两份实例 (FLASH / ITCM)
  * ══════════════════════════════════════════════════════════════════ */
 #define DEFINE_ENGINE_SCAN(FN, ATTR)                                           \
-ATTR uint32_t FN(uint8_t *base, uint32_t n)                                    \
+ATTR uint32_t FN(uint8_t *base, uint32_t first, uint32_t count)                \
 {                                                                              \
-    if (n > MAX_ROUTES) n = MAX_ROUTES;                                        \
+    uint32_t n = count;                                                        \
+    if (first >= MAX_ROUTES) return 0;                                         \
+    if (first + n > MAX_ROUTES) n = MAX_ROUTES - first;                        \
     const RouteEntry_t *rt = (const RouteEntry_t *)(base + OFF_ROUTE_TABLE);    \
     const ParamEntry_t *pm = (const ParamEntry_t *)(base + OFF_PARAM_TABLE);    \
     StateEntry_t       *st = (StateEntry_t       *)(base + OFF_STATE_TABLE);    \
@@ -189,9 +197,9 @@ ATTR uint32_t FN(uint8_t *base, uint32_t n)                                    \
     float *lu = (float *)(base + OFF_LUT_DATA);                                \
     uint32_t acc = 0;                                                          \
                                                                                \
-    for (uint32_t i = 0; i < n; i++) {                                         \
-        const RouteEntry_t *r = &rt[i];                                        \
-        /* 未激活的路由跳过 (S3 桶化只放 ACTIVE, 这里全表扫需显式判) */         \
+    for (uint32_t k = 0; k < n; k++) {                                         \
+        const RouteEntry_t *r = &rt[first + k];                                 \
+        /* 未激活的路由跳过 (S3 桶化只放 ACTIVE, 全表扫需显式判) */             \
         if (!(r->flags & ROUTE_FLAG_ACTIVE)) continue;                         \
         uint32_t dv = r->period & PERIOD_DIV_MASK;                             \
         float dt = (dv == PERIOD_DIV_IDX_MID) ? DT_MID                         \
@@ -220,7 +228,119 @@ DEFINE_ENGINE_SCAN(engine_scan_flash, __attribute__((section(".scan_flash"), noi
 DEFINE_ENGINE_SCAN(engine_scan_itcm,  __attribute__((section(".itcm_text"), noinline)))
 
 /* ══════════════════════════════════════════════════════════════════
- * 表填充 (测量用的确定性装载, 不是 deploy —— deploy 属阶段 3)
+ * 阶段 3: 档桶调度 (S3 OA15 治本)
+ *
+ * 为什么需要它: 阶段 2 的"全表扫"实测 128 条混合程序要 39426~41166 cyc,
+ * 占拍 98~104% —— 贴着上限, 一次无关改动的落位就能把它推过线。
+ * 桶化后每拍只跑 [div0 全部] + [div1 本拍 phase] + [div2 本拍 phase]。
+ * ══════════════════════════════════════════════════════════════════ */
+
+uint32_t engine_build_buckets(uint8_t *base, uint32_t nr)
+{
+    if (nr > MAX_ROUTES) nr = MAX_ROUTES;
+    RouteEntry_t *act = (RouteEntry_t *)(base + OFF_ROUTE_TABLE);
+    RouteEntry_t *scr = (RouteEntry_t *)(base + OFF_ROUTE_STAGING);  /* 暂存 */
+    uint16_t *bkt  = (uint16_t *)(base + OFF_ROUTE_BUCKETS);
+    uint16_t *off1 = bkt, *cnt1 = bkt + BUCKET_DIV1_PHASES;
+    uint16_t *off2 = bkt + 20, *cnt2 = bkt + 120;
+
+    /* 快照源表 (重排是"读源写目"的同表操作, 必须先存) */
+    for (uint32_t i = 0; i < nr; i++) scr[i] = act[i];
+
+    /* ★ 幂等的关键: 桶表必须**先清零**。不清的话第二次调用会把计数叠加上去
+     *   (S3 "脚本非幂等"那一族在固件里的对应形态)。 */
+    for (int i = 0; i < ROUTE_BUCKET_U16; i++) bkt[i] = 0;
+
+    /* ---- 第一遍: 统计各桶容量 ---- */
+    uint16_t n0 = 0;
+    for (uint32_t i = 0; i < nr; i++) {
+        uint32_t dv = scr[i].period & PERIOD_DIV_MASK;
+        if      (dv == PERIOD_DIV_IDX_FAST) n0++;
+        else if (dv == PERIOD_DIV_IDX_MID)  cnt1[(scr[i].period >> PERIOD_PHASE_SHIFT)
+                                                 % BUCKET_DIV1_PHASES]++;
+        else if (dv == PERIOD_DIV_IDX_SLOW) cnt2[(scr[i].period >> PERIOD_PHASE_SHIFT)
+                                                 % BUCKET_DIV2_PHASES]++;
+    }
+
+    /* ---- 计算桶起点 (off1[0] 兼作"div0 条数", 与 S3 同语义) ---- */
+    uint16_t acc = n0;
+    for (int p = 0; p < BUCKET_DIV1_PHASES; p++) { off1[p] = acc; acc += cnt1[p]; }
+    uint16_t div1_total = (uint16_t)(acc - n0);
+    for (int p = 0; p < BUCKET_DIV2_PHASES; p++) { off2[p] = acc; acc += cnt2[p]; }
+
+    /* ---- 第二遍: 按桶序落位 (对源表按序扫描 → 桶内相对顺序不变 = 稳定排序,
+     *      所以对已归组的表再跑一次是恒等变换 ⇒ 幂等) ---- */
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < nr; i++) {                      /* div0 段 */
+        if ((scr[i].period & PERIOD_DIV_MASK) == PERIOD_DIV_IDX_FAST) act[w++] = scr[i];
+    }
+    for (int p = 0; p < BUCKET_DIV1_PHASES; p++) {           /* div1 各 phase 桶 */
+        for (uint32_t i = 0; i < nr; i++) {
+            if ((scr[i].period & PERIOD_DIV_MASK) != PERIOD_DIV_IDX_MID) continue;
+            if (((scr[i].period >> PERIOD_PHASE_SHIFT) % BUCKET_DIV1_PHASES) != (uint32_t)p) continue;
+            act[w++] = scr[i];
+        }
+    }
+    for (int p = 0; p < BUCKET_DIV2_PHASES; p++) {           /* div2 各 phase 桶 */
+        for (uint32_t i = 0; i < nr; i++) {
+            if ((scr[i].period & PERIOD_DIV_MASK) != PERIOD_DIV_IDX_SLOW) continue;
+            if (((scr[i].period >> PERIOD_PHASE_SHIFT) % BUCKET_DIV2_PHASES) != (uint32_t)p) continue;
+            act[w++] = scr[i];
+        }
+    }
+    (void)div1_total;
+    return w;   /* 应 == nr */
+}
+
+uint32_t engine_bucket_checksum(const uint8_t *base)
+{
+    const uint16_t *bkt = (const uint16_t *)(base + OFF_ROUTE_BUCKETS);
+    uint32_t h = 0x811C9DC5u;
+    for (int i = 0; i < ROUTE_BUCKET_U16; i++) {
+        h = (h ^ (uint32_t)bkt[i]) * 16777619u;
+    }
+    return h;
+}
+
+uint32_t engine_bucket_dead_slots(const uint8_t *base)
+{
+    /* 槽 64..99 在**两个**数组里: off2[64..99] 与 cnt2[64..99] */
+    const uint16_t *bkt = (const uint16_t *)(base + OFF_ROUTE_BUCKETS);
+    const uint16_t *off2 = bkt + 20, *cnt2 = bkt + 120;
+    uint32_t bad = 0;
+    for (int p = BUCKET_DIV2_PHASES; p < 100; p++) {
+        if (off2[p]) bad++;
+        if (cnt2[p]) bad++;
+    }
+    return bad;
+}
+
+ATTR_ITCM uint32_t engine_tick(uint8_t *base, uint32_t tick, engine_scan_fn impl,
+                               uint32_t *nrun_out)
+{
+    const uint16_t *bkt  = (const uint16_t *)(base + OFF_ROUTE_BUCKETS);
+    const uint16_t *off1 = bkt, *cnt1 = bkt + BUCKET_DIV1_PHASES;
+    const uint16_t *off2 = bkt + 20, *cnt2 = bkt + 120;
+
+    uint32_t ph1 = tick % (uint32_t)BUCKET_DIV1_PHASES;
+    uint32_t ph2 = tick % (uint32_t)BUCKET_DIV2_PHASES;
+    uint32_t nrun = 0, ck = 0;
+
+    uint32_t n0 = off1[0];                       /* div0 段: [0, n0) 每拍全跑 */
+    if (n0) { ck ^= impl(base, 0, n0); nrun += n0; }
+
+    uint32_t b1 = off1[ph1], c1 = cnt1[ph1];     /* div1: 本拍 phase 桶 */
+    if (c1) { ck ^= impl(base, b1, c1); nrun += c1; }
+
+    uint32_t b2 = off2[ph2], c2 = cnt2[ph2];     /* div2: 本拍 phase 桶 */
+    if (c2) { ck ^= impl(base, b2, c2); nrun += c2; }
+
+    if (nrun_out) *nrun_out = nrun;
+    return ck;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * 表填充 (测量用的确定性装载, 不是 deploy —— deploy 属阶段 3.2)
  * ══════════════════════════════════════════════════════════════════ */
 static const uint8_t k_mixed_ops[19] = {
     OP_DIRECT, OP_CMP, OP_CLAMP, OP_SCALE, OP_AND, OP_OR, OP_NOT, OP_MUX,
@@ -258,9 +378,22 @@ void engine_fill_tables(uint8_t *base, int profile)
     for (int i = 0; i < MAX_ROUTES; i++) {
         uint8_t op;
         switch (profile) {
-            case 1:  op = k_mixed_ops[i % 19]; break;
-            case 2:  op = OP_PID;              break;
-            default: op = OP_DIRECT;           break;
+            case 1:  op = k_mixed_ops[i % 19]; break;   /* 19 原语轮转 */
+            case 2:  op = OP_PID;              break;   /* 最重档 */
+            case 4:  op = k_mixed_ops[i % 19]; break;   /* 三档混合 · 原语轮转 */
+            default: op = OP_DIRECT;           break;   /* 0 与 3 */
+        }
+        /* ---- 档位/相位分配 (★ 必须与工具里的 Python 预测逐字对应) ----
+         * profile 3/4 = 三档混合: div = i % 3, 约 1/3 落在 div0/1/2;
+         *   div1 phase = (i/3) % BUCKET_DIV1_PHASES
+         *   div2 phase = (i/3) % BUCKET_DIV2_PHASES   (64, 不是 100 —— 见 engine.h 的 H9)
+         * 其它 profile = 全 div0 (与阶段 2 的表保持一致, 便于对照)。 */
+        uint8_t dv = PERIOD_DIV_IDX_FAST, ph = 0;
+        if (profile == 3 || profile == 4) {
+            uint32_t g = (uint32_t)i / 3u;
+            uint32_t m = (uint32_t)i % 3u;
+            if (m == 1)      { dv = PERIOD_DIV_IDX_MID;  ph = (uint8_t)(g % BUCKET_DIV1_PHASES); }
+            else if (m == 2) { dv = PERIOD_DIV_IDX_SLOW; ph = (uint8_t)(g % BUCKET_DIV2_PHASES); }
         }
         rt[i].src_type     = (uint8_t)((i % 3 == 0) ? SRC_SENSOR
                                      : (i % 3 == 1) ? SRC_WIRE : SRC_CONST);
@@ -279,6 +412,12 @@ void engine_fill_tables(uint8_t *base, int profile)
         rt[i].wire2_idx    = (uint16_t)((op == OP_AND || op == OP_OR || op == OP_ARITH ||
                                          op == OP_SR  || op == OP_CNT)
                                         ? ((i + 7) % MAX_WIRES) : 0);
-        rt[i].period       = PERIOD_DIV_IDX_FAST;          /* 全 div0 (本阶段不分档) */
+        rt[i].period       = (uint8_t)(dv | (uint8_t)(ph << PERIOD_PHASE_SHIFT));
+        rt[i].reserved     = 0;
     }
+
+    /* ★ 归组重排 + 生成桶索引 (幂等)。
+     *   非三档 profile 也照跑 —— 结果是恒等变换(全 div0), 但保证桶表一定被建立,
+     *   不会出现"某档忘了建桶 → 每拍空扫"的静默失效。 */
+    engine_build_buckets(base, MAX_ROUTES);
 }
