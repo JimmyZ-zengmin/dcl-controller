@@ -34,5 +34,5 @@ fi
 "$CMAKE" --build "$BUILD"
 
 echo
-echo "产物: $HERE/build/dcl_h723.{elf,bin,hex}"
+echo "产物: $HERE/build/dcl_h723 (ELF, 无扩展名) + .bin + .hex + .map"
 echo "烧录: pyocd flash -t stm32h723xx \"$HERE/build/dcl_h723.hex\""
