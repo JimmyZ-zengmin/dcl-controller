@@ -1,2 +1,4 @@
 build/
+build_min/
 .la/
+tmp_dap/

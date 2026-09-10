@@ -15,7 +15,16 @@ project(dcl_h723 C ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-set(TARGET dcl_h723)
+# ★ 独立的"最小固件"开关: 1 = 只编 src/min_uart.c (与 DCL 引擎/中断/协议全无关)。
+#   排障用: 当"串口不通"时, 用它把自研代码整体排除, 先证明 USART 通路本身可用。
+set(DCL_MIN_UART "0" CACHE STRING "1 = 只编最小 UART 固件 (src/min_uart.c), 与引擎无关")
+set(DCL_MIN_STRESS "0" CACHE STRING "最小固件: 1 = TX 不停发 (压力模式, 便于判 TX 通路)")
+
+if(DCL_MIN_UART)
+    set(TARGET min_uart)
+else()
+    set(TARGET dcl_h723)
+endif()
 
 # ---- bench 启动默认配置 (外部仪器测非默认配置时必须编进固件, 见 main.c 注释) ----
 set(DCL_BOOT_PROFILE "0" CACHE STRING "启动默认 table_profile (0 全DIRECT / 1 混合 / 2 全PID)")
@@ -64,6 +73,7 @@ add_compile_options(
     -DUART_SELFTEST=${DCL_UART_SELFTEST}
     -DUART_BAUD=${DCL_UART_BAUD}u
     -DDEPLOY_SELFTEST=${DCL_DEPLOY_SELFTEST}
+    -DMIN_TX_STRESS=${DCL_MIN_STRESS}
 )
 
 # syscalls.c 是 newlib 桩: 函数签名由 newlib 规定, 参数天然用不上。
@@ -87,16 +97,24 @@ set_source_files_properties(${STARTUP} PROPERTIES
     LANGUAGE ASM
     COMPILE_OPTIONS "-x;assembler-with-cpp")
 
-set(SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/engine.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/clock.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/transport.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/uart.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/sysmem.c
-    ${STARTUP}
-)
+if(DCL_MIN_UART)
+    # 最小固件: 只要一个 C 文件 + 启动文件 (不用 newlib, 不用 syscalls/sysmem)
+    set(SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/min_uart.c
+        ${STARTUP}
+    )
+else()
+    set(SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/engine.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/clock.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/uart.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/sysmem.c
+        ${STARTUP}
+    )
+endif()
 
 add_executable(${TARGET} ${SOURCES})
 

@@ -13,9 +13,15 @@
  *  ⑤ 接收中断体放 ITCM (每字节都走, 属热路径; flash 取指成本随落位摆动 15%,
  *     见 docs/REF-flash-placement.md)。
  *
- * 波特率: BRR = round(PCLK2 × 16 / baud)  (OVER8=0, PRESC=0)
- *   H723 本项目: PCLK2 = 100 MHz, 115200 → 13889 = 0x3641
- *   实际波特率 100e6/(868 + 1/16) = 115199.6 → 误差 0.0004% (远优于 2% 容限)
+ * 波特率: BRR = round(PCLK2 / baud)   (OVER8=0 即 16 倍过采样, PRESC=0)
+ *   H723 本项目: PCLK2 = 100 MHz, 115200 → 868 = 0x364
+ *   实际波特率 100e6/868 = 115207 → 误差 0.006% (远优于 2% 容限)
+ *
+ * ★★ 公式勘误 (真事故, 别再改回去): 这里曾写成 `PCLK2*16/baud`,
+ *   注释还"自证"说 100e6*16/115200 = 0x3641 是对的 —— 其实那是 16 倍分频,
+ *   实际波特率只有 7200。OVER8=0 时 BRR 就是**分频值本身**, 不乘 16。
+ *   症状: CR1/BRR/GPIO 读写全"正常", TE 开着、TXE/TC 都为 1,
+ *        唯独对端一个字节都解不出来 —— 因为波特率差了 16 倍。
  */
 #include "uart.h"
 #include "regs.h"
@@ -32,6 +38,16 @@ static volatile uint8_t  s_ring[RX_RING_SZ];
 static volatile uint32_t s_head = 0, s_tail = 0;
 static volatile uint32_t s_ore_cnt = 0;      /* 硬件溢出次数 */
 static volatile uint32_t s_drop_cnt = 0;     /* 软件满丢弃次数 */
+
+/* ★ 诊断用计数 (供外部 SWD 读走): "只收到 1 个字节" 这类故障无法靠猜,
+ *   必须把 ISR 的**进入次数 / 每次看到的标志 / 收到的字节**都暴露出来。 */
+static volatile uint32_t s_isr_n    = 0;     /* ISR 进入次数 */
+static volatile uint32_t s_ore_n    = 0;     /* ISR 里看到 ORE 的次数 */
+static volatile uint32_t s_fe_n     = 0;     /* 帧错误 (FE) 次数 —— 非 0 说明线上波形不对 */
+static volatile uint32_t s_ne_n     = 0;     /* 噪声错误 (NE) 次数 */
+static volatile uint32_t s_push_n   = 0;     /* 真正推进环形的字节数 */
+static volatile uint32_t s_last_isr = 0;     /* 最近一次读到的 ISR 寄存器原值 */
+static volatile uint32_t s_last_byte= 0;     /* 最近一次收到的字节 */
 
 void uart1_init(uint32_t pclk2_hz, uint32_t baud)
 {
@@ -64,7 +80,7 @@ void uart1_init(uint32_t pclk2_hz, uint32_t baud)
     /* ── 波特率 ── */
     USART_CR1(USART1_BASE) = 0;               /* 先关 UE 再改配置 */
     USART_PRESC(USART1_BASE) = 0;             /* 时钟预分频 ÷1 */
-    s_brr = (pclk2_hz * 16u + baud / 2u) / baud;
+    s_brr = (pclk2_hz + baud / 2u) / baud;    /* OVER8=0: BRR = fCK/baud */
     USART_BRR(USART1_BASE) = s_brr;
 
     USART_ICR(USART1_BASE) = USART_ICR_ORECF | USART_ICR_TCCF;   /* 清残留标志 */
@@ -103,6 +119,13 @@ int uart1_rx_pop(uint8_t *out)
 
 uint32_t uart1_ore_count(void)  { return s_ore_cnt; }
 uint32_t uart1_drop_count(void) { return s_drop_cnt; }
+uint32_t uart1_isr_count(void)  { return s_isr_n; }
+uint32_t uart1_isr_ore(void)    { return s_ore_n; }
+uint32_t uart1_fe_count(void)   { return s_fe_n; }
+uint32_t uart1_ne_count(void)   { return s_ne_n; }
+uint32_t uart1_push_count(void) { return s_push_n; }
+uint32_t uart1_last_isr(void)   { return s_last_isr; }
+uint32_t uart1_last_byte(void)  { return s_last_byte; }
 
 /* ★ 直接读 NVIC 的 ISER 位, 不是本地缓存 —— 这样"写错寄存器"也能被抓到 (A1 事故) */
 uint32_t uart1_irq_enabled(void) { return nvic_is_enabled(IRQ_USART1); }
@@ -110,15 +133,32 @@ uint32_t uart1_irq_enabled(void) { return nvic_is_enabled(IRQ_USART1); }
 UART_ISR_PLACE void USART1_IRQHandler(void)
 {
     uint32_t isr = USART_ISR(USART1_BASE);
+    s_isr_n++;
+    s_last_isr = isr;
+    /* ★★ 错误标志必须**逐个显式清除** —— 这是本轮实测撞出来的真缺陷:
+     *   原实现只清 ORE, 不管 FE/NE。结果实测 (诊断固件) 每帧 6 字节**只收到 1 个**,
+     *   且那一个字节的 ISR 原值 0x006010F4 里 NE=1 —— 也就是"第一个字节带着噪声错误
+     *   进来, 之后整帧就再也收不到了"。错误标志不清会**卡住接收通路**,
+     *   表现完全不像"线断了"(ISR 次数=帧数, ORE=0, drop=0, 一切"看起来正常")。 */
+    uint32_t icr = 0;
+    if (isr & USART_ISR_PE) { icr |= USART_ICR_PECF; }
+    if (isr & USART_ISR_FE) { s_fe_n++; icr |= USART_ICR_FECF; }   /* 帧错误: 线上波形不对 */
+    if (isr & USART_ISR_NE) { s_ne_n++; icr |= USART_ICR_NECF; }   /* 噪声: 起始位附近有毛刺 */
+    if (icr) USART_ICR(USART1_BASE) = icr;
 
-    if (isr & USART_ISR_ORE) {                     /* ③ 必须显式清, 否则接收被卡 */
+    /* ★★ ORE 必须**先于** RXNE 处理, 且清完之后**再读一次 ISR**:
+     *   ORE 置位时 RDR 里是**旧数据**; 只有清掉 ORE 才知道 RXNE 是不是新的。 */
+    if (isr & USART_ISR_ORE) {
         USART_ICR(USART1_BASE) = USART_ICR_ORECF;
         s_ore_cnt++;
+        isr = USART_ISR(USART1_BASE);
+        s_last_isr = isr;
     }
     if (isr & USART_ISR_RXNE) {
         uint8_t b = (uint8_t)(USART_RDR(USART1_BASE) & 0xFFu);
+        s_last_byte = b;
         uint32_t nh = (s_head + 1u) & RX_RING_MASK;
-        if (nh != s_tail) { s_ring[s_head] = b; s_head = nh; }
+        if (nh != s_tail) { s_ring[s_head] = b; s_head = nh; s_push_n++; }
         else              { s_drop_cnt++; }         /* 写满: 丢弃并计数, 不覆盖 */
     }
 }

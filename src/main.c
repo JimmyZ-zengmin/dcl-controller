@@ -452,6 +452,14 @@ OBS uint32_t g_uart_irq_en   = 0;
 OBS uint32_t g_uart_rx_bytes = 0;
 OBS uint32_t g_uart_tx_bytes = 0;
 OBS uint32_t g_uart_ore      = 0;    /* 硬件溢出: 非 0 = 主循环排空太慢 (故障信号) */
+/* ── UART 接收诊断 (排 "只收到 1 个字节" 这类故障必备) ── */
+OBS uint32_t g_uart_isr_n    = 0;   /* ISR 进入次数 */
+OBS uint32_t g_uart_isr_ore  = 0;   /* ISR 里看到 ORE 的次数 */
+OBS uint32_t g_uart_fe       = 0;   /* 帧错误 (线上波形不对) */
+OBS uint32_t g_uart_ne       = 0;   /* 噪声错误 */
+OBS uint32_t g_uart_push     = 0;   /* 真正入环形缓冲的字节数 */
+OBS uint32_t g_uart_last_isr = 0;   /* 最近一次 ISR 原值 */
+OBS uint32_t g_uart_last_byte= 0;   /* 最近一次收到的字节 */
 OBS uint32_t g_uart_drop     = 0;    /* 环形缓冲写满丢弃 */
 OBS uint32_t g_frame_ok      = 0;    /* CRC 通过的完整帧数 —— 解析链路的正向证据 */
 OBS uint32_t g_frame_bad     = 0;    /* 超长 / CRC 不符 */
@@ -811,6 +819,13 @@ static void proto_poll(void)
     }
     g_uart_ore    = uart1_ore_count();
     g_uart_drop   = uart1_drop_count();
+    g_uart_isr_n     = uart1_isr_count();
+    g_uart_isr_ore   = uart1_isr_ore();
+    g_uart_fe        = uart1_fe_count();
+    g_uart_ne        = uart1_ne_count();
+    g_uart_push      = uart1_push_count();
+    g_uart_last_isr  = uart1_last_isr();
+    g_uart_last_byte = uart1_last_byte();
     g_uart_irq_en = uart1_irq_enabled();   /* ★ 中断使能位必须每轮刷新 (A1 判据) */
 }
 
@@ -888,6 +903,9 @@ static void obs_anchor(void)
     sink ^= g_frame_bad;                  sink ^= g_cmd_count;
     sink ^= g_cmd_last;                   sink ^= g_nak_count;
     sink ^= g_banner_count;               sink ^= g_selftest_state;
+    sink ^= g_uart_isr_n;   sink ^= g_uart_isr_ore;  sink ^= g_uart_fe;
+    sink ^= g_uart_ne;      sink ^= g_uart_push;     sink ^= g_uart_last_isr;
+    sink ^= g_uart_last_byte;
     sink ^= g_selftest_frames;
     sink ^= g_deploy_ok;                  sink ^= g_deploy_nak;
     sink ^= g_deploy_routes;              sink ^= g_deploy_budget;

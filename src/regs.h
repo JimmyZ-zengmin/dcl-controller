@@ -203,12 +203,18 @@
 #define USART_CR1_OVER8   (1u << 15)   /* 8 倍过采样 (本项目用 16 倍 → 必须 0) */
 
 /* ISR (L21188 起) */
+#define USART_ISR_PE      (1u << 0)    /* 校验错误 (ISR.bit0) */
+#define USART_ISR_FE      (1u << 1)    /* 帧错误: 停止位不是 1 (RM0468 ISR.bit1) */
+#define USART_ISR_NE      (1u << 2)    /* 噪声错误: 起始位附近有毛刺 (ISR.bit2) */
 #define USART_ISR_ORE     (1u << 3)    /* 溢出错误 */
 #define USART_ISR_RXNE    (1u << 5)    /* 收到数据 (读 RDR 清除) */
 #define USART_ISR_TC      (1u << 6)    /* 发送完成 */
 #define USART_ISR_TXE     (1u << 7)    /* 发送数据寄存器空 */
 
 /* ICR (L21274 起) */
+#define USART_ICR_PECF    (1u << 0)
+#define USART_ICR_FECF    (1u << 1)
+#define USART_ICR_NECF    (1u << 2)
 #define USART_ICR_ORECF   (1u << 3)    /* 清溢出标志 */
 #define USART_ICR_TCCF    (1u << 6)    /* 清发送完成标志 */
 

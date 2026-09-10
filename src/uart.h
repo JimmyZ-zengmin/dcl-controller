@@ -31,7 +31,7 @@ void uart1_init(uint32_t pclk2_hz, uint32_t baud);
 /** @brief 轮询发送 n 字节, 返回时保证最后一字节**已完整移出**(等 TC) */
 void uart1_write(const uint8_t *p, uint32_t n);
 
-/** @brief 当前 BRR 值 (供外部核对波特率分频: 100MHz/115200 → 0x3641) */
+/** @brief 当前 BRR 值 (供外部核对波特率分频: 100MHz/115200 → 0x364) */
 uint32_t uart1_brr(void);
 
 /** @brief 取一个已收到的字节; 返回 0 = 缓冲空 (主循环调用) */
@@ -42,6 +42,14 @@ uint32_t uart1_ore_count(void);
 
 /** @brief 环形缓冲写满丢弃累计次数 —— 非 0 说明主循环被长时间阻塞 */
 uint32_t uart1_drop_count(void);
+/* 诊断计数 (排障用, 每字节都能被外部读走) */
+uint32_t uart1_isr_count(void);
+uint32_t uart1_isr_ore(void);
+uint32_t uart1_fe_count(void);
+uint32_t uart1_ne_count(void);
+uint32_t uart1_push_count(void);
+uint32_t uart1_last_isr(void);
+uint32_t uart1_last_byte(void);
 
 /**
  * @brief 回读"RXNE 中断真的被使能了吗" —— 1 = 使能
