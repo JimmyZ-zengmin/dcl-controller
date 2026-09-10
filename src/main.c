@@ -198,6 +198,17 @@ OBS uint32_t g_timing_resets  = 0;/* timing_stats_reset 次数 (OA13 幂等判�
 OBS uint32_t g_engine_run_seen = 0;/* ISR 观察到的 ENGINE_RUN 值快照 */
 OBS uint32_t g_isr_cyc_first = 0;
 
+/* ══════════ W2: Force 的观测面 ══════════
+ * ★ 判据要点: 强制**非零值**才算真验证过 (OA9 事故: 全用 val=0 的用例里
+ *   "只写 WIRE_MAP 不写 FORCE_VAL" 这个 bug 与期望完全重合 → 13/13 全绿却错)。
+ *   所以这里记的是"最近一次强制值", 工具必须断言它非零。 */
+OBS uint32_t g_force_set     = 0;   /* 成功强制次数 */
+OBS uint32_t g_force_rel     = 0;   /* 成功释放次数 */
+OBS uint32_t g_force_nak     = 0;   /* 被拒次数 (idx OOR / bad mode / non-finite) */
+OBS uint32_t g_force_last_idx = 0;  /* 最近一次成功强制的 wire 号 (0xFFFFFFFF = 无) */
+OBS uint32_t g_force_last_val = 0;  /* 最近一次成功强制的值 (f32 位模式, 工具断言非零) */
+OBS uint32_t g_force_clears  = 0;   /* eng_force_clear 被调用次数 (deploy/RESET 联动) */
+
 /* ── 引擎扫描: 统计 (CPU 周期) ── */
 OBS uint32_t g_eng_cyc_last = 0;
 OBS uint32_t g_eng_cyc_min  = 0xFFFFFFFFu;
@@ -413,6 +424,14 @@ ISR_PLACE void TIM2_IRQHandler(void)
             uint32_t sel = g_engine_sel;
             uint32_t ck;
             uint32_t nrun = 0;
+
+            /* ★★ W2.2 拍首 Force 覆写 —— 必须在**两条扫描路径之外**统一调用。
+             *   第一版把它写在 engine_tick() 内, 于是 BOOT_SCAN_MODE=0 的板子上
+             *   (走全表扫分支) force 完全不生效, 而 SHM 里 fmask/fval 全是对的值 —
+             *   症状是"配置全对、效果为零", 与 A1 事故同族。
+             *   ⇒ 凡"每拍都必须发生"的动作, 不能挂在某条分支里。 */
+            engine_force_apply(g_shm);
+
             if (g_scan_mode) {
                 /* 阶段 3: 分档调度 —— 本拍只跑 [div0]+[div1 本拍桶]+[div2 本拍桶] */
                 ck = engine_tick(g_shm, g_tick_count, sel ? engine_scan_itcm
@@ -665,6 +684,11 @@ static void h_deploy(const uint8_t *p, uint32_t n)
     /* ④ 装载 STAGING (不碰 ACTIVE) → 置 RELOAD 让 ISR 在下一拍原子切换 */
     uint16_t nw = engine_stage_program(g_shm, d, nr, np, ns);
     g_deploy_routes = nw;
+    /* ★ W2: 新程序 = 新语义, 旧的 force 点位可能指向新程序里根本不存在的 wire。
+     *   留着它会在下一拍把无关 wire 钉住, 而 PC 完全看不到 (MASK 位还在但程序换了)。
+     *   位置在装载**之后**: 此刻表已就绪, 清 force 与下一拍的扫描无竞争窗口。*/
+    eng_force_clear(g_shm);
+    g_force_clears++;
     g_deploy_seq++;
     SHM_U16(g_shm, OFF_CTRL_DEPLOY_SEQ) = (uint16_t)g_deploy_seq;
     g_deploy_set_tick = g_tick_count;
@@ -725,6 +749,9 @@ static void h_engine_status(void)
 #define NAKRH_SHORT    4u   /* 载荷长度不足 */
 #define NAKRH_NONFIN   5u   /* 写 float 区但值非有限 (NaN/Inf) */
 #define NAKRH_BUDGET   6u   /* START 时发现程序超预算 (F11 毒药表兜底) */
+#define NAKRH_FIDX     7u   /* force: wire 号越界 */
+#define NAKRH_FMODE    8u   /* force: mode 不是 0/1 */
+#define NAKRH_FFIN     9u   /* force: 强制值为 NaN/Inf */
 
 /* 0x20 READ [addr:u32] → ACK [val:u32] */
 static void h_read_w1(const uint8_t *p, uint32_t n)
@@ -845,8 +872,52 @@ static void h_stop_w1(void)
 /* 0x13 RESET — 收敛的冷启动清理 (新增域必须登记到 cold_start_reset) */
 static void h_reset_w1(void)
 {
-    cold_start_reset();
+    cold_start_reset();          /* 整段 memset, 天然覆盖 FORCE_MASK/VAL (W2.1) */
+    g_force_clears++;            /* ★ 用同一计数证明 RESET 真的清过 force */
     g_reset_ok++;
+    ack(NULL, 0);
+}
+
+/* ══════════ W2.3 — 0x24 FORCE (强制/释放 wire) ══════════
+ * 载荷 [idx:u16][mode:u8][val:f32]   mode 0=释放 1=强制
+ * ★ 逐字搬 S3 的语义 (main.c:204-232), 三处必须保留:
+ *    ① mode==1 时必须校验 val 有限 (Inf 会被拍首覆写**每拍**钉进 WIRE_MAP,
+ *       无法像一次性写那样被后续计算自愈 —— 比 0x21 的同类检查更要紧)
+ *    ② 强制必须**同时写** FORCE_VAL 与 WIRE_MAP (OA9): 只写 WIRE_MAP 会在
+ *       下一拍拍首被 FORCE_VAL(0) 抹掉, 而"强制 0"恰好是常见用例 → 判据盲区
+ *    ③ 释放时清 FORCE_VAL 残留 (防下次置位前的陈旧值)
+ * ★ 这里是**立即生效**的: 拍首覆写下一拍就会用上新值, 不需要 deploy/重载。 */
+static void h_force_w2(const uint8_t *p, uint32_t n)
+{
+    if (n < 7) { g_force_nak++; g_nak_last = NAKRH_SHORT; nak("force: short"); return; }
+    uint16_t idx; uint8_t mode; uint32_t vb;
+    memcpy(&idx, p, 2);
+    mode = p[2];
+    vb = get32(p + 3);
+    if (idx >= MAX_WIRES)   { g_force_nak++; g_nak_last = NAKRH_FIDX;  nak("force: wire OOR"); return; }
+    if (mode > 1)           { g_force_nak++; g_nak_last = NAKRH_FMODE; nak("force: bad mode"); return; }
+    if (mode == 1 && !is_finite_bits(vb)) {
+        g_force_nak++; g_nak_last = NAKRH_FFIN; nak("force: non-finite"); return;
+    }
+
+    volatile uint32_t *fm = (volatile uint32_t *)(void *)(g_shm + OFF_FORCE_MASK);
+    volatile float    *fv = (volatile float    *)(void *)(g_shm + OFF_FORCE_VAL);
+    volatile float    *wm = (volatile float    *)(void *)(g_shm + OFF_WIRE_MAP);
+
+    if (mode == 1) {
+        float f; memcpy(&f, &vb, 4);
+        fm[idx >> 5] |= (1u << (idx & 31u));
+        fv[idx] = f;              /* ★ OA9: 这一行才是"强制值真的生效"的原因 */
+        wm[idx] = f;              /* 立即写一次, 使"下一拍前"读到的也是新值 */
+        g_force_last_idx = idx;
+        g_force_last_val = vb;
+        g_force_set++;
+    } else {
+        fm[idx >> 5] &= ~(1u << (idx & 31u));
+        fv[idx] = 0.0f;           /* 清残留 */
+        g_force_rel++;
+    }
+    __asm__ volatile("dsb" ::: "memory");
     ack(NULL, 0);
 }
 
@@ -976,6 +1047,8 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_READ_BURST:    h_read_burst_w1(p, n); break;
         case CMD_WRITE:         h_write_w1(p, n); break;
         case CMD_WRITE_BURST:   h_write_burst_w1(p, n); break;
+        /* ---- W2: Force ---- */
+        case CMD_FORCE:         h_force_w2(p, n); break;
         /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
          *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
          *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
@@ -1105,6 +1178,10 @@ static void obs_anchor(void)
     sink ^= g_reset_ok;    sink ^= g_safe_calls;
     sink ^= g_safe_gpio_mask; sink ^= g_timing_resets;
     sink ^= g_engine_run_seen;
+    /* W2 Force 观测面 */
+    sink ^= g_force_set;   sink ^= g_force_rel;
+    sink ^= g_force_nak;   sink ^= g_force_last_idx;
+    sink ^= g_force_last_val; sink ^= g_force_clears;
     (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
 }
 

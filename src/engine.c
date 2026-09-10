@@ -222,7 +222,20 @@ ATTR uint32_t FN(uint8_t *base, uint32_t first, uint32_t count)                \
         if (!_finite_f(src)) src = 0.0f;                                       \
         if (!_finite_f(wb))  wb  = 0.0f;                                       \
         float res = prim_exec(r->op, src, p, s, wm, lu, wb, dt);               \
-        if (r->dst_channel < MAX_WIRES) wm[r->dst_channel] = res;              \
+        if (r->dst_channel < MAX_WIRES) {                                      \
+            /* ★★ W2.2 写端屏蔽: 被强制的 wire **不允许**被路由覆写。          \
+             *   拍首已把它钉成 FORCE_VAL, 这里是同一拍内的另一半 —— 少了它,   \
+             *   强制只在"路由不写该 wire"时有效, 一旦有路由写它, 值立刻被改。  \
+             *   判据 (tools/h723_force.py 用例 2): 部署一条写 wire[3] 的路由,  \
+             *   强制 wire[3]=7.5 → 跑 ≥3 拍后回读仍须 == 7.5 (写端被屏蔽)。   \
+             * ★ mask 就地 volatile 读而不是从栈快照取: 栈快照是**拍首**的值,  \
+             *   而 h_force 可能在本拍扫描**进行中被协议侧改掉** —— 用旧快照会  \
+             *   让"刚刚置位的 force"晚一拍生效 (判据会看到 3 拍里第 1 拍漏过)。 */ \
+            uint32_t dw = (uint32_t)r->dst_channel;                            \
+            uint32_t msk = *(const volatile uint32_t *)                        \
+                (base + OFF_FORCE_MASK + (dw >> 5) * 4u);                      \
+            if (!(msk & (1u << (dw & 31u)))) wm[r->dst_channel] = res;         \
+        }                                                                      \
         uint16_t ai = r->actuator_idx;                                         \
         if (ai && ai < MAX_ACTUATORS) ac[ai] = res;                            \
         /* 校验和: ① 防死代码消除 ② 给外部一个"真算过"的证据 */                \
@@ -325,6 +338,53 @@ uint32_t engine_bucket_dead_slots(const uint8_t *base)
     return bad;
 }
 
+ATTR_ITCM /* ══════════════════ W2.2 — 拍首 Force 覆写 (独立入口) ══════════════════
+ *
+ * ★★ 为什么必须在 engine_tick **之外**单独存在一个入口:
+ *    第一版把覆写写在 engine_tick() 里 —— 但 ISR 有**两条扫描路径**:
+ *      · g_scan_mode=1 → engine_tick()      (分档调度)
+ *      · g_scan_mode=0 → engine_scan_*(全表扫, 阶段 2 基线与 bench 用)
+ *    覆写只在其中一条上, 于是"BOOT_SCAN_MODE=0 的板子上 force 完全不生效"。
+ *    实测 2026-09-11: fmask=0x8 / fval=7.5 都写进去了, wire[3] 却恒为路由值 1.5
+ *    —— 症状是"SHM 全对但效果为零", 与 A1 事故 (NVIC_ISER 位移溢出) 同族。
+ *    ⇒ 凡"每拍都必须发生"的动作, 不能挂在某条分支里; 必须是扫描**之前**的
+ *      统一前置步骤。这条同时修掉了"换 scan_mode 就静默失效"的隐患。
+ *
+ * 语义 (S3 core0_isr.c:196-215 同构):
+ *   被强制的 wire 先钉成 FORCE_VAL, 然后才扫路由。
+ *   ⇒ 下游路由读到的就是强制值 (而不是"上一拍的旧值 + 这一拍才被覆盖")。
+ *
+ * ★ 为什么值必须写 FORCE_VAL 而不是只写 WIRE_MAP (OA9 事故本身):
+ *   拍首覆写是**每拍**做的。若只写 WIRE_MAP, 下一拍拍首会用 FORCE_VAL(0)
+ *   把它抹掉 —— 强制值为 0 时看不出问题 (bug 与期望重合), 一旦强制非零值
+ *   就立刻暴露。S3 旧版 13/13 全绿正是"测试全用 val=0.0"造成的判据盲区。
+ *
+ * ★ 只遍历置位位 (ctz): 全扫 128 固定要 ~2000 cyc = 预算 5%;
+ *   强制 1 个 wire 不该和强制 128 个同样贵 —— 循环次数 = 置位数。
+ *
+ * ★ 放 ITCM: 这是每拍都要跑的代码, 且它必须在拍长内完成。
+ */
+ATTR_ITCM void engine_force_apply(uint8_t *base)
+{
+    uint32_t fm[FORCE_MASK_WORDS];
+    fm[0] = *(const volatile uint32_t *)(base + OFF_FORCE_MASK + 0u);
+    fm[1] = *(const volatile uint32_t *)(base + OFF_FORCE_MASK + 4u);
+    fm[2] = *(const volatile uint32_t *)(base + OFF_FORCE_MASK + 8u);
+    fm[3] = *(const volatile uint32_t *)(base + OFF_FORCE_MASK + 12u);
+    if (!(fm[0] | fm[1] | fm[2] | fm[3])) return;   /* 无强制 = 快路径 (零成本) */
+
+    volatile float *wm = (volatile float *)(void *)(base + OFF_WIRE_MAP);
+    const volatile float *fv = (const volatile float *)(const void *)(base + OFF_FORCE_VAL);
+    for (uint32_t w = 0; w < FORCE_MASK_WORDS; w++) {
+        uint32_t m = fm[w];
+        while (m) {
+            uint32_t b = (uint32_t)__builtin_ctz(m);
+            wm[w * 32u + b] = fv[w * 32u + b];
+            m &= m - 1u;
+        }
+    }
+}
+
 ATTR_ITCM uint32_t engine_tick(uint8_t *base, uint32_t tick, engine_scan_fn impl,
                                uint32_t *nrun_out)
 {
@@ -360,10 +420,31 @@ static const uint8_t k_mixed_ops[19] = {
 
 void engine_fill_tables(uint8_t *base, int profile)
 {
+    /* ★★ W1/W2 补漏 (实测 2026-09-11): 填表**不得改变运行态**。
+     *
+     * 缺口: cold_start_reset() 是"单一入口整段 memset" (S3 第二十六轮纪律), 它会把
+     *   OFF_CTRL_ENGINE_RUN 一起清 0。上电路径没问题 (main 在 fill **之后**才置 1),
+     *   但**运行期 reinit 路径** (主循环 g_reinit=1 → fill) 清完就没人置回来了 ⇒
+     *   ISR 的双门 (gate && ENGINE_RUN) 恒不成立 ⇒ 引擎**永久停摆**,
+     *   而所有"配置类"量 (表校验和/桶校验和/条数) 全部正常。
+     *   ⇒ 症状与 A1 事故同族: "写过了就算" 的量全绿, 功能整体不可用。
+     *
+     * 为什么在 fill 里保存/恢复而不是改 cold_start_reset:
+     *   ① cold_start_reset 的"整段清零"是**故意的** (NOLOAD 段上电内容不确定),
+     *      让它按字段挑着清会给后来人一个"哪些字段不清"的清单要维护 —— 正是
+     *      S3 第二十六轮收口要消灭的东西。
+     *   ② "填表 = 只动配置域, 不动控制域" 才是 fill_tables 的正确语义, 这条
+     *      边界本来就该在这里显式表达, 而不是靠调用方记得补一句。
+     *   (换程序时**该不该**停引擎是调用方的事 —— deploy 与 reinit 各有各的语义,
+     *    所以这里只负责"不擅自改变它"。) */
+    uint8_t run_state = SHM_U8(base, OFF_CTRL_ENGINE_RUN);
+
     /* ★ 先走单一入口清零 (不允许这里自带 memset —— 见 cold_start_reset 注释)。
      *   约定: base 必须是 g_shm 本身 (表的唯一归属地是 .dtcm_shm)。
      *   若将来真需要第二块表区, 必须回 cold_start_reset 登记, 而不是绕过它。 */
     cold_start_reset();
+
+    SHM_U8(base, OFF_CTRL_ENGINE_RUN) = run_state;   /* ★ 运行态原样恢复 */
 
     float *sm = (float *)(base + OFF_SENSOR_MAP);
     float *wm = (float *)(base + OFF_WIRE_MAP);
@@ -442,6 +523,37 @@ void engine_fill_tables(uint8_t *base, int profile)
      *   非三档 profile 也照跑 —— 结果是恒等变换(全 div0), 但保证桶表一定被建立,
      *   不会出现"某档忘了建桶 → 每拍空扫"的静默失效。 */
     engine_build_buckets(base, MAX_ROUTES);
+
+    /* ★★ W2 补漏: 把 "装了几条" 落到 SHM —— 这条**原来缺失**。
+     *   缺口后果 (实测 2026-09-11): profile 装载后 SHM 的 N_ROUTES 恒为 0, 而
+     *   引擎实际在扫 128 条 (靠 C 全局 g_n_routes)。两处"条数"不一致导致:
+     *     ① h_start_w1 的 F11 预算兜底被**静默跳过** (nr==0 → if(nr) 不成立)
+     *        —— 也就是说 "毒药表必须拒 START" 这条 W1 判据**, 在 profile 装载路径下
+     *        从未真正被走到过**。它在 deploy 路径下有效, 所以 S3/阶段 3 的测试
+     *        全绿 —— 又一处"判据看起来在、其实没生效"。
+     *     ② PC 侧按 N_ROUTES 判断"程序装了几条"会恒读 0。
+     *   ⇒ 修法: 装载路径与 deploy 路径**都**维护这个量 (它们是同一个量的两个来源,
+     *     不允许只有一个写)。 */
+    SHM_U16(base, OFF_CTRL_N_ROUTES) = (uint16_t)MAX_ROUTES;
+    SHM_U16(base, OFF_CTRL_N_PARAMS) = (uint16_t)MAX_PARAMS;
+    SHM_U16(base, OFF_CTRL_N_STATES) = (uint16_t)MAX_STATES;
+}
+
+/* ══════════════════ W2: Force 辅助 (engine.h 声明) ══════════════════
+ * ★ force_clear 的三处调用点 (与 S3 main.c:374/565/661 同语义):
+ *     deploy(0x10) / RESET(0x13) / SEQ_DEPLOY(0x44)
+ *   理由: force 是**调试态**, 不是组态。新程序 = 新语义, 旧的强制点位指向的
+ *   wire 可能根本不存在于新程序里 —— 留着它会在下一拍把无关 wire 钉住,
+ *   且 PC 完全看不到 (MASK 位还在, 但程序换了)。
+ * ★ 清 VAL 残留是 S3 审计建议: 只清 MASK 的话, 下次"置位"前若忘了写 VAL
+ *   (或写入失败), 会复用上一次的陈旧值 —— 一个只在特定时序下出现的幽灵。 */
+void eng_force_clear(uint8_t *base)
+{
+    volatile uint32_t *fm = (volatile uint32_t *)(void *)(base + OFF_FORCE_MASK);
+    volatile float    *fv = (volatile float    *)(void *)(base + OFF_FORCE_VAL);
+    for (uint32_t i = 0; i < (uint32_t)FORCE_MASK_WORDS; i++) fm[i] = 0u;
+    for (uint32_t i = 0; i < (uint32_t)MAX_WIRES; i++)       fv[i] = 0.0f;
+    __asm__ volatile("dsb" ::: "memory");
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -729,14 +841,18 @@ int eng_shm_off_is_float(uint32_t off)
     if (off >= OFF_PARAM_TABLE     && off < OFF_PARAM_STAGING)   return 1;
     if (off >= OFF_PARAM_STAGING   && off < OFF_STATE_TABLE)     return 1;
     if (off >= OFF_STATE_TABLE     && off < OFF_STATE_STAGING)   return 1;
-    /* ★ 状态 staging 到路由桶之间是保留洞 (未定义的域) —— 不列入 float 区,
-     *   写进去既不拦 NaN 也不报错, 与 S3 的"洞外一律放行"行为一致。
-     *   (要改成更严的话应先把这个洞变成真区 + 断言, 而不是在这里猜语义) */
+    /* ★ W2.1: FORCE_VAL 是浮点区 —— 强制值必须过有限性闸。
+     *   若放行 NaN/Inf, 拍首覆写会把坏值直接钉进 WIRE_MAP, 且**每拍重钉**
+     *   (与一次性写入不同, 它无法被后续计算自愈)。 */
+    if (off >= OFF_FORCE_VAL       && off < OFF_RSVD_EXEC_TAIL)  return 1;
+    /* FORCE_MASK 是位图, 不是浮点 (放行任意 32 位模式) —— 刻意不列入。
+     * ★ 状态 staging 到路由桶之间是保留洞 (未定义的域) —— 不列入 float 区,
+     *   写进去既不拦 NaN 也不报错, 与 S3 的"洞外一律放行"行为一致。 */
     return 0;
 }
 
-/* float 位模式有限性: 指数 8 位全 1 = ±Inf / NaN。不用浮点比较, 不依赖 FPU 状态 */
-static inline int is_finite_bits(uint32_t v) { return ((v & 0x7F800000u) != 0x7F800000u); }
+/* float 位模式有限性: 定义已移到 engine.h (0x21 写守卫 / 0x24 强制守卫 / ISR
+ * 三处必须共用同一判据, 各写一份就是"改一处忘一处"的温床)。 */
 
 int eng_write_allowed(uint32_t a, uint32_t v)
 {

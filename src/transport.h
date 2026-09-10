@@ -110,10 +110,9 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
 #define DCL_FW_VERSION_H723   0x0200u
 
 /* ---- 逐条列出**未声明**的能力与原因 (防止日后"顺手"把它报上去) ----
- *   DCL_CAP_PERSISTENT(0x0004) — 掉电保持: 未实现 (阶段 3.3)
+ *   DCL_CAP_PERSISTENT(0x0004) — 掉电保持: W2.4 未完成 (裸 Flash 双副本)
  *   DCL_CAP_STATE_COLD(0x0008) — RESET(0x13) 命令不存在, 故不声明
  *   DCL_CAP_SEQ       (0x0040) — Sequencer 未移植
- *   DCL_CAP_FORCE     (0x0080) — CMD_FORCE(0x24) 未实现
  *   DCL_CAP_COMM      (0x0100) — Modbus RTU 从站未移植
  *   DCL_CAP_HMI       (0x0200) — SRC_HMI 是**留位**(engine.c 显式 case, 恒返 0)
  *   DCL_CAP_AI        (0x0400) — ADC 未接
@@ -123,21 +122,21 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
  *     "实现了却不报"。评审提醒: 这类漏改**没有任何编译期保护**, 只能靠纪律 +
  *     上面的清单与下面的宏**在同一屏内可见**(所以刻意放在一起)。 */
 #define DCL_CAP_H723_IMPL   (DCL_CAP_MULTICYCLE | DCL_CAP_HOTRELOAD | \
-                             DCL_CAP_WIRE2_FLAG | DCL_CAP_VERINFO)   /* = 0x0033 */
+                             DCL_CAP_WIRE2_FLAG | DCL_CAP_VERINFO | \
+                             DCL_CAP_FORCE)                          /* = 0x00B3 */
 
-/* ★ 上线的两项说明 (写清楚"为什么现在可以报"):
+/* ★ 上线的各项说明 (写清楚"为什么现在可以报"):
  *   DCL_CAP_HOTRELOAD (0x0002) — 阶段 3.2: engine_reload_active() 在 ITCM 内
  *     切换 ACTIVE 表, 且 APPLIED_SEQ 回读确认 (0x10 ACK 带 seq/budget,
  *     0x38 尾部带 deploy_seq/applied_seq/applied_lat)。自检 9/9。
  *   DCL_CAP_WIRE2_FLAG(0x0010) — A3 修复后, ISR 的第二输入判据改为
  *     `wire2_valid(flags, wire2_idx)` = (显式标志 || 非 0 索引) && 索引合法,
- *     即**真的按 ROUTE_FLAG_WIRE2 标志办事**了 (此前标志被定义但从未被引用)。 */
-
-/* ★ 编译期一致性护栏: 把"仍未实现"的位显式并起来, 断言它与已声明位**不相交**。
- *   它能挡住"清单没删却把位报上去了"这类矛盾; 挡不住"忘了删清单"(那需要人眼,
- *   所以清单与宏刻意相邻放置)。 */
+ *     即**真的按 ROUTE_FLAG_WIRE2 标志办事**了 (此前标志被定义但从未被引用)。
+ *   DCL_CAP_FORCE     (0x0080) — W2: CMD_FORCE(0x24) 落地, 拍首覆写 + 写端屏蔽
+ *     两半都在 (engine_tick / DEFINE_ENGINE_SCAN), 且 FORCE_VAL 列入 float 区。
+ *     ★ 验收证据必须是**非零强制值** (OA9 事故的判据盲区修正)。 */
 #define DCL_CAP_H723_NOTYET (DCL_CAP_PERSISTENT | DCL_CAP_STATE_COLD | DCL_CAP_SEQ | \
-                             DCL_CAP_FORCE | DCL_CAP_COMM | DCL_CAP_HMI | DCL_CAP_AI)
+                             DCL_CAP_COMM | DCL_CAP_HMI | DCL_CAP_AI)
 _Static_assert((DCL_CAP_H723_IMPL & DCL_CAP_H723_NOTYET) == 0u,
                "cap bitmap contradiction: bit present in BOTH impl and not-yet lists");
 

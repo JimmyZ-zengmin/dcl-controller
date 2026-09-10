@@ -116,12 +116,29 @@
  *   "吃掉"邻区字节也不会有任何提示 (与 S3 的 OA20 同族 —— 那一族的本质就是
  *   "无人设防的区域迟早出事")。现在把空洞显式命名, 并把尺寸**钉成常量断言**:
  *   谁把邻区改大/改小, 这里立刻编译失败。 */
-#define OFF_RSVD_DSL_DOMAIN     0x3840   /* S3 的 macro/force/seq 域, H723 未落地 */
+#define OFF_RSVD_DSL_DOMAIN     0x3840   /* S3 的 macro/seq 域, H723 部分落地 */
 #define OFF_RSVD_DSL_DOMAIN_SZ  (OFF_ROUTE_BUCKETS - OFF_RSVD_DSL_DOMAIN)   /* 0xC40 */
-#define OFF_RSVD_EXEC_DOMAIN    0x47F0   /* S3 的 exec/force 域, H723 未落地 */
-#define OFF_RSVD_EXEC_DOMAIN_SZ (OFF_MB_SET - OFF_RSVD_EXEC_DOMAIN)         /* 0x2B0 */
+
+/* ── W2.1: Force 域 (从 EXEC 保留洞里划出来, 落实"无人区迟早出事"的设防) ──
+ *
+ * ★ 布局依据 S3 语义 (shared_mem.h:84-85) 但**起址不同**: S3 用 0x3A00/0x3A10,
+ *   在 H723 上 0x3A00 落在 SHM 的 **BUCKET 区内** (OFF_ROUTE_BUCKETS_ST=0x4638 ≤
+ *   0x3A00 < OFF_ROUTE_BUCKETS? 不 —— 0x3A00 < 0x4480, 所以落在**保留洞**里,
+ *   但 0x3A00 + 16 + 512 = 0x3C10 < 0x4480 也是洞内, 看似可行)。
+ *   那为什么不用 S3 的偏移? 因为洞内布局与 PC 脚本无关 (没有任何 S3 工具按绝对
+ *   偏移读 force) —— 而 OFF_FORCE 必须与 OFF_ROUTE_BUCKETS 之后的区**同族**,
+ *   否则"桶表之后是 exec 域"这条结构性事实会被打乱。选择紧贴桶表末尾起址。
+ *
+ * ★ 尺寸: MASK = MAX_WIRES/32 = 4 × u32 = 16B; VAL = 128 × f32 = 512B。
+ *   合起来 528B; 原 EXEC 洞 0x2B0 = 688B, 剩下 160B 作 tail。
+ *   ⇒ 三者**必须精确相接** (下面的 _Static_assert 用 == 而不是 <=)。 */
+#define FORCE_MASK_WORDS     (MAX_WIRES / 32)          /* 4 */
+#define OFF_FORCE_MASK       0x47F0                    /* u32[4]: 128 bit 强制位图 */
+#define OFF_FORCE_VAL        0x4800                    /* f32[128]: 强制值 (★ OA9 的核心) */
+#define OFF_RSVD_EXEC_TAIL   0x4A00                    /* 剩余 0xA0 备用 */
+#define OFF_RSVD_EXEC_TAIL_SZ (OFF_MB_SET - OFF_RSVD_EXEC_TAIL)   /* 0xA0 */
 #define OFF_MB_TAIL             0x4B20   /* MB_SET 之后到 SHM 末尾, 备用 */
-#define OFF_MB_TAIL_SZ          (SHM_SIZE - OFF_MB_TAIL)                    /* 0x34E0 */
+#define OFF_MB_TAIL_SZ          (SHM_SIZE - OFF_MB_TAIL)          /* 0x34E0 */
 
 /* ★★ A7 修正: 原为 0x4AC0, 与 S3 的 0x4AA0 差 32 字节 —— 而本头文件开头写着
  *   "全部逐字节对齐 esp32-core0", 目标是"S3 的 20 套回归脚本零改动"。
@@ -353,13 +370,15 @@ _Static_assert(OFF_STATE_STAGING   + MAX_STATES    * 16 <= OFF_RSVD_DSL_DOMAIN, 
 _Static_assert(OFF_RSVD_DSL_DOMAIN + OFF_RSVD_DSL_DOMAIN_SZ == OFF_ROUTE_BUCKETS, "SHM DSL reserved-hole size mismatch");
 _Static_assert(OFF_ROUTE_BUCKETS   + ROUTE_BUCKET_U16 * 2 == OFF_ROUTE_BUCKETS_ST,  "SHM ROUTE_BUCKETS must abut staging");
 _Static_assert(OFF_ROUTE_BUCKETS_ST + ROUTE_BUCKET_U16 * 2 == OFF_ROUTE_BUCKETS_END, "SHM ROUTE_BUCKETS_ST must abut end");
-_Static_assert(OFF_ROUTE_BUCKETS_END == OFF_RSVD_EXEC_DOMAIN,                  "SHM EXEC reserved-hole start mismatch");
-_Static_assert(OFF_RSVD_EXEC_DOMAIN + OFF_RSVD_EXEC_DOMAIN_SZ == OFF_MB_SET,   "SHM EXEC reserved-hole size mismatch");
+_Static_assert(OFF_ROUTE_BUCKETS_END == OFF_FORCE_MASK,                        "SHM FORCE_MASK must start right after buckets end");
+_Static_assert(OFF_FORCE_MASK      + FORCE_MASK_WORDS * 4 == OFF_FORCE_VAL,    "SHM FORCE_VAL must abut FORCE_MASK");
+_Static_assert(OFF_FORCE_VAL       + MAX_WIRES * 4 == OFF_RSVD_EXEC_TAIL,      "SHM FORCE_VAL must abut exec tail");
+_Static_assert(OFF_RSVD_EXEC_TAIL  + OFF_RSVD_EXEC_TAIL_SZ == OFF_MB_SET,      "SHM exec tail must abut MB_SET");
 _Static_assert(OFF_MB_SET          + MB_NREG       * 2 == OFF_MB_TAIL,         "SHM MB_SET must abut MB tail");
 _Static_assert(OFF_MB_TAIL        + OFF_MB_TAIL_SZ == SHM_SIZE,                "SHM MB tail must end exactly at SHM_SIZE");
 /* ★ 保留区尺寸钉成常量: 邻区一改, 这三条立刻失败 (它们就是"无人区"的哨兵) */
 _Static_assert(OFF_RSVD_DSL_DOMAIN_SZ  == 0xC40u, "DSL hole size changed from 0xC40 - did you resize a neighbour?");
-_Static_assert(OFF_RSVD_EXEC_DOMAIN_SZ == 0x2B0u, "EXEC hole size changed from 0x2B0 - did you resize a neighbour?");
+_Static_assert(OFF_RSVD_EXEC_TAIL_SZ   == 0x00A0u, "EXEC tail size changed from 0xA0 - did you resize a neighbour?");
 _Static_assert(OFF_MB_TAIL_SZ          == 0x34E0u, "MB tail hole size changed from 0x34E0");
 /* 反向断言: 控制块区的每个字段都必须落在区内 (防止上面某个宏被改大而不自知) */
 _Static_assert(OFF_CTRL_MAGIC + 4 <= OFF_CTRL_N_SEQ + 8, "SHM ctrl field overruns 0x40");
@@ -411,6 +430,20 @@ uint32_t engine_bucket_dead_slots(const uint8_t *base);
  */
 uint32_t engine_tick(uint8_t *base, uint32_t tick, engine_scan_fn impl,
                      uint32_t *nrun_out);
+
+/** @brief ★ W2.2 拍首 Force 覆写 —— **必须在任何扫描之前**调用, 且两条扫描路径
+ *         (engine_tick 分档调度 / engine_scan_* 全表扫) **都要**调。
+ *
+ * 语义: 被强制的 wire 先钉成 FORCE_VAL, 然后才扫路由 ⇒ 下游读到的是强制值。
+ *
+ * ★★ 为什么是独立函数而不是塞进 engine_tick (第一版的教训):
+ *    ISR 有两条扫描路径, 塞进其中一条 ⇒ "换 scan_mode 就静默失效"。
+ *    实测 2026-09-11: fmask/fval 全对但 wire 不变, 症状是"SHM 全对效果为零"。
+ *    ⇒ 凡"每拍都必须发生"的动作, 不能挂在分支里, 要做成统一的**前置步骤**。
+ *
+ * ★ 无强制位时是零成本快路径 (一次读 + 一次或运算即返回)。
+ * ★ 放 ITCM (热路径)。 */
+void engine_force_apply(uint8_t *base);
 
 /** @brief SHM 静态区 (定义在 engine.c, 链接段 .dtcm_shm / DTCM 0x20000000) */
 extern uint8_t g_shm[SHM_SIZE];
@@ -498,10 +531,31 @@ int eng_shm_off_is_float(uint32_t off);
 /** @brief 0x21/0x23 写放行: SHM float 区只收有限值, 其余一律放行 */
 int eng_write_allowed(uint32_t a, uint32_t v);
 
+/** @brief float 位模式有限性 (指数 8 位全 1 = ±Inf/NaN)
+ *  ★ 用**位模式**而不是浮点比较: 不依赖 FPU 状态, 且在 ISR 里也安全。
+ *  ★ 必须由 engine.h 统一提供 —— 0x21 写守卫、0x24 强制守卫、ISR 的 src/wb
+ *    有限性检查是**同一个判据**, 各写一份就是"改一处忘一处"的温床 (S3 审计常客)。 */
+static inline int is_finite_bits(uint32_t v)
+{
+    return ((v & 0x7F800000u) != 0x7F800000u);
+}
+
 /** @brief 输出安全态: GPIO 只清不置 + 执行器数组归零 (STOP/RESET 用)
  *  ★ S3 用 GPIO_OUT_W1TC (只清不置); H723 无此寄存器, 等价物是
  *    **BSRR 的高 16 位** (`GPIOx_BSRR = mask << 16`)。低位是置位, 高位是清位 ——
  *    写高位就天然"只清不置", 掩码外的引脚不受影响。 */
 void eng_outputs_safe(void);
+
+/* ══════════════════ W2: Force (wire 强制/释放) ══════════════════
+ * 语义: "PC 把某个 wire 钉在固定值上, 引擎照常跑但不许改它" —— 用于现场
+ * 调试/开环验证 (没有真实传感器时给控制器一个假输入)。
+ * ★ 与 STOP 的安全态无关: STOP 是清零; FORCE 是钉住一个**由 PC 指定的**值,
+ *   所以它比 STOP 危险 (值不是 0, 执行器可能真的动) —— 因此 deploy/RESET 必须清它。 */
+
+/** @brief 清空全部 force 位与值 (deploy / RESET / SEQ_DEPLOY 调用)
+ *  ★ 必须在**关掉扫描**或至少与 ISR 无竞争的前提下调用 (写 MASK 的 4 个字
+ *    不是原子的 —— 中途被拍中断会看到半更新的掩码)。本实现由协议侧串行调用,
+ *    且 ISR 只读不写 MASK, 所以最坏情况是"少强制一拍"。 */
+void eng_force_clear(uint8_t *base);
 
 #endif /* DCL_ENGINE_H */
