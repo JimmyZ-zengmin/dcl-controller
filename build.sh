@@ -39,7 +39,7 @@ fi
 # ── 全部开关的默认值 (必须与 CMakeLists.txt 的 set(... CACHE ...) 默认值一致) ──
 DEFAULTS=(
     -DDCL_BOOT_PROFILE=0
-    -DDCL_BOOT_GATE=0
+    -DDCL_BOOT_GATE=1
     -DDCL_BOOT_SEL=1
     -DDCL_BOOT_SCAN_MODE=0
     -DSCAN_FLASH_PAD=0

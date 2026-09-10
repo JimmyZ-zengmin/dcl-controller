@@ -59,12 +59,17 @@
  *   实测 pyocd 断开后目标核心被 HALT, 且 `connect_mode=under-reset` 的每次连接
  *   都会**复位目标** (工位经验: 会话内写、会话内读才可靠)。
  *   所以"要用外部仪器(LA)测某个非默认配置"就必须把它**编进固件**。
- * 默认 (0/0/1) = 骨架态 (不开扫描门) —— 上电即安全, 不跑引擎。 */
+ * ★ W1 调整 (2026-09-11): 默认从"骨架态(0/0/1)"改为"**跑引擎态(0/1/1)**" ——
+ *   骨架态是阶段 1/2 的 bench 默认 (上电安全、不跑引擎)。进入 W1 后引擎配置
+ *   已能由协议 (0x10 deploy + 0x11 START) 控制, "上电不跑"不再是安全考虑,
+ *   反而会掩盖问题 (PC 发 START 却看不出引擎有没有真动)。
+ *   ENGINE_RUN 初始 = 1: 上电即跑空转 (表是 profile 0 全 DIRECT, 无副作用)。
+ *   bench 复现阶段 1/2 基线时显式传 -DBOOT_GATE=0。 */
 #ifndef BOOT_PROFILE
 #define BOOT_PROFILE 0
 #endif
 #ifndef BOOT_GATE
-#define BOOT_GATE    0
+#define BOOT_GATE    1
 #endif
 #ifndef BOOT_SEL
 #define BOOT_SEL     1
@@ -173,6 +178,24 @@ OBS uint32_t g_eng_n_used   = 0;     /* 最近一拍实际扫的条数 */
  *   对一个主打确定性的项目方向正好反了。留痕之后, 外部工具能判断
  *   "min == first ⇒ 这个 min 不可当稳态最小值用"。 */
 OBS uint32_t g_eng_cyc_first = 0;   /* 清统计后第一个样本 (0 = 还没有样本) */
+
+/* ══════════ W1: 运行控制 + SHM 读写 的观测面 ══════════
+ * 纪律: 每个计数器都要有"能被外部读走"的落点, 且判据必须能失败 ——
+ * 只数成功会让"全部被拒"看起来像"没跑过"; 只数失败会让"全部放行"看起来像"很严格"。
+ * ⇒ 成功/拒绝**分开计数**, 并且记录最后一次拒绝的原因码。 */
+OBS uint32_t g_shm_rd_ok   = 0;   /* 0x20/0x22 成功次数 */
+OBS uint32_t g_shm_rd_nak  = 0;   /* 0x20/0x22 被拒次数 */
+OBS uint32_t g_shm_wr_ok   = 0;   /* 0x21/0x23 成功次数 */
+OBS uint32_t g_shm_wr_nak  = 0;   /* 0x21/0x23 被拒次数 */
+OBS uint32_t g_nak_last    = 0;   /* 最后一次拒绝的原因码 (见 NAKRH_* 枚举) */
+OBS uint32_t g_start_ok    = 0;
+OBS uint32_t g_start_nak   = 0;   /* ★ 与 S3 的 F11 兜底联动: 毒药表 START 必须走这条 */
+OBS uint32_t g_stop_ok     = 0;
+OBS uint32_t g_reset_ok    = 0;
+OBS uint32_t g_safe_calls  = 0;   /* eng_outputs_safe() 被调用次数 (证明安全态真跑过) */
+OBS uint32_t g_safe_gpio_mask = 0;/* 最近一次安全态用的掩码 (判据: 非零才算真清过) */
+OBS uint32_t g_timing_resets  = 0;/* timing_stats_reset 次数 (OA13 幂等判据) */
+OBS uint32_t g_engine_run_seen = 0;/* ISR 观察到的 ENGINE_RUN 值快照 */
 OBS uint32_t g_isr_cyc_first = 0;
 
 /* ── 引擎扫描: 统计 (CPU 周期) ── */
@@ -375,8 +398,17 @@ ISR_PLACE void TIM2_IRQHandler(void)
             g_reload_count++;
         }
 
-        /* ---- 引擎扫描 (ta..tb 只包住扫描体本身) ---- */
-        if (g_engine_gate) {
+        /* ---- 引擎扫描 (ta..tb 只包住扫描体本身) ----
+         * ★ W1 (0x11/0x12): 门的条件是 **两个** ——
+         *     g_engine_gate  = bench 运行期旋钮 (pyocd 用, 阶段 2 的 A/B 实验入口)
+         *     ENGINE_RUN     = 协议运行控制 (PC 用, 0x11 置 / 0x12 清)
+         *   为什么保留两个: g_engine_gate 属于"实验仪器", ENGINE_RUN 属于"产品语义"。
+         *   把它们合成一个会让 bench 组 (gate=1, RUN=0) 无法复现阶段 2 的基线数字。
+         *   ★ 但 ISR **不能**用 gate 单独开跑 —— 那意味着"上电即跑引擎"而 PC 无法停,
+         *   所以真实运行条件是 (gate && RUN)。这同时让 0x12 STOP 成为**可失败判据**:
+         *   STOP 后 routes_total 必须停止增长 (见 tools/h723_runctrl.py)。 */
+        g_engine_run_seen = SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN);
+        if (g_engine_gate && g_engine_run_seen) {
             uint32_t ta = DWT_CYCCNT;
             uint32_t sel = g_engine_sel;
             uint32_t ck;
@@ -676,6 +708,148 @@ static void h_engine_status(void)
     ack(r, 37);
 }
 
+/* ══════════ W1: 运行控制 + SHM 读写 (0x11/0x12/0x13 + 0x20-0x23) ══════════
+ * 这 7 条命令的意义: 把引擎的配置态从**编译期旋钮**搬到**运行期协议**。
+ * 在此之前"改一条路由"要重新编译+烧录; 之后 PC 一条帧就能读写。
+ *
+ * ★ 与 S3 的关系: 语义逐字搬, 地址表必须重写 (见 engine.h 守卫段说明)。
+ * ★ 四个安全守卫必须搬全 (S3 main.c:83-140), 少一个就是一个可利用的洞:
+ *     valid_addr / valid_range / write_allowed(NaN 防护) / outputs_safe
+ */
+
+/* 拒绝原因码 —— 让"为什么被拒"可被外部读走, 而不是只有一串 NAK 文本。
+ * 文本对人类友好, 码对**脚本判据**友好 (脚本比对字符串太脆, 改一个字就失效)。 */
+#define NAKRH_ADDR     1u   /* 地址非法 / 不对齐 */
+#define NAKRH_RANGE    2u   /* burst 区间非法 / 越界 / 跨禁区 */
+#define NAKRH_COUNT    3u   /* count 为 0 或 > 256 */
+#define NAKRH_SHORT    4u   /* 载荷长度不足 */
+#define NAKRH_NONFIN   5u   /* 写 float 区但值非有限 (NaN/Inf) */
+#define NAKRH_BUDGET   6u   /* START 时发现程序超预算 (F11 毒药表兜底) */
+
+/* 0x20 READ [addr:u32] → ACK [val:u32] */
+static void h_read_w1(const uint8_t *p, uint32_t n)
+{
+    if (n < 4) { g_shm_rd_nak++; g_nak_last = NAKRH_SHORT; nak("need addr"); return; }
+    uint32_t a = get32(p);
+    if (!eng_valid_addr(a)) { g_shm_rd_nak++; g_nak_last = NAKRH_ADDR; nak("bad addr"); return; }
+    uint32_t v = *(volatile uint32_t *)(uintptr_t)a;
+    uint8_t r[4]; put32(r, v);
+    g_shm_rd_ok++;
+    ack(r, 4);
+}
+
+/* 0x22 READ_BURST [addr:u32][count:u16] → ACK [count×u32] */
+static void h_read_burst_w1(const uint8_t *p, uint32_t n)
+{
+    if (n < 6) { g_shm_rd_nak++; g_nak_last = NAKRH_SHORT; nak("need addr+count"); return; }
+    uint32_t a = get32(p);
+    uint16_t c = get16(p + 4);
+    if (!c || c > 256u) { g_shm_rd_nak++; g_nak_last = NAKRH_COUNT; nak("bad count"); return; }
+    if (!eng_valid_range(a, (uint32_t)c * 4u)) {
+        g_shm_rd_nak++; g_nak_last = NAKRH_RANGE; nak("bad range"); return;
+    }
+    /* 256×4 = 1024B ≤ FRAME_PAYLOAD_MAX(6150) —— 单帧放得下, S3 T19 同口径 */
+    static uint8_t r[1024];
+    for (uint32_t i = 0; i < c; i++) {
+        uint32_t v = *(volatile uint32_t *)(uintptr_t)(a + i * 4u);
+        put32(r + i * 4u, v);
+    }
+    g_shm_rd_ok++;
+    ack(r, (uint32_t)c * 4u);
+}
+
+/* 0x21 WRITE [addr:u32][value:u32] → ACK [addr:u32] (回显地址, 便于脚本确认) */
+static void h_write_w1(const uint8_t *p, uint32_t n)
+{
+    if (n < 8) { g_shm_wr_nak++; g_nak_last = NAKRH_SHORT; nak("need addr+value"); return; }
+    uint32_t a = get32(p), v = get32(p + 4);
+    if (!eng_valid_addr(a)) { g_shm_wr_nak++; g_nak_last = NAKRH_ADDR; nak("bad addr"); return; }
+    if (!eng_write_allowed(a, v)) {
+        g_shm_wr_nak++; g_nak_last = NAKRH_NONFIN; nak("non-finite rejected"); return;
+    }
+    *(volatile uint32_t *)(uintptr_t)a = v;
+    __asm__ volatile("dsb" ::: "memory");
+    uint8_t r[4]; put32(r, a);
+    g_shm_wr_ok++;
+    ack(r, 4);
+}
+
+/* 0x23 WRITE_BURST [addr:u32][count:u16][count×u32] → ACK [addr:u32]
+ * ★ P1b 语义: **先全量预检, 再落笔** —— 否则写到第 5 个字发现 NaN 时,
+ *   前 4 个字已经写进去了, 表处于半新半旧的破状态 (比"整体拒绝"危险得多)。 */
+static void h_write_burst_w1(const uint8_t *p, uint32_t n)
+{
+    if (n < 8) { g_shm_wr_nak++; g_nak_last = NAKRH_SHORT; nak("need addr+count+data"); return; }
+    uint32_t a = get32(p);
+    uint16_t c = get16(p + 4);
+    if (!c || c > 256u) { g_shm_wr_nak++; g_nak_last = NAKRH_COUNT; nak("bad count"); return; }
+    if (n < 6u + (uint32_t)c * 4u) { g_shm_wr_nak++; g_nak_last = NAKRH_SHORT; nak("short"); return; }
+    if (!eng_valid_range(a, (uint32_t)c * 4u)) {
+        g_shm_wr_nak++; g_nak_last = NAKRH_RANGE; nak("bad range"); return;
+    }
+    const uint8_t *d = p + 6;
+    for (uint32_t i = 0; i < c; i++) {
+        uint32_t v = get32(d + i * 4u);
+        if (!eng_write_allowed(a + i * 4u, v)) {
+            g_shm_wr_nak++; g_nak_last = NAKRH_NONFIN; nak("non-finite rejected"); return;
+        }
+    }
+    for (uint32_t i = 0; i < c; i++) {
+        *(volatile uint32_t *)(uintptr_t)(a + i * 4u) = get32(d + i * 4u);
+    }
+    __asm__ volatile("dsb" ::: "memory");
+    uint8_t r[4]; put32(r, a);
+    g_shm_wr_ok++;
+    ack(r, 4);
+}
+
+/* 0x11 START — 三处语义必须保留 (S3 main.c:895-921) */
+static void h_start_w1(void)
+{
+    /* ① F11 兜底: persist 恢复的历史毒药表 (超预算程序) 必须拒 START,
+     *    否则上电即进"锁死死循环"—— 而 PC 侧只会看到引擎卡住, 查不到原因。 */
+    uint16_t nr = SHM_U16(g_shm, OFF_CTRL_N_ROUTES);
+    if (nr) {
+        uint32_t b = engine_prog_budget((const uint8_t *)(g_shm + OFF_ROUTE_TABLE), nr);
+        if (b > EXEC_DEPLOY_BUDGET) {
+            g_start_nak++; g_nak_last = NAKRH_BUDGET;
+            nak("prog exceeds budget; redeploy");
+            return;
+        }
+    }
+    /* ② OA13 幂等: 只在 STOP→RUN 转变时清统计。
+     *    已 RUN 再收 START (热重载 deploy 默认补发一条 0x11) 必须**不清零**,
+     *    否则 T4 "心跳连续" 判据 (samples 单调增长证明未停机) 被误伤。 */
+    if (!SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN)) {
+        stats_reset();
+        g_timing_resets++;
+    }
+    SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN) = 1;
+    __asm__ volatile("dsb" ::: "memory");
+    g_start_ok++;
+    ack(NULL, 0);
+}
+
+/* 0x12 STOP — 停机进安全态 (P1-2): 停机 ≠ 保持最后一拍输出 */
+static void h_stop_w1(void)
+{
+    SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN) = 0;
+    __asm__ volatile("dsb" ::: "memory");
+    g_safe_gpio_mask = SHM_U32(g_shm, OFF_CTRL_GPIO_MASK);
+    eng_outputs_safe();
+    g_safe_calls++;
+    g_stop_ok++;
+    ack(NULL, 0);
+}
+
+/* 0x13 RESET — 收敛的冷启动清理 (新增域必须登记到 cold_start_reset) */
+static void h_reset_w1(void)
+{
+    cold_start_reset();
+    g_reset_ok++;
+    ack(NULL, 0);
+}
+
 /* ══════════ deploy 自检 (阶段 3.2) ══════════
  * 为什么需要它: CH340 还没接线, 无法从 PC 侧验证 deploy。自检把**同一个 h_deploy**
  * 用合成载荷驱动一遍 —— 验证的是真代码路径, 不是复制一份逻辑出来单独测。
@@ -793,6 +967,15 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_GET_VERSION:   h_get_version(); break;
         case CMD_DEPLOY:        h_deploy(p, n); break;
         case CMD_ENGINE_STATUS: h_engine_status(); break;
+        /* ---- W1: 运行控制 ---- */
+        case CMD_START:         h_start_w1(); break;
+        case CMD_STOP:          h_stop_w1(); break;
+        case CMD_RESET:         h_reset_w1(); break;
+        /* ---- W1: SHM 读写 ---- */
+        case CMD_READ:          h_read_w1(p, n); break;
+        case CMD_READ_BURST:    h_read_burst_w1(p, n); break;
+        case CMD_WRITE:         h_write_w1(p, n); break;
+        case CMD_WRITE_BURST:   h_write_burst_w1(p, n); break;
         /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
          *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
          *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
@@ -914,6 +1097,14 @@ static void obs_anchor(void)
     sink ^= g_reload_lat;                 sink ^= g_deploy_set_tick;
     sink ^= g_dst_case[0];                sink ^= g_dst_case[DSELFTEST_CASES - 1];
     sink ^= g_dst_done;
+    /* W1 观测面 */
+    sink ^= g_shm_rd_ok;   sink ^= g_shm_rd_nak;
+    sink ^= g_shm_wr_ok;   sink ^= g_shm_wr_nak;
+    sink ^= g_nak_last;    sink ^= g_start_ok;
+    sink ^= g_start_nak;   sink ^= g_stop_ok;
+    sink ^= g_reset_ok;    sink ^= g_safe_calls;
+    sink ^= g_safe_gpio_mask; sink ^= g_timing_resets;
+    sink ^= g_engine_run_seen;
     (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
 }
 
@@ -979,6 +1170,10 @@ int main(void)
     g_scan_mode     = BOOT_SCAN_MODE;
     g_n_routes      = MAX_ROUTES;
     g_engine_gate   = BOOT_GATE;
+    /* ★ W1: 上电即置 ENGINE_RUN —— 与 S3 行为对齐 (S3 上电引擎空转, 等 PC deploy)。
+     *   写在表格装载**之后**: 配置就绪前让 ISR 别扫半张表。 */
+    SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN) = 1;
+    __asm__ volatile("dsb" ::: "memory");
     g_stage = 5;
 
     /* ④ DWT 标定 */

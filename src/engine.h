@@ -472,4 +472,36 @@ uint16_t engine_stage_program(uint8_t *base, const uint8_t *payload,
 void shm_guard_paint(void);
 int  shm_guard_ok(void);
 
+/* ══════════════════ W1: SHM 读写命令的地址守卫 ══════════════════
+ * S3 `main.c:83-140` 的同构实现。**逐字搬的是判据, 不是地址表** ——
+ * S3 写的是 S3 的地址 (0x60004000 GPIO / 0x60009000 LEDC / 0x60000000 外设),
+ * 在 H723 上一个都不成立, 照抄会放行一片**根本不存在的外设区**, 写进去
+ * 触发 BusFault (S3 上 LX7 可能只是静默错位, H7 上直接 HardFault)。
+ *
+ * ★★ 为什么要有白名单 (而不是"SHM 之外一律拒"):
+ *    0x20-0x23 的存在意义就是"用协议访问 SHM **和** 外设寄存器" ——
+ *    S3 的 T8 就是靠 0x20 读 GPIO_OUT_REG 拿外部证据的。所以必须有外设白名单。
+ * ★★ 为什么外设白名单**必须窄**:
+ *    H723 的 RCC(0x58024400) / PWR(0x58024800) / FLASH(0x52002000) 全在同一片
+ *    APB3/AHB4 里。放行整个 0x58000000-0x58025000 就等于让 PC 能写 PLL 分频、
+ *    关掉 VOS、擦 Flash —— 一次误写就是砖。这里**显式排除**这三个。 */
+
+/** @brief 单地址可访问性 (4B 对齐 + SHM 内 或 白名单外设区) */
+int eng_valid_addr(uint32_t a);
+
+/** @brief 区间可访问性 (burst 用: 起止必须落在**同一个**合法区内, 防跨区越界) */
+int eng_valid_range(uint32_t a, uint32_t bytes);
+
+/** @brief 该 SHM 偏移是否属于 float 数据区 (决定是否要拦 NaN/Inf) */
+int eng_shm_off_is_float(uint32_t off);
+
+/** @brief 0x21/0x23 写放行: SHM float 区只收有限值, 其余一律放行 */
+int eng_write_allowed(uint32_t a, uint32_t v);
+
+/** @brief 输出安全态: GPIO 只清不置 + 执行器数组归零 (STOP/RESET 用)
+ *  ★ S3 用 GPIO_OUT_W1TC (只清不置); H723 无此寄存器, 等价物是
+ *    **BSRR 的高 16 位** (`GPIOx_BSRR = mask << 16`)。低位是置位, 高位是清位 ——
+ *    写高位就天然"只清不置", 掩码外的引脚不受影响。 */
+void eng_outputs_safe(void);
+
 #endif /* DCL_ENGINE_H */

@@ -28,7 +28,7 @@ endif()
 
 # ---- bench 启动默认配置 (外部仪器测非默认配置时必须编进固件, 见 main.c 注释) ----
 set(DCL_BOOT_PROFILE "0" CACHE STRING "启动默认 table_profile (0 全DIRECT / 1 混合 / 2 全PID)")
-set(DCL_BOOT_GATE    "0" CACHE STRING "启动默认 engine_gate (0 骨架 / 1 开扫描)")
+set(DCL_BOOT_GATE    "1" CACHE STRING "启动默认 engine_gate (0 骨架 / 1 开扫描; W1 起默认 1)")
 set(DCL_BOOT_SEL     "1" CACHE STRING "启动默认 engine_sel  (0 走FLASH / 1 走ITCM)")
 set(SCAN_FLASH_PAD   "0" CACHE STRING "engine_scan_flash 之前的填充字节数 (落位敏感实验)")
 set(DCL_BOOT_SCAN_MODE "0" CACHE STRING "启动默认 scan_mode (0 全表扫 / 1 分档调度)")

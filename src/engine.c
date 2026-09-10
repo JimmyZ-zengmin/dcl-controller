@@ -22,6 +22,7 @@
  *   命中与否还会让成本随程序历史漂移 —— 确定性直接破产。
  */
 #include <string.h>
+#include "regs.h"
 #include "engine.h"
 #include "lsym.h"
 #include "primitives.h"
@@ -664,4 +665,103 @@ void engine_reload_active(uint8_t *base)
     SHM_U32(base, OFF_CTRL_PROG_MAGIC) = 0x44434C31u;   /* 'DCL1' */
     /* ★ 生效确认: 把"已切换"这件事写成可观测的量 (S3 的 ACK≠已生效 语义债) */
     SHM_U16(base, OFF_CTRL_APPLIED_SEQ) = SHM_U16(base, OFF_CTRL_DEPLOY_SEQ);
+}
+
+/* ══════════════════ W1: SHM 读写命令的地址守卫 ══════════════════
+ * 结构与 S3 `main.c:83-140` 同构, 但地址表**必须重写** —— 见 engine.h 的说明。 */
+
+/* ── H723 外设可见区白名单 ──
+ * 只放行"读了有意义、写了不会砖"的区。★ 三个禁区必须显式排除:
+ *   RCC(0x58024400) / PWR(0x58024800) / FLASH(0x52002000) */
+#define ENG_SHMF  (0x40000000u)   /* APB1 起始 (TIM2 0x40000000 / USART2 0x40004400...) */
+#define ENG_SHMFE (0x40025000u)   /* APB2 结束 (USART1 0x40011000 / SPI1 0x40013000) */
+#define ENG_GPIOF (0x58020000u)   /* GPIOA 起始 */
+#define ENG_GPIOFE (0x58022000u)  /* GPIOK 结束 (0x58020000 + 0x400*11) */
+
+/* RCC / PWR / FLASH 各自 1KB 的禁区, valid_addr 里逐个排除 */
+#define ENG_IS_FORBIDDEN(a) \
+    (((a) >= RCC_BASE   && (a) < RCC_BASE   + 0x400u) || \
+     ((a) >= PWR_BASE   && (a) < PWR_BASE   + 0x400u) || \
+     ((a) >= FLASH_BASE && (a) < FLASH_BASE + 0x400u))
+
+int eng_valid_addr(uint32_t a)
+{
+    /* 非对齐访问在 M7 上会触发 UsageFault (S3 的 LX7 是静默错位数据) —— 两种都该拒,
+     * 但 H723 上不拒的后果更硬: 直接 HardFault 把协议打挂。 */
+    if (a & 3u) return 0;
+    if (a >= (uint32_t)(uintptr_t)g_shm && a < (uint32_t)(uintptr_t)g_shm + SHM_SIZE) return 1;
+    if (ENG_IS_FORBIDDEN(a)) return 0;
+    if (a >= ENG_SHMF  && a < ENG_SHMFE)  return 1;   /* APB1/APB2 外设 */
+    if (a >= ENG_GPIOF && a < ENG_GPIOFE) return 1;   /* GPIOA..K */
+    return 0;
+}
+
+int eng_valid_range(uint32_t a, uint32_t bytes)
+{
+    if (bytes == 0) return 0;
+    if (a & 3u) return 0;      /* burst 基址须 4 对齐 (步进 4B) */
+    uint32_t e = a + bytes;    /* ★ 溢出检查: a+bytes 回绕会让下面的比较全部通过 */
+    if (e < a) return 0;
+    if (a >= (uint32_t)(uintptr_t)g_shm && e <= (uint32_t)(uintptr_t)g_shm + SHM_SIZE) return 1;
+    /* 外设区: 起止都落在同区, 且区间**不与禁区相交**。
+     * ★ 不能用"大区包住禁区就算过"—— 那样 [RCC-4, RCC+4) 这种跨禁区的 burst 会被放行,
+     *   而这正是最危险的一种越界 (读会出错值, 写会改时钟)。 */
+    if (a >= ENG_SHMF && e <= ENG_SHMFE) {
+        if (e <= RCC_BASE   || a >= RCC_BASE   + 0x400u) {
+        if (e <= PWR_BASE   || a >= PWR_BASE   + 0x400u) {
+        if (e <= FLASH_BASE || a >= FLASH_BASE + 0x400u) {
+            return 1;
+        }}}
+        return 0;
+    }
+    if (a >= ENG_GPIOF && e <= ENG_GPIOFE) return 1;
+    return 0;
+}
+
+/* SHM 内哪些区是 float 数据区 (接受 NaN/Inf 会让 LUT/MUX/EDGE 的 float→int
+ * 转换触发 C 未定义行为 → 静默越界读, S3 AUDIT P1b)。外设寄存器无浮点语义, 不拦。 */
+int eng_shm_off_is_float(uint32_t off)
+{
+    if (off >= OFF_SENSOR_MAP      && off < OFF_ACTUATOR_STATUS) return 1;
+    if (off >= OFF_ACTUATOR_STATUS && off < OFF_WIRE_MAP)        return 1;
+    if (off >= OFF_WIRE_MAP        && off < OFF_LUT_DATA)        return 1;
+    if (off >= OFF_LUT_DATA        && off < OFF_ROUTE_TABLE)     return 1;
+    if (off >= OFF_PARAM_TABLE     && off < OFF_PARAM_STAGING)   return 1;
+    if (off >= OFF_PARAM_STAGING   && off < OFF_STATE_TABLE)     return 1;
+    if (off >= OFF_STATE_TABLE     && off < OFF_STATE_STAGING)   return 1;
+    /* ★ 状态 staging 到路由桶之间是保留洞 (未定义的域) —— 不列入 float 区,
+     *   写进去既不拦 NaN 也不报错, 与 S3 的"洞外一律放行"行为一致。
+     *   (要改成更严的话应先把这个洞变成真区 + 断言, 而不是在这里猜语义) */
+    return 0;
+}
+
+/* float 位模式有限性: 指数 8 位全 1 = ±Inf / NaN。不用浮点比较, 不依赖 FPU 状态 */
+static inline int is_finite_bits(uint32_t v) { return ((v & 0x7F800000u) != 0x7F800000u); }
+
+int eng_write_allowed(uint32_t a, uint32_t v)
+{
+    uint32_t base = (uint32_t)(uintptr_t)g_shm;
+    if (a < base || (a & 3u)) return 1;          /* SHM 外/非对齐: valid_addr 已挡 */
+    uint32_t o = a - base;
+    if (o >= SHM_SIZE) return 1;
+    return eng_shm_off_is_float(o) ? is_finite_bits(v) : 1;
+}
+
+/* 输出安全态: 停机 ≠ 输出保持最后一拍 —— 工业语义"停机 = 进安全态"。
+ * ★ H723 没有 GPIO_OUT_W1TC (S3 的"只清不置"), 等价物 = BSRR 高 16 位。
+ *   掩码外的引脚完全不受影响 (这正是 S3 用 W1TC 的用意: 别碰没被引擎管的脚)。 */
+void eng_outputs_safe(void)
+{
+    uint32_t mask = SHM_U32(g_shm, OFF_CTRL_GPIO_MASK);
+    if (mask) {
+        /* 掩码按 16 位分到各 port: 每 port 用一支 BSRR 清位 (高 16 位写 1 = 清) */
+        for (uint32_t p = 0; p < 12u; p++) {          /* GPIOA..K (0..10), 12 留余 */
+            uint32_t m = (mask >> (p * 2u)) & 0xFFFFu;
+            if (m) GPIO_BSRR(p) = m << 16;
+        }
+    }
+    /* 执行器状态数组归零 (S3: memset ACTUATOR_STATUS) */
+    volatile uint32_t *act = (volatile uint32_t *)(void *)(g_shm + OFF_ACTUATOR_STATUS);
+    for (uint32_t i = 0; i < (uint32_t)MAX_ACTUATORS; i++) act[i] = 0u;
+    __asm__ volatile("dsb" ::: "memory");
 }
