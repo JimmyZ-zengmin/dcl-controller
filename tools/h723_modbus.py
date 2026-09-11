@@ -99,6 +99,32 @@ def find_port(explicit):
     return ports[0].device if ports else None
 
 
+def open_serial(port, baud=115200, timeout=0.5):
+    """打开串口, 并**立刻把 DTR/RTS 释放到非有效态**。
+
+    ★★★ 为什么必须有这一句 (2026-09-11 真实事故, 代价 = 一整轮开发停摆):
+      如果 CH340 的 `RTS` 被接到了板子的 `NRST` (想用 PC 复位板子), 那么**任何工具
+      只要一打开串口**, pyserial/驱动就会 assert RTS ⇒ **NRST 被按住** ⇒
+        · 串口 0 字节 (板子在复位里)
+        · 连 SWD 的非复位 attach 也失败 (`SWD/JTAG communication failure (WAIT ACK)`)
+      两个接口**同时**失效 ⇒ 症状看起来像"固件挂了/探针坏了", 排查方向被完全带偏。
+      实测: 拆掉那根线后 SWD 立刻恢复 5/5, 串口恢复 ACK。
+    ⇒ 本函数把"释放复位"变成结构事实, 而不是靠使用者记得。即使没接那根线也无害
+      (CH340 的 RTS 空闲态本来就是非有效)。
+
+    ★ 反过来说: 要做"PC 复位板子"(S3 套件 T15 的重启半段), 直连 RTS→NRST 是**错的**
+      接法 —— 正确做法是 **RTS ——100nF—— NRST**(交流耦合: 只有电平跳变产生一个短脉冲,
+      稳态按不住板子), 并且要确认 RTS 输出是 3.3V 而不是 5V。
+    """
+    s = serial.Serial(port, baud, timeout=timeout)
+    try:
+        s.setDTR(False)
+        s.setRTS(False)
+    except Exception:
+        pass
+    return s
+
+
 class Link:
     """最小协议客户端 (与 h723_w1.py 同款; 该文件修过一个 bytes(int) 类型 bug,
     这里的 sts 保持为 **int** —— 见 h723_w1.py:128 的审计记录)"""
