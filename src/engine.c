@@ -1038,6 +1038,27 @@ int eng_write_allowed(uint32_t a, uint32_t v)
     return eng_shm_off_is_float(o) ? is_finite_bits(v) : 1;
 }
 
+/* ══════════ 物理输出面注册表 (见 engine.h 的说明) ══════════
+ * 一个极小的函数指针数组: 各域 init 后把自己的"安全态"挂上来。
+ * ★ 为什么不用"在 eng_outputs_safe 里直接调 hil_outputs_safe()":
+ *   那样每次新增输出面都要回来改 core 文件 ⇒ 又变成"改一处忘一处"。
+ *   注册表把"新增域必须登记"变成**调用方的一次显式动作**, 而登记数可被外部读走。
+ * ★ 容量 4: 当前只有 HIL 一个面 (GPIO 执行器面在 H723 尚未实现)。满了就静默丢弃
+ *   —— 不静默: 由 `g_safe_surfaces_reg` 与 0x38 byte38 暴露实际登记数, 判据可查。 */
+static void (*s_out_safe[ENG_MAX_OUT_SURFACES])(void);
+static uint32_t s_out_safe_n = 0;
+
+/* 观测: 上一次安全态**实际执行**的面数 (与登记数对照 ⇒ 能区分"没登记"与"登记了没跑") */
+volatile uint32_t g_safe_surfaces_ran = 0;
+
+void eng_register_output_surface(void (*fn)(void))
+{
+    if (!fn || s_out_safe_n >= (uint32_t)ENG_MAX_OUT_SURFACES) return;
+    s_out_safe[s_out_safe_n++] = fn;
+}
+
+uint32_t eng_output_surface_count(void) { return s_out_safe_n; }
+
 /* 输出安全态: 停机 ≠ 输出保持最后一拍 —— 工业语义"停机 = 进安全态"。
  * ★ H723 没有 GPIO_OUT_W1TC (S3 的"只清不置"), 等价物 = BSRR 高 16 位。
  *   掩码外的引脚完全不受影响 (这正是 S3 用 W1TC 的用意: 别碰没被引擎管的脚)。 */
@@ -1068,5 +1089,11 @@ void eng_outputs_safe(void)
     /* 执行器状态数组归零 (S3: memset ACTUATOR_STATUS) —— 这一半是**有效**的 */
     volatile uint32_t *act = (volatile uint32_t *)(void *)(g_shm + OFF_ACTUATOR_STATUS);
     for (uint32_t i = 0; i < (uint32_t)MAX_ACTUATORS; i++) act[i] = 0u;
+    /* ★★ 覆盖**全部已注册的物理输出面** (审计 #1 的结构性对策, 见 engine.h)。
+     *   放在 ACTUATOR 数组归零**之后**: 数组是内部镜像, 物理面才是对外效果 ——
+     *   "停机后执行器不再动作"这句话的判据必须在物理面上量, 不是在镜像上量。
+     *   (顺序不影响正确性, 但影响可读性: 先内部后外部, 一眼看出覆盖顺序。) */
+    for (uint32_t i = 0; i < s_out_safe_n; i++) s_out_safe[i]();
+    g_safe_surfaces_ran = s_out_safe_n;
     __asm__ volatile("dsb" ::: "memory");
 }

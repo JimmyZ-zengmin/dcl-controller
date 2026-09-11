@@ -30,4 +30,11 @@
 void hil_init(uint8_t *base);
 void hil_tick(uint8_t *base, uint32_t tick_now);
 
+/** @brief HIL 物理输出的**安全态** —— 由 engine 的物理输出面注册表在 STOP/RESET 时调用。
+ *  ★ 语义: 把 PWM 占空比压到 0 (输出归零), 并回写 `OFF_HIL_DUTY` 镜像。
+ *  ★ 为什么必须回写镜像: `OFF_HIL_DUTY` 的契约是"最近写入 TIM3_CCR1 的值"。
+ *    只清寄存器不回写 ⇒ 任何读镜像做的停机安全判据都看不到安全态,
+ *    "停机已进安全态"就变成一句不可核对的宣称 (本项目"宣称必须等于实现")。 */
+void hil_outputs_safe(void);
+
 #endif /* DCL_HIL_H */

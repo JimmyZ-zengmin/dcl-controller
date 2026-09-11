@@ -209,6 +209,7 @@ OBS uint32_t g_stop_ok     = 0;
 OBS uint32_t g_reset_ok    = 0;
 OBS uint32_t g_safe_calls  = 0;   /* eng_outputs_safe() 被调用次数 (证明安全态真跑过) */
 OBS uint32_t g_safe_gpio_mask = 0;/* 最近一次安全态用的掩码 (判据: 非零才算真清过) */
+OBS uint32_t g_out_surfaces  = 0; /* 已注册的**物理输出面**个数 (审计 #1: 必须 ≥1) */
 OBS uint32_t g_timing_resets  = 0;/* timing_stats_reset 次数 (OA13 幂等判据) */
 OBS uint32_t g_engine_run_seen = 0;/* ISR 观察到的 ENGINE_RUN 值快照 */
 OBS uint32_t g_isr_cyc_first = 0;
@@ -1336,7 +1337,7 @@ static void h_adc_scan(const uint8_t *p, uint32_t n)
  *   基线的一部分, 不该为一个"被轮询才需要"的视图付每拍的代价。 */
 static void h_engine_status(void)
 {
-    uint8_t r[38];
+    uint8_t r[40];
     uint32_t pn = (g_per_cyc_min == 0xFFFFFFFFu) ? 0u : g_per_cyc_min;
     uint32_t en = (g_isr_cyc_min == 0xFFFFFFFFu) ? 0u : g_isr_cyc_min;
     /* ★★ 审计发现 D 修复: 原来读的是 C 全局 `g_active_routes`, 而它只在启动/reinit
@@ -1369,7 +1370,13 @@ static void h_engine_status(void)
     r[33] = (uint8_t)(g_applied_seq); r[34] = (uint8_t)(g_applied_seq >> 8);
     r[35] = (uint8_t)(g_reload_lat);  r[36] = (uint8_t)(g_reload_lat >> 8);
     r[37] = (uint8_t)g_engine_gate;   /* H723 扩展: 扫描门 (S3 无此量, 故挪到尾部) */
-    ack(r, 38);
+    /* ★ 审计 #1: 物理输出面**登记数** —— 让"停机安全态契约覆盖了几个面"可被外部核对。
+     *   判据: 必须 ≥1 (当前 = HIL 的 PWM 面)。若为 0 ⇒ 注册步骤没跑到 ⇒ 停机不清任何
+     *   物理输出。★ 为什么单靠"读 OFF_HIL_DUTY 是不是 0"不够: 登记数为 0 时 duty
+     *   恰好也是 0 (没人写它), 于是"没登记"与"已进安全态"在读数上**完全一样** ——
+     *   必须有一个独立的量把这两件事分开。 */
+    r[38] = (uint8_t)g_out_surfaces;
+    ack(r, 39);
 }
 
 /* ══════════ W1: 运行控制 + SHM 读写 (0x11/0x12/0x13 + 0x20-0x23) ══════════
@@ -1576,6 +1583,15 @@ static void h_reset_w1(void)
      *   ⇒ RESET 必须显式补一次 stats_reset()。 */
     stats_reset();
     g_timing_resets++;
+    /* ★★ 审计 #1: RESET 也必须进安全态 —— 与 0x12 STOP 同理, 而且更隐蔽:
+     *   cold_start_reset() 把 SHM 整段清零 (含 ENGINE_RUN=0 与 HIL 的 duty 镜像),
+     *   但**物理寄存器 TIM3_CCR1 不在 SHM 里** —— 它保留着上一次的占空比。
+     *   ⇒ 只清状态不清输出 = "看起来停机了, 执行器还在动"。
+     *   ★ 这条是"变量归零 ≠ 物理输出归零"的标本: 两者住在不同地址空间
+     *     (SHM/DTCM vs 外设寄存器), 必须各自显式处理 —— 所以才有
+     *     eng_outputs_safe() 这个统一入口, 而不是在每个清零路径里各写一遍。 */
+    eng_outputs_safe();
+    g_safe_calls++;              /* 契约: 本计数 = eng_outputs_safe 被调用次数 (含 STOP 与 RESET) */
     g_reset_ok++;
     ack(NULL, 0);
 }
@@ -2026,6 +2042,8 @@ static void obs_anchor(void)
     sink ^= g_cmd_req_cnt;     sink ^= g_cmd_req_last;
     /* 审计发现 H 的观测面 (engine.c 侧, 不读会被回收) */
     sink ^= g_safe_mask_nonzero;
+    /* 审计 #1 的观测面: 物理输出面 登记数 / 上次实际执行数 */
+    sink ^= g_out_surfaces;    sink ^= g_safe_surfaces_ran;
     /* W4 通信域 */
     sink ^= g_mb_inject_ok;    sink ^= g_mb_nak;
     sink ^= g_mb_ticks;
@@ -2234,6 +2252,20 @@ int main(void)
     g_stage = 22; ai_init(g_shm);
     g_stage = 23; di_init(g_shm);
     g_stage = 24; hil_init(g_shm);
+    /* ★★ 把 HIL 的物理输出登记为"安全态必须覆盖的面" (审计 #1)。
+     *   必须在 hil_init **之后** —— 登记的是一个会写 TIM3_CCR1 的回调,
+     *   TIM3 时钟/引脚未配置时调用它只是往未使能的外设写, 语义上不该发生。
+     *   ★ 顺序纪律: **先 init 硬件, 再登记安全态** —— 反过来会出现
+     *     "已经被登记、但硬件还没配"的窗口。 */
+#if HIL_SAFE
+    g_stage = 25; eng_register_output_surface(hil_outputs_safe);
+#else
+    /* A/B 对照档 (HIL_SAFE=0) **改前行为**: 故意**不登记** ⇒ 注册表为空
+     * ⇒ eng_outputs_safe() 清不到任何物理面 ⇒ 复现"STOP 后 PWM 保持最后占空比"。
+     * 交付构建永远走上面那支。 */
+    g_stage = 25;
+#endif
+    g_out_surfaces = eng_output_surface_count();
     g_w5_ready = 1;
     g_stage = 12;
 

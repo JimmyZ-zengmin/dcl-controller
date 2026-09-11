@@ -197,8 +197,11 @@ bash build.sh -DDCL_PA9_MODE=0           # 回退到阶段 1 的 PA9 方波 (线
 # ★ 阶段 3.2 deploy 专用
 python tools/h723_op_sweep.py --dur 0.3 --json build/op_cost.json   # 逐原语成本 (约 30s)
 bash build.sh -DDCL_DEPLOY_SELFTEST=1    # 上电跑 deploy 自检 (9 例, 用 SWD 读结果)
+bash build.sh -DDCL_HIL_SAFE=0           # A/B: 停机不覆盖 HIL 输出 (改前行为, 仅供对照)
 
-# ★ 验收套件 (10 套, 177 PASS / 0 FAIL —— 名单见 docs/STATUS-2026-09-11.md)
+# ★ 验收套件 (10 套, 181 PASS / 0 FAIL —— 名单见 docs/STATUS-2026-09-11.md)
+#   ★ 跑串口套件请**显式传 --port COM14**: find_port() 只按 VID 1A86 匹配,
+#     而 CH343(COM7, ESP32-S3) 也是 1A86 ⇒ 会认错口。
 python tools/h723_audit_m234.py     # 外部审计 M2/M3/M4 + P3      12/12
 python tools/h723_proto.py          # 协议层 (需 CH340 接线)        12/12
 python tools/h723_w1.py             # 运行控制 + SHM 读写          28/28
@@ -207,12 +210,16 @@ python tools/h723_seq.py            # W3 顺序域                    27/27
 python tools/h723_persist.py        # W2.4 掉电保持 (会写 flash)    26/26
 python tools/h723_modbus.py         # W4 Modbus RTU                15/15
 python tools/h723_macro.py          # W5.1 macro VM                18/18
-python tools/h723_w5.py             # W5 外设域 (DI/AI/HIL)        14/14
+python tools/h723_w5.py             # W5 外设域 (DI/AI/HIL)        18/18
 python tools/h723_t26.py            # ★ PERSISTENT 落盘 (T26)      11/11
 
 # ★ A/B: 擦除期间丢拍 (证明"判据能失败")
 bash build.sh -DDCL_VTOR_ITCM=0 && pyocd flash ... && python tools/h723_tick_erase.py  # 应报缺口
 bash build.sh                  && pyocd flash ... && python tools/h723_tick_erase.py  # 应报 0
+
+# ★ A/B: 停机安全态覆盖 HIL 输出 (证明 H-2 判据能失败, 见 docs/FIX-REPORT-R1-hil-safe-state.md)
+bash build.sh -DDCL_HIL_SAFE=0 && pyocd flash ... && python tools/h723_w5.py --port COM14  # H-2b/H-2d 应 FAIL
+bash build.sh                  && pyocd flash ... && python tools/h723_w5.py --port COM14  # 应 18/18
 ```
 
 ### 串口接线（PC 直连）

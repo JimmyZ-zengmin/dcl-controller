@@ -45,6 +45,15 @@ set(DCL_UART_SELFTEST  "0"      CACHE STRING "上电回环自检 (1 需 PA9↔PA
 set(DCL_UART_BAUD      "115200" CACHE STRING "协议波特率")
 set(DCL_DEPLOY_SELFTEST "0"     CACHE STRING "上电跑 deploy 自检 (9 例)")
 
+# ---- 审计 #1 的 A/B 对照开关: 停机安全态是否覆盖 HIL 物理输出 ----
+#   1 = 交付行为: HIL 的 PWM 登记为"输出面", STOP/RESET 归零, 且输出臂受 ENGINE_RUN 门控
+#   0 = **改前行为**: 不登记、不门控 ⇒ STOP 后 PWM 保持最后占空比 (这正是被修掉的缺陷)
+#   ★ 为什么必须有 0 档 (本项目纪律, 与 DCL_VTOR_ITCM 同一条):
+#     "改完只跑交付版看到 PASS" 不构成证据 —— 无法排除"判据本身量不出问题"。
+#     必须用**同一套测量方法**在 0 档上量到 FAIL(占空比不归零), 判据才算成立。
+#     (历史教训: 向量表那次就是靠 0 档量出 8153 拍缺口, 才证明判据没瞎。)
+set(DCL_HIL_SAFE "1" CACHE STRING "停机安全态覆盖 HIL 输出 (1 交付 / 0 改前行为对照)")
+
 # Cortex-M7 + 双精度 FPU + 硬浮点 (与老项目 build.bat 一致)
 set(MCU_FLAGS -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb)
 
@@ -79,6 +88,7 @@ add_compile_options(
     -DUART_BAUD=${DCL_UART_BAUD}u
     -DDEPLOY_SELFTEST=${DCL_DEPLOY_SELFTEST}
     -DMIN_TX_STRESS=${DCL_MIN_STRESS}
+    -DHIL_SAFE=${DCL_HIL_SAFE}
 )
 
 # syscalls.c 是 newlib 桩: 函数签名由 newlib 规定, 参数天然用不上。

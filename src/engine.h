@@ -819,6 +819,14 @@ extern uint8_t g_shm[SHM_SIZE];
  *  ★ 这是一个**否定性声称的外部证据**: 它恒 0 ⇔ 从没人往语义未定的 GPIO_MASK
  *    写过值。若非 0 ⇒ 有路径绕过了定案, 属必须查的 bug。 */
 extern volatile uint32_t g_safe_mask_nonzero;
+
+/** @brief 上一次 eng_outputs_safe() **实际执行**的物理输出面个数
+ *  ★ 与 `eng_output_surface_count()` (登记数) 对照使用:
+ *      登记数 = 0        ⇒ 没有任何域登记过 ⇒ 停机不会清任何物理输出 (配置错误)
+ *      登记数 > 执行数   ⇒ 注册表满了被静默丢弃, 或调用路径没跑到 (必须查)
+ *    两个数一起读才能区分"没登记"与"登记了却没跑" —— 只读一个都分不清。 */
+extern volatile uint32_t g_safe_surfaces_ran;
+
 /** @brief 冷启动清零 (.dtcm_shm 是 NOLOAD, 上电内容不确定 → 必须显式清)
  *  ★ 单一入口纪律 (S3 第二十六轮收口): "新增任何域必须在此登记"。
  *    本实现直接整段 memset(SHM_SIZE), 所以天然完整 —— 但**新域若放在 SHM 之外**
@@ -911,10 +919,30 @@ static inline int is_finite_bits(uint32_t v)
     return ((v & 0x7F800000u) != 0x7F800000u);
 }
 
-/** @brief 输出安全态: GPIO 只清不置 + 执行器数组归零 (STOP/RESET 用)
+/* ══════════ 物理输出面注册 —— 「停机 = 进安全态」的结构性保证 ══════════
+ * ★★★ 为什么需要这个机制 (2026-09-11 迁移保真度审查 一级 #1):
+ *   范本里「停机 = 进安全态」是 P1 不变量, 靠 `eng_outputs_safe()` 清 GPIO 位图实现。
+ *   迁到 H723 后**新增了一个真实物理输出面** —— HIL 的 PWM (`TIM3_CCR1` / PA6),
+ *   而安全态还停在"清 S3 那个 GPIO 位图"的模型上(且该位图在 H723 语义未定、不可达)。
+ *   ⇒ 结果: **STOP 之后 PWM 保持最后占空比不动** —— 停机不进安全态, 电机/阀门会继续动。
+ *   注意这不是"某人忘了改一行", 而是**契约形状本身有洞**: 契约写的是"清某个寄存器",
+ *   于是每新增一个输出面就漏一个。⇒ 契约改成"**覆盖全部已注册的物理输出面**"。
+ * ★ 纪律 (新增输出面时): init 之后必须调用 `eng_register_output_surface(自己的安全态)`。
+ *   不注册 = 停机不进它的安全态。注册数可被外部读走 (0x38 尾部 byte 38), 所以
+ *   "我把所有面都改了"不是一句无法核对的宣称。 */
+#define ENG_MAX_OUT_SURFACES 4
+/** @brief 注册一个物理输出面的安全态处理 (幂等: 重复注册同一函数只记一次的空位不保证) */
+void eng_register_output_surface(void (*fn)(void));
+/** @brief 已注册的输出面个数 (观测: 证明契约真的覆盖了 N 个面) */
+uint32_t eng_output_surface_count(void);
+
+/** @brief 输出安全态: **全部已注册物理输出面归零** + 执行器数组归零 (STOP/RESET 用)
  *  ★ S3 用 GPIO_OUT_W1TC (只清不置); H723 无此寄存器, 等价物是
  *    **BSRR 的高 16 位** (`GPIOx_BSRR = mask << 16`)。低位是置位, 高位是清位 ——
- *    写高位就天然"只清不置", 掩码外的引脚不受影响。 */
+ *    写高位就天然"只清不置", 掩码外的引脚不受影响。
+ *  ★ 但 H723 当前**没有** GPIO 执行器输出: 引擎只写 SHM 的 ACTUATOR_STATUS 浮点槽,
+ *    `OFF_CTRL_GPIO_MASK` 语义未定且不可达 (见上方该字段说明) ⇒ 上述 BSRR 路径不可达。
+ *    真正在动的是**注册进来的物理面** (当前 = HIL PWM)。两者都要覆盖。 */
 void eng_outputs_safe(void);
 
 /* ══════════════════ W2: Force (wire 强制/释放) ══════════════════

@@ -14,6 +14,12 @@ h723_w5.py — W5 外设域验收: DI · AI(ADC 16bit) · HIL
 接线 (按需, 逐个实验):
   DI : PC0..PC3 → GND (或一根线依次碰)       AI : PA0→3.3V, PA1→GND, 共地
   HIL: PA6 → PA5 直连 (串 1kΩ+1µF 更干净)    所有实验都要与板子共地
+       ★ H-0 与 H-2(停机安全态) 是**零接线**判据 (只读 TIM3_CCR1 镜像, 不需要跳线);
+         只有 H-1 需要那根跳线。
+       ★ H-2 验的是"停机 = 进安全态": STOP/RESET 后物理输出必须归零。
+         它需要 `DCL_HIL_SAFE=1` 的构建 (默认即 1)。用对照构建
+         `bash build.sh -DDCL_HIL_SAFE=0` 跑它**必须 FAIL** —— 那是这条判据
+         "能失败"的证据, 不是排障。交付构建永远不是那一档。
 
 用法:  python tools/h723_w5.py
 """
@@ -50,6 +56,8 @@ CMD_READ_BURST  = 0x22
 CMD_WRITE       = 0x21
 CMD_ENGINE_STATUS = 0x38
 CMD_RESET       = 0x13
+CMD_START       = 0x11
+CMD_STOP        = 0x12
 CMD_PIN_SELFTEST = 0x36
 CMD_ADC_SCAN     = 0x37   # [ch_start][count] → count × u16 raw (接线/映射排障)
 
@@ -219,6 +227,15 @@ def main():
         # ══════════ ③ HIL ══════════
         print("\n── ③ HIL (PWM 输出 PA6 ← WIRE[20]; 反馈 PA5 → SENSOR[2]) ──")
 
+        # ★★ 前置条件 (2026-09-11 审计 #1 起**显式收紧**): 输出臂只在**引擎 RUN** 时
+        #   才跟随 WIRE[20] —— 停机时 PWM 必须停在安全态 0, 这正是 H-2 要验的不变量。
+        #   所以"零接线看输出臂"(H-0) 必须在 RUN 下做。
+        #   ★ 这是**被修的不变量导致的前置条件显式化**, 不是"为了让判据通过而调参":
+        #     改前实现里输出臂无条件跟随 ⇒ 停机也不归零, 那才是缺陷。
+        #   ★ 副作用提醒: RUN 且**无程序**时引擎不写 WIRE, 所以下面的 0x21 外部写入
+        #     不会被每拍覆写掉 (若将来这里先 deploy 了程序, 这条前提就变了)。
+        L.xact(CMD_START); time.sleep(0.3)
+
         def set_u(val):
             L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, f32(val)))
             time.sleep(0.15)
@@ -268,6 +285,57 @@ def main():
                    1.2 <= (v50 if v50 is not None else -1) <= 2.1,
                    "50%%=%.3fV (期望 1.65)" % (v50 if v50 is not None else -1))
 
+        # ══════════ ④ H-2 停机安全态 (审计 #1) ══════════
+        # 不变量 (范本 AUDIT P1-2 定为 P1, 迁移线上以新形态失守):
+        #   「停机 = 进安全态」⇒ STOP/RESET 之后**物理输出必须归零**,
+        #   否则电机/阀门在"已停机"之后继续动作。
+        # ★ 判据顺序不能颠倒: 先证"RUN 时输出真的非零"(阳性对照), 再看 STOP 归零。
+        #   没有阳性对照, "STOP 后 duty=0" 会被"duty 恒 0"(例如 PWM 根本没配好、
+        #   或输出面根本没登记) 通过 —— 那就是一个空判据。
+        print("\n── ④ H-2 停机安全态 (STOP/RESET ⇒ 物理输出归零) ──")
+
+        d_run = set_u(1024.0)                    # 引擎此刻在 RUN (上面已 START)
+        record("H-2a 阳性对照: RUN 且 WIRE[20]=1024 ⇒ 占空比非零",
+               (d_run is not None and d_run > 900), "duty=%s (期望≈1000)" % d_run)
+
+        L.xact(CMD_STOP)
+        # 等 ≥3 个 hil_tick 周期(10ms): 要证的是"**持续**为 0", 不是碰巧某一拍读到 0
+        time.sleep(0.25)
+        _r1 = rd_burst(shm + OFF_HIL_DUTY, 1)
+        d_s1 = struct.unpack("<I", _r1)[0] if _r1 and len(_r1) >= 4 else None
+        time.sleep(0.15)
+        _r2 = rd_burst(shm + OFF_HIL_DUTY, 1)
+        d_s2 = struct.unpack("<I", _r2)[0] if _r2 and len(_r2) >= 4 else None
+        record("H-2b ★STOP 后物理输出归零 (读 TIM3_CCR1 镜像, 两次相隔 150ms)",
+               (d_s1 == 0 and d_s2 == 0),
+               "STOP 后 duty=%s, 再等 150ms=%s (期望 0/0)" % (d_s1, d_s2))
+        # ★ 为什么"读镜像"可以代表"物理输出": 镜像是固件在**写 TIM3_CCR1 的同一处**
+        #   回写的同一个数 (hil_tick / hil_outputs_safe 都成对写), 而"镜像 == 按公式算出的
+        #   计数值"这一点由 H-0 独立判据把着。有 LA 时再把探头夹 PA6 抓二阶证据。
+
+        L.xact(CMD_START); time.sleep(0.3)
+        d_back = set_u(1024.0)
+        record("H-2c 恢复: 重新 START ⇒ 输出回到非零 (排除'PWM 永久坏')",
+               (d_back is not None and d_back > 900), "duty=%s" % d_back)
+
+        sts, st = L.xact(CMD_ENGINE_STATUS)
+        nsurf = st[38] if (sts == 0 and len(st) >= 39) else None
+        record("H-2d ★物理输出面登记数 ≥1 (停机安全态契约覆盖了几个面)",
+               (nsurf is not None and nsurf >= 1), "registered=%s (0x38 byte38)" % nsurf)
+        # ★ H-2d 与 H-2b 各把一个洞: 登记数为 0 时 duty 恰好也是 0 (没人写它),
+        #   于是"没登记"与"已进安全态"在读数上一样 —— H-2b 单独读不出这个区别。
+
+        # ★★ 为什么**没有**给 RESET(0x13) 单独记一条判据 —— 实测结论, 不是偷懒:
+        #   RESET 之后两档的 duty 读回来**都是 0** (2026-09-11 实测) ⇒ 这条判据
+        #   **不具备判别力, 不假装有用**(本项目纪律)。机制: `h_reset_w1` 走
+        #   cold_start_reset() 整段 memset ⇒ **WIRE[20] 也被清零** ⇒ 即使输出臂
+        #   没有 RUN 门控, 它算出来的 u 也只是 0 ⇒ 物理输出"侥幸"归零。
+        #   ⇒ 真正被利用的洞只在 **STOP** 那条路径 (h_stop_w1 刻意**不**清 WIRE ——
+        #     "停机时当前值必须是可读的现场信息"), 那正是 H-2b 抓到的。
+        #   ⇒ 本次对 h_reset_w1 补的 eng_outputs_safe() 属**纵深防御**(把"侥幸安全"
+        #     改成"显式安全", 不再依赖 WIRE 恰好为 0), 但它**无法被黑盒判据证实**,
+        #     故此处只记录, 不记分。
+        L.xact(CMD_STOP); time.sleep(0.1)
         L.xact(CMD_RESET); time.sleep(0.1)
 
     print("\n" + "=" * 74)

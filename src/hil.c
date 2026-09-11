@@ -9,6 +9,10 @@
 
 #define TIM3 TIM3_BASE_ADDR
 
+/* ★ 物理输出面的安全态回调签名统一是 `void (*)(void)` (见 engine.h 的注册表),
+ *   带不了 base 参数 ⇒ init 时把基址记一份。它上电后不变, 存静态变量是安全的。 */
+static uint8_t *s_hil_base = 0;
+
 static inline float hil_read_f(uint8_t *base, uint32_t off)
 {
     return *(volatile float *)(base + off);
@@ -20,7 +24,7 @@ static inline void hil_write_f(uint8_t *base, uint32_t off, float v)
 
 void hil_init(uint8_t *base)
 {
-    (void)base;
+    s_hil_base = base;                                /* 供 hil_outputs_safe 回写镜像 */
     /* ① PWM 脚 PA6 → AF2 (TIM3_CH1) */
     RCC_AHB4ENR |= (1u << 0);
     uint32_t bit = HIL_PWM_PIN & 15u;                 /* PA6 → bit6, 端口 A */
@@ -61,6 +65,22 @@ void hil_tick(uint8_t *base, uint32_t tick_now)
 
     /* 输出臂: WIRE[HIL_U_WIRE] → 占空比 (钳到 [0, RES]) */
     float u = hil_read_f(base, OFF_WIRE_MAP + (uint32_t)HIL_U_WIRE * 4u);
+#if HIL_SAFE
+    /* ★★ 停机 ⇒ 安全态 (2026-09-11 迁移保真度审查 一级 #1):
+     *   引擎停扫后 WIRE[20] 是**冻结的陈旧值**。若无条件回写, STOP 之后 PWM 会一直保持
+     *   最后占空比不动 —— "停机 = 进安全态"在真实执行器上不成立。
+     *   ⇒ 输出臂受 ENGINE_RUN 门控: 未运行就把 u 压到 0。
+     *   ★ 为什么这里要再判一次, 而不只靠 STOP 那一刻的清零:
+     *     STOP 的一次性清零只覆盖"走了 0x12 命令"这条路径。安全态应当是**持续成立的性质**
+     *     (任何把占空比留在非零的路径都会在 ≤10ms 内被纠回), 而不是"某时刻做过一次动作"。
+     *     ⇒ h_stop_w1 的即时清零 (快) + 本处的周期自检 (稳), 两者都要。
+     *   ★ 反馈眼 (下面的 ADC 采样) **不**受门控: 停机时仍要能读现场值。 */
+    if (!*(volatile uint8_t *)(base + OFF_CTRL_ENGINE_RUN)) u = 0.0f;
+#else
+    /* A/B 对照档 (HIL_SAFE=0) **改前行为**: 无条件回写 ⇒ STOP 后仍保持最后占空比。
+     * 这一档存在的唯一目的, 是让"停机安全态"判据能在同一套测量方法下量到 FAIL
+     * (否则无法排除"判据本身量不出问题")。交付构建永远不是这一档。 */
+#endif
     if (!(u > 0.0f)) u = 0.0f;
     if (u > (float)HIL_PWM_RES) u = (float)HIL_PWM_RES;
     uint32_t arr1 = TIM_ARR(TIM3) + 1u;
@@ -83,5 +103,17 @@ void hil_tick(uint8_t *base, uint32_t tick_now)
     *(volatile uint32_t *)(base + OFF_HIL_FB_RAW) = last_raw;
     float v = (float)(acc / (uint32_t)HIL_FB_AVG) * 3.3f / 65535.0f;
     hil_write_f(base, OFF_SENSOR_MAP + (uint32_t)HIL_FB_SENSOR * 4u, v);
+    __asm__ volatile("dsb" ::: "memory");
+}
+
+/* ---- 物理输出面安全态 (注册到 engine 的输出面表; STOP/RESET 时被调用) ----
+ * 见 engine.h "物理输出面注册" 与 hil.h 的 hil_outputs_safe 说明。
+ * ★ 幂等: 反复调用只是反复写 0, 无副作用 (安全态必须幂等 —— 它可能被并发路径多次进入)。 */
+void hil_outputs_safe(void)
+{
+    if (!s_hil_base) return;              /* init 之前被调: 硬件未配, 无事可做 */
+    TIM_CCR1(TIM3) = 0u;                  /* 输出臂归零 (OC1PE: 下一个更新事件生效, ≤1 个 PWM 周期) */
+    /* ★ 镜像必须跟着写, 否则"停机已进安全态"读不出来 (契约见 hil.h)。 */
+    *(volatile uint32_t *)(s_hil_base + OFF_HIL_DUTY) = 0u;
     __asm__ volatile("dsb" ::: "memory");
 }
