@@ -143,7 +143,7 @@ def run_chain(cmds, timeout=900, allow_fail=False):
     chain = []
     for c in cmds:
         chain += ["-c", c]
-    cmd = ["pyocd", "cmd", "-t", TARGET, "-O", "connect_mode=under-reset"] + chain
+    cmd = ["pyocd", "cmd", "-t", TARGET, "-O", "connect_mode=under-reset"] + chain + ["-c", "go"]   # ★M4: 收尾 go, 别把核留在 halt
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:

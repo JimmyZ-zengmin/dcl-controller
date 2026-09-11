@@ -158,6 +158,47 @@ class Link:
         return struct.unpack("<I", p[:4])[0]
 
 
+def revive_if_dead(port, verbose=True):
+    """M4 哨兵: 串口不响应时, 先判"核是不是被 pyocd 留在 halt", 并解卡。
+
+    ★ 为什么需要它 (外部审计 M4 的第二半 —— 只有尾部 `go` 不够):
+      pyocd 会话若以 halt 收尾, **或链条中途报错/超时以致尾部的 `go` 根本没执行到**,
+      核就停在暂停; 此后所有串口工具一律"无响应"。更隐蔽的是: **用 pyocd 去查
+      "为什么串口没响应"本身会让串口没响应** (观察者效应)。
+      ⇒ 每个串口套件在 T0 之前先过这道哨兵, 就不会再把"核被暂停"误判成"固件挂了"。
+    返回 True = 链路现在活着 (可能刚解卡); False = 仍不通 (那是真故障: 查接线/端口占用)。
+    """
+    import subprocess, time
+    import serial
+
+    def ping():
+        try:
+            with serial.Serial(port, 115200, timeout=0.4) as s:
+                time.sleep(0.15); s.reset_input_buffer()
+                s.write(build_frame(CMD_GET_VERSION)); s.flush()
+                return bool(s.read(64))
+        except Exception:
+            return False
+
+    if ping():
+        return True
+    if verbose:
+        print("  [M4 哨兵] 串口无响应 → 先按[核被 pyocd 留 halt]处理, 尝试解卡 …")
+    try:
+        subprocess.run(["pyocd", "cmd", "-t", "stm32h723xx",
+                        "-O", "connect_mode=under-reset",
+                        "-c", "reset", "-c", "go", "-c", "sleep", "400"],
+                       capture_output=True, text=True, timeout=120)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    ok = ping()
+    if verbose:
+        print("  [M4 哨兵] %s" % ("已解卡, 链路活" if ok else
+                                 "仍无响应 ⇒ 不是 halt 问题 (查接线 / 端口被占用)"))
+    return ok
+
+
 def find_port(explicit):
     if explicit:
         return explicit
@@ -176,6 +217,13 @@ def main():
     a = ap.parse_args()
 
     port = find_port(a.port)
+    try:
+        # M4 sentinel: un-halt the core if a pyocd session left it halted
+        from h723_w1 import revive_if_dead as _rv
+        _rv(port)
+    except Exception:
+        pass
+
     if not port:
         print("!! 找不到串口")
         return 2

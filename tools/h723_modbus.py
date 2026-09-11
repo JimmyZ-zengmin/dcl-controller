@@ -137,6 +137,13 @@ def main():
     sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 
     port = find_port(a.port)
+    try:
+        # M4 sentinel: un-halt the core if a pyocd session left it halted
+        from h723_w1 import revive_if_dead as _rv
+        _rv(port)
+    except Exception:
+        pass
+
     if not port:
         print("!! 找不到串口")
         return 2

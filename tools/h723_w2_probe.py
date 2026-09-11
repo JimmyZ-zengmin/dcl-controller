@@ -197,7 +197,7 @@ def main():
     for c in cs:
         chain += ["-c", c]
 
-    cmd = ["pyocd", "cmd", "-t", TARGET, "-O", "connect_mode=under-reset"] + chain
+    cmd = ["pyocd", "cmd", "-t", TARGET, "-O", "connect_mode=under-reset"] + chain + ["-c", "go"]   # ★M4: 收尾 go, 别把核留在 halt
     print("  (命令链 %d 条, 单会话执行中...)" % len(chain))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)

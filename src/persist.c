@@ -142,19 +142,30 @@ int persist_probe(PersistInfo_t *out)
     out->crc_b = vb ? cb : 0u;
 
     /* 决定"接下来该写哪份": 有效的两份里 seq 小的那份 (它被替换掉不损失任何东西);
-     * 只有一份有效 → 写另一份; 都无效 → 写 A 并让 seq 从 1 开始。 */
+     * 只有一份有效 → 写另一份; 都无效 → 写 A 并让 seq 从 1 开始。
+     * ★★ M3 修复 (2026-09-11 外部审计): `n_routes/n_params/n_states` 必须取**最新有效
+     *    副本**(seq 大)的那份 —— 0x43 问的是"flash 里持久化了几条"。
+     *    旧实现两份都有效时固定取 A ⇒ **两份条数不同时报错**。
+     *    复现: RESET → deploy 3 → 落盘 → deploy 8 → 落盘 ⇒ 旧代码报 3, 真值 8。
+     *    (这与 `active` 的语义**不是一回事**: active 是"待覆盖的旧副本"。别混用。) */
     if (va && vb) {
-        out->active = (ha.seq <= hb.seq) ? 0u : 1u;   /* 写旧的那份 */
-        out->n_routes = ha.n_routes; out->n_params = ha.n_params; out->n_states = ha.n_states;
+        const PersistHdr_t *hi = (ha.seq >= hb.seq) ? &ha : &hb;   /* 最新有效副本 */
+        const PersistHdr_t *lo = (ha.seq >= hb.seq) ? &hb : &ha;
+        out->active = (ha.seq <= hb.seq) ? 0u : 1u;               /* 待覆盖(旧的)那份 */
+        out->n_routes = hi->n_routes; out->n_params = hi->n_params; out->n_states = hi->n_states;
+        out->n_routes_old = lo->n_routes;
     } else if (va) {
         out->active = 1u;                             /* 写 B (空的那份) */
         out->n_routes = ha.n_routes; out->n_params = ha.n_params; out->n_states = ha.n_states;
+        out->n_routes_old = 0u;
     } else if (vb) {
         out->active = 0u;
         out->n_routes = hb.n_routes; out->n_params = hb.n_params; out->n_states = hb.n_states;
+        out->n_routes_old = 0u;
     } else {
         out->active = 0u;
         out->n_routes = 0u; out->n_params = 0u; out->n_states = 0u;
+        out->n_routes_old = 0u;
     }
     return 0;
 }

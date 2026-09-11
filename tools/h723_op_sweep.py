@@ -94,6 +94,7 @@ def run(sym, ops, dur):
     args = ["pyocd", "cmd", "-t", "stm32h723xx", "-O", "connect_mode=under-reset"]
     for c in cmd:
         args += ["-c", c]
+    args += ["-c", "go"]   # M4: 收尾 go, 别把核留在 halt
     r = subprocess.run(args, capture_output=True, text=True, timeout=1800)
     vals = []
     for line in r.stdout.splitlines():

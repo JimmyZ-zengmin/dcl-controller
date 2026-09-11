@@ -182,6 +182,13 @@ def main():
         return 2
 
     print("串口 %s @ %d" % (port, a.baud))
+    try:
+        # M4 sentinel: un-halt the core if a pyocd session left it halted
+        from h723_w1 import revive_if_dead as _rv
+        _rv(port)
+    except Exception:
+        pass
+
     ser = serial.Serial(port, a.baud, timeout=0.05)
     time.sleep(0.2)
     link = Link(ser, verbose=a.raw)

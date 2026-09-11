@@ -50,6 +50,7 @@ def read_words(addrs, run_s):
         args += ["-c", "sleep %d" % int(run_s * 1000)]
     for a in addrs:
         args += ["-c", "read32 0x%08X" % a]
+    args += ["-c", "go"]   # M4: 收尾 go, 别把核留在 halt
     r = subprocess.run(args, capture_output=True, text=True, timeout=300)
     vals = []
     for line in r.stdout.splitlines():

@@ -25,7 +25,7 @@
  *
  * 每拍 WCET 说明:
  *   RX / TX / BUILD: ≤ MB_TICK_BUDGET(4) 字节 → 有界常数
- *   请求 CRC 校验: 单拍整段 (≤MB_MAX_FRAME-2 = 126 字节) —
+ *   请求 CRC 校验: 单拍整段 (≤MB_MAX_FRAME-2 = 253 字节; M2 修复后由 126 升) —
  *     "外部请求长度受限"项, 上界随 MB_MAX_FRAME 收敛 (非无界)
  *     ★ H723 上要实测: ITCM 取指下应显著快于 S3 的值 (成本表是代码的函数)
  */
@@ -180,7 +180,7 @@ static void ATTR_ITCM mb_parse_frame(uint8_t *base)
     } else if (rx[0] == 0 || rx[0] != c->slave_addr) {
         respond = 0;                                  /* 广播 / 非本站 */
     } else {
-        /* CRC 校验 (低字节在前)。★WCET: 单拍 ≤126B, 上界随 MB_MAX_FRAME 收敛 */
+        /* CRC 校验 (低字节在前)。★WCET: 单拍 ≤253B (M2 修复后), 上界随 MB_MAX_FRAME 收敛 */
         uint16_t crc_recv = (uint16_t)(rx[len - 2] | ((uint16_t)rx[len - 1] << 8));
         if (mb_crc16(rx, (uint16_t)(len - 2)) != crc_recv) {
             c->err_crc++;

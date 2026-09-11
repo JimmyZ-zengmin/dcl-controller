@@ -101,10 +101,15 @@ _Static_assert(sizeof(PersistHdr_t) == PERSIST_HDR_SIZE,
 
 typedef struct {
     uint8_t  ab_valid;    /* 上述 PERSIST_AB_* */
-    uint8_t  active;      /* 当前加载/将要写的是 A(0) 还是 B(1) */
-    uint16_t n_routes;
+    uint8_t  active;      /* ★ 语义 = "**接下来该写**哪份" (A=0/B=1): 两份都有效时 = seq **小**
+                           *   的那份 (它被覆盖不损失任何东西)。**不是**"最新的那份"。 */
+    uint16_t n_routes;    /* ★★ M3 修复后的语义 = **最新有效副本**(seq 大)的条数 ——
+                           *   这正是 0x43 该答的"flash 里持久化了几条"。
+                           *   旧实现固定取 A 的条数 ⇒ 两份条数不同时报错 (连续两次
+                           *   deploy 后各落盘一次即可复现: 报 3 而真值 8)。 */
     uint16_t n_params;
     uint16_t n_states;
+    uint16_t n_routes_old;/* 待覆盖(seq 小)那份的条数 —— 仅供排障/审计对照, 不进协议载荷 */
     uint32_t seq_a;
     uint32_t seq_b;
     uint32_t crc_a;       /* 0 = A 无效 */

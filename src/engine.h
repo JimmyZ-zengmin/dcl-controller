@@ -266,7 +266,18 @@
 #define MB_EX_ILLEGAL_ADDR  0x02
 #define MB_EX_ILLEGAL_VAL   0x03
 #define MB_EX_SLAVE_FAIL    0x04
-#define MB_MAX_FRAME   128    /* **请求帧**上限 (RX 接收缓冲上限; RTU 规约 256, 取 128 够用) */
+/* ★★ MB_MAX_FRAME = **请求帧**上限。2026-09-11 外部审计 M2 修复: 128 → 255。
+ *   为什么是 255 而不是 RTU 的 256:
+ *     `MbCtrl_t.rx_len` 是 **uint8_t**(最多 255)。若设 256, 则 `rx_len < MB_MAX_FRAME`
+ *     永真 ⇒ rx_len 到 255 再 ++ 会**回绕成 0** (静默丢帧/错帧)。
+ *   而 qty≤123 的 0x10 写请求最长 = 9 + 2×123 = **255** ⇒ 255 已覆盖一切**合法**请求
+ *   (qty=124 → 257B 本就超 RTU ADU 上限, 协议非法)。
+ *   ★ 旧值 128 的后果 (M2): `0x10` 写 qty≥60 (len = 9+2qty ≥ 129) —— 一条**完全合法**
+ *     的写请求 —— 在隧道被 NAK "mb: bad frame len", 在物理口被 `rx_len < 128` **静默截断**
+ *     ⇒ CRC 必失败 ⇒ 无声无响应 (最难查的那一种)。
+ *   ★ 代价: 请求 CRC 单拍校验的 WCET 上界从 ≤126B 升到 ≤253B —— 仍随本常量**收敛**,
+ *     不是无界 (同 modbus.c 顶部的 WCET 说明)。 */
+#define MB_MAX_FRAME   255    /* **请求帧**上限 (见上方 M2 说明; RX 缓冲 256B 放得下) */
 /* ★★ MB_TX_SIZE: **响应帧**缓冲大小 = RTU ADU 上限 (256)。
  *   ★ 外部审计 W4 的 M1 (P1) 是"把这两个量当成同一个"造成的:
  *     响应长度由 qty 决定 (0x03: 3 + 2*qty + 2, qty≤125 ⇒ 最大 255),
