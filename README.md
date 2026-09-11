@@ -199,6 +199,8 @@ python tools/h723_op_sweep.py --dur 0.3 --json build/op_cost.json   # 逐原语�
 bash build.sh -DDCL_DEPLOY_SELFTEST=1    # 上电跑 deploy 自检 (9 例, 用 SWD 读结果)
 bash build.sh -DDCL_HIL_SAFE=0           # A/B: 停机不覆盖 HIL 输出 (改前行为, 仅供对照)
 
+# ★ 架构与机制参考: docs/ARCH-H723.md  ← 微调功能前先读它 (§12 是改动检查清单)
+
 # ★ 验收套件 (12 套, 195 PASS / 0 FAIL —— 名单见 docs/STATUS-2026-09-11.md)
 #   ★ 跑串口套件请**显式传 --port COM14**: find_port() 只按 VID 1A86 匹配,
 #     而 CH343(COM7, ESP32-S3) 也是 1A86 ⇒ 会认错口。
