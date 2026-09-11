@@ -335,6 +335,42 @@ _Static_assert(OFF_MB_TX   + 256             == OFF_MB_HOLD, "SHM: MB TX 256B �
 
 #define SHM_SIZE             0x8000   /* 32KB (S3 为 64KB; H723 DTCM 128KB 充裕) */
 
+/* ══════════ W5: macro 字节码域 (驻 MB_TAIL 备用区内) ══════════
+ * ★★ 与 S3 的差异必须说清 (否则就是"宣称>实现"):
+ *   S3: 64KB flash 分区 (macro_data) + 64KB RAM 缓冲 —— 因为有 8MB PSRAM。
+ *   H723: **无 PSRAM** (MIGRATE §7 已列为风险), 故瘦身为 **4KB 字节码**, 且直接
+ *     驻 SHM (RAM), 不走 flash:
+ *       代价① 容量 64KB → 4KB (demo 足够; PC 侧行为一致)
+ *       代价② **掉电丢失** (S3 是 flash 持久)。本域随 cold_start_reset 的 memset
+ *              一起清零 —— 即 0x13 RESET / deploy 装载 / 上电都会清掉已上传的程序。
+ *              这是 v0 的**明确边界**, 不是遗漏; flash 持久化留待后续 (要动 flash.c)。
+ *   ★ 位置: OFF_MB_TAIL 原注释就是"备用", 其前段给 macro, 不影响通信域/暂存区。 */
+#define OFF_MACRO_CTRL        0x5DE0   /* 控制块 (MacroCtrl_t, 16B) */
+#define OFF_MACRO_CODE        0x5DF0   /* 字节码缓冲 4KB (PC 可用 0x22 burst 读回) */
+#define OFF_MACRO_CODE_SZ     0x1000
+#define OFF_MACRO_END         0x6DF0   /* == 0x5DE0 + 16 + 0x1000 */
+#define MACRO_MAX_CODE        512      /* 单次 0x40 一次性执行的字节码上限 (同 S3) */
+_Static_assert(OFF_MACRO_CTRL + 16u == OFF_MACRO_CODE, "SHM: MACRO_CTRL 必须紧接 CODE");
+_Static_assert(OFF_MACRO_CODE + OFF_MACRO_CODE_SZ == OFF_MACRO_END, "SHM: MACRO_CODE 尺寸不符");
+_Static_assert(OFF_MACRO_END <= SHM_SIZE, "SHM: MACRO 域越出 SHM 末尾");
+
+/* ---- macro 控制块 (16B) ----
+ * ★ 与 S3 macro_loop 的 OFF_MACRO_* 单字段不同, 这里聚成一个块 (H723 风格:
+ *   可整体读写、便于 0x22 burst 观察)。字段语义与 S3 同名量一致:
+ *     run=OFF_MACRO_RUN, len=OFF_MACRO_LEN, loop_ms=OFF_MACRO_LOOP_MS,
+ *     err=OFF_MACRO_ERR, loop_cnt=OFF_MACRO_LOOP_CNT。 */
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  run;        /* 1 = 循环执行中 */
+    uint8_t  err;        /* 最近一次执行错误码 (rc<0 → -rc; 0 = 无错) */
+    uint16_t len;        /* 当前字节码长度 (0 = 无程序) */
+    uint16_t loop_ms;    /* 循环间隔 ms (最小 10, 与 S3 同) */
+    uint16_t rsv;        /* 补齐 */
+    uint32_t loop_cnt;   /* 已执行轮数 (单调递增, 供 PC 判"真的在跑") */
+    uint32_t last_tick;  /* 上次执行时的 g_tick_count (100μs/拍) — 内部节拍 */
+} MacroCtrl_t;
+_Static_assert(sizeof(MacroCtrl_t) == 16, "MacroCtrl_t must be 16 bytes");
+
+
 /* ══════════ 路由条目 (16B packed) —— 与 S3 逐字节相同 ══════════ */
 typedef struct __attribute__((packed, aligned(4))) {
     uint8_t  src_type;

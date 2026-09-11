@@ -53,7 +53,10 @@
                                     *    确实已经写好了 8 条 —— "命令没回" ≠ "命令没做"。) */
 #define CMD_SEQ_DEPLOY      0x44   /* Sequencer v0: 部署顺序域 (设计 D6: 独立命令
                                       不往 0x10 塞 — 3078B 压线教训) */
-#define CMD_MACRO           0x40
+#define CMD_MACRO           0x40   /* W5: 一次性执行字节码 → ACK 返回栈内容 (同 S3)
+                                    * 载荷 = 原始字节码 (≤ MACRO_MAX_CODE=512) */
+#define CMD_MACRO_UPLOAD    0x41   /* W5: 上传 [loop_ms u16][code...] → SHM 并停循环 (同 S3) */
+#define CMD_MACRO_CTRL      0x42   /* W5: 控制 [action u8] (0=stop 1=start) (同 S3) */
 #define CMD_DISPLAY_INIT    0x51   /* 固件原生 — ST7735 初始化 */
 #define CMD_DISPLAY_FILL    0x52   /* 固件原生 — 填充矩形 */
 #define CMD_DISPLAY_TEXT    0x53   /* 固件原生 — 绘制文字 */
@@ -82,6 +85,11 @@
 #define DCL_CAP_COMM        0x0100   /* 通信域 Modbus RTU 从站 (0x60/0x61/0x62) */
 #define DCL_CAP_HMI         0x0200   /* SRC_HMI 设定值源 (DSL 引用 40065+, OA21/v1.7) */
 #define DCL_CAP_AI          0x0400   /* AI 模拟量输入组件 (SENSOR[8..10], v1.7) */
+#define DCL_CAP_MACRO       0x0800   /* W5: macro 字节码 VM (0x40 一次性执行 / 0x41 上传 / 0x42 控制)
+                                      * ★ **H723 扩展位**: S3 的 11 位止于 0x0400, 无 macro 位
+                                      *   (S3 把 macro 当"永远可用"、不单独声明)。本平台按
+                                      *   "宣称 = 实现"补一位 —— 实现了就该报 (A4 事故教训)。
+                                      *   旧上位机忽略未知位, 不受影响。 */
 
 /* N2 (外部审计): 原 1024 使 WRITE_BURST count=255/256 的请求帧 (6+count×4 > 1024)
  * 在解析层被静默丢弃 (TIMEOUT 无 NAK), 与 READ_BURST 响应 1030B 不对称。
@@ -136,12 +144,15 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
  *     —— tools/h723_seq.py 27 项全绿 (T28 灵魂测试 14 + T29 校验器 13) 为凭据。
  *   ★ W4 (2026-09-11): DCL_CAP_COMM 同样已移入下面的宏 (0x0040→0x00F7→0x01F7)
  *     —— Modbus RTU 从站 (0x60/0x61/0x62) 落地; 证据见 tools/h723_modbus.py。
+ *   ★ W5 (2026-09-11): DCL_CAP_MACRO 新开一位 (0x0800) 并入宏 (0x01F7→0x02F7)
+ *     —— macro 字节码 VM (0x40/0x41/0x42) 落地; 证据见 tools/h723_macro.py。
+ *     ★ 这是**扩展位**, S3 侧无对应位 (S3 的 11 位止于 0x0400)。
  *   ★★ 纪律提醒 (已在 W3 吃过一次): **改能力位必须同步 tools/h723_proto.py 的
  *     EXPECT_CAP** —— 那里是第二个手工副本, 曾经停在 0x0033 三轮未同步。 */
 #define DCL_CAP_H723_IMPL   (DCL_CAP_MULTICYCLE | DCL_CAP_HOTRELOAD | \
                              DCL_CAP_PERSISTENT | DCL_CAP_WIRE2_FLAG | \
                              DCL_CAP_VERINFO | DCL_CAP_FORCE | \
-                             DCL_CAP_SEQ | DCL_CAP_COMM)              /* = 0x01F7 */
+                             DCL_CAP_SEQ | DCL_CAP_COMM | DCL_CAP_MACRO)   /* = 0x02F7 */
 
 /* ★ 上线的各项说明 (写清楚"为什么现在可以报"):
  *   DCL_CAP_HOTRELOAD (0x0002) — 阶段 3.2: engine_reload_active() 在 ITCM 内

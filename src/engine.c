@@ -25,6 +25,7 @@
 #include "regs.h"
 #include "engine.h"
 #include "modbus.h"
+#include "macro.h"
 #include "lsym.h"
 #include "primitives.h"
 
@@ -85,6 +86,14 @@ void cold_start_reset(void)
      *   (S3 不需要这一步是因为它的 cold_start_reset 不整段 memset; 差异已记在
      *    modbus.h 的 mb_config 说明里。) */
     mb_config(g_shm, MB_DEFAULT_ADDR, MB_DEFAULT_USE_UART);
+    /* ★ W5: macro 域登记。
+     *   本函数的 memset 已经把 macro 控制块清了 (run/len/loop_cnt 全 0 = 停),
+     *   这里显式调 macro_reset 是**登记动作** —— 让"新域必须登记到单一入口"
+     *   这条纪律在代码里可见, 并为将来可能出现的非零默认值留落点。
+     *   ★ 语义后果必须说清: 因为 macro 字节码也驻 SHM, 所以**任何清零路径
+     *     (上电 / 0x13 RESET / deploy 装载) 都会清掉已上传的程序** —— 这是
+     *     macro.h 声明的 v0 边界 (RAM-only, 掉电/RESET 丢失), 不是缺陷。 */
+    macro_reset(g_shm);
 }
 
 /* ══════════ 栈边界哨兵 (设防) ══════════

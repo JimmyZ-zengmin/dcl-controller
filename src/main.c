@@ -52,6 +52,7 @@
 #include "flash.h"
 #include "persist.h"
 #include "modbus.h"
+#include "macro.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -296,6 +297,12 @@ OBS uint32_t g_seq_armed      = 0;
 OBS uint32_t g_mb_inject_ok   = 0;   /* 0x60 成功受理次数 */
 OBS uint32_t g_mb_nak         = 0;   /* 0x60/0x62 被拒次数 */
 OBS uint32_t g_mb_ticks       = 0;   /* mb_tick 被调用拍数 (证明状态机在推进) */
+
+/* ── W5: macro VM 观测面 (拆开计数: "被拒"与"执行成功"必须可区分) ── */
+OBS uint32_t g_macro_exec_ok   = 0;  /* 0x40 一次性执行成功次数 */
+OBS uint32_t g_macro_upload_ok = 0;  /* 0x41 上传成功次数 */
+OBS uint32_t g_macro_nak       = 0;  /* 0x40/0x41/0x42 被拒次数 */
+OBS uint32_t g_macro_ticks     = 0;  /* macro_tick 实际执行的轮次 (证明循环在跑) */
 
 /* ── 引擎扫描: 统计 (CPU 周期) ── */
 OBS uint32_t g_eng_cyc_last = 0;
@@ -1105,6 +1112,55 @@ static void h_mb_cfg(const uint8_t *p, uint32_t n)
     ack(r, 3);
 }
 
+/* ══════════ W5: macro 字节码 VM (0x40 / 0x41 / 0x42) ══════════
+ * 语义逐字对齐 S3 (S3 main.c 的 handle_macro / h_macro_upload / h_macro_ctrl):
+ *   0x40 = **一次性执行** payload 里的字节码, ACK 返回栈内容 (每值 4B 小端)
+ *   0x41 = 上传 [loop_ms u16][code...] → SHM (H723 驻 RAM, 不落 flash, 见 macro.h)
+ *   0x42 = 控制 [action] 0=stop 1=start
+ * ★ 一次性执行 (0x40) 与循环执行 (macro_tick) **共用同一个 macro_exec** ——
+ *   保证"能单跑"与"能循环跑"是同一份语义, 不会长出两套行为。 */
+static void h_macro(const uint8_t *p, uint32_t n)
+{
+    if (n == 0 || n > MACRO_MAX_CODE) { g_macro_nak++; nak("bad macro len"); return; }
+    uint32_t out[MACRO_STACK_DEPTH];
+    uint16_t on = 0;
+    int rc = macro_exec(g_shm, p, (uint16_t)n, out, &on);
+    if (rc != 0) { g_macro_nak++; nak("macro exec failed"); return; }
+    uint8_t r[MACRO_STACK_DEPTH * 4];
+    for (uint16_t i = 0; i < on; i++) {
+        r[i * 4 + 0] = (uint8_t)(out[i] & 0xFF);
+        r[i * 4 + 1] = (uint8_t)((out[i] >> 8) & 0xFF);
+        r[i * 4 + 2] = (uint8_t)((out[i] >> 16) & 0xFF);
+        r[i * 4 + 3] = (uint8_t)((out[i] >> 24) & 0xFF);
+    }
+    g_macro_exec_ok++;
+    ack(r, (uint32_t)on * 4u);
+}
+
+static void h_macro_upload(const uint8_t *p, uint32_t n)
+{
+    if (n < 2) { g_macro_nak++; nak("need loop_ms"); return; }
+    uint16_t loop_ms = (uint16_t)(p[0] | (p[1] << 8));
+    const uint8_t *code = p + 2;
+    uint16_t code_len = (uint16_t)(n - 2);
+    if (macro_upload(g_shm, loop_ms, code, code_len) != 0) {
+        g_macro_nak++; nak("macro too long"); return;
+    }
+    uint8_t r[4];
+    r[0] = (uint8_t)(code_len & 0xFF); r[1] = (uint8_t)(code_len >> 8);
+    r[2] = (uint8_t)(loop_ms & 0xFF);  r[3] = (uint8_t)(loop_ms >> 8);
+    g_macro_upload_ok++;
+    ack(r, 4);
+}
+
+static void h_macro_ctrl(const uint8_t *p, uint32_t n)
+{
+    if (n < 1) { g_macro_nak++; nak("need action"); return; }
+    int rc = macro_ctrl(g_shm, p[0]);
+    if (rc != 0) { g_macro_nak++; nak(rc == -1 ? "macro: no prog" : "bad action"); return; }
+    ack(NULL, 0);
+}
+
 /* 0x38 ENGINE_STATUS — **前 31 字节与 S3 逐字节同布局** (上位机脚本零改动),
  * 尾部追加 H723 扩展 6B (S3 的"尾部追加保前段兼容"惯例)。
  *
@@ -1608,6 +1664,10 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_MB_INJECT:     h_mb_inject(p, n); break;
         case CMD_MB_RESP:       h_mb_resp(); break;
         case CMD_MB_CFG:        h_mb_cfg(p, n); break;
+        /* ---- W5: macro 字节码 VM ---- */
+        case CMD_MACRO:         h_macro(p, n); break;
+        case CMD_MACRO_UPLOAD:  h_macro_upload(p, n); break;
+        case CMD_MACRO_CTRL:    h_macro_ctrl(p, n); break;
         /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
          *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
          *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
@@ -1772,6 +1832,9 @@ static void obs_anchor(void)
     /* W4 通信域 */
     sink ^= g_mb_inject_ok;    sink ^= g_mb_nak;
     sink ^= g_mb_ticks;
+    /* W5 macro VM */
+    sink ^= g_macro_exec_ok;   sink ^= g_macro_upload_ok;
+    sink ^= g_macro_nak;       sink ^= g_macro_ticks;
     (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
 }
 
@@ -2005,6 +2068,12 @@ int main(void)
          * ★ 为什么放主循环不放 ISR: 同上 —— 它不参与拍内时序 (§S3 也是放 ISR,
          *   但它那边是 core1 独立核, 本平台单核必须更省)。 */
         if ((g_tick_count % 100u) == 0u) mb_refresh_hold(g_shm);
+
+        /* ★ W5: macro 循环执行 —— 由**主循环**驱动, 不在 ISR 里。
+         *   macro 是 ms 级慢动作 (S3 用 10ms FreeRTOS 任务); 塞进 100μs 硬拍会
+         *   直接吃掉拍预算。macro_tick 内部按 loop_ms 自节流, 未到间隔即返回，
+         *   所以每轮调用只花几条指令。 */
+        if (macro_tick(g_shm, g_tick_count)) g_macro_ticks++;
 
         /* 栈哨兵周期巡检 (廉价: 32 个字, 主循环有 100μs 一次的机会) */
         g_guard_ok = (uint32_t)shm_guard_ok();
