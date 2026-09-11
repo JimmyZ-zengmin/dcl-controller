@@ -258,8 +258,14 @@ def axis3_peer_view(ser):
             return ("ACK" if f[1] == 0 else "NAK", f[4:need - 2])
         return ("TIMEOUT", b"")
 
+    # ★★ 0x43 是**已知的慢命令**, 必须给长超时 —— 否则本审计会**自己制造偶发失败**:
+    #   载荷为空的 0x43 = "纯查询", 而固件的空闲窗口自动落盘正是**由纯查询触发**的
+    #   (见 src/main.c 的 g_persist_auto)。若此刻 dirty==1 且引擎 STOP, 它会落盘
+    #   ~1s ⇒ 用 0.5s 超时的后续探测全部 TIMEOUT —— 症状看起来像"固件挂了"。
+    #   实测: 整轮审计偶发 3 项 FAIL, 重跑即恢复; 就是这一条引起的。
+    SLOW_CMD = {0x43}          # 可能需要 ~1s 完成 (sector erase)
     for code in range(0x00, 0x80):
-        st, _ = xact(code)
+        st, _ = xact(code, timeout_s=(2.5 if code in SLOW_CMD else 0.5))
         if st == "ACK":
             ack.append(code)
         elif st == "NAK":

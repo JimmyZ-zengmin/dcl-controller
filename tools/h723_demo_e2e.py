@@ -149,10 +149,15 @@ def suite_seq(sess, files):
     durs = [(trans[i + 1][0] - trans[i][0], trans[i][1]) for i in range(1, len(trans) - 1)]
     dwell = [x for x, s in durs if s in (2.0, 4.0)]
     inst = [x for x, s in durs if s in (1.0, 3.0)]
-    ok_dwell = len(dwell) >= 2 and all(0.94 <= x <= 1.06 for x in dwell)
-    record("A3 DWELL 步停留 1s (实测 %s)" % ["%.3f" % x for x in dwell[:4]],
-           ok_dwell, "%d 段完整停留, 范围 %.3f~%.3f" % (len(dwell), min(dwell), max(dwell))
-           if dwell else "无完整停留段样本")
+    # ★ 判据口径 (2026-09-11 加固): 原实现要求**每一段**都落在 ±60ms 内。
+    #   采样是 PC 侧 0x22 往返, Windows 上单次可卡顿几十 ms ⇒ 会产生**偶发假失败**
+    #   (实测: 一套 12 套件的回归里偶发 1 次)。改成**中位数 + 多数合格**:
+    #   中位数对单个卡顿样本免疫, 而"档桶配错"会让**全部**段一起偏 ⇒ 照样抓得住。
+    med = sorted(dwell)[len(dwell) // 2] if dwell else 0.0
+    good = sum(1 for x in dwell if 0.94 <= x <= 1.06)
+    ok_dwell = len(dwell) >= 2 and (0.97 <= med <= 1.03) and good >= max(2, len(dwell) - 1)
+    record("A3 DWELL 步停留 1s (中位数 %.3f, %d/%d 段合格)" % (med, good, len(dwell)),
+           ok_dwell, "各段 %s" % ["%.3f" % x for x in dwell[:5]])
     # UNTIL 立真的瞬时步只占一个 10ms 档桶 —— 但**不能按 8~13ms 卡**:
     #   采样是 PC 侧 0x22 往返 (Windows 上单次可抖动到几十 ms), 段时长会被测量误差抬高
     #   ⇒ 用 8ms 当上界会得到一个**会随机失败**的判据 (第一版实测就这样, 3 次里偶发 1 次 FAIL)。
@@ -165,9 +170,11 @@ def suite_seq(sess, files):
 
     t1s = [t for t, s, _ in trans if s == 1.0]
     per = [(t1s[i + 1] - t1s[i]) for i in range(len(t1s) - 1)] if len(t1s) > 1 else []
-    ok_per = per and all(1.90 <= x <= 2.14 for x in per)
-    record("A5 整周期 ≈ 2.02s (1s+1s+2档桶)", ok_per,
-           "实测 %s (期望 2.02±0.12)" % ["%.3f" % x for x in per])
+    # ★ 同上: 用中位数而不是"全部落在窗口内" —— 单次采样卡顿不应判固件不合格。
+    pmed = sorted(per)[len(per) // 2] if per else 0.0
+    ok_per = bool(per) and (1.98 <= pmed <= 2.07)
+    record("A5 整周期 ≈ 2.02s (中位数 %.3f)" % pmed, ok_per,
+           "各周期 %s (期望 2.02, 判中位数落在 ±0.05)" % ["%.3f" % x for x in per])
 
     d.send(0x12)                     # STOP
     time.sleep(0.35)
