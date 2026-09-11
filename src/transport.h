@@ -57,6 +57,12 @@
                                     * 载荷 = 原始字节码 (≤ MACRO_MAX_CODE=512) */
 #define CMD_MACRO_UPLOAD    0x41   /* W5: 上传 [loop_ms u16][code...] → SHM 并停循环 (同 S3) */
 #define CMD_MACRO_CTRL      0x42   /* W5: 控制 [action u8] (0=stop 1=start) (同 S3) */
+#define CMD_PIN_SELFTEST    0x36   /* W5: **零接线自检** —— 用 GPIO 内部上拉/下拉把引脚拉到
+                                    * 已知电平, 验证 DI 输入通路与 ADC 输入通路。
+                                    * 载荷 [method u8] (ADC 用: 0=引脚 analog 1=input)。
+                                    * 返回 [AI 3ch×2 raw u16][DI 4ch×2 电平 u8] = 12+8 字节。
+                                    * ★ 为什么需要它: 没有外部信号源时, "读数为常量" 与
+                                    *   "引脚没接" 无法区分; 内部上/下拉能主动制造已知电平。 */
 #define CMD_DISPLAY_INIT    0x51   /* 固件原生 — ST7735 初始化 */
 #define CMD_DISPLAY_FILL    0x52   /* 固件原生 — 填充矩形 */
 #define CMD_DISPLAY_TEXT    0x53   /* 固件原生 — 绘制文字 */
@@ -134,7 +140,7 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
  *                                (deploy 时清 state 表) 由 engine_reload_active 的
  *                                M2 清零实现 —— 待 W2 收口时与 S3 口径核对后决定是否声明
  *   DCL_CAP_HMI       (0x0200) — SRC_HMI 是**留位**(engine.c 显式 case, 恒返 0)
- *   DCL_CAP_AI        (0x0400) — ADC 未接 (W5)
+ *   (DCL_CAP_AI 已在 W5 从本清单移出 → 见下方宏)
  * ★ 这份清单同时是**上线检查表的雏形**: 每落地一项就在这里删一行、在上面的
  *   宏里加一位 —— 两处必须同步, 否则就是"报了个没实现的"或"实现了却不报"。
  *   ★ A4 事故 (2026-09-10): 阶段 3.2 落地了热重载, 却忘了改这里 —— 正是
@@ -147,12 +153,15 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
  *   ★ W5 (2026-09-11): DCL_CAP_MACRO 新开一位 (0x0800) 并入宏 (0x01F7→0x02F7)
  *     —— macro 字节码 VM (0x40/0x41/0x42) 落地; 证据见 tools/h723_macro.py。
  *     ★ 这是**扩展位**, S3 侧无对应位 (S3 的 11 位止于 0x0400)。
- *   ★★ 纪律提醒 (已在 W3 吃过一次): **改能力位必须同步 tools/h723_proto.py 的
- *     EXPECT_CAP** —— 那里是第二个手工副本, 曾经停在 0x0033 三轮未同步。 */
+ *   ★ W5 (2026-09-11): DCL_CAP_AI (0x0400) 从上面未声明清单**移入宏** (0x02F7→0x0DF7)
+ *     —— ADC1 16bit + AI 3 通道 (SENSOR[8..10]) 落地; 证据见 tools/h723_w5.py。
+ *     ★ DI/HIL 与 S3 一样**无专用能力位** (S3 的 11 位本就没有它们); 其存在经
+ *       0x36 零接线自检 (AI/DI 通路) 与 SENSOR 观测证明。 */
 #define DCL_CAP_H723_IMPL   (DCL_CAP_MULTICYCLE | DCL_CAP_HOTRELOAD | \
                              DCL_CAP_PERSISTENT | DCL_CAP_WIRE2_FLAG | \
                              DCL_CAP_VERINFO | DCL_CAP_FORCE | \
-                             DCL_CAP_SEQ | DCL_CAP_COMM | DCL_CAP_MACRO)   /* = 0x02F7 */
+                             DCL_CAP_SEQ | DCL_CAP_COMM | DCL_CAP_MACRO | \
+                             DCL_CAP_AI)                                  /* = 0x0DF7 */
 
 /* ★ 上线的各项说明 (写清楚"为什么现在可以报"):
  *   DCL_CAP_HOTRELOAD (0x0002) — 阶段 3.2: engine_reload_active() 在 ITCM 内
@@ -169,7 +178,7 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
  *     两半都在 (engine_tick / DEFINE_ENGINE_SCAN), 且 FORCE_VAL 列入 float 区。
  *     ★ 验收证据必须是**非零强制值** (OA9 事故的判据盲区修正)。 */
 #define DCL_CAP_H723_NOTYET (DCL_CAP_STATE_COLD | \
-                             DCL_CAP_HMI | DCL_CAP_AI)
+                             DCL_CAP_HMI)
 _Static_assert((DCL_CAP_H723_IMPL & DCL_CAP_H723_NOTYET) == 0u,
                "cap bitmap contradiction: bit present in BOTH impl and not-yet lists");
 

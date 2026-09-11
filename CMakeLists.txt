@@ -112,6 +112,9 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/persist.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/modbus.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/macro.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/adc.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/di.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/hil.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/uart.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.c

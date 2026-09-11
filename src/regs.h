@@ -234,6 +234,60 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
 #define TIM_SR_UIF      (1u << 0)
 #define TIM_EGR_UG      (1u << 0)   /* 立即产生更新事件 (把 PSC 立刻装载) */
 
+/* ══════════ W5: ADC1(16bit) + TIM3(PWM) 寄存器 ══════════
+ * ★★ 位定义/偏移**全部取自官方 `stm32h723xx.h`** (本机 CubeIDE 参考工程),
+ *   不是手推 —— 本项目 BRR 事故的铁律: "公式自洽但单位/位域错" 最会骗人。
+ * ★ RCC 结构顺序交叉验证: AHB3ENR(0xD4) AHB1ENR(0xD8) AHB2ENR(0xDC) AHB4ENR(0xE0)
+ *   —— 与项目既有 RCC_AHB4ENR=+0xE0 / RCC_APB1LENR=+0xE8 一致 (两条独立来源互证)。 */
+#define RCC_AHB1ENR     REG32(RCC_BASE + 0x0D8)
+#define RCC_D1CCIPR     REG32(RCC_BASE + 0x04C)
+#define RCC_D3CCIPR     REG32(RCC_BASE + 0x058)
+#define RCC_AHB1ENR_ADC12EN        (1u << 5)
+#define RCC_APB1LENR_TIM3EN        (1u << 1)
+#define RCC_D1CCIPR_CKPERSEL_SHIFT 28u   /* per_ck 源: 00=HSI 01=CSI 10=HSE 11=rsvd */
+#define RCC_D3CCIPR_ADCSEL_SHIFT   16u   /* adc_ker_ck: 00=PLL2P 01=PLL3R 10=CLKP(per_ck) */
+
+#define ADC1_BASE          0x40022000UL
+#define ADC_ISR(n)         REG32((n) + 0x00)
+#define ADC_CR(n)          REG32((n) + 0x08)
+#define ADC_CFGR(n)        REG32((n) + 0x0C)
+#define ADC_SMPR1(n)       REG32((n) + 0x14)
+#define ADC_SMPR2(n)       REG32((n) + 0x18)
+#define ADC_SQR1(n)        REG32((n) + 0x30)
+#define ADC_DR(n)          REG32((n) + 0x40)
+/* ★★ ADC12_COMMON 地址 = 0x40022300 (= ADC1_BASE + 0x300) —— **实测裁决**。
+ *   板商参考工程的 stm32h723xx.h 把它定义成 `D2_AHB1PERIPH_BASE + 0x2300` (=0x40023000),
+ *   却与它**自己的** ADC_Common_TypeDef 注释 "Address offset: ADC1/3 base address + 0x300"
+ *   **自相矛盾**。实测 (pyocd read32): 0x40022300 可读; 0x40023000 → "memory transfer failed"
+ *   (未实现地址) ⇒ 写它会触发**非精确总线错** (IMPRECISERR → HardFault), 且因"非精确"
+ *   会在**下一条**寄存器访问处才爆 —— 极易把真因误指向 ADC_CR (本轮实际踩过)。
+ *   ⇒ 两个"权威"冲突时用实测裁决, 并把矛盾记在原地 (本项目 BRR 事故的同族教训)。 */
+#define ADC12_COMMON_BASE  0x40022300UL
+#define ADC_CCR            REG32(ADC12_COMMON_BASE + 0x08)
+#define ADC_CR_ADEN        (1u << 0)
+#define ADC_CR_ADDIS       (1u << 1)
+#define ADC_CR_ADSTART     (1u << 2)
+#define ADC_CR_BOOST       (1u << 8)
+/* ★★ ADVREGEN/DEEPPWD 在 **ADC_CR** 而非 ADC_CCR —— H723(RM0468) 与 H743 的差异,
+ *   照 H743 写会静默失败 (寄存器写进去了但 ADC 不上电)。 */
+#define ADC_CR_ADVREGEN    (1u << 28)
+#define ADC_CR_DEEPPWD     (1u << 29)
+#define ADC_CR_ADCAL       (1u << 31)
+#define ADC_ISR_ADRDY      (1u << 0)
+#define ADC_ISR_EOC        (1u << 2)
+#define ADC_CCR_CKMODE_SHIFT 16u   /* 00=异步(ADCSEL) 01=AHB/1 10=AHB/2 11=AHB/4 */
+#define ADC_CCR_PRESC_SHIFT  18u   /* 异步分频: 0=/1 1=/2 2=/4 … */
+#define ADC_CFGR_RES_SHIFT   2u    /* 000=16bit */
+
+#define TIM3_BASE_ADDR     0x40000400UL
+#define TIM_CCMR1(t)       REG32((t) + 0x18)
+#define TIM_CCER(t)        REG32((t) + 0x20)
+#define TIM_CCR1(t)        REG32((t) + 0x34)
+#define TIM_CCMR1_OC1M_SHIFT 4u
+#define TIM_CCMR1_OC1PE    (1u << 3)
+#define TIM_CCER_CC1E      (1u << 0)
+#define TIM_CR1_ARPE       (1u << 7)
+
 /* ───────────────────────── USART1 (D2/APB2, 0x40011000) ─────────────────────────
  * ★ 权威来源: 板商参考工程自带的 ST 官方 CMSIS 设备头
  *   `D:/STM/tools/lxb_ref/1.LED闪烁/Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h723xx.h`

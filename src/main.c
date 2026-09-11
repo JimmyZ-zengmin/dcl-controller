@@ -53,6 +53,9 @@
 #include "persist.h"
 #include "modbus.h"
 #include "macro.h"
+#include "adc.h"
+#include "di.h"
+#include "hil.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -303,6 +306,10 @@ OBS uint32_t g_macro_exec_ok   = 0;  /* 0x40 一次性执行成功次数 */
 OBS uint32_t g_macro_upload_ok = 0;  /* 0x41 上传成功次数 */
 OBS uint32_t g_macro_nak       = 0;  /* 0x40/0x41/0x42 被拒次数 */
 OBS uint32_t g_macro_ticks     = 0;  /* macro_tick 实际执行的轮次 (证明循环在跑) */
+
+/* ── W5: 外设域观测面 ── */
+OBS uint32_t g_w5_ready        = 0;  /* 外设域初始化完成 (adc/ai/di/hil 都 init 过) */
+OBS uint32_t g_pin_selftest_n  = 0;  /* 0x36 零接线自检被调用次数 */
 
 /* ── 引擎扫描: 统计 (CPU 周期) ── */
 OBS uint32_t g_eng_cyc_last = 0;
@@ -1161,6 +1168,29 @@ static void h_macro_ctrl(const uint8_t *p, uint32_t n)
     ack(NULL, 0);
 }
 
+/* ══════════ W5: 0x36 PIN_SELFTEST — **零接线自检** ══════════
+ * 用 GPIO 内部上拉/下拉把引脚拉到已知电平, 验证:
+ *   · ADC 输入通路 (AI 3 路, 读原始码): 上拉应接近满量程, 下拉应接近 0
+ *   · DI 输入通路 (4 路, 读电平): 上拉应=1, 下拉应=0
+ * 载荷 [method u8]: ADC 用 (0 = 引脚置 analog + 上/下拉; 1 = 置 input + 上/下拉)
+ * 响应: [AI 3ch × 2 raw u16 = 12B][DI 4ch × 2 电平 u8 = 8B] = 20B
+ * ★ 这条判据**能失败**: 若引脚配置/取样路径错, 上拉与下拉读数会相同 (常量),
+ *   而"同一个值"正是"没采到这个脚"的特征 —— 比"读到一个数字"强得多。 */
+static void h_pin_selftest(const uint8_t *p, uint32_t n)
+{
+    uint32_t method = (n >= 1u) ? p[0] : 0u;
+    uint16_t ai[AI_NCH * 2];
+    uint8_t  di[DI_COUNT * 2];
+    ai_selftest(g_shm, method, ai);
+    di_selftest(di);
+    uint8_t r[AI_NCH * 2 * 2 + DI_COUNT * 2];
+    uint32_t o = 0;
+    for (int i = 0; i < AI_NCH * 2; i++) { r[o++] = (uint8_t)(ai[i] & 0xFFu); r[o++] = (uint8_t)(ai[i] >> 8); }
+    for (int i = 0; i < DI_COUNT * 2; i++) r[o++] = di[i];
+    g_pin_selftest_n++;
+    ack(r, o);
+}
+
 /* 0x38 ENGINE_STATUS — **前 31 字节与 S3 逐字节同布局** (上位机脚本零改动),
  * 尾部追加 H723 扩展 6B (S3 的"尾部追加保前段兼容"惯例)。
  *
@@ -1668,6 +1698,8 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_MACRO:         h_macro(p, n); break;
         case CMD_MACRO_UPLOAD:  h_macro_upload(p, n); break;
         case CMD_MACRO_CTRL:    h_macro_ctrl(p, n); break;
+        /* ---- W5: 外设域零接线自检 ---- */
+        case CMD_PIN_SELFTEST:  h_pin_selftest(p, n); break;
         /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
          *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
          *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
@@ -1835,6 +1867,8 @@ static void obs_anchor(void)
     /* W5 macro VM */
     sink ^= g_macro_exec_ok;   sink ^= g_macro_upload_ok;
     sink ^= g_macro_nak;       sink ^= g_macro_ticks;
+    /* W5 外设域 */
+    sink ^= g_w5_ready;        sink ^= g_pin_selftest_n;
     (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
 }
 
@@ -1976,7 +2010,16 @@ int main(void)
 #endif
     g_stage = 11;
 
-    /* ⑦ 统一锚定全部观测变量 (防 --gc-sections 回收; 见 obs_anchor 注释) */
+    /* ⑦ W5 外设域: ADC1(16bit)+AI / DI / HIL
+     *   ★ 时机: 必须在 clock_init() 之后 —— ADC 的 adc_ker_ck 取自 HSE/per_ck。 */
+    g_stage = 21; adc_init();
+    g_stage = 22; ai_init(g_shm);
+    g_stage = 23; di_init(g_shm);
+    g_stage = 24; hil_init(g_shm);
+    g_w5_ready = 1;
+    g_stage = 12;
+
+    /* ⑧ 统一锚定全部观测变量 (防 --gc-sections 回收; 见 obs_anchor 注释) */
     obs_anchor();
 
     for (;;) {
@@ -2074,6 +2117,11 @@ int main(void)
          *   直接吃掉拍预算。macro_tick 内部按 loop_ms 自节流, 未到间隔即返回，
          *   所以每轮调用只花几条指令。 */
         if (macro_tick(g_shm, g_tick_count)) g_macro_ticks++;
+
+        /* ★ W5: AI / DI / HIL 周期任务 (各自按 10ms 自节流, 主循环驱动, 不进 ISR) */
+        ai_tick(g_shm, g_tick_count);
+        di_tick(g_shm, g_tick_count);
+        hil_tick(g_shm, g_tick_count);
 
         /* 栈哨兵周期巡检 (廉价: 32 个字, 主循环有 100μs 一次的机会) */
         g_guard_ok = (uint32_t)shm_guard_ok();
