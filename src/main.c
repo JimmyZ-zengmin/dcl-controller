@@ -589,6 +589,21 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   ★ 但 ISR **不能**用 gate 单独开跑 —— 那意味着"上电即跑引擎"而 PC 无法停,
          *   所以真实运行条件是 (gate && RUN)。这同时让 0x12 STOP 成为**可失败判据**:
          *   STOP 后 routes_total 必须停止增长 (见 tools/h723_runctrl.py)。 */
+        /* ★★★ #2 修复 (2026-09-11 迁移保真度审查): HEARTBEAT 的语义必须是
+         *   "**每拍无条件**" = CPU + 定时器存活, 与范本 OA14 **一字不差**:
+         *     范本 `core0_isr.c:355` 把 `HEARTBEAT += 1` 写在 `if (!run) return`
+         *     **之前**, 那条注释原文是:
+         *       "OA14 (P2, 审计): 心跳必须在 run 门外无条件翻 — 停机也翻
+         *        (外部可观测 CPU+定时器存活)。上一版把 return 放心跳前 → STOP 心跳停,
+         *        与注释相反, 且 LA 的 STOP/RUN 抖动对照场景无法复现。"
+         *   ★ 而 H723 原来把它放在 `gate && RUN` 门**内** ⇒ 与**同一张表里 0x18**
+         *     的 SAMPLES 语义**完全对调**。同址反义是最危险的一类静默读错:
+         *     按"心跳看 CPU 存活"写的上位机会把"引擎已停机"读成"CPU 死了";
+         *     按"samples 看本次运行段"写的会把"停机后的空拍"算进统计段。
+         *   ★ 为什么放这里: 在 `g_tick_count++` 之后、**任何门之前** ——
+         *     只要这一拍进来了就翻一次, 与引擎跑不跑无关。 */
+        SHM_U32(g_shm, OFF_CTRL_HEARTBEAT)++;
+
         g_engine_run_seen = SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN);
         if (g_engine_gate && g_engine_run_seen) {
             uint32_t ta = DWT_CYCCNT;
@@ -648,20 +663,12 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   一旦因为 n_routes=0 而跳过整段, 这类程序会静默不推进。
          *   本实现把 seq 放在同一个 if 里但**不依赖 n_routes**, 所以两条路都通。 */
         if (g_engine_gate && g_engine_run_seen) {
-            /* ★★ 审计发现 C 的配套: HEARTBEAT = **引擎拍计数**, 写进 SHM 让 PC 可读。
-             *   为什么需要它 (而不是复用 0x38 的 samples):
-             *     0x38 的 samples = g_isr_n = **拍中断**次数 —— STOP 之后 ISR 照跑,
-             *     它继续增长。于是"引擎停了没"这件事**没有外部可读的量**:
-             *     PC 只能看到"计数值还在涨"(以为还在跑) 或"不变"(以为死了),
-             *     两种解读都可能是错的。
-             *   ⇒ HEARTBEAT 只在 gate && RUN 内递增, 语义是"引擎在推进"。
-             *     与 samples 成对读, 就能区分三种状态:
-             *       samples↑ HEARTBEAT↑  → 引擎在跑
-             *       samples↑ HEARTBEAT=停 → ISR 在跑但引擎已 STOP (正常的停机态)
-             *       samples=停            → ISR 都没了 (固件死了/未启动)
-             *   ★ 这正是 W1 的 S2 判据需要的量 —— 审计发现 B/S2 指出原判据用错了量。
-             *   ★ 放在 if 内首行: 与 seq 同门, 成本 1 次 volatile 读改写 (可忽略)。 */
-            SHM_U32(g_shm, OFF_CTRL_HEARTBEAT)++;
+            /* ★★ #2 修复: HEARTBEAT 的递增**已移到上面门之外** (语义 = 每拍无条件)。
+             *   这里原来放的就是它 —— 那个位置正好把语义写反了, 见上面的长注释。
+             *   ★ 换过来之后"引擎停了没"依然可观测, 只是两个量对调了 (S3 契约):
+             *       HEARTBEAT↑ samples↑   → 引擎在跑
+             *       HEARTBEAT↑ samples=停 → ISR 在跑但引擎已 STOP (正常停机态)
+             *       HEARTBEAT=停          → ISR 都没了 (固件死了/未启动) */
             g_seq_ticks++;
             uint32_t sw = engine_seq_tick(g_shm, g_tick_count);
             g_seq_wrote_last = sw;
@@ -709,7 +716,15 @@ ISR_PLACE void TIM2_IRQHandler(void)
             if (di > g_isr_cyc_max) g_isr_cyc_max = di;
             g_isr_cyc_sum += di;
         }
-        g_isr_n++;
+        /* ★★ #2 修复: samples (g_isr_n) = **仅 RUN 拍** (范本语义)。
+         *   范本 `core0_isr.c:358` 的 `SAMPLES += 1` 写在 `if (!run) return` **之后**
+         *   —— 即 OA13 "统计只反映本次 RUN 段"; 而且 0x38 的 samples 正是取自它
+         *   (`esp32-core0/main/main.c:242`), 所以两侧必须同口径。
+         *   ⇒ 原来这里**每拍都加** = 与 0x08 的语义完全对调 (见上方的长注释)。
+         *   ★ 计数条件与扫描门用**同一个** (gate && RUN) ⇒ samples 的增量恰好等于
+         *     "引擎真的推进过的拍数", 而不是"中断进来过几次"。
+         *   ★ 副作用(正面): STOP 后 samples 冻结 —— 这正是"0x12 STOP 可失败判据"的一半。 */
+        if (g_engine_gate && g_engine_run_seen) g_isr_n++;
 
         if (g_per_prev) {
             uint32_t p = t0 - g_per_prev;

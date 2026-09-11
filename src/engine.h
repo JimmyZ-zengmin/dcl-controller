@@ -72,11 +72,24 @@
 
 #define OFF_CTRL_MAGIC       0x00   /* u32 [写] CTRL_MAGIC: SHM 已初始化 (唯一就绪判据) */
 #define OFF_CTRL_VERSION     0x04   /* u32 [写] SHM_LAYOUT_VERSION: 字段语义版本 (非偏移版本) */
-#define OFF_CTRL_HEARTBEAT   0x08   /* u32 [写] **引擎拍计数** — 仅在 gate && RUN 时递增。
-                                     *   ★ 语义是"引擎在推进", 不是"CPU 活着" (后者用 0x38
-                                     *     的 samples = 拍中断数, 它 STOP 后仍增长)。
-                                     *   两者成对使用才能区分"ISR 在跑"与"引擎在跑" ——
-                                     *   这正是 W1 S2 判据需要的量 (审计发现 B/S2)。 */
+#define OFF_CTRL_HEARTBEAT   0x08   /* u32 [写] **每拍无条件递增** = CPU + 定时器存活。
+                                     *   ★★ #2 修复 (2026-09-11 迁移保真度审查): 这里原本
+                                     *     写的是"引擎拍计数 — 仅在 gate && RUN 时递增",
+                                     *     与范本**正好反义**。范本 `core0_isr.c:355` 把
+                                     *     `HEARTBEAT += 1` 放在 `if (!run) return` **之前**,
+                                     *     注释原文: "OA14 (P2, 审计): 心跳必须在 run 门外
+                                     *     无条件翻 — 停机也翻 (外部可观测 CPU+定时器存活)"。
+                                     *   ★ 同址反义是最危险的一类静默读错: 按"心跳看存活"
+                                     *     写的上位机会把"引擎已停机"读成"CPU 死了"。
+                                     *   ⇒ 现在两个量的契约与范本**完全一致**:
+                                     *       0x08 HEARTBEAT = 每拍无条件 (存活)
+                                     *       0x18 SAMPLES   = **仅 RUN 拍** (本次运行段)
+                                     *     成对读可区分三态 (注意与修复前是**对调**的):
+                                     *       0x08↑ 0x18↑   → 引擎在跑
+                                     *       0x08↑ 0x18=停 → ISR 在跑但引擎已 STOP (正常停机态)
+                                     *       0x08=停       → ISR 都没了 (固件死了/未启动)
+                                     *   ★ 成本: 每拍一次 volatile 读改写 (DTCM) —— 与修复前
+                                     *     同级 (原来也每拍写一次, 只是写在门内)。 */
 #define OFF_CTRL_RELOAD      0x0C   /* u8  */
 #define OFF_CTRL_ENGINE_RUN  0x0D   /* u8  */
 #define OFF_CTRL_N_ROUTES    0x0E   /* u16 ★ 条数的**唯一权威来源** (见 g_active_routes 说明) */
@@ -91,7 +104,11 @@
  *   0x22 READ_BURST 就能一次取走全部计时视图 (无需多次 0x38 往返)。
  *   ⇒ 两者的关系写死: C 全局 = 权威(每拍更新, 精度最高); SHM 区 = 采样镜像。
  *     审计若发现两者不一致, **以 C 全局为准**, 因为 SHM 是滞后的拷贝。 */
-#define OFF_TIMING_SAMPLES      0x18   /* u32 [写] = g_isr_n          */
+#define OFF_TIMING_SAMPLES      0x18   /* u32 [写] = g_isr_n = **仅 RUN 拍**的拍数。
+                                        *   ★ #2 修复: 契约与范本 OFF_TIMING_SAMPLES 一致
+                                        *     (范本在 `if (!run) return` **之后**递增, 且范本
+                                        *      0x38 的 samples 就取自它: `main.c:242`)。
+                                        *     STOP 后**冻结** —— 与 0x08 恰好互补, 见上。 */
 #define OFF_TIMING_PERIOD_MIN   0x1C   /* u32 [写] = g_per_cyc_min    */
 #define OFF_TIMING_PERIOD_MAX   0x20   /* u32 [写] = g_per_cyc_max    */
 #define OFF_TIMING_EXEC_MIN     0x24   /* u32 [写] = g_isr_cyc_min    */

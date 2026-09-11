@@ -300,25 +300,25 @@ def main():
 
         # ★★ 审计发现 B/S2 的核心: "引擎停了没"需要两个语义**不同**的量, 缺一不可。
         def samples():
-            """拍**中断**次数 (0x38 r[0:4] = g_isr_n)。
-            ★ 它反映的是 **ISR 在不在跑**, 不是"引擎在不在跑" —— STOP 只是关掉引擎门
-              (gate && RUN), ISR 本身照跑。所以这个量在 STOP 之后**仍会增长**。
-              原判据拿它测"STOP 后停止" ⇒ 必然 FAIL, 且失败信息会把人引向
-              "固件没停机", 而真相是**判据选错了量**。"""
+            """**本次 RUN 段的拍数** (0x38 r[0:4] = g_isr_n → SHM 0x18 = OFF_TIMING_SAMPLES)。
+            ★ 契约与 S3 范本**一字不差**: 范本把 `SAMPLES += 1` 写在 `if (!run) return`
+              **之后** (`core0_isr.c:358`, OA13 "统计只反映本次 RUN 段"), 且范本 0x38
+              的 samples 就取自它 (`main.c:242`) ⇒ 所以 STOP 之后它**冻结**。
+            ★★ #2 修复前 H723 是**每拍都加** —— 与 0x08 的语义完全对调; 本工具原来的
+              S2/S2b 判据正建立在那个反义上, 现在一并改正 (判据跟着契约走, 不是反过来)。"""
             s, b = L.xact(CMD_ENGINE_STATUS)
             if s != STS_ACK or len(b) < 4:
                 return None
             return struct.unpack("<I", b[:4])[0]
 
         def heartbeat():
-            """引擎**拍计数** (SHM 0x08 = OFF_CTRL_HEARTBEAT)。
-            ★ 固件在 `gate && RUN` 门内递增它 ⇒ 这才是"引擎在推进"的判据。
-              两个量成对使用可区分三种状态:
-                 samples↑ HEARTBEAT↑  → 引擎在跑
-                 samples↑ HEARTBEAT=停 → ISR 在跑但引擎已 STOP (正常停机态)
-                 samples=停            → ISR 都没了 (固件死了/未启动)
-              (审计发现 C 补写了这个字段 —— 在此之前它恒 0, 即"引擎活性"在外
-              部根本不可观测, 这正是 S2 判据写不出来的根因。)"""
+            """**每拍无条件**递增的存活计数 (SHM 0x08 = OFF_CTRL_HEARTBEAT)。
+            ★ 契约与 S3 范本**一字不差**: 范本把 `HEARTBEAT += 1` 写在 `if (!run) return`
+              **之前** (`core0_isr.c:355`), 注释原文 "OA14 (P2, 审计): 心跳必须在 run 门外
+              无条件翻 — 停机也翻 (外部可观测 CPU+定时器存活)"。
+            ★ 所以它在 STOP 之后**仍然增长** —— 它回答的是"CPU + 定时器活着吗",
+              不是"引擎在推进吗"(那是 samples 的问题)。
+              成对读可区分三态: 0x08↑0x18↑ 在跑 / 0x08↑0x18=停 停机态 / 0x08=停 固件死。"""
             return L.rd32(shm + OFF_CTRL_HEARTBEAT)
 
         # ───────── R1/R2: SHM 读写 ─────────
@@ -443,35 +443,36 @@ def main():
         record("S1b RESET 后 ENGINE_RUN=0 (读对齐字 0x0C 取 bit8 — 审计 B/S1b)",
                run_after_reset == 0, "0x0C=0x%08X → run=%s" % (w if w is not None else 0, run_after_reset))
 
-        # STOP 后引擎心跳必须**停止增长**
+        # ★★ #2 的核心判据: STOP 之后 **samples 必须冻结** (本次 RUN 段已结束),
+        #   而 **HEARTBEAT 必须继续增长** (CPU + 定时器存活)。两者在**同一时刻**给出
+        #   **相反**的结论 —— 这是"两个量语义不同"最硬的可失败证据: 只测其中一个的话,
+        #   就算两者被对调了也看不出来。(修复前本工具正是这么被蒙过去的。)
         sts, _ = L.xact(CMD_STOP)
         ok_stop = (sts == STS_ACK)
         time.sleep(0.3)
         h1, s1 = heartbeat(), samples()
         time.sleep(0.4)
         h2, s2 = heartbeat(), samples()
-        record("S2 STOP 后引擎心跳停止 (HEARTBEAT 不增长 — 审计 B/S2 换用正确量)",
-               ok_stop and h1 is not None and h1 == h2, "HEARTBEAT %s→%s" % (h1, h2))
-        # ★ 这条把"原来用错了量"变成一个**正面判据**: 同时刻拍中断数**仍在增长**。
-        #   它同时证明两件事: ① ISR 活着 (链路/固件没死) ② 两个量语义确实不同。
-        record("S2b ★对照: 同时刻拍中断数仍在增长 (证明两量语义不同)",
-               s1 is not None and s2 is not None and s2 > s1, "samples %s→%s" % (s1, s2))
+        record("S2 ★STOP 后 samples 冻结 (仅 RUN 拍 — 范本 OA13 语义)",
+               ok_stop and s1 is not None and s1 == s2, "samples %s→%s" % (s1, s2))
+        record("S2b ★对照: 同时刻 HEARTBEAT 仍在增长 (每拍无条件 — 范本 OA14 语义)",
+               h1 is not None and h2 is not None and h2 > h1, "HEARTBEAT %s→%s" % (h1, h2))
 
-        # START 后必须恢复增长
+        # START 后 samples 必须恢复增长
         sts, _ = L.xact(CMD_START)
         time.sleep(0.3)
-        h3 = heartbeat()
+        s3 = samples()
         time.sleep(0.4)
-        h4 = heartbeat()
-        record("S3 START 后引擎心跳恢复增长", sts == STS_ACK and h3 is not None
-               and h4 is not None and h4 > h3, "HEARTBEAT %s→%s" % (h3, h4))
+        s4 = samples()
+        record("S3 START 后 samples 恢复增长 (引擎在推进)", sts == STS_ACK and s3 is not None
+               and s4 is not None and s4 > s3, "samples %s→%s" % (s3, s4))
 
-        # OA13 幂等: 二次 START 不重置心跳 (值必须继续增长/不回退)
+        # OA13 幂等: 二次 START 不重置统计 (samples 必须继续增长/不回退)
         sts, _ = L.xact(CMD_START)
         time.sleep(0.1)
-        h5 = heartbeat()
-        record("S4 二次 START 幂等 (HEARTBEAT 不回退, OA13)",
-               h5 is not None and h4 is not None and h5 >= h4, "h4=%s → h5=%s" % (h4, h5))
+        s5 = samples()
+        record("S4 二次 START 幂等 (samples 不回退, OA13)",
+               s5 is not None and s4 is not None and s5 >= s4, "s4=%s → s5=%s" % (s4, s5))
 
         # ───────── S5: 毒药表兜底 (F11) ─────────
         print("\n── S5 F11 毒药表兜底 ──")
