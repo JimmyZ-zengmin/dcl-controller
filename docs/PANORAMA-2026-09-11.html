@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>H723 PLC 内核 — 项目全景（审计版）</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --panel2:#f0f2f5; --line:#d8dce3;
+    --tx:#1a1d21; --tx2:#5a616b; --tx3:#8b939e;
+    --ok:#1a7f37; --okbg:#e6f4ea;
+    --wip:#9a6700; --wipbg:#fff8e1;
+    --todo:#6e7781; --todobg:#eef0f3;
+    --na:#a8b0ba; --nabg:#f2f3f5;
+    --bad:#b42318; --badbg:#fdecea;
+    --accent:#2f6feb; --accentbg:#e8f0fe;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0d1117; --panel:#161b22; --panel2:#1c2128; --line:#30363d;
+      --tx:#e6edf3; --tx2:#9aa4b0; --tx3:#6e7781;
+      --ok:#3fb950; --okbg:#0d2a17;
+      --wip:#d29922; --wipbg:#2b2312;
+      --todo:#8b949e; --todobg:#21262d;
+      --na:#6e7781; --nabg:#1a1e24;
+      --bad:#f85149; --badbg:#2d1416;
+      --accent:#58a6ff; --accentbg:#12233d;
+    }
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--tx);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:28px 20px 60px}
+  .wrap{max-width:1180px;margin:0 auto}
+  h1{font-size:23px;font-weight:650;letter-spacing:-.01em}
+  h2{font-size:15px;font-weight:620;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:9px}
+  h2 .n{display:inline-flex;align-items:center;justify-content:center;width:21px;height:21px;border-radius:5px;background:var(--accentbg);color:var(--accent);font-size:11.5px;font-weight:700}
+  .sub{color:var(--tx2);font-size:12.5px;margin-top:5px}
+  .mono{font-family:ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,monospace}
+
+  /* 顶栏 */
+  .head{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap;margin-bottom:22px}
+  .meta{font-size:12px;color:var(--tx2);text-align:right;line-height:1.9}
+  .meta b{color:var(--tx);font-weight:600}
+  .chip{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11.5px;font-weight:600;background:var(--panel2);color:var(--tx2);border:1px solid var(--line)}
+  .chip.ok{background:var(--okbg);color:var(--ok);border-color:transparent}
+
+  /* 指标卡 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 16px}
+  .card .k{font-size:11.5px;color:var(--tx2);letter-spacing:.02em}
+  .card .v{font-size:25px;font-weight:680;margin:5px 0 2px;letter-spacing:-.02em}
+  .card .v small{font-size:14px;font-weight:500;color:var(--tx3)}
+  .card .d{font-size:11.5px;color:var(--tx3)}
+  .v.ok{color:var(--ok)} .v.wip{color:var(--wip)} .v.accent{color:var(--accent)}
+
+  /* 进度条 */
+  .bar{height:7px;border-radius:99px;background:var(--panel2);overflow:hidden;margin-top:9px;display:flex}
+  .bar i{display:block;height:100%}
+  .bar i.ok{background:var(--ok)} .bar i.wip{background:var(--wip)}
+
+  /* 波次 */
+  .wave{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-bottom:11px;overflow:hidden}
+  .wave .top{display:flex;align-items:center;gap:12px;padding:13px 16px;border-bottom:1px solid var(--line)}
+  .wave .tag{font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:5px;white-space:nowrap}
+  .wave .tag.ok{background:var(--okbg);color:var(--ok)}
+  .wave .tag.wip{background:var(--wipbg);color:var(--wip)}
+  .wave .tag.todo{background:var(--todobg);color:var(--todo)}
+  .wave .name{font-weight:620;font-size:14px}
+  .wave .cnt{margin-left:auto;font-size:11.5px;color:var(--tx3);white-space:nowrap}
+  .wave .body{padding:13px 16px;font-size:12.5px;color:var(--tx2);line-height:1.85}
+  .wave .body b{color:var(--tx);font-weight:600}
+  .ev{display:flex;gap:9px;align-items:baseline;flex-wrap:wrap;margin-top:8px;padding-top:9px;border-top:1px dashed var(--line)}
+  .ev .lbl{font-size:11px;color:var(--tx3);letter-spacing:.03em;font-weight:600}
+
+  /* 命令矩阵 */
+  .cmds{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:8px}
+  .cmd{border-radius:8px;padding:9px 11px;border:1px solid transparent;font-size:12px}
+  .cmd .c{font-family:ui-monospace,monospace;font-size:12px;font-weight:700}
+  .cmd .t{font-size:11px;margin-top:2px;opacity:.85}
+  .cmd.ok{background:var(--okbg);color:var(--ok);border-color:color-mix(in srgb,var(--ok) 25%,transparent)}
+  .cmd.todo{background:var(--todobg);color:var(--todo)}
+  .cmd.na{background:var(--nabg);color:var(--na);opacity:.72}
+
+  /* 表 */
+  table{width:100%;border-collapse:collapse;font-size:12.5px;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  th{text-align:left;font-weight:620;font-size:11.5px;color:var(--tx2);letter-spacing:.03em;padding:10px 13px;background:var(--panel2);border-bottom:1px solid var(--line);white-space:nowrap}
+  td{padding:10px 13px;border-bottom:1px solid var(--line);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  td.r{text-align:right;font-family:ui-monospace,monospace;white-space:nowrap}
+  .pill{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:600;white-space:nowrap}
+  .pill.ok{background:var(--okbg);color:var(--ok)}
+  .pill.wip{background:var(--wipbg);color:var(--wip)}
+  .pill.todo{background:var(--todobg);color:var(--todo)}
+  .pill.bad{background:var(--badbg);color:var(--bad)}
+
+  /* 发现 */
+  .find{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:0 10px 10px 0;padding:14px 16px;margin-bottom:11px}
+  .find.good{border-left-color:var(--ok)}
+  .find.warn{border-left-color:var(--wip)}
+  .find .ti{font-weight:640;font-size:13.5px;margin-bottom:7px}
+  .find .tx{font-size:12.5px;color:var(--tx2);line-height:1.85}
+  .find code{background:var(--panel2);padding:1.5px 5px;border-radius:4px;font-family:ui-monospace,monospace;font-size:11.5px;color:var(--tx)}
+
+  /* 缺口 */
+  .gap{display:flex;gap:11px;align-items:flex-start;padding:11px 14px;background:var(--panel);border:1px solid var(--line);border-radius:9px;margin-bottom:8px;font-size:12.5px}
+  .gap .num{flex:none;width:20px;height:20px;border-radius:5px;background:var(--badbg);color:var(--bad);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
+  .gap.w .num{background:var(--wipbg);color:var(--wip)}
+  .gap .tx b{color:var(--tx)}
+  .gap .tx{color:var(--tx2);line-height:1.75}
+
+  .note{font-size:11.5px;color:var(--tx3);line-height:1.8;margin-top:9px;padding-left:11px;border-left:2px solid var(--line)}
+  footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--line);font-size:11.5px;color:var(--tx3);line-height:1.9}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="head">
+    <div>
+      <h1>H723 PLC 内核 — 项目全景</h1>
+      <div class="sub">ESP32-S3 老线 → STM32H723 新线的可信重建　|　审计视图</div>
+    </div>
+    <div class="meta">
+      分支 <b class="mono">main</b>　最新提交 <b class="mono">993caef</b><br>
+      基线 <b class="mono">66f46f5</b>（W2.4）→ <b class="mono">993caef</b>（W3）<br>
+      <span class="chip ok">工作区干净 · 已推送</span>
+      <span class="chip">2026-09-11</span>
+    </div>
+  </div>
+
+  <!-- ══════ 指标 ══════ -->
+  <div class="cards">
+    <div class="card">
+      <div class="k">命令覆盖</div>
+      <div class="v accent">13<small> / 20</small></div>
+      <div class="d">S3 命令表实测 20 条</div>
+      <div class="bar"><i class="ok" style="width:65%"></i></div>
+    </div>
+    <div class="card">
+      <div class="k">波次进度</div>
+      <div class="v ok">3<small> / 5 完成</small></div>
+      <div class="d">W1 · W2 · W3 已落地</div>
+      <div class="bar"><i class="ok" style="width:60%"></i></div>
+    </div>
+    <div class="card">
+      <div class="k">自研代码</div>
+      <div class="v">5996<small> 行</small></div>
+      <div class="d">src/ — 零警告闸门</div>
+    </div>
+    <div class="card">
+      <div class="k">最近回归</div>
+      <div class="v ok">全绿</div>
+      <div class="d">13/13 · 守卫✓ · 26/26 · 27/27</div>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>口径说明（审计请先核对）</b>：PLAN 文档记"目标 18 / 20，不适用 2 条"，但按 S3 <span class="mono">components/transport/uart_protocol.h</span> + <span class="mono">main.c:839</span> 实测为 <b>20 条</b>；H723 侧未定义 0x50 SHELL，display 为 0x51/0x52/0x53 三条。<br>
+    ⇒ 此处按<b>实测</b>呈现：<b>13 / 20 已实现</b>，其中 display 三条（无 TFT）明确不迁，实际待做 <b>4 条</b>（macro 1 + Modbus 3）。PLAN 的 18/20 与此差 1 条，建议审计时定案。
+  </div>
+
+  <!-- ══════ 波次 ══════ -->
+  <h2><span class="n">1</span>波次路线图</h2>
+
+  <div class="wave">
+    <div class="top">
+      <span class="tag ok">已完成</span>
+      <span class="name">W1 — 运行控制 + SHM 读写</span>
+      <span class="cnt">7 条命令</span>
+    </div>
+    <div class="body">
+      0x20/0x21/0x22/0x23（SHM 读写，含四个安全守卫：地址白名单 / 范围 / NaN 防护 / 输出安全）
+      · 0x11/0x12/0x13（START / STOP / RESET）。
+      <div class="ev">
+        <span class="lbl">证据</span>
+        <span class="pill wip">验收未闭合</span>
+        <span style="color:var(--tx2)">代码已落地、构建零警告；<b>PC 侧串口（CH340）未接线</b>，<span class="mono">tools/h723_w1.py</span> 报链路不活 —— 归为旁路，接线后补跑</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="wave">
+    <div class="top">
+      <span class="tag ok">已完成</span>
+      <span class="name">W2 — Force 域 + 掉电保持</span>
+      <span class="cnt">1 条命令 + 双副本存储</span>
+    </div>
+    <div class="body">
+      <b>W2.1–2.3 Force</b>：SHM Force 区 + ISR 拍首覆写 + 写端屏蔽两半齐全，0x24 落地。
+      <br>
+      <b>W2.4 persist</b>：裸 Flash 双副本 A/B（扇区 6/7），写 seq 小的一份，任何时刻至少一份完整；H7 编程粒度 32B 的 8 连写修复。
+      <div class="ev">
+        <span class="lbl">证据</span>
+        <span class="pill ok">13 / 13 PASS</span>
+        <span class="mono" style="font-size:11.5px">h723_w2_probe.py</span>
+        <span class="pill ok" style="margin-left:9px">26 / 26 PASS</span>
+        <span class="mono" style="font-size:11.5px">h723_persist.py</span>
+        <span style="color:var(--tx2);margin-left:9px">含擦除中复位 → 目标扇区被擦、保护副本完好 → 重启恢复成功</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="wave">
+    <div class="top">
+      <span class="tag ok">已完成</span>
+      <span class="name">W3 — 顺序域 Sequencer</span>
+      <span class="cnt">1 条命令 · 本次交付</span>
+    </div>
+    <div class="body">
+      0x44 SEQ_DEPLOY + <span class="mono">engine_seq_tick()</span>（ITCM 热路径）。
+      四件语义：<b>阈值转移 / 超时强推 / 末步 loop / 步号镜像</b>（受 FORCE 屏蔽）。
+      ISR 插点三条理由：路由扫描<b>之后</b>（条件读本拍最新值，译码同拍闭合）、计时统计<b>之前</b>（seq 成本天然计入 isr_cyc，被既有预算门抓住）、<span class="mono">gate &amp;&amp; RUN</span> 门内（STOP 后步号冻结保持）。
+      SHM SEQ 区 <span class="mono">0x4000/0x4400/0x4480</span> 与 S3 <b>逐字节同偏移</b>。
+      能力位 <span class="mono">0x00B7 → 0x00F7</span>（加 DCL_CAP_SEQ）。
+      <div class="ev">
+        <span class="lbl">证据</span>
+        <span class="pill ok">27 / 27 PASS</span>
+        <span class="mono" style="font-size:11.5px">h723_seq.py</span>
+        <span style="color:var(--tx2);margin-left:9px">T28 灵魂测试 14（闭环：改输入→等拍→读输出）+ T29 校验器 13</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="wave">
+    <div class="top">
+      <span class="tag todo">未开始</span>
+      <span class="name">W4 — Modbus 通信域</span>
+      <span class="cnt">3 条命令 + 约 370 行</span>
+    </div>
+    <div class="body">
+      0x60 MB_INJECT / 0x61 MB_RESP / 0x62 MB_CFG。移植 S3 <span class="mono">components/core0/modbus.c</span>。
+      <div class="ev">
+        <span class="lbl">阻塞点</span>
+        <span class="pill wip">待决策</span>
+        <span style="color:var(--tx2)"><b>USART2 独立口</b>（需外接 USB-UART 桥）还是 <b>UART1 单口复用</b> —— 影响接线与 LA 验证方案</span>
+      </div>
+      <div class="ev">
+        <span class="lbl">验收要求</span>
+        <span style="color:var(--tx2)">必须有 <b>LA 外部证据</b>（Saleae Logic2，<span class="mono">saleae-la-verify</span> skill + S3 的 <span class="mono">verify_la_modbus.py</span> 范例，7/7 PASS 口径）</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="wave">
+    <div class="top">
+      <span class="tag todo">未开始</span>
+      <span class="name">W5 — 外设域</span>
+      <span class="cnt">ADC + macro + DI/HIL/AI</span>
+    </div>
+    <div class="body">
+      W5.1 ADC 16 位 + DMA → SENSOR_MAP　·　W5.2 macro 字节码 VM（0x40，约 331 行）　·　W5.3 DI / HIL / AI（约 499 行）。
+      <div class="ev">
+        <span class="lbl">注</span>
+        <span style="color:var(--tx2)">W5.4「ST 标准语言前端」S3 也没有，属超越项，非本阶段验收范围</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="wave">
+    <div class="top">
+      <span class="tag todo">未开始</span>
+      <span class="name">最终验收 — test_dcl 移植 + 一次性审计</span>
+      <span class="cnt">18 套全绿 + 2 套 SKIP</span>
+    </div>
+    <div class="body">
+      从 S3 <span class="mono">tools/test_dcl.py</span> 移植为 <span class="mono">tools/h723_test_dcl.py</span>（T3 改用 ADC 通道，非 DHT22）。
+      全部 W 完成后对照 S3 四轮审计口径做一遍：判据可失败性 / 宣称=实现 / 对端视角 / 成本表受控对照。
+    </div>
+  </div>
+
+  <!-- ══════ 命令矩阵 ══════ -->
+  <h2><span class="n">2</span>命令矩阵（13 / 20）</h2>
+  <div class="cmds">
+    <div class="cmd ok"><div class="c">0x01</div><div class="t">GET_VERSION</div></div>
+    <div class="cmd ok"><div class="c">0x10</div><div class="t">DEPLOY（含预算门）</div></div>
+    <div class="cmd ok"><div class="c">0x11</div><div class="t">START（含 seq arm）</div></div>
+    <div class="cmd ok"><div class="c">0x12</div><div class="t">STOP</div></div>
+    <div class="cmd ok"><div class="c">0x13</div><div class="t">RESET</div></div>
+    <div class="cmd ok"><div class="c">0x20</div><div class="t">READ</div></div>
+    <div class="cmd ok"><div class="c">0x21</div><div class="t">WRITE</div></div>
+    <div class="cmd ok"><div class="c">0x22</div><div class="t">READ_BURST</div></div>
+    <div class="cmd ok"><div class="c">0x23</div><div class="t">WRITE_BURST</div></div>
+    <div class="cmd ok"><div class="c">0x24</div><div class="t">FORCE</div></div>
+    <div class="cmd ok"><div class="c">0x38</div><div class="t">ENGINE_STATUS</div></div>
+    <div class="cmd ok"><div class="c">0x43</div><div class="t">PERSIST</div></div>
+    <div class="cmd ok"><div class="c">0x44</div><div class="t">SEQ_DEPLOY</div></div>
+    <div class="cmd todo"><div class="c">0x40</div><div class="t">MACRO　→ W5</div></div>
+    <div class="cmd todo"><div class="c">0x60</div><div class="t">MB_INJECT　→ W4</div></div>
+    <div class="cmd todo"><div class="c">0x61</div><div class="t">MB_RESP　→ W4</div></div>
+    <div class="cmd todo"><div class="c">0x62</div><div class="t">MB_CFG　→ W4</div></div>
+    <div class="cmd na"><div class="c">0x51</div><div class="t">DISPLAY_INIT　不迁</div></div>
+    <div class="cmd na"><div class="c">0x52</div><div class="t">DISPLAY_FILL　不迁</div></div>
+    <div class="cmd na"><div class="c">0x53</div><div class="t">DISPLAY_TEXT　不迁</div></div>
+  </div>
+  <div class="note">
+    绿 = 已实现并已进 <span class="mono">proto_dispatch</span>　·　灰 = 未实现（已显式 NAK <span class="mono">"bad cmd"</span>，不静默丢弃）　·　暗 = 明确不迁（H723 无 TFT，S3 对应 fs/shell 线）<br>
+    未实现命令一律返回带原因的 NAK —— 静默丢弃会让上位机只能看到 TIMEOUT，分不清"固件挂了"与"命令没实现"。
+  </div>
+
+  <!-- ══════ 验证资产 ══════ -->
+  <h2><span class="n">3</span>验证资产（13 个工具，可复跑）</h2>
+  <table>
+    <thead>
+      <tr><th>工具</th><th>覆盖对象</th><th>判据</th><th>最近结果</th><th>依赖</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="mono">h723_stage1_read.py</td>
+        <td>时钟 / 落位自检 / 扫描模式</td>
+        <td class="r">阶段 1 组</td>
+        <td><span class="pill todo">本次未复跑</span></td>
+        <td>pyocd</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_stage2_read.py</td>
+        <td>ISR 成本 · 分档调度 · 守卫</td>
+        <td class="r">FLASH 10819 / ITCM 7381 cyc</td>
+        <td><span class="pill ok">守卫全 ✓</span></td>
+        <td>pyocd</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_op_sweep.py</td>
+        <td>逐原语成本表（建预算模型）</td>
+        <td class="r">19 原语</td>
+        <td><span class="pill todo">本次未复跑</span></td>
+        <td>pyocd</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_pad_sweep.py</td>
+        <td>FLASH 取指 padding 敏感性</td>
+        <td class="r">地址 mod 32</td>
+        <td><span class="pill todo">本次未复跑</span></td>
+        <td>pyocd</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_proto.py</td>
+        <td>协议帧 / CRC / 版本协商</td>
+        <td class="r">T1.x 组</td>
+        <td><span class="pill wip">待接线</span></td>
+        <td>串口</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_w1.py</td>
+        <td>SHM 读写 + 运行控制</td>
+        <td class="r">W1 组</td>
+        <td><span class="pill wip">待接线</span></td>
+        <td>串口</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_w2_probe.py</td>
+        <td>Force 拍首覆写 / 写端屏蔽</td>
+        <td class="r">13</td>
+        <td><span class="pill ok">13 / 13</span></td>
+        <td>pyocd</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_persist.py</td>
+        <td>掉电保持 · 双副本 · 擦除中复位</td>
+        <td class="r">26</td>
+        <td><span class="pill ok">26 / 26</span></td>
+        <td>pyocd</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_seq.py</td>
+        <td>Sequencer 闭环 + 校验器</td>
+        <td class="r">27</td>
+        <td><span class="pill ok">27 / 27</span></td>
+        <td>pyocd</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_loopback.py</td>
+        <td>串口自收（链路二分）</td>
+        <td class="r">—</td>
+        <td><span class="pill wip">待接线</span></td>
+        <td>串口</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_ports.py</td>
+        <td>串口枚举 / 识别</td>
+        <td class="r">—</td>
+        <td><span class="pill wip">待接线</span></td>
+        <td>串口</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_findpin.py</td>
+        <td>引脚扫描</td>
+        <td class="r">—</td>
+        <td><span class="pill todo">本次未复跑</span></td>
+        <td>pyocd</td>
+      </tr>
+      <tr>
+        <td class="mono">h723_wire_probe.py</td>
+        <td>接线核对</td>
+        <td class="r">—</td>
+        <td><span class="pill todo">本次未复跑</span></td>
+        <td>pyocd</td>
+      </tr>
+      <tr style="background:var(--panel2)">
+        <td class="mono">_layout_probe.c</td>
+        <td>C/Python 结构体布局一致性（编译期断言）</td>
+        <td class="r">32 条 <span class="mono">_Static_assert</span></td>
+        <td><span class="pill ok">通过</span></td>
+        <td>编译期</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <b>"本次复跑"口径</b>：标 <span class="pill ok">通过/数字</span> 的五项（stage2 守卫 / w2_probe / persist / seq / 布局探针）是 2026-09-11 W3 收口时<b>实际执行过</b>的；
+    标 <span class="pill todo">本次未复跑</span> 的是历史通过的既有工具，<b>未在本次收口窗口中重跑</b>，审计若需采信请自行复跑（命令见 §7）。<br>
+    <b>凡"未复跑"不得计入"已通过"</b> —— 这是本项目的防造假纪律：判据必须可复跑，且"曾经通过"≠"现在通过"。
+  </div>
+
+  <!-- ══════ 确定性指标 ══════ -->
+  <h2><span class="n">4</span>确定性指标（对标 S3 基线）</h2>
+  <table>
+    <thead>
+      <tr><th>指标</th><th>S3 基线</th><th>H723 目标</th><th>实测</th><th>状态</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>单路由扫描成本</td><td class="r">234 cyc</td><td class="r">&lt; 100 cyc</td><td class="r">56.0 cyc</td><td><span class="pill ok">达标（4.2×）</span></td></tr>
+      <tr><td>分档调度收益</td><td class="r">2.59×</td><td class="r">≥ 2.59×</td><td class="r">2.59×</td><td><span class="pill ok">达标</span></td></tr>
+      <tr><td>热重载延迟</td><td class="r">—</td><td class="r">&lt; 1 拍</td><td class="r">3.6 μs</td><td><span class="pill ok">达标</span></td></tr>
+      <tr><td>拍周期</td><td class="r">99.9973 μs</td><td class="r">≥ 100.0000 μs</td><td class="r">待测</td><td><span class="pill todo">待测</span></td></tr>
+      <tr><td>拍抖动</td><td class="r">极差 0 cyc</td><td class="r">0 cyc</td><td class="r">待测</td><td><span class="pill todo">待测</span></td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    拍周期 / 抖动两项须在协议层接入后测（含 UART 中断影响），且<b>必须诚实标注</b>：本项目既有结论已证明"拍周期抖动 0"是"没超载"的结果，而非"解耦"的证明。含协议层后若为 ≤ 4 cyc 需如实记录。
+  </div>
+
+  <!-- ══════ 关键发现 ══════ -->
+  <h2><span class="n">5</span>期间抓到的真缺陷（审计重点）</h2>
+
+  <div class="find">
+    <div class="ti">W3 · 步号镜像初值缺失（移植遗漏，已修）</div>
+    <div class="tx">
+      S3 <span class="mono">main.c:918</span> 在 START 时写 <code>wm[out_wire] = 1.0f</code>，H723 第一版<b>漏了这句</b>。
+      后果不是"少个功能"，而是<b>宣称≠实现</b>：停在 step0 期间 <span class="mono">out_wire</span> 上是<b>上一个程序的残值</b>（实测 boot profile 的 0.01）。
+      语义层"镜像反映当前步号"是假的；功能层若译码路由写 <span class="mono">CMP(步号&lt;1.5)</span> 或 DIRECT，第一步期间会读到残值并<b>输出错误的执行器信号</b> —— 只有 <span class="mono">CMP(&gt;1.5)</span> 是恰好正确的。
+      <br><b>抓出方式</b>：T28.B1「起点快照」判据（期望 1.0，实测 0.01）。只测"推进后对不对"永远发现不了这类缺陷。
+    </div>
+  </div>
+
+  <div class="find warn">
+    <div class="ti">W2/W2.4/W3 · 能力位三处不同步（已修）</div>
+    <div class="tx">
+      <span class="mono">tools/h723_proto.py</span> 的 <span class="mono">EXPECT_CAP</span> 停在 <b>0x0033</b>，三次落地（PERSISTENT / FORCE / SEQ）都漏同步。
+      属 A4 事故同族 —— <b>"两处手工同步，改一处必忘另一处"</b>。已改为 0x00F7，并写明纪律。
+      <br><b>审计建议</b>：检查是否还有第三处手工同步的能力位副本。
+    </div>
+  </div>
+
+  <div class="find good">
+    <div class="ti">W2.4 · H7 Flash 编程粒度（已修，含判据）</div>
+    <div class="tx">
+      H7 编程粒度是 32B 的 8×u32 连续写，非 32 位独立写。错误标志 <span class="mono">PGSERR(bit18)</span> + <span class="mono">INCERR(bit21)</span> = 编程序列被打断。
+      修复后掉电判据（擦除中复位）5 项全绿。
+    </div>
+  </div>
+
+  <div class="find good">
+    <div class="ti">W3 · 单核竞争窗口（设计修正，非缺陷）</div>
+    <div class="tx">
+      S3 是 core0 写 / core1 扫，靠 <span class="mono">memw</span> 排序，顺序是"先置 RUN 再写 ctrl"。
+      H723 <b>单核</b>：先置 RUN 会让 ISR 在写完 ctrl 前推进步号，随后被写回的 <span class="mono">step_cur=0</span> <b>静默吞掉一次真实推进</b>。
+      ⇒ 改为"先把 ctrl 与镜像备好，<b>最后</b>才开 RUN 门"，竞争窗口归零。
+      这是<b>照搬语义、不照搬时序</b>的判例。
+    </div>
+  </div>
+
+  <!-- ══════ 缺口 ══════ -->
+  <h2><span class="n">6</span>缺口清单（审计待办）</h2>
+
+  <div class="gap">
+    <div class="num">1</div>
+    <div class="tx">
+      <b>PC 侧串口全程未接线</b> —— CH340 未接，导致 W1 / 协议层（<span class="mono">h723_proto.py</span>、<span class="mono">h723_w1.py</span>）的验收<b>未闭合</b>。
+      当前所有"协议路径"证据都靠 <b>pyocd 免串口帧钩子</b>取得（走真实 <span class="mono">proto_dispatch</span>，但绕过了物理链路层）。
+      ⇒ 接线后须补跑，且补跑结果<b>不得</b>与已有 pyocd 结论混为一谈。
+    </div>
+  </div>
+
+  <div class="gap">
+    <div class="num">2</div>
+    <div class="tx">
+      <b>拍周期 / 抖动未测</b> —— 两项都依赖协议层接入后的完整负载，属最终验收项。
+    </div>
+  </div>
+
+  <div class="gap">
+    <div class="num">3</div>
+    <div class="tx">
+      <b>W4 Modbus 阻塞在物理口决策</b> —— USART2 独立口 vs UART1 单口复用。且验收必须有 <b>LA 外部证据</b>（不能用固件自证）。
+    </div>
+  </div>
+
+  <div class="gap">
+    <div class="num">4</div>
+    <div class="tx">
+      <b>命令覆盖口径待定案</b> —— PLAN 记 18/20，实测命令表 20 条且 H723 未定义 0x50 SHELL。见顶部口径说明。
+    </div>
+  </div>
+
+  <div class="gap w">
+    <div class="num">5</div>
+    <div class="tx">
+      <b>persist 是否扩展存 seq 段未决策</b> —— S3 的 persist v2 会把 seq 组态一起落盘；H723 当前 persist 只存路由/参数/状态三表 + seq 计数。若要与 S3 对齐需扩展格式（涉及版本号变更，须全局搜硬编码断言）。
+    </div>
+  </div>
+
+  <div class="gap w">
+    <div class="num">6</div>
+    <div class="tx">
+      <b>T24 的诚实标注</b> —— <span class="mono">h723_persist.py</span> 已如实记录"F11 预算兜底在本平台当前不具约束力"（128×140 = 17920 ≤ 26000）。这是<b>主动声明的无效判据</b>，不是通过项 —— 审计时不应计为"已覆盖"。
+    </div>
+  </div>
+
+  <!-- ══════ 复跑指引 ══════ -->
+  <h2><span class="n">7</span>审计复跑指引</h2>
+  <table>
+    <thead><tr><th>步骤</th><th>命令</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>构建</td><td class="mono">bash build.sh</td><td>硬闸门：零警告（本工程源文件 + 链接器 + 汇编）</td></tr>
+      <tr><td>烧录</td><td class="mono">pyocd flash -t stm32h723xx -O connect_mode=under-reset build/dcl_h723.hex</td><td><b>每次 build 后必须重烧</b>，否则 nm 符号与芯片镜像不匹配</td></tr>
+      <tr><td>清持久化</td><td class="mono">python tools/h723_seq.py --wipe</td><td><b>跑任何回归前必做</b>：flash 里有有效 persist 配置时上电不走 BOOT_PROFILE</td></tr>
+      <tr><td>W3 验收</td><td class="mono">python tools/h723_seq.py</td><td>27 判据（T28 灵魂 14 + T29 校验器 13）</td></tr>
+      <tr><td>W2 回归</td><td class="mono">python tools/h723_w2_probe.py</td><td>13 判据</td></tr>
+      <tr><td>W2.4 回归</td><td class="mono">python tools/h723_persist.py</td><td>26 判据（约 1 分 15 秒，含真擦除）</td></tr>
+      <tr><td>阶段 2 守卫</td><td class="mono">python tools/h723_stage2_read.py --quick</td><td>守卫必须全 ✓，否则该组数据不可信</td></tr>
+      <tr><td>布局一致性</td><td class="mono">arm-none-eabi-gcc -c tools/_layout_probe.c</td><td>编译通过 = C/Python 两侧结构体布局一致</td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    <b>项目定位</b>：不做愿景，做求职作品 —— 一台「文本组态 + 100μs 硬实时引擎 + 下载前静态校验」的 PLC 内核。<br>
+    <b>项目铁律</b>：① 宣称必须等于实现　② 先逻辑推演再实机验证　③ 防造假（双闸回归 + 可复跑可审计）　④ 先有机制再有因果　⑤ 判据必须能失败<br>
+    <b>老线结论</b>：ESP32-S3 老项目因测试造假已冻结（只修不增），其结论<b>不可直接采信</b>，须在本线重新实证。
+  </footer>
+
+</div>
+</body>
+</html>
