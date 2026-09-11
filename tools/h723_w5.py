@@ -38,6 +38,7 @@ CMD_WRITE       = 0x21
 CMD_ENGINE_STATUS = 0x38
 CMD_RESET       = 0x13
 CMD_PIN_SELFTEST = 0x36
+CMD_ADC_SCAN     = 0x37   # [ch_start][count] → count × u16 raw (接线/映射排障)
 
 OFF_SENSOR_MAP = 0x0040
 OFF_WIRE_MAP   = 0x0240
@@ -171,8 +172,17 @@ def main():
                        "差 = %.3fV" % (ai_v[0] - ai_v[1]))
             else:
                 skip("A-1 ★AI 外部 (需 PA0→3.3V, PA1→GND)",
-                     "PA0=%.3fV PA1=%.3fV → 未接" % (ai_v[0], ai_v[1]))
+                     "PA0=%.3fV PA1=%.3fV → 未读到外部电压" % (ai_v[0], ai_v[1]))
                 skip("A-2 ★AI 满量程跨度", "同上")
+                # 自动诊断: 是"线没落到 ADC1 任何脚" 还是 "我的通道号映射错"?
+                # 两者在 AI 读数上**完全一样**, 只能扫全通道裁决。
+                sts, sc = L.xact(CMD_ADC_SCAN, bytes([0, 20]))
+                if sts == 0 and sc and len(sc) >= 40:
+                    chs = [struct.unpack_from("<H", sc, i * 2)[0] for i in range(20)]
+                    hot = [(i, v) for i, v in enumerate(chs) if v > 40000]
+                    print("   ↳ ADC1 全通道扫描: 高电平(>2V)通道 = %s"
+                          % (hot if hot else "无 ⇒ 3.3V 没落到 ADC1 的任何脚上 (接错脚/没通)"))
+                    print("     全部 = %s" % " ".join("%d:%d" % (i, v) for i, v in enumerate(chs)))
 
         # ══════════ ③ HIL ══════════
         print("\n── ③ HIL (PWM 输出 PA6 ← WIRE[20]; 反馈 PA5 → SENSOR[2]) ──")
@@ -206,7 +216,18 @@ def main():
                    "50%%=%.3fV 0%%=%.3fV (期望 1.65 / 0.00)" % (v50, v0 or -1))
         else:
             skip("H-1 ★HIL 物理回环 (需 PA6→PA5 跳线)",
-                 "反馈未跟随 (50%%=%.3fV 0%%=%.3fV) → 跳线未接" % (v50 or -1, v0 or -1))
+                 "反馈未跟随 (50%%=%.3fV 0%%=%.3fV)" % (v50 or -1, v0 or -1))
+            # 自动诊断: 保持 50% 占空扫全通道 —— PWM 若真到某个 ADC1 脚, 该通道应读到 ~1.6V
+            L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, f32(512.0)))
+            time.sleep(0.2)
+            sts, sc = L.xact(CMD_ADC_SCAN, bytes([0, 20]))
+            L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, 0))
+            if sts == 0 and sc and len(sc) >= 40:
+                chs = [struct.unpack_from("<H", sc, i * 2)[0] for i in range(20)]
+                mid = [(i, v) for i, v in enumerate(chs) if 15000 < v < 50000]
+                print("   ↳ 保持 50%% 占空扫全通道: 中间电平通道 = %s"
+                      % (mid if mid else "无 ⇒ PWM 没到任何 ADC1 脚 (跳线未通/脚不对)"))
+                print("     全部 = %s" % " ".join("%d:%d" % (i, v) for i, v in enumerate(chs)))
 
         L.xact(CMD_RESET); time.sleep(0.1)
 

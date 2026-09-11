@@ -1191,6 +1191,23 @@ static void h_pin_selftest(const uint8_t *p, uint32_t n)
     ack(r, o);
 }
 
+/* 0x37 ADC_SCAN — 扫描 ADC1 通道原始码 (接线/映射排障用), 见 transport.h 说明。
+ * 载荷 [ch_start u8][count u8] → ACK: count × u16 LE (原始码) */
+static void h_adc_scan(const uint8_t *p, uint32_t n)
+{
+    uint32_t ch0 = (n >= 1u) ? p[0] : 0u;
+    uint32_t cnt = (n >= 2u) ? p[1] : 20u;
+    if (ch0 > 19u) ch0 = 0u;
+    if (cnt == 0u || cnt > 20u || ch0 + cnt > 20u) { nak("bad adc scan"); return; }
+    uint8_t r[40];
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint16_t v = adc_read(ch0 + i);
+        r[i * 2]     = (uint8_t)(v & 0xFFu);
+        r[i * 2 + 1] = (uint8_t)(v >> 8);
+    }
+    ack(r, cnt * 2u);
+}
+
 /* 0x38 ENGINE_STATUS — **前 31 字节与 S3 逐字节同布局** (上位机脚本零改动),
  * 尾部追加 H723 扩展 6B (S3 的"尾部追加保前段兼容"惯例)。
  *
@@ -1700,6 +1717,7 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_MACRO_CTRL:    h_macro_ctrl(p, n); break;
         /* ---- W5: 外设域零接线自检 ---- */
         case CMD_PIN_SELFTEST:  h_pin_selftest(p, n); break;
+        case CMD_ADC_SCAN:      h_adc_scan(p, n); break;
         /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
          *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
          *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
