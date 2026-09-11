@@ -2,7 +2,8 @@
 
 日期: 2026-09-11 · 项目: `9.10 H723newest`
 来源: `docs/audit/REVIEW-MIGRATION-FIDELITY.md` **一级 #1**
-状态: **已修 + 已上板对照实证 + 已跑全量回归**
+状态: **已修 + 已上板对照实证 + 已跑全量回归（11 套 186 PASS / 0 FAIL）**
+（含子项 ④ `actuator_idx` 下载期校验 —— 见 §7）
 
 ---
 
@@ -127,7 +128,15 @@ H723 新增了一个真实物理输出面（HIL 的 PWM `TIM3_CCR1` / PA6），
 | `h723_modbus` | 15 PASS / 0 FAIL |
 | `h723_macro` | 18 PASS / 0 FAIL |
 | `h723_w5` | **18** PASS / 0 FAIL（基线 14 → +4 = H-2 四条） |
-| **合计** | **158 PASS / 0 FAIL / 0 SKIP** |
+| `h723_t26` | 11 PASS / 0 FAIL |
+| `h723_r1_actuator` | **5** PASS / 0 FAIL（本子项 ④ 新增） |
+| **合计（11 套）** | **186 PASS / 0 FAIL / 0 SKIP**（基线 177 → +4 +5） |
+
+* 计数口径：以**各套件自己打印的汇总行**为准；
+  另用 `grep -F` 在**全部日志**上复核过 `[FAIL]` 出现次数 = **0**。
+  ★ 复核时必须用 `grep -F`（固定串）：本次用 `grep -c "\[FAIL\]"` 曾得到 26 的**假阳性**
+  —— 反斜杠转义在当前 shell 里被吃掉 ⇒ 判据本身在说谎。这与本项目
+  "**工具坏了会伪装成被测对象故障**"是同一条教训。
 
 ---
 
@@ -145,10 +154,41 @@ H723 新增了一个真实物理输出面（HIL 的 PWM `TIM3_CCR1` / PA6），
 
 ---
 
-## 7. 未做 / 待决策
+## 7. 子项 ④：`actuator_idx` 越界 —— 已在**下载期**拒绝（并纠正了范本口径）
 
-* **审查 #1 的子项 ④**：`engine_route_validate()` 缺范本的两条 actuator 校验
-  （`actuator_idx >= 32` 拒绝 / 受保护引脚拒绝）。H723 的 `actuator_idx` 语义已变
-  （**仅 SHM 浮点槽，不是物理脚**），需要二选一：补校验，或把新语义写进能力声明。
-  **这是一个需要定案的语义问题，未擅自改动。**
-* LA 抓 PA6 的二阶证据（有 LA 时补）。
+**问题**：`engine_route_validate()` 原本**完全没有** `actuator_idx` 的校验，而运行期是
+`if (ai && ai < MAX_ACTUATORS) ac[ai] = res;` ⇒ **>=64 静默丢弃**
+⇒ "配置被接受、物理无输出"（最难查的一类）。
+
+**★ 关键判断：不能照搬范本的 `>= 32`**
+* 范本是**单端口 u32 位图**（位 = 引脚）⇒ 上界 32；
+* H723 **没有 GPIO 执行器面**，`actuator_idx` 的语义是 **SHM 浮点槽索引**
+  （`ACTUATOR_STATUS[0..63]`，`MAX_ACTUATORS = 64`）⇒ 上界 **64**；
+* **照搬 32 会把合法的 32..63 槽一起误杀** —— 那不是"更严格"，是换个错法。
+
+**修法**：`engine.c` 的 `engine_route_validate()` 加一条
+`if (r->actuator_idx >= MAX_ACTUATORS) return "actuator_idx out of range";`
+（`0` = 本路由不驱动执行器，与 ISR 的 `if (ai && ...)` 一致，故不拦 0）；
+同时把新语义写进 `engine.h` 的 `RouteEntry_t::actuator_idx` 字段说明。
+
+**判据**：新增 `tools/h723_r1_actuator.py`（两侧都有，否则是空判据）
+
+| 判据 | 旧固件（无校验） | 交付档（有校验） |
+|---|---|---|
+| T1 阳性对照 `actuator_idx=63`（合法上界） | PASS → ACK | PASS → ACK |
+| **T2 ★`actuator_idx=64`** | **FAIL → ACK（静默接受）** | **PASS → NAK `actuator_idx out of range`** |
+| T3 阳性对照 `actuator_idx=0` | PASS → ACK | PASS → ACK |
+| T4 工具自检 `dst_channel=200`（必然非法） | PASS → NAK | PASS → NAK |
+| 合计 | 4/5 | **5/5** |
+
+* **T1/T3 是必须有的阳性对照**：没有它们，"64 被拒"无法区分"校验正确"与"deploy 一律失败"。
+* **T4** 证明 NAK 通道本身是通的（不是"N 个 ACK 里夹一个可疑的 NAK"）。
+* 对照用的旧固件**不需要另做构建**：它正是 §3 里那份 `HIL_SAFE=0` 的产物
+  （它构建于本子项之前 ⇒ 天然不带这条校验），故 `T2` 在它上面 FAIL 就是"判据能失败"的证据。
+
+---
+
+## 8. 未做 / 待补
+
+* LA 抓 PA6 的二阶证据（有 LA 时补；当前零接线判据读 `TIM3_CCR1` 镜像已足够定案）。
+* 审查的其余条目（#4 相位/建桶、#2 同址反义、#3 FORCE 迁址、#5–#9）按既定收口顺序推进。

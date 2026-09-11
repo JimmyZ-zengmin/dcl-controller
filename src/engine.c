@@ -797,6 +797,19 @@ const char *engine_route_validate(const RouteEntry_t *r)
         return "stateful op needs state_offset";
     if (r->dst_channel  >= MAX_WIRES)  return "dst_channel out of range";
     if (r->wire2_idx    >= MAX_WIRES)  return "wire2_idx out of range";
+    /* ★★ R1 子项 ④ (2026-09-11 迁移保真度审查): actuator_idx 的边界。
+     *   范本在这里有两条校验 (`actuator_idx >= 32` 拒绝 / 受保护引脚拒绝), 迁移时按
+     *   "本平台没有 GPIO 执行器"整段略掉了 —— 于是越界索引会被**配置接受、物理无输出**:
+     *   ISR 侧是 `if (ai && ai < MAX_ACTUATORS) ac[ai] = res;` ⇒ >=64 **静默丢弃**。
+     *   ★ 为什么**不能照搬范本的 32**: 范本是**单端口 u32 位图**(位 = 引脚)所以上界 32;
+     *     H723 **没有 GPIO 执行器面**, `actuator_idx` 的语义是
+     *     **SHM 浮点槽索引** (`ACTUATOR_STATUS[0..63]`, 见 engine.h 的字段说明),
+     *     上界是 `MAX_ACTUATORS` = 64。照搬 32 会把**合法的 32..63 槽一起误杀**。
+     *   ★ `0` 的含义是"本路由不驱动执行器" (与 ISR 的 `if (ai && ...)` 一致)
+     *     ⇒ 只拦 `>= MAX_ACTUATORS`, 不拦 0。
+     *   ★ 判据 (tools/h723_r1_actuator.py): 64 → NAK "actuator_idx out of range";
+     *     63 → ACK (阳性对照, 证明这条不是"一律拒绝")。 */
+    if (r->actuator_idx >= MAX_ACTUATORS) return "actuator_idx out of range";
     if ((r->period & PERIOD_DIV_MASK) > PERIOD_DIV_IDX_SLOW) return "bad div";
 
     switch (r->src_type) {

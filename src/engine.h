@@ -429,7 +429,12 @@ typedef struct __attribute__((packed, aligned(4))) {
     uint8_t  flags;
     uint16_t param_idx;
     uint16_t state_offset;
-    uint16_t actuator_idx;
+    uint16_t actuator_idx;  /* ★ 语义 (H723): **SHM 浮点槽索引** ACTUATOR_STATUS[0..63],
+                             *   不是物理引脚 —— 本平台没有 GPIO 执行器面 (见下方
+                             *   ENG_MAX_OUT_SURFACES 段与 eng_outputs_safe 的说明)。
+                             *   `0` = 本路由不驱动执行器。上界 = MAX_ACTUATORS(64),
+                             *   越界在 engine_route_validate **下载期拒绝**
+                             *   (范本是 u32 位图所以上界 32, 照搬会误杀合法的 32..63)。 */
     uint16_t wire2_idx;
     uint8_t  period;   /* offset 14: div_idx(2bit) + phase(6bit) */
     uint8_t  reserved; /* offset 15: S3 里这是编译器的**尾部填充字节** (15 个字段
