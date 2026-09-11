@@ -210,15 +210,57 @@
 #define OFF_FORCE_VAL        0x4800                    /* f32[128]: 强制值 (★ OA9 的核心) */
 #define OFF_RSVD_EXEC_TAIL   0x4A00                    /* 剩余 0xA0 备用 */
 #define OFF_RSVD_EXEC_TAIL_SZ (OFF_MB_SET - OFF_RSVD_EXEC_TAIL)   /* 0xA0 */
-#define OFF_MB_TAIL             0x4B20   /* MB_SET 之后到 SHM 末尾, 备用 */
-#define OFF_MB_TAIL_SZ          (SHM_SIZE - OFF_MB_TAIL)          /* 0x34E0 */
 
-/* ★★ A7 修正: 原为 0x4AC0, 与 S3 的 0x4AA0 差 32 字节 —— 而本头文件开头写着
- *   "全部逐字节对齐 esp32-core0", 目标是"S3 的 20 套回归脚本零改动"。
- *   S3 的 tools/verify_hmi.py (MB_SET_OFF = 0x4AA0) 与 tools/dclc.py 都按 0x4AA0
- *   读写: 偏移差 32 字节不会报错, 只会**静默读写到错误地址** (写进去也读不出来)。
- *   这是全表 125 个常量里唯一被改动的一个值 —— 已改回。 */
-#define OFF_MB_SET           0x4AA0   /* 写区 64 WORD (SRC_HMI 源, 阶段 4 落地) */
+/* ══════════ W4: 通信域 Modbus 区 (0x4AA0..0x4DE0) ══════════
+ *
+ * ★★ 与 S3 的偏移**有意不同**, 理由与事实如下 (这是本区最容易被误改的一处):
+ *
+ *   S3 (components/core0/shared_mem.h:130-135, OA18 调整之后):
+ *       MB_CTRL 0x4800[64] → MB_RX 0x4840[256] → MB_TX 0x4940[256]
+ *       → MB_HOLD 0x4A40[128] → MB_SET 0x4AC0[128] → MB_END 0x4B40
+ *   H723 (本文件):
+ *       MB_SET 0x4AA0[128] → MB_CTRL 0x4B20[64] → MB_RX 0x4B60[256]
+ *       → MB_TX 0x4C60[256] → MB_HOLD 0x4D60[128] → MB_END 0x4DE0
+ *
+ *   ① **为什么不能对齐**: S3 的 MB 区起点 0x4800 在 H723 上已被 **FORCE_VAL
+ *      (0x4800 起 512B)** 占用 —— 两平台的 Force 域落点不同 (H723 从桶表之后的
+ *      EXEC 洞里划, 见上文 W2.1 说明), 于是 MB 区只能另找位置。
+ *      强行对齐意味着把已验证的 FORCE 域搬家并重跑 13 项判据 —— 不值。
+ *   ② **对齐本来也不必要**: 已核实 **S3 的 PC 侧工具不依赖 MB 的 SHM 偏移** ——
+ *      verify_modbus.py / verify_hmi.py 全部走**协议命令** (0x60 MB_INJECT 隧道
+ *      模式 / 0x20 READ), 没有一处硬编码 0x4A40/0x4AC0 这类偏移。
+ *      ⇒ "S3 回归脚本零改动"这个目标**不受本差异影响**。
+ *   ③ ★ 更正一条过时注释 (2026-09-11, 与审计发现 G 同族):
+ *      本区此前写着"原为 0x4AC0, 与 S3 的 0x4AA0 差 32 字节 ... 已改回 0x4AA0"。
+ *      该说法**与 S3 当前源码不符** —— S3 在 OA18 (控制块 32B→40B) 之后把
+ *      MB_SET 定在 **0x4AC0**, 并把整段后移。也就是说"0x4AA0 才是 S3 的值"
+ *      这个前提在 S3 侧早已不成立。事实见上方两行对照表。
+ *      ★ 它仍然保留 0x4AA0 是对的 —— 但理由不是"对齐 S3", 而是"该值已在
+ *        本平台发布且无冲突" —— 注释必须说对理由, 否则下次有人照它去改 S3 侧。
+ *
+ * ★ 语义 (S3 原样, 与偏移无关):
+ *   MB_HOLD = 读区 40001-40064 (wire 工程量镜像, ×100 取整, 只读)
+ *   MB_SET  = 写区 40065-40128 (上位机设定值, DSL 显式引用 → SRC_HMI 源)
+ *   MB_CTRL = MbCtrl_t 状态机控制块 (state/slave_addr/tick_budget/src/tx_uart…)
+ *   MB_RX/TX= 帧收发缓冲 (各 256B; 单帧上限 MB_MAX_FRAME=128)
+ */
+#define OFF_MB_SET           0x4AA0   /* 写区 64 WORD = 128B (SRC_HMI 源) */
+#define OFF_MB_CTRL          0x4B20   /* 控制块 (预留 64B; MbCtrl_t 当前 40B) */
+#define OFF_MB_RX            0x4B60   /* RX 帧缓冲 256B */
+#define OFF_MB_TX            0x4C60   /* TX 帧缓冲 256B */
+#define OFF_MB_HOLD          0x4D60   /* 读区 64 WORD = 128B (wire 镜像, 只读) */
+#define OFF_MB_END           0x4DE0   /* 通信域结束 */
+
+/* ---- W3 免串口协议帧暂存区 (原落在 0x4B20 = OFF_MB_CTRL, W4 落地后必须让位) ----
+ * ★ 挪到 MB_END 之后: 它是"调试器直写 + 主循环消费"的暂存区, 与通信域无耦合,
+ *   放在通信域尾部既保持独立, 又让 MB 区成为一整块连续区域 (便于断言与理解)。
+ *   ★ 尺寸仍是 4096: 0x10 deploy 的最大载荷约 3KB, 留余量。
+ *     (它现在定义在 engine.h 而非 main.c —— 因为下面的布局断言需要它。) */
+#define OFF_CMD_REQ          0x4DE0   /* 免串口帧暂存区 (cmd + payload) */
+#define DEPLOY_REQ_MAX       4096     /* 单帧载荷上限 (字节) */
+#define OFF_MB_TAIL          0x5DE0   /* 暂存区之后到 SHM 末尾, 备用 */
+#define OFF_MB_TAIL_SZ       (SHM_SIZE - OFF_MB_TAIL)             /* 0x2220 */
+
 #define SHM_SIZE             0x8000   /* 32KB (S3 为 64KB; H723 DTCM 128KB 充裕) */
 
 /* ══════════ 路由条目 (16B packed) —— 与 S3 逐字节相同 ══════════ */
@@ -503,12 +545,19 @@ _Static_assert(OFF_ROUTE_BUCKETS_END == OFF_FORCE_MASK,                        "
 _Static_assert(OFF_FORCE_MASK      + FORCE_MASK_WORDS * 4 == OFF_FORCE_VAL,    "SHM FORCE_VAL must abut FORCE_MASK");
 _Static_assert(OFF_FORCE_VAL       + MAX_WIRES * 4 == OFF_RSVD_EXEC_TAIL,      "SHM FORCE_VAL must abut exec tail");
 _Static_assert(OFF_RSVD_EXEC_TAIL  + OFF_RSVD_EXEC_TAIL_SZ == OFF_MB_SET,      "SHM exec tail must abut MB_SET");
-_Static_assert(OFF_MB_SET          + MB_NREG       * 2 == OFF_MB_TAIL,         "SHM MB_SET must abut MB tail");
-_Static_assert(OFF_MB_TAIL        + OFF_MB_TAIL_SZ == SHM_SIZE,                "SHM MB tail must end exactly at SHM_SIZE");
+/* W4 通信域: 五段必须**精确相接** (用 == 而非 <= —— 留缝就等于留无人区) */
+_Static_assert(OFF_MB_SET   + MB_NREG * 2 == OFF_MB_CTRL,                     "SHM MB_SET must abut MB_CTRL");
+_Static_assert(OFF_MB_CTRL  + 64u         == OFF_MB_RX,                       "SHM MB_CTRL must abut MB_RX (预留 64B)");
+_Static_assert(OFF_MB_RX    + 256u        == OFF_MB_TX,                       "SHM MB_RX must abut MB_TX");
+_Static_assert(OFF_MB_TX    + 256u        == OFF_MB_HOLD,                     "SHM MB_TX must abut MB_HOLD");
+_Static_assert(OFF_MB_HOLD  + MB_NREG * 2 == OFF_MB_END,                      "SHM MB_HOLD must abut MB_END");
+/* 免串口暂存区紧随通信域之后 (W4 起; W3 时它曾占 0x4B20 = 现在的 MB_CTRL) */
+_Static_assert(OFF_MB_END   + DEPLOY_REQ_MAX == OFF_MB_TAIL,                  "SHM CMD_REQ must abut MB tail");
+_Static_assert(OFF_MB_TAIL  + OFF_MB_TAIL_SZ == SHM_SIZE,                     "SHM MB tail must end exactly at SHM_SIZE");
 /* ★ 保留区尺寸钉成常量: 邻区一改, 这三条立刻失败 (它们就是"无人区"的哨兵) */
 _Static_assert(OFF_RSVD_DSL_DOMAIN_SZ  == 0xC40u, "DSL hole size changed from 0xC40 - did you resize a neighbour?");
 _Static_assert(OFF_RSVD_EXEC_TAIL_SZ   == 0x00A0u, "EXEC tail size changed from 0xA0 - did you resize a neighbour?");
-_Static_assert(OFF_MB_TAIL_SZ          == 0x34E0u, "MB tail hole size changed from 0x34E0");
+_Static_assert(OFF_MB_TAIL_SZ          == 0x2220u, "MB tail hole size changed from 0x2220 (W4 挪过 CMD_REQ)");
 /* 反向断言: 控制块区的每个字段都必须落在区内 (防止上面某个宏被改大而不自知) */
 _Static_assert(OFF_CTRL_MAGIC + 4 <= OFF_CTRL_N_SEQ + 8, "SHM ctrl field overruns 0x40");
 _Static_assert(OFF_TIMING_LAST_EXEC + 4 <= OFF_CTRL_GPIO_MASK + 4, "SHM timing region overlaps GPIO_MASK");

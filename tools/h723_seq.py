@@ -387,7 +387,10 @@ def wipe():
 #   [丙] 免串口发帧: 把裸载荷写进 SHM 尾部 (OFF_MB_TAIL), 置 g_cmd_req_len/g_cmd_req,
 #        主循环交给**真实的 proto_dispatch** —— 命令分发/校验器/ACK-NAK 全被走到。
 
-MB_TAIL_OFF = 0x4B20     # 必须与 src/engine.h 的 OFF_MB_TAIL 一致
+# 免串口协议帧暂存区偏移 —— 必须与 src/engine.h 的 OFF_CMD_REQ 一致。
+# ★ W4 起从 0x4B20 改为 0x4DE0: W3 时它落在 0x4B20, 而 W4 的 MB_CTRL 要用那一段
+#   (通信域五段现在占 0x4AA0..0x4DE0), 暂存区随之后移到 MB_END 之后。
+MB_TAIL_OFF = 0x4DE0
 
 
 def _stage_cmd(stg, cmd, payload=b""):

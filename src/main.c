@@ -257,8 +257,11 @@ OBS uint32_t          g_persist_req_cnt = 0;   /* 实际受理的请求数 (与 
  *       校验器、ACK/NAK、观测面计数**全部被真实走到**。
  *     · 与 g_persist_req 同族: volatile 且被主循环真读, 不会被 gc-sections 回收。
  *
- *   ★ 暂存区选 SHM 尾部 (OFF_MB_TAIL = 0x4B20, 24KB 空闲) —— 不与任何已落地域重叠。 */
-#define DEPLOY_REQ_MAX   4096          /* 单帧载荷上限 (0x10 deploy 最大 ~3KB) */
+ *   ★ 暂存区位置 (W4 起): SHM 的 **OFF_CMD_REQ (0x4DE0)**, 紧随通信域之后。
+ *     该常量与尺寸 DEPLOY_REQ_MAX 都定义在 engine.h (布局断言需要它们),
+ *     不在本文件里另立一份 —— "同一个尺寸两处定义"是本项目反复踩过的坑。
+ *     ★ W3 时它落在 0x4B20, 而 W4 的 MB_CTRL 正好要用那一段 ⇒ 已让位。
+ */
 OBS volatile uint32_t g_cmd_req      = 0;   /* 写 1 → 主循环执行一次暂存帧 */
 OBS volatile uint32_t g_cmd_req_len  = 0;   /* 暂存帧的字节数 (由工具写) */
 OBS uint32_t          g_cmd_req_cnt  = 0;   /* 实际受理的请求数 */
@@ -1848,7 +1851,7 @@ int main(void)
             uint32_t rl = g_cmd_req_len;
             if (rl > DEPLOY_REQ_MAX) rl = DEPLOY_REQ_MAX;
             if (rl >= 1u) {
-                const uint8_t *pl = (const uint8_t *)(g_shm + OFF_MB_TAIL);
+                const uint8_t *pl = (const uint8_t *)(g_shm + OFF_CMD_REQ);
                 g_cmd_req_cnt++;
                 g_cmd_req_last = pl[0];
                 proto_dispatch(pl[0], pl + 1u, rl - 1u);
