@@ -49,6 +49,10 @@ SYNC_MCU2PC = 0xC1
 STS_ACK = 0x00
 STS_NAK = 0xFF
 
+# ★ cap 期望值只有**一处**权威来源 (h723_proto) —— 固件改能力位时只改那里,
+#   这里跟着变。T0 用它做"内容匹配", 避免"能收到字节就算链路活"那种空判据。
+from h723_proto import EXPECT_CAP   # noqa: E402  (放在常量区, 便于与固件能力位对照)
+
 CMD_GET_VERSION   = 0x01
 CMD_DEPLOY        = 0x10
 CMD_START         = 0x11
@@ -249,11 +253,22 @@ def main():
         # ───────── T0: 链路活性 (以下所有判据的前提) ─────────
         print("── T0 链路活性 ──")
         sts, p = L.xact(CMD_GET_VERSION)
-        if sts != STS_ACK or len(p) < 4:
+        # ★★ 审计轴1 修复 (2026-09-11): 原实现是"上面 if 不通过就 return 2, 然后无条件
+        #   `record(..., True, ...)`" —— 判据本身不参与判定, 形式上就是**恒真**。
+        #   机械审计抓到了它, 而且抓得对: 只要将来有人把那个 guard 改成 print 而不 return,
+        #   这行会继续报 PASS ⇒ 假 PASS。
+        #   现在把**解析结果**当判据: ACK + 载荷够长 + **cap 与期望一致**
+        #   (cap 一致还额外证明对端就是这台固件 —— 避免"别的设备在回话"被判成链路活)。
+        fw = cap = None
+        if sts == STS_ACK and len(p) >= 4:
+            fw, cap = struct.unpack("<HH", p[:4])
+        t0_ok = (fw is not None) and (cap == EXPECT_CAP)
+        record("T0 链路活性 (0x01 → ACK + cap 内容匹配)", t0_ok,
+               ("fw=0x%04X cap=0x%04X (期望 0x%04X)" % (fw, cap, EXPECT_CAP)) if fw is not None
+               else "无有效应答帧 (sts=%s len=%d)" % (sts, len(p)))
+        if not t0_ok:
             print("  [FAIL] T0 链路不活 —— 后续全部无法判定")
             return 2
-        fw, cap = struct.unpack("<HH", p[:4])
-        record("T0 链路活性 (GET_VERSION→ACK)", True, "fw=0x%04X cap=0x%04X" % (fw, cap))
 
         # ★★★ 工具自检闸门 (审计发现 A 的直接对策, 采纳审计建议) ★★★
         #   审计发现 A 的形态是: **工具自己的解析器坏了**, 导致 `sts != STS_ACK`

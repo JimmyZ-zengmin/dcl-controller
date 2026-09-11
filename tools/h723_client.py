@@ -36,6 +36,7 @@ OFF_SENSOR_MAP = 0x0040
 OFF_WIRE_MAP = 0x0240
 MAX_WIRES = 128
 
+CMD_GET_VERSION = 0x01
 CMD_DEPLOY = 0x10
 CMD_START = 0x11
 CMD_STOP = 0x12
@@ -120,3 +121,34 @@ def persist_flags(dcl):
     if sts == "ACK" and len(p) >= 8:
         return (p[7] & 1) != 0, (p[7] & 2) != 0
     return None
+
+
+def link_alive(port=None, tries=3, expect_cap=0x0DF7):
+    """链路活性判据 —— **内容匹配**，不是"有没有字节"。
+
+    ★★★ 为什么不能是 `if d: return True` (这是一次审计发现):
+      噪声、波特率不匹配、打开端口的瞬态**都会产生字节**，但**产生不出**
+      "状态字节 = ACK + 长度合法 + CRC 通过"的帧。用字节数判活性的后果是:
+      一条时基全错的链路会被判成"活" ⇒ 后续所有失败被错误归因到别处。
+      (本项目 BRR 事故就是这么被带偏一整轮的: "AB 两端都收不到" 与 "时基全错"
+       在 PC 侧表现完全一样。)
+    ⇒ 判据 = 解析出帧 + 状态字节是 ACK + 载荷长度 ≥4 + **独立实现**的 CRC 通过
+      (+ 可选: cap 与期望一致, 说明对端确实是这台固件)。
+
+    返回 True/False；不抛异常（调用方通常在"准备阶段"用它）。
+    """
+    try:
+        d = Dcl(port)
+    except Exception:
+        return False
+    try:
+        for _ in range(tries):
+            sts, p = d.send(CMD_GET_VERSION)
+            if sts == "ACK" and len(p) >= 4:
+                cap = p[2] | (p[3] << 8)
+                if expect_cap is None or cap == expect_cap:
+                    return True
+            time.sleep(0.15)
+        return False
+    finally:
+        d.close()

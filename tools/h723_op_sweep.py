@@ -84,21 +84,33 @@ SAMPLE_SYMS = [("g_eng_cyc_min", 1), ("g_eng_cyc_max", 1), ("g_eng_cyc_sum", 2),
 
 def run(sym, ops, dur):
     """单会话跑完全部测量（pyocd 每次连接都会复位目标 → 必须一条链跑完）"""
-    cmd = ["reset", "sleep 400",
+    # ★★★ 审计修复 (2026-09-11): 补**三段式 boot 时序** —— 本工具"复核路径断了"的根因。
+    #   原链 `reset → 注入 → 读` 里**整程核都没在运行**: 实测 pyocd `-c reset` 之后核停在
+    #   halt (tick 0x7c738 → 0x7c738, 400ms 零前进; 加 `-c go` 才跑 → 0xf91)。
+    #   ⇒ main() 从未执行 ⇒ 表根本没被填过; 读到的全是**上一次会话遗留的 DTCM 值**
+    #     (恒为 profile 0 的表, ck=0x90DA0A50); 于是 19 个原语量到**完全相同**的 7292。
+    #   症状 = 工具报 `0 / 19 原语数据可信` (它**拒绝认证**是对的, 比"报 0"好),
+    #   但"成本表是实测的"这条宣称因此**失去了可复核路径**。
+    #   严格三段式: ① reset→go→sleep(BOOT)→halt ② 注入 ③ go→sleep(dur)→halt→读
+    BOOT_MS = 500
+    cmd = ["reset", "go", "sleep %d" % BOOT_MS, "halt",
            "write32 0x%08X 0" % sym["g_engine_gate"]]
     cur = None
     for op, n in ops:
         prof = 100 + op
         if prof != cur:
             cmd += ["write32 0x%08X %d" % (sym["g_table_profile"], prof),
-                    "write32 0x%08X 1" % sym["g_reinit"], "sleep 300"]
+                    "write32 0x%08X 1" % sym["g_reinit"],
+                    # ★ 注入后必须**放核跑一段**让主循环消费 g_reinit; 停在 halt 上,
+                    #   g_reinit 只是内存里一个 1, 表不会变 (原链的错就在这里)。
+                    "go", "sleep 300", "halt"]
             cur = prof
         cmd += ["write32 0x%08X 1" % sym["g_engine_sel"],      # 1 = ITCM
                 "write32 0x%08X 0" % sym["g_scan_mode"],      # 0 = 全表扫 (阶段 2 口径)
                 "write32 0x%08X %d" % (sym["g_n_routes"], n),
                 "write32 0x%08X 1" % sym["g_stat_reset"],
                 "write32 0x%08X 1" % sym["g_engine_gate"],
-                "sleep %d" % int(dur * 1000)]
+                "go", "sleep %d" % int(dur * 1000), "halt"]
         for nm, w in SAMPLE_SYMS:
             for k in range(w):
                 cmd.append("read32 0x%08X" % (sym[nm] + 4 * k))

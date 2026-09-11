@@ -315,9 +315,16 @@ def main():
            bits2f(a1_w) != 0.0 and bits2f(a2_w) != 0.0 and near(bits2f(a1_w), bits2f(a2_w)),
            "%.4f / %.4f" % (bits2f(a1_w), bits2f(a2_w)))
 
+    # ★★ 审计轴1 F2 修复 (2026-09-11): 原实现这里是**字面量 True** ——
+    #   判据写成常数就等于"不可失败", 与"A' 阳性对照"这个名字完全矛盾
+    #   (阳性对照的全部意义就是"它能被推翻")。
+    #   现在**用已采到的值真算**: 6 个采样点 (A1/A2/B1/C1/E1/D1) 里至少出现 3 个互不
+    #   相同的值 ⇒ 才能证明"A 的值确实会因引擎改而不同, 不是恒等于初值"。
+    _vals = [bits2f(x) for x in (a1_w, a2_w, b1_w, c1_w, e1_w, d1_w)]
+    _distinct = sorted({round(v, 4) for v in _vals})
     record("A' 阳性对照: A 的值确实会因引擎改而不同 (排除'恒等于初值')",
-           True,  # 由 B/C/E/D 的值变化共同证明; 这里只标记已测
-           "见 B/C/E/D 的四次值变化")
+           len(_distinct) >= 3,
+           "6 个采样点出现 %d 个不同值: %s" % (len(_distinct), _distinct))
 
     record("B1 拍首覆写: 跑 %dms 后 wire[%d] == %.2f" % (SPIN, W, V_FORCE1),
            near(bits2f(b1_w), V_FORCE1),

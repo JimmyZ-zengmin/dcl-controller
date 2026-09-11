@@ -69,9 +69,19 @@
                                     *   ① 线没落到该脚 (全通道都低) 还是 ② **通道号映射错**
                                     *   (某个通道读到高 → 那才是该脚的真实通道)。
                                     *   没有它, 这两种原因在读数上**完全一样**, 只能靠猜。 */
-#define CMD_DISPLAY_INIT    0x51   /* 固件原生 — ST7735 初始化 */
-#define CMD_DISPLAY_FILL    0x52   /* 固件原生 — 填充矩形 */
-#define CMD_DISPLAY_TEXT    0x53   /* 固件原生 — 绘制文字 */
+/* ── ★★ 保留码 RESERVED (占号但**不实现**) ──
+ * display 三命令是 S3 的 (ST7735 TFT)。**H723 板无 TFT, 本平台不迁** (见 STATUS §4)。
+ * 为什么**保留号段**而不删: 这三个码是 S3 协议的一部分, 删掉会让它们被将来某个新命令
+ *   复用成语义完全不同的东西 —— 那才是真的危险 (同一个码两种语义)。
+ * 为什么**标 DCL_RESERVED**: 宏留在交付头文件里, 使用者容易误以为"有这个命令"。
+ *   这个标记是**机器可读**的, `tools/h723_audit_full.py` 的 2.1 会核:
+ *     带标记的宏 **应当** 不被 proto_dispatch 派发; 不带标记的宏 **必须** 被派发。
+ *   ⇒ "保留"与"声称已实现"从此可区分, 且这个区分**会随代码漂移被审计抓到**。
+ * 行为: 落到 `proto_dispatch` 的 `default: nak("bad cmd")` ⇒ **显式 NAK, 不是 TIMEOUT**
+ *   (静默丢弃才会变成 TIMEOUT, 那会让人分不清"固件挂了"还是"命令没实现")。 */
+#define CMD_DISPLAY_INIT    0x51   /* DCL_RESERVED — S3 ST7735, 本平台不实现 */
+#define CMD_DISPLAY_FILL    0x52   /* DCL_RESERVED — 同上 */
+#define CMD_DISPLAY_TEXT    0x53   /* DCL_RESERVED — 同上 */
 /* 通信域 COMM (Modbus RTU 从站) — 隧道模式: 零硬件验证协议栈。
  * 字节源切换为 UART1 FIFO 后这两个命令仍保留 (调试/回归用) */
 #define CMD_MB_INJECT       0x60   /* 注入一帧 Modbus RTU 请求 → ISR 状态机消费 */

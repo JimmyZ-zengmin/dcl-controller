@@ -83,21 +83,18 @@ def persist_cmd(L, mode=None, timeout=6.0):
 
 
 def serial_alive(port, tries=3):
-    """独立开一个串口问 0x01 —— 这是 M4 的判据本体 (链路活性)。"""
-    from h723_w1 import build_frame
-    for _ in range(tries):
-        try:
-            with serial.Serial(port, 115200, timeout=0.4) as s:
-                time.sleep(0.15)
-                s.reset_input_buffer()
-                s.write(build_frame(CMD_GET_VERSION)); s.flush()
-                d = s.read(64)
-                if d:
-                    return True
-        except Exception:
-            pass
-        time.sleep(0.2)
-    return False
+    """链路活性判据本体 (M4 用它验"halt 时死 / go 后活")。
+
+    ★★ 审计轴1 F1 修复 (2026-09-11): 原实现是 `d = s.read(64); if d: return True` ——
+       **用"有没有字节"判活性**, 违反本项目铁律"判据用内容匹配, 不用字节数"。
+       后果: 噪声、波特率不匹配、打开端口的瞬态**都会产生字节** ⇒ 一条时基全错的链路
+       会被判成"活" (BRR 事故就是这么被带偏一整轮的)。
+       现在复用 `h723_client.link_alive`: 必须**解析出 ACK 帧**且 **cap 与期望一致**
+       (cap 一致还额外证明对端就是这台固件, 不是别的设备在回话)。
+       ★ 对 M4 的语义没有削弱: 核被 halt 时不会有任何合法帧 ⇒ 仍判"死"。
+    """
+    from h723_client import link_alive
+    return link_alive(port, tries=tries)
 
 
 def main():
@@ -116,10 +113,13 @@ def main():
         _rv(port)
     except Exception:
         pass
-    if not serial_alive(port):
-        print("  !! 链路仍不活。跑 python tools/h723_revive.py 看诊断, 再重试。")
+    # ★ 审计轴1 F1 修复: 判据本身参与判定 (而不是"检查完再无条件记一行 True")。
+    alive = serial_alive(port)
+    record("T0 链路活性 (0x01 → ACK 帧 + cap 内容匹配)", alive,
+           "已确认 (ACK 帧 + cap=0x0DF7)" if alive else "无有效应答帧")
+    if not alive:
+        print("  !! 链路不活 —— 先跑 python tools/h723_revive.py 看诊断, 再重试。")
         return 2
-    record("T0 链路活性 (GET_VERSION→ACK)", True, "已确认")
 
     with serial.Serial(port, 115200, timeout=0.05) as ser:
         L = Link(ser)
