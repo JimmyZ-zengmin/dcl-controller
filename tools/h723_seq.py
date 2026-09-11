@@ -307,6 +307,9 @@ def wipe():
         "erase 0x%08X 1" % SEC_B,
         "read32 0x%08X 32" % SEC_A,
         "read32 0x%08X 32" % SEC_B,
+        # ★★ 同 persist 的 wipe: **erase 之后 `go` 无效, 必须 `reset` + `go`**
+        #    (实测对照)。run_chain 已自动在这个 reset 之后补 `go`。
+        "reset",
     ])
     if vals is None or len(vals) < 16:
         print("!! wipe 失败")

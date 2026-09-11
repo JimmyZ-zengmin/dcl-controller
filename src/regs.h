@@ -338,11 +338,29 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
  *   所以 IRQ_USART2 只作记录 —— 但本文件已有 A1 事故 (NVIC 位移溢出) 的教训,
  *   凡出现 IRQ 号就必须同时给出 < 64 的编译期断言 (见文件末尾 IRQ 断言段)。
  *
- * ★ BRR 必须按权威定义算, 不许照抄常数 (本项目吃过 16 倍错, 代价 = 一整轮协议不可用):
- *   OVER8=0 ⇒ BRR = fCK / baud (整数部分即可, 无小数位)
- *   本平台 PCLK1 = 100 MHz, baud = 115200 ⇒ BRR = 100e6/115200 = 868.05 → **868 = 0x364**
- *   ✗ 错误写法 (曾经真实发生在 USART1 上): round(fCK × 16 / baud) = 13889 = 0x3641
- *     —— 数字算得没错, 但那是 16 倍分频的值 ⇒ 实际波特率 7200 而非 115200。
+ * ★★ BRR 的权威推导 (P3 补齐)。旧写法只给结论 "OVER8=0 ⇒ BRR = fCK/baud", 结论**是对的**,
+ *   但它与 RM0468 的位域布局 `DIV_Mantissa[15:4] | DIV_Fraction[3:0]` 摆在一起看像是矛盾,
+ *   后人很容易把它"修正"回去 —— 所以这里把中间那两步补上:
+ *
+ *   ① 波特率公式 (RM0468 USART 章节):  baud = fCK / (8 × (2 − OVER8) × USARTDIV)
+ *      OVER8 = 0 (16 倍过采样, 本项目用值) ⇒ baud = fCK / (16 × USARTDIV)
+ *      ⇒ USARTDIV = fCK / (16 × baud)
+ *
+ *   ② BRR 的编码:  BRR[15:4] = DIV_Mantissa = USARTDIV 的整数部分
+ *                  BRR[3:0]  = DIV_Fraction = USARTDIV 的小数部分 × 16
+ *      ⇒ 把整个 BRR 当"定点小数"读, 它就等于 **USARTDIV × 16**。
+ *
+ *   ③ 两式相消:  BRR(定点值) = USARTDIV × 16 = [fCK/(16·baud)] × 16 = **fCK / baud**
+ *      ⇒ "BRR = fCK/baud" 与 RM 的位域布局**并不矛盾** —— 被消掉的那 16 就是 ② 的 ×16。
+ *
+ *   本平台: PCLK1 = 100 MHz, baud = 115200 ⇒ BRR = 100e6/115200 = 868.05 → **868 = 0x364**
+ *          反解实际波特率 = 100e6/868 = 115207.4 ⇒ 误差 +0.006% (容限 2%, 实测两端均正确)。
+ *   ★ 换口/换波特率按 ③ 直接算 (USART1 用 PCLK2, 见 uart.c 的 s_brr 计算)。
+ *
+ *   ✗ 错误写法 (真实发生过, 代价 = 一整轮协议不可用):
+ *       `s_brr = (fCK × 16 + baud/2) / baud` = 13889 = 0x3641 —— 数字算得没错,
+ *       但那等于把 ① 的 USARTDIV 又乘了一次 16 ⇒ 实际波特率 7200 而非 115200;
+ *       而它的"自洽假注释"(100MHz×16/115200=0x3641, 误差0.0004%)把错误锁死了三轮。
  */
 #define USART2_BASE     0x40004400UL
 #define RCC_APB1LENR_USART2EN  (1u << 17)

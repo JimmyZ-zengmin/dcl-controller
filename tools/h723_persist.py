@@ -419,6 +419,11 @@ def wipe(quiet=False):
         "erase 0x%08X 1" % SEC_B,
         "read32 0x%08X 32" % SEC_A,
         "read32 0x%08X 32" % SEC_B,
+        # ★★ M4 追加发现 (2026-09-11 实测): **`erase` 之后光 `go` 放不开核** ——
+        #    对照实验: [reset halt; erase; go] → 串口仍无响应; [reset halt; erase; reset; go] → 活。
+        #    ⇒ erase 会 stall 住核, 必须在末尾补一次 `reset` (run_chain 会在其后自动加 `go`)。
+        #    另一半好处: reset 让固件**按刚擦干净的 flash 重新启动**, 这正是 wipe 想要的语义。
+        "reset",
     ])
     if vals is None or len(vals) < 16:
         print("!! wipe 失败 (读回 %s)" % (len(vals) if vals is not None else "None"))

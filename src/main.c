@@ -1209,8 +1209,12 @@ static void h_adc_scan(const uint8_t *p, uint32_t n)
     ack(r, cnt * 2u);
 }
 
-/* 0x38 ENGINE_STATUS — **前 31 字节与 S3 逐字节同布局** (上位机脚本零改动),
- * 尾部追加 H723 扩展 6B (S3 的"尾部追加保前段兼容"惯例)。
+/* 0x38 ENGINE_STATUS — **前 31 字节与 S3 同布局 _且同语义_** (上位机脚本零改动),
+ * 尾部追加 H723 扩展 7B (沿用 S3 的"尾部追加保前段兼容"惯例)。
+ *
+ * ★★ P3 修复 (外部审计): 之前 r[22] 放的是 `g_engine_gate`, 而 S3 同位置是 **run** ——
+ *    "布局同、语义不同"比"布局不同"更坏: 按 run 解析的旧上位机会**静默拿到错值**。
+ *    现 r[22] 恢复 S3 语义 (引擎是否在跑), H723 特有的 gate 挪到尾部 r[37]。
  *
  * ★ 数据源: 本平台的统计量住在 DTCM 的 C 全局里 (g_*), 不在 SHM 计时区 ——
  *   所以这里**按需打包**, 而不是让 ISR 每拍去维护第二份 SHM 计时块。
@@ -1218,7 +1222,7 @@ static void h_adc_scan(const uint8_t *p, uint32_t n)
  *   基线的一部分, 不该为一个"被轮询才需要"的视图付每拍的代价。 */
 static void h_engine_status(void)
 {
-    uint8_t r[37];
+    uint8_t r[38];
     uint32_t pn = (g_per_cyc_min == 0xFFFFFFFFu) ? 0u : g_per_cyc_min;
     uint32_t en = (g_isr_cyc_min == 0xFFFFFFFFu) ? 0u : g_isr_cyc_min;
     /* ★★ 审计发现 D 修复: 原来读的是 C 全局 `g_active_routes`, 而它只在启动/reinit
@@ -1239,14 +1243,19 @@ static void h_engine_status(void)
     put32(r + 12, en);           /* exec_min   */
     put32(r + 16, g_isr_cyc_max);/* exec_max   */
     r[20] = (uint8_t)(nr); r[21] = (uint8_t)(nr >> 8);
-    r[22] = (uint8_t)g_engine_gate;
+    /* ★ P3 修复 (外部审计): 这里原先是 `g_engine_gate` —— 而 S3 的同位置是 **run**。
+     *   头部宣称"前 31 字节与 S3 逐字节同布局", 于是"布局同、语义不同"就成了**会静默
+     *   骗人**的陷阱: 按 run 解析的旧上位机会拿到 gate 的值。⇒ 本位置恢复 S3 语义 =
+     *   **引擎是否在跑**; 而 H723 特有的 gate 移到尾部扩展 (一个都不丢)。 */
+    r[22] = SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN) ? 1u : 0u;   /* = S3 的 `run` */
     put32(r + 23, g_shm_addr);   /* SHM 地址 (供上位机发现) */
     put32(r + 27, 0u);           /* overrun: H723 暂未实现超预算计数 (列未决) */
-    /* ---- H723 尾部扩展: 部署生效确认 ---- */
+    /* ---- H723 尾部扩展 (byte 31 起; 前 31 字节布局**与语义**均与 S3 一致) ---- */
     r[31] = (uint8_t)(g_deploy_seq);  r[32] = (uint8_t)(g_deploy_seq >> 8);
     r[33] = (uint8_t)(g_applied_seq); r[34] = (uint8_t)(g_applied_seq >> 8);
     r[35] = (uint8_t)(g_reload_lat);  r[36] = (uint8_t)(g_reload_lat >> 8);
-    ack(r, 37);
+    r[37] = (uint8_t)g_engine_gate;   /* H723 扩展: 扫描门 (S3 无此量, 故挪到尾部) */
+    ack(r, 38);
 }
 
 /* ══════════ W1: 运行控制 + SHM 读写 (0x11/0x12/0x13 + 0x20-0x23) ══════════

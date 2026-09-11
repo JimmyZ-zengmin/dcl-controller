@@ -98,18 +98,41 @@ def main():
     import serial
 
     devs = tool("get_devices", {})
-    did = devs["devices"][0]["deviceId"]
+    devlist = (devs or {}).get("devices") or []
+    if not devlist:
+        print("!! 找不到 Logic 分析仪 —— 检查:")
+        print("   ① LA 是否插好 ② Saleae 桥是否在跑 (MCP over HTTP @ 127.0.0.1:10530)")
+        print("   (本工具需要 LA 抓 PA2 波形; 没有 LA 时请用 tools/h723_modbus.py 验协议栈)")
+        return 2
+    did = devlist[0]["deviceId"]
     print("LA 设备: %s" % did)
 
     # ★ 采集前先确认"探针真的接着"(skill 坑 7): 无法用软件判定接线,
     #   所以用**对照法** —— 先采一次"固件不发任何东西"的窗口, 应 0 跳变。
-    with serial.Serial(a.port, 115200, timeout=0.05) as ser:
+    # ★ M4 哨兵: 若核被 pyocd 留在 halt, 串口必然无响应 —— 先解卡, 别误判成"固件挂了"
+    try:
+        from h723_w1 import revive_if_dead
+        revive_if_dead(a.port)
+    except Exception:
+        pass
+
+    # ★ P3 修复: timeout 0.05 → 0.25。旧值偏紧, 本机实测偶发读不到响应 ——
+    #   那会把"工具太急"误报成"协议链路不活", 与"配置全对≠功能可用"同族的判据噪声。
+    with serial.Serial(a.port, 115200, timeout=0.25) as ser:
         L = Link(ser, False)
         time.sleep(0.3)
         sts, _ = L.xact(0x01)
         if sts != 0:
             print("!! 协议链路不活 (COM 口), 无法触发 —— 先解决这个")
             return 2
+        # ★ P3 修复: 补 T0c 工具自检 (与 h723_modbus.py 同款闸门) ——
+        #   未实现命令必须回 NAK; 否则"sts 恒 0 / 判据恒真"这类**工具侧** bug 会让
+        #   后续所有判据假通过 (本项目反复吃亏的那一族)。
+        s_bad, _ = L.xact(0x7F)
+        if s_bad != 0xFF:
+            print("!! T0c 工具自检失败: 0x7F 应回 NAK, 实得 sts=%s ⇒ 判据不可信" % s_bad)
+            return 2
+        print("  [PASS] T0 链路活性 + T0c 工具自检 (未实现命令 0x7F → NAK)")
         L.xact(CMD_RESET); time.sleep(0.2)
 
         # ★★ 先把 40065/40066 写成**已知值**, 否则读到的是 RESET 后的 0,

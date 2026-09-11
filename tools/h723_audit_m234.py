@@ -34,6 +34,8 @@ from h723_seq import rt_route, SRC_WIRE, OP_DIRECT
 
 CMD_GET_VERSION = 0x01
 CMD_DEPLOY = 0x10
+CMD_START = 0x11
+CMD_STOP = 0x12
 CMD_RESET = 0x13
 CMD_ENGINE_STATUS = 0x38
 CMD_READ_BURST = 0x22
@@ -93,8 +95,16 @@ def main():
 
     # ══════════ M4-① 先确认链路活着 (否则后面所有判据都无意义) ══════════
     print("── T0 前置 ──")
+    # ★ M4 哨兵 (与 5 个串口套件同款): 无响应就先按"核被 pyocd 留 halt"处理并解卡 ——
+    #   别把"上一个工具把核留在暂停"误判成"固件挂了"。本工具自己就撞过一次:
+    #   它末尾的 wipe 走 erase, 而 **erase 之后光 `go` 放不开核** (实测), 于是下一轮 T0 直接挂。
+    try:
+        from h723_w1 import revive_if_dead as _rv
+        _rv(port)
+    except Exception:
+        pass
     if not serial_alive(port):
-        print("  !! 链路不活。先跑 python tools/h723_revive.py 解卡, 再重试。")
+        print("  !! 链路仍不活。跑 python tools/h723_revive.py 看诊断, 再重试。")
         return 2
     record("T0 链路活性 (GET_VERSION→ACK)", True, "已确认")
 
@@ -160,6 +170,22 @@ def main():
         record("M3-e ★0x43 报最新副本条数 = 8 (旧代码固定取 A 会报 3)",
                s5 == 0 and nr == 8, "n_routes=%s ab_valid=%s seq=%s" % (nr, ab, seqv))
 
+        # ══════════ P3: 0x38 r[22] 语义 = S3 的 run ══════════
+        print("\n── P3: 0x38 r[22] 必须是 S3 语义的 run (gate 已挪到尾部 r[37]) ──")
+
+        def st38():
+            s, p = L.xact(CMD_ENGINE_STATUS)
+            return (p[22], p[37]) if (s == 0 and len(p) >= 38) else (None, None)
+
+        L.xact(CMD_START); time.sleep(0.2)
+        run_on, gate_on = st38()
+        L.xact(CMD_STOP); time.sleep(0.2)
+        run_off, gate_off = st38()
+        record("P3 ★r[22] 跟随 START/STOP (run), r[37]=gate 不受影响",
+               run_on == 1 and run_off == 0 and gate_on == 1 and gate_off == 1,
+               "START: r22=%s r37=%s | STOP: r22=%s r37=%s"
+               % (run_on, gate_on, run_off, gate_off))
+
         L.xact(CMD_RESET); time.sleep(0.1)
 
     # ══════════ M4: halt 会让串口假死, go 能救回来 ══════════
@@ -194,7 +220,7 @@ def main():
     print("\n" + "=" * 74)
     npass = sum(1 for _, ok, _ in RESULTS if ok)
     nfail = len(RESULTS) - npass
-    print("审计 M2/M3/M4 回归: %d PASS / %d FAIL" % (npass, nfail))
+    print("审计 M2/M3/M4 + P3 回归: %d PASS / %d FAIL" % (npass, nfail))
     print("=" * 74)
     return 0 if nfail == 0 else 1
 
