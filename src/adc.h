@@ -35,7 +35,14 @@
 #define HIL_FB_CH_PA5   19u   /* ADC12_INP19 (HIL 反馈, 由 hil.c 使用) */
 
 void     adc_init(void);                 /* 时钟 + 上电 + 校准 + 16bit 配置 (调一次) */
-uint16_t adc_read(uint32_t ch);          /* 单次转换读原始码 (0..65535), 失败返回 0xFFFF */
+
+/* 单次转换读原始码。返回 0 = 成功 (*out 有效), -1 = 超时/未就绪。
+ * ★★ 为什么改成"状态码 + 出参"而不是"返回 0xFFFF 当错误哨兵":
+ *   0xFFFF 是 **16bit 的合法满幅读数** —— 引脚接 3.3V 时本来就该读 0xFFFF。
+ *   v0 版把 0xFFFF 当超时哨兵, 于是 hil.c 的 `if (r==0xFFFF) r=0;` 把**真实满幅**
+ *   清成 0 ⇒ SENSOR[2] 在满幅时读回 0 (实测撞到, 花了很久定位)。
+ *   ⇒ 教训: **错误哨兵绝不能落在合法值域内**。 */
+int      adc_read(uint32_t ch, uint16_t *out);
 void     adc_analog_pin(uint32_t pin);   /* 把某引脚置 analog 模式 (供 HIL 用) */
 
 void ai_init(uint8_t *base);             /* 配 3 路引脚 analog + SENSOR 初值 */

@@ -377,9 +377,11 @@ _Static_assert(sizeof(MacroCtrl_t) == 16, "MacroCtrl_t must be 16 bytes");
  *   使输出臂在**零外部仪器**下也能被逐值核对 (PC 用 0x22 burst 读回)。
  *   ★ 与 S3 的差异: S3 的 LEDC 占空比同样不可读, 这是本平台补的观测。 */
 #define OFF_HIL_DUTY        0x6E00   /* u32: 最近写入 TIM3_CCR1 的计数值 (0..ARR+1) */
-#define OFF_W5_OBS_END      0x6E04
+#define OFF_HIL_FB_RAW      0x6E04   /* u32: HIL 反馈**最近一次** ADC 原始码 (排障用:
+                                      * 与 0x37 扫描同一通道的读数直接对照) */
+#define OFF_W5_OBS_END      0x6E08
 _Static_assert(OFF_MACRO_END <= OFF_HIL_DUTY, "SHM: W5 观测区与 MACRO 区重叠");
-_Static_assert(OFF_HIL_DUTY + 4u <= SHM_SIZE, "SHM: W5 观测区越出 SHM 末尾");
+_Static_assert(OFF_HIL_FB_RAW + 4u <= SHM_SIZE, "SHM: W5 观测区越出 SHM 末尾");
 
 
 /* ══════════ 路由条目 (16B packed) —— 与 S3 逐字节相同 ══════════ */

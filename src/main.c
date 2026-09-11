@@ -1201,7 +1201,8 @@ static void h_adc_scan(const uint8_t *p, uint32_t n)
     if (cnt == 0u || cnt > 20u || ch0 + cnt > 20u) { nak("bad adc scan"); return; }
     uint8_t r[40];
     for (uint32_t i = 0; i < cnt; i++) {
-        uint16_t v = adc_read(ch0 + i);
+        uint16_t v = 0;
+        (void)adc_read(ch0 + i, &v);
         r[i * 2]     = (uint8_t)(v & 0xFFu);
         r[i * 2 + 1] = (uint8_t)(v >> 8);
     }

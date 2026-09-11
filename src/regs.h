@@ -255,6 +255,13 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
 #define ADC_SMPR2(n)       REG32((n) + 0x18)
 #define ADC_SQR1(n)        REG32((n) + 0x30)
 #define ADC_DR(n)          REG32((n) + 0x40)
+/* ★★ ADC1/2 pre-channel selection (H72x/73x 特有; offset 0x1C)。
+ *   必须为**每个要用的通道置位**, 否则该通道的输入**根本不接到 ADC 内部** ⇒ 读到的是
+ *   漂浮值, 且 CR/CFGR/CCR/MODER 等"配置类"寄存器**全部正确** —— 2026-09-11 实测踩到:
+ *   AI/HIL 三条外部线(3.3V/GND/PWM回环)与内部上下拉**全都不跟随**, 查了很久。
+ *   权威依据: stm32h7xx_ll_adc.h 的 LL_ADC_SetChannelPreselection() —— HAL 每配置一个
+ *   通道就写一次; 它**不在我原来核对的那几个寄存器里**, 所以"读回核对"没抓到它。 */
+#define ADC_PCSEL(n)       REG32((n) + 0x1C)
 /* ★★ ADC12_COMMON 地址 = 0x40022300 (= ADC1_BASE + 0x300) —— **实测裁决**。
  *   板商参考工程的 stm32h723xx.h 把它定义成 `D2_AHB1PERIPH_BASE + 0x2300` (=0x40023000),
  *   却与它**自己的** ADC_Common_TypeDef 注释 "Address offset: ADC1/3 base address + 0x300"

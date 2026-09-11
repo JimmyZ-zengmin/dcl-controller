@@ -72,11 +72,15 @@ void hil_tick(uint8_t *base, uint32_t tick_now)
 
     /* 反馈眼: ADC 多次平均 (无 RC 时采到方波 → 平均≈占空比×VDDA) → SENSOR[2] (V) */
     uint32_t acc = 0;
+    uint16_t last_raw = 0;
     for (int i = 0; i < HIL_FB_AVG; i++) {
-        uint16_t r = adc_read(HIL_FB_CH_PA5);
-        if (r == 0xFFFFu) { r = 0u; }
+        uint16_t r = 0;
+        if (adc_read(HIL_FB_CH_PA5, &r) != 0) r = 0;   /* 超时按 0 计 (显式, 不用哨兵值) */
+        last_raw = r;
         acc += r;
     }
+    /* 排障镜像: 与 0x37 扫描同通道读数对照 (SENSOR[2]=0 而扫描=满幅时, 看这里) */
+    *(volatile uint32_t *)(base + OFF_HIL_FB_RAW) = last_raw;
     float v = (float)(acc / (uint32_t)HIL_FB_AVG) * 3.3f / 65535.0f;
     hil_write_f(base, OFF_SENSOR_MAP + (uint32_t)HIL_FB_SENSOR * 4u, v);
     __asm__ volatile("dsb" ::: "memory");

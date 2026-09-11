@@ -43,6 +43,7 @@ CMD_ADC_SCAN     = 0x37   # [ch_start][count] → count × u16 raw (接线/映�
 OFF_SENSOR_MAP = 0x0040
 OFF_WIRE_MAP   = 0x0240
 OFF_HIL_DUTY   = 0x6E00   # u32: 固件实际写入 TIM3_CCR1 的计数值 (engine.h)
+OFF_HIL_FB_RAW = 0x6E04   # u32: HIL 反馈最近一次 ADC 原始码 (排障镜像)
 AI_SENSOR_BASE = 8      # SENSOR[8..10] = PA0/PA1/PA4
 DI_SENSOR_BASE = 3      # SENSOR[3..6]  = PC0..PC3
 HIL_FB_SENSOR  = 2      # SENSOR[2]     = PA5 反馈
@@ -165,6 +166,17 @@ def main():
         else:
             record("A-0 ADC 在转换 (读数非超时哨兵)", all(v < 3.5 for v in ai_v),
                    "V=%s" % ["%.3f" % v for v in ai_v])
+            # ★ ADC 通道**是否真的接到引脚**: 每路要么被**外部钉住**(pu≈pd 且 高/低),
+            #   要么**内部上下拉生效**(pu 明显 > pd)。两者都证明该通道连到了 pad。
+            #   (此前这条判不出来是因为漏写 PCSEL —— ADC 根本没接引脚, 详见 adc.c。)
+            if ai_pp:
+                def _sel_ok(pu, pd):
+                    if abs(pu - pd) < 500 and (pu > 60000 or pu < 500):
+                        return True                       # 被外部钉住 (高 / 低)
+                    return (pu - pd) >= 2000              # 内部上下拉生效
+                record("A-sel ★ADC 通道跟随引脚 (被外部钉住 或 内部上下拉生效)",
+                       all(_sel_ok(ai_pp[i*2], ai_pp[i*2+1]) for i in range(3)),
+                       "pu/pd = %s" % [(ai_pp[i*2], ai_pp[i*2+1]) for i in range(3)])
             if ai_v[0] >= 2.8 and ai_v[1] <= 0.3:
                 record("A-1 ★AI 外部: PA0=3.3V→SENSOR[8]∈[3.0,3.4] 且 PA1=GND→SENSOR[9]≤0.2",
                        3.0 <= ai_v[0] <= 3.4, "V=%s" % ["%.3f" % v for v in ai_v])
@@ -203,31 +215,38 @@ def main():
         record("H-0 ★HIL 输出臂(零接线): WIRE[20] → TIM3 占空比镜像符合公式",
                ok_d, "u=512→%s(期望500) u=1024→%s(期望1000) u=0→%s" % (d512, dfull, d0))
 
-        # H-1 物理回环 (需 PA6→PA5 跳线)
-        L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, f32(512.0)))
-        time.sleep(0.3)
-        v50 = rd_f32(shm + OFF_SENSOR_MAP + HIL_FB_SENSOR * 4)
-        L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, 0))
-        time.sleep(0.3)
-        v0 = rd_f32(shm + OFF_SENSOR_MAP + HIL_FB_SENSOR * 4)
-        if v50 is not None and v50 >= 0.6:
-            record("H-1 ★HIL 回环: 50%% 占空 → SENSOR[2]≈1.65V, 0%% → ≈0V",
-                   (1.2 <= v50 <= 2.1) and (v0 is not None and v0 <= 0.5),
-                   "50%%=%.3fV 0%%=%.3fV (期望 1.65 / 0.00)" % (v50, v0 or -1))
-        else:
+        # H-1 物理回环 (需 PA6→PA5 跳线)。★ 分两级判: 先"轨道"再"中间值" ——
+        #   满幅/零幅对采样相位**免疫**, 能直接回答"跳线通了没"; 50% 走平均,
+        #   无 RC 时还受采样相位影响(混叠)。分开放, 失败点才定位得准。
+        def hold_u(val):
+            L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, f32(val)))
+            time.sleep(0.35)
+            return rd_f32(shm + OFF_SENSOR_MAP + HIL_FB_SENSOR * 4)
+
+        v100, v0, v50 = hold_u(1024.0), hold_u(0.0), hold_u(512.0)
+        _rp = rd_burst(shm + OFF_HIL_FB_RAW, 1)
+        fbraw = struct.unpack("<I", _rp)[0] if _rp and len(_rp) >= 4 else None
+        print("   反馈原始码镜像 OFF_HIL_FB_RAW = %s (SENSOR[2]=%.3fV)" % (fbraw, v50 if v50 is not None else -1))
+        if v100 is None or v100 < 3.0:
             skip("H-1 ★HIL 物理回环 (需 PA6→PA5 跳线)",
-                 "反馈未跟随 (50%%=%.3fV 0%%=%.3fV)" % (v50 or -1, v0 or -1))
-            # 自动诊断: 保持 50% 占空扫全通道 —— PWM 若真到某个 ADC1 脚, 该通道应读到 ~1.6V
-            L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, f32(512.0)))
+                 "满幅时反馈=%.3fV (应≥3.0V) ⇒ 跳线未通/脚不对" % (v100 or -1))
+            # 自动诊断: 保持**满幅**扫全通道 —— PWM 若真到某个 ADC1 脚, 该通道应读到满幅
+            L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, f32(1024.0)))
             time.sleep(0.2)
             sts, sc = L.xact(CMD_ADC_SCAN, bytes([0, 20]))
             L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, 0))
             if sts == 0 and sc and len(sc) >= 40:
                 chs = [struct.unpack_from("<H", sc, i * 2)[0] for i in range(20)]
-                mid = [(i, v) for i, v in enumerate(chs) if 15000 < v < 50000]
-                print("   ↳ 保持 50%% 占空扫全通道: 中间电平通道 = %s"
-                      % (mid if mid else "无 ⇒ PWM 没到任何 ADC1 脚 (跳线未通/脚不对)"))
+                hot = [(i, v) for i, v in enumerate(chs) if v > 40000]
+                print("   ↳ 满幅占空扫全通道: 高电平通道 = %s"
+                      % (hot if hot else "无 ⇒ PA6 的 PWM 没到任何 ADC1 脚"))
                 print("     全部 = %s" % " ".join("%d:%d" % (i, v) for i, v in enumerate(chs)))
+        else:
+            record("H-1a ★HIL 物理回环(轨道): u=1024→SENSOR[2]≥3.0V 且 u=0→≤0.4V",
+                   (v0 is not None and v0 <= 0.4), "满幅=%.3fV 零幅=%.3fV" % (v100, v0 or -1))
+            record("H-1b ★HIL 占空比跟随: u=512 → SENSOR[2]≈1.65V (16 次跨周期平均)",
+                   1.2 <= (v50 if v50 is not None else -1) <= 2.1,
+                   "50%%=%.3fV (期望 1.65)" % (v50 if v50 is not None else -1))
 
         L.xact(CMD_RESET); time.sleep(0.1)
 
