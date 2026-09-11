@@ -2,3 +2,6 @@ build/
 build_min/
 .la/
 tmp_dap/
+
+# LA 导出临时文件 (h723_la_modbus.py 生成)
+tools/_la_modbus.txt
