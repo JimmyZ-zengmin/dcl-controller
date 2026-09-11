@@ -117,9 +117,16 @@ def p3_w1_criteria():
 
 # ── P4: 条数双来源探针 (在线) ───────────────────────────────
 def p4_route_count_probe(port):
+    """★ 2026-09-11 修正 —— 旧版无区分力。
+    对方在 RESPONSE §4.1 指出: 旧判据写死"0x38/0x43 与 SHM 不一致", 于是 D 项修复后
+    依然 PASS、且仍打印"报陈旧值", 而实测 0x38=8(正确)、0x43=0(未落盘, 也正确)。
+    ⇒ 一条"修复前后都通过"的判据不具区分力, 不能作为证据。
+    新版**主动制造区分**: 先落盘 3 条 → 再 deploy 8 条(不落盘)
+      期望: 0x38 跟 SHM (=8), 0x43 仍报 flash 里的 3  → 落盘后才变 8。
+    """
     print()
     print("=" * 64)
-    print(f"P4  条数双来源不一致探针   (报告 §5)   [port={port}]")
+    print(f"P4  条数双来源探针 (含区分力)   [port={port}]")
     print("=" * 64)
     try:
         import time
@@ -128,22 +135,35 @@ def p4_route_count_probe(port):
         print("  跳过: 未安装 pyserial")
         return None
 
-    ser = serial.Serial(port, 115200, timeout=0.8)
+    ser = serial.Serial(port, 115200, timeout=1.0)
 
     def xchg(frame, wait=0.8):
         ser.reset_input_buffer()
         ser.write(frame)
         ser.flush()
         time.sleep(wait)
-        b = ser.read(256)
+        b = ser.read(512)
         if not b or b[0] != SOF_RESP:
             return None, b
         n = b[2] | (b[3] << 8)
         return b[1], b[4:4 + n]
 
-    def read32(off, shm):
-        st, pl = xchg(build_frame(CMD_READ, struct.pack("<I", shm + off)))
-        return struct.unpack("<I", pl[:4])[0] if st == 0 and pl and len(pl) >= 4 else None
+    def dep(n):
+        rts = b"".join(struct.pack("<BBBBBBHHHHBB", 2, i, 2, i, 0, 0x01, i, 0, 0, 0, 0, 0)
+                       for i in range(n))
+        ps = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in range(n))
+        ss = b"".join(struct.pack("<ffff", 0.0, 0.0, 0.0, 0.0) for _ in range(n))
+        return xchg(build_frame(CMD_DEPLOY, struct.pack("<HHH", n, n, n) + rts + ps + ss), 1.2)
+
+    def get38():
+        st, pl = xchg(build_frame(CMD_ENGINE_STATUS))
+        return struct.unpack("<H", pl[20:22])[0] if st == 0 and pl and len(pl) >= 22 else None
+
+    def get43(mode=0):
+        pl_in = bytes([mode]) if mode else b""
+        # ★ mode=1 的 ACK 要等 flash 擦除完成 (H7 单 sector 128KB, 实测 0.84s, 可达数秒)
+        st, pl = xchg(build_frame(CMD_PERSIST_STATUS, pl_in), 4.0 if mode else 0.8)
+        return struct.unpack("<H", pl[1:3])[0] if st == 0 and pl and len(pl) >= 3 else None
 
     st, pl = xchg(build_frame(CMD_ENGINE_STATUS))
     if st != 0 or not pl or len(pl) < 27:
@@ -153,36 +173,34 @@ def p4_route_count_probe(port):
     shm = struct.unpack("<I", pl[23:27])[0]
     print(f"  SHM base = 0x{shm:08X}")
 
+    # [1] 先落盘 3 条 -> flash 里持久化条数 = 3 (制造区分基准)
     xchg(build_frame(CMD_RESET), 0.5)
-    NR = NP = NS = 8
-    rts = b"".join(struct.pack("<BBBBBBHHHHBB", 2, i, 2, i, 0, 0x01, i, 0, 0, 0, 0, 0)
-                   for i in range(NR))
-    ps = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in range(NP))
-    ss = b"".join(struct.pack("<ffff", 0.0, 0.0, 0.0, 0.0) for _ in range(NS))
-    st, _ = xchg(build_frame(CMD_DEPLOY, struct.pack("<HHH", NR, NP, NS) + rts + ps + ss), 1.0)
-    print(f"  deploy {NR} 条 DIRECT -> ACK={st == 0}")
+    st, _ = dep(3)
+    print(f"  [1] deploy 3 条 -> ACK={st == 0}")
+    get43(1)
+    f3 = get43()
+    print(f"      -> 0x43 报 flash 里 = {f3}   (期望 3)")
 
-    st38, pl38 = xchg(build_frame(CMD_ENGINE_STATUS))
-    nr38 = struct.unpack("<H", pl38[20:22])[0] if pl38 and len(pl38) >= 22 else None
-    st43, pl43 = xchg(build_frame(CMD_PERSIST_STATUS))
-    nr43 = struct.unpack("<H", pl43[1:3])[0] if pl43 and len(pl43) >= 3 else None
-    v = read32(SHM_OFF_N_ROUTES_WORD, shm)
-    nr_shm = (v >> 16) & 0xFFFF if v is not None else None
+    # [2] 不 RESET, 直接 deploy 8 条 (未落盘): 0x38 应跟 SHM, 0x43 应仍是 3
+    st, _ = dep(8)
+    e8, f8 = get38(), get43()
+    rv = xchg(build_frame(CMD_READ, struct.pack("<I", shm + SHM_OFF_N_ROUTES_WORD)))[1]
+    nr_shm = (struct.unpack("<I", rv[:4])[0] >> 16) & 0xFFFF if rv and len(rv) >= 4 else None
+    print(f"  [2] deploy 8 条(未落盘): SHM={nr_shm}  0x38={e8}  0x43={f8}")
 
+    # [3] 落盘 -> 0x43 应变 8
+    get43(1)
+    f8b = get43()
+    print(f"  [3] 落盘后: 0x43 = {f8b}")
+
+    a = (nr_shm == 8 and e8 == 8)
+    b = (f3 == 3 and f8 == 3)
+    c = (f8b == 8)
     print()
-    print(f"  SHM  N_ROUTES (真相)     = {nr_shm}")
-    print(f"  0x38 r[20:22] (引擎报告) = {nr38}")
-    print(f"  0x43 r[1:2]   (persist)  = {nr43}")
-    print()
-    if nr_shm == NR and (nr38 != NR or nr43 != NR):
-        print("  PASS 坐实: SHM=8 但 0x38/0x43 报陈旧值 -> g_active_routes deploy 路径未更新")
-        ok = True
-    elif nr_shm == NR and nr38 == NR and nr43 == NR:
-        print("  三来源一致 (该问题可能已修)")
-        ok = True
-    else:
-        print("  结果异常, 请人工核对")
-        ok = False
+    print(f"  P4a 0x38 跟随 SHM (deploy 后立即=8)   : {'PASS' if a else 'FAIL'}  (SHM={nr_shm} 0x38={e8})")
+    print(f"  P4b 0x43 报 flash 内容 (未落盘仍=3)    : {'PASS' if b else 'FAIL'}  (0x43={f8})")
+    print(f"  P4c 落盘后 0x43 == 8                  : {'PASS' if c else 'FAIL'}  (0x43={f8b})")
+    ok = a and b and c
     ser.close()
     return ok
 
