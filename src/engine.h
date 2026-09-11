@@ -45,23 +45,74 @@
 #define SHM_U32(b, off)  (*(volatile uint32_t *)((b) + (off)))
 #define SHM_PTR(b, off)  (void *)((b) + (off))
 
-#define OFF_CTRL_MAGIC       0x00   /* u32 */
-#define OFF_CTRL_VERSION     0x04   /* u32 */
-#define OFF_CTRL_HEARTBEAT   0x08   /* u32 */
+/* ══════════ SHM 控制块 (0x00..0x3F) —— 每字段必须写清"谁写、什么语义" ══════════
+ * ★★ 审计发现 C 的系统化升级 (2026-09-11):
+ *   审计只报了 `OFF_CTRL_MAGIC` 一个"定义了却从不设置"。按同一手法对整个控制块
+ *   做了一遍自查, 发现**共 11 个字段只定义、从不写入**:
+ *     MAGIC / VERSION / HEARTBEAT / TIMING×(6) / GPIO_MASK
+ *   这违反了本项目的基本纪律 —— **字段存在就意味着它被宣称有语义**。
+ *   一个"恒 0 的 MAGIC"会让 PC 侧"SHM 是否就绪"的判据失去依据, 而错误方向
+ *   指向"固件坏了"而不是"这个字段从来没人写"。
+ *   ⇒ 处置分三类 (逐条在下面标注):
+ *      [写] 有明确语义 → 补写入点 (MAGIC / VERSION / HEARTBEAT / TIMING×6)
+ *      [留] 语义未定     → 显式标注"本平台未定义 + 不可达", 不假装有值 (GPIO_MASK)
+ *      [废] 平台不适用   → 显式标注废弃原因 (本块暂无; S3 的 display/fs 域在别处)
+ *   ★ 配套自查脚本已在审计回执里给出 (正则扫"宏被用于写"的位置), 可复跑防复发。 */
+
+/* ---- [写] 就绪标志与布局版本 ----
+ * ★ 为什么必须有 MAGIC: PC 侧需要一个**不断言任何内容、只回答"SHM 已初始化"**
+ *   的判据。没有它, 上电初期的读数与"固件跑起来了但表是空的"无法区分 ——
+ *   两者都表现为"读到 0"。S3 用 `SHM_U32(OFF_CTRL_MAGIC) = CTRL_MAGIC`。
+ * ★ 为什么还要 VERSION: MAGIC 只答"是/否就绪", 不答"**哪一版**布局"。
+ *   本项目承诺"SHM 与 S3 逐字节同偏移", 但偏移不变 ≠ 字段语义不变
+ *   (W3 就往 0x38 加了 N_SEQ)。PC 脚本据此可显式判断"我认不认得这块 SHM",
+ *   而不是靠字段内容反推。版本号只在**语义**变化时递增。 */
+#define CTRL_MAGIC           0x44434C31u   /* 'DCL1' — 与 PROG_MAGIC 同族 */
+#define SHM_LAYOUT_VERSION   0x00010000u   /* 1.0 — W3 加入 N_SEQ 后的语义版本 */
+
+#define OFF_CTRL_MAGIC       0x00   /* u32 [写] CTRL_MAGIC: SHM 已初始化 (唯一就绪判据) */
+#define OFF_CTRL_VERSION     0x04   /* u32 [写] SHM_LAYOUT_VERSION: 字段语义版本 (非偏移版本) */
+#define OFF_CTRL_HEARTBEAT   0x08   /* u32 [写] **引擎拍计数** — 仅在 gate && RUN 时递增。
+                                     *   ★ 语义是"引擎在推进", 不是"CPU 活着" (后者用 0x38
+                                     *     的 samples = 拍中断数, 它 STOP 后仍增长)。
+                                     *   两者成对使用才能区分"ISR 在跑"与"引擎在跑" ——
+                                     *   这正是 W1 S2 判据需要的量 (审计发现 B/S2)。 */
 #define OFF_CTRL_RELOAD      0x0C   /* u8  */
 #define OFF_CTRL_ENGINE_RUN  0x0D   /* u8  */
-#define OFF_CTRL_N_ROUTES    0x0E   /* u16 */
+#define OFF_CTRL_N_ROUTES    0x0E   /* u16 ★ 条数的**唯一权威来源** (见 g_active_routes 说明) */
 #define OFF_CTRL_N_PARAMS    0x10   /* u16 */
 #define OFF_CTRL_N_STATES    0x12   /* u16 */
 #define OFF_CTRL_PROG_MAGIC  0x14   /* u32 */
-#define OFF_TIMING_SAMPLES      0x18   /* u32 */
-#define OFF_TIMING_PERIOD_MIN   0x1C   /* u32 */
-#define OFF_TIMING_PERIOD_MAX   0x20   /* u32 */
-#define OFF_TIMING_EXEC_MIN     0x24   /* u32 */
-#define OFF_TIMING_EXEC_MAX     0x28   /* u32 */
-#define OFF_TIMING_LAST_PERIOD  0x2C   /* u32 */
-#define OFF_TIMING_LAST_EXEC    0x30   /* u32 */
-#define OFF_CTRL_GPIO_MASK      0x34   /* u32 */
+
+/* ---- [写] 计时统计镜像 (0x18..0x33) ----
+ * ★ H723 的**权威**计时数据住在 DTCM 的 C 全局 (g_isr_cyc_* / g_per_cyc_*),
+ *   因为 ISR 每拍直接更新它们是零代价 (寄存器相对寻址), 而 SHM 要走基址+偏移。
+ *   这一区是**镜像**, 由主循环周期性从 C 全局同步过来 —— 目的是让 PC 用一条
+ *   0x22 READ_BURST 就能一次取走全部计时视图 (无需多次 0x38 往返)。
+ *   ⇒ 两者的关系写死: C 全局 = 权威(每拍更新, 精度最高); SHM 区 = 采样镜像。
+ *     审计若发现两者不一致, **以 C 全局为准**, 因为 SHM 是滞后的拷贝。 */
+#define OFF_TIMING_SAMPLES      0x18   /* u32 [写] = g_isr_n          */
+#define OFF_TIMING_PERIOD_MIN   0x1C   /* u32 [写] = g_per_cyc_min    */
+#define OFF_TIMING_PERIOD_MAX   0x20   /* u32 [写] = g_per_cyc_max    */
+#define OFF_TIMING_EXEC_MIN     0x24   /* u32 [写] = g_isr_cyc_min    */
+#define OFF_TIMING_EXEC_MAX     0x28   /* u32 [写] = g_isr_cyc_max    */
+#define OFF_TIMING_LAST_PERIOD  0x2C   /* u32 [写] = g_per_cyc_last   */
+#define OFF_TIMING_LAST_EXEC    0x30   /* u32 [写] = g_isr_cyc_last   */
+
+/* ---- [留] 输出掩码 —— **本平台语义未定义, 当前不可达** (审计发现 H) ----
+ * ★★ 现状必须说清 (否则它就是下一个"定义了却没人写"的坑):
+ *   `eng_outputs_safe()` 里的位映射是 `mask >> (p*2) & 0xFFFF`, 每 port 只取 **2 位** ——
+ *   而每个 GPIO port 有 **16 个引脚**, 语义对不上。
+ * 根因: `u32 mask` 装不下 H723 的输出空间。S3 是**单端口** u32 (位 = 引脚),
+ *   而 H723 有 GPIOA..GPIOK 共 11 个端口 × 16 引脚 = **176 位** ⇒ 需要 u32[6]。
+ *   ★ 当前**不可达**: 没有任何代码写这个字段 (恒 0), `if (mask)` 直接短路, 所以
+ *     "停机不清输出"这个隐患尚未成为事实。但一旦接真实 GPIO 执行器就会复发
+ *     (P1-2 同族: 停机 ≠ 保持输出)。
+ * ⇒ 定案前**不许**让任何路径写它 (写了就等于宣称一个错的语义)。
+ *   接 GPIO 执行器时的两条路: ① 扩成 u32[6] (语义干净, 改 SHM 偏移) 或
+ *   ② 明确"只用 GPIOA"+ 断言 `mask < (1<<16)` (零偏移代价)。
+ *   下面的 _Static_assert 把"当前无人写"这件事钉住, 防止悄悄出现半吊子写入。 */
+#define OFF_CTRL_GPIO_MASK      0x34   /* u32 [留] 语义未定, 当前恒 0 且不可达 */
 #define OFF_CTRL_N_SEQ          0x38   /* u8  Sequencer 实例数 (阶段 5) */
 /* 0x39 空闲 (1 字节); 0x3A-0x3F 已被下面的 deploy 生效确认字段占满 ——
  * ★ A8 修正: 旧注释写"0x38-0x3F 空闲, 阶段 5 Sequencer", 与事实不符
@@ -287,9 +338,15 @@ _Static_assert(_Alignof(SeqCtrl_t) == 4, "SeqCtrl_t alignment must be 4");
 
 /* ══════════════ 绊线断言: 预算门当前"具不具约束力" ══════════════
  * ★★ 这是一个**故意的反向断言**, 语义要说清楚:
- *   128 条上限 × 最贵原语 145 cyc = 18560 cyc = 拍长的 **46%** —— 也就是说
+ *   128 条上限 × 最贵原语 140 cyc = **17920** cyc = 拍长的 **44.8%** —— 也就是说
  *   **在 MAX_ROUTES=128 的前提下, 任何合法程序都不可能把拍吃满**, 预算门
  *   当前**永远不会触发**。它是一条"未来的门"。
+ *   ★ 审计发现 G (2026-09-11): 这里原本写"145 cyc = 18560" —— 而
+ *     `OP_COST_MAX_MEASURED` 早在 A3 重测后就改成了 140 (DIRECT 56→50, PID 相应下调),
+ *     注释没跟上。**注释数字与常量不一致本身就是一种"自洽的假验证"**:
+ *     读者复核"145×128=18560"算得没错, 于是不会再去质疑 145 这个**输入**是不是当前值
+ *     (与 BRR 那条"算得对但公式错 16 倍"的注释同族)。
+ *     ⇒ 已改正, 并把两个数写成同源表述 (引用常量名), 避免再次各自漂移。
  *   为什么仍然保留它: ① 引擎成本模型必须在扩容前就位 (S3 的 OA12→OA22 就是
  *   成本模型漏维度反复返工); ② DTCM 能放 ~2000 条路由 —— **一旦扩容, 这个门
  *   立刻变成真门**, 到那时它就必须被实测验证"真的拦得住超载"。
@@ -547,6 +604,11 @@ uint32_t engine_seq_tick(uint8_t *base, uint32_t tick);
 
 /** @brief SHM 静态区 (定义在 engine.c, 链接段 .dtcm_shm / DTCM 0x20000000) */
 extern uint8_t g_shm[SHM_SIZE];
+
+/** @brief 审计发现 H 的观测面: 停机清输出时 GPIO_MASK 非 0 的次数 (应恒为 0)
+ *  ★ 这是一个**否定性声称的外部证据**: 它恒 0 ⇔ 从没人往语义未定的 GPIO_MASK
+ *    写过值。若非 0 ⇒ 有路径绕过了定案, 属必须查的 bug。 */
+extern volatile uint32_t g_safe_mask_nonzero;
 /** @brief 冷启动清零 (.dtcm_shm 是 NOLOAD, 上电内容不确定 → 必须显式清)
  *  ★ 单一入口纪律 (S3 第二十六轮收口): "新增任何域必须在此登记"。
  *    本实现直接整段 memset(SHM_SIZE), 所以天然完整 —— 但**新域若放在 SHM 之外**

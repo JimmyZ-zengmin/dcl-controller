@@ -39,7 +39,18 @@
 #define CMD_WRITE_BURST     0x23
 #define CMD_FORCE           0x24   /* P2: 强制/释放 wire — [idx:u16][mode:u8][val:f32] */
 #define CMD_ENGINE_STATUS   0x38
-#define CMD_PERSIST         0x43   /* W2.4: 掉电保持查询/落盘 — 空=查询, [mode:u8]=1 落盘 */
+#define CMD_PERSIST         0x43   /* W2.4: 掉电保持查询/落盘 — 空=查询, [mode:u8]=1 落盘
+                                    *
+                                    * ★★ PC 侧必读: [mode=1] 的 **ACK 延迟 = 擦除耗时**。
+                                    *   H7 最小擦除粒度是整扇区 128KB, 实测 0.5~1s
+                                    *   (串口实测 0.84s; 极端情况可到数秒)。
+                                    *   ⇒ **PC 侧 timeout 必须 ≥ 4 秒**。
+                                    *   若用默认 0.6s, 会把"正在擦除"误判成 NAK 或超时 ——
+                                    *   而**落盘其实成功了** (查 0x43 空载荷可见条数已更新)。
+                                    *   这与 h723_persist.py 的 pyocd 路径不同: 那条走
+                                    *   g_persist_req 直写, 不受串口 timeout 影响。
+                                    *   (本次实测踩到: 0.6s 超时被脚本判成 NAK, 而 flash 里
+                                    *    确实已经写好了 8 条 —— "命令没回" ≠ "命令没做"。) */
 #define CMD_SEQ_DEPLOY      0x44   /* Sequencer v0: 部署顺序域 (设计 D6: 独立命令
                                       不往 0x10 塞 — 3078B 压线教训) */
 #define CMD_MACRO           0x40

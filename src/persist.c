@@ -300,25 +300,48 @@ int persist_save(uint8_t *base)
     /* ---- ⑤ 擦 → 写 → 回读 (每一步都检查) ---- */
     g_persist_target = info.active ? 1u : 0u;
 
+    /* ★★ 审计发现 F 修复: 原来是三条 `return` 各自返回, 只有**成功路径**调了
+     *   flash_lock() —— 即 erase/write/回读**任一失败**, Flash 就保持解锁状态。
+     *   这与 flash.h 自己写的契约("持久化完成**必须**调用 flash_lock")直接冲突,
+     *   是"防御性 API 被绕过"的典型。
+     *   ★ 为什么改成单一出口而不是"在三个 return 前各补一句":
+     *     补三句只是修好**今天已知**的三条路径; 明天新增第四条 return 时,
+     *     同样会漏 —— 缺陷的**类别**没被消灭。
+     *     单一出口把"无论成败都必须落锁"变成**结构性事实**: 新增任何失败分支
+     *     都自动经过 `out:`, 漏不掉。这正是本项目"把纪律变成结构"的一贯做法
+     *     (同族: build.sh 每次显式传全默认值、DCL_CAP_H723_NOTYET 的断言)。 */
     int r = flash_erase_sector(tgt_sector);
-    if (r != FL_OK) { g_persist_erase_fail++; g_persist_last_err = (uint32_t)(-r); g_persist_save_fail++; return r; }
+    if (r != FL_OK) {
+        g_persist_erase_fail++;
+        g_persist_last_err = (uint32_t)(-r);
+        g_persist_save_fail++;
+        goto out;
+    }
     g_persist_erase_ok++;
 
     r = flash_write(flash_sector_base(tgt_sector), s_blob, blen);
-    if (r != FL_OK) { g_persist_last_err = (uint32_t)(-r); g_persist_save_fail++; return r; }
+    if (r != FL_OK) {
+        g_persist_last_err = (uint32_t)(-r);
+        g_persist_save_fail++;
+        goto out;
+    }
 
     /* ★ 回读校验: "命令返回" ≠ "写对了"。这是"落盘成功"的唯一判据。 */
     __builtin_memcpy(s_rdbuf, (const void *)(uintptr_t)flash_sector_base(tgt_sector), blen);
     if (__builtin_memcmp(s_rdbuf, s_blob, blen) != 0) {
         g_persist_last_err = 0xFFFFu;   /* 专用码: 回读不一致 */
         g_persist_save_fail++;
-        return FL_ERR_SRERROR;
+        r = FL_ERR_SRERROR;
+        goto out;
     }
-    flash_lock();
 
     g_persist_writes++;
     g_persist_dirty = 0;
     g_persist_save_ok++;
     g_persist_last_err = 0;
-    return 0;
+    r = FL_OK;
+
+out:
+    flash_lock();          /* ★ 单一出口: 成功/擦除失败/写失败/回读失败**都**落锁 */
+    return r;
 }

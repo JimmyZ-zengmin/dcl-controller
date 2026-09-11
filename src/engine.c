@@ -45,6 +45,14 @@ extern uint8_t _shm_end[];
 volatile uint32_t g_shm_start_addr = 0;
 volatile uint32_t g_shm_end_addr   = 0;
 
+/* ★★ 审计发现 H 的观测面: 停机安全清输出时, 若 GPIO_MASK **非 0** 就 +1。
+ *   为什么需要这个量: 审计判定"该位映射语义未定且当前不可达"。但"不可达"是一个
+ *   **否定性声称** —— 按本项目纪律, 否定性声称同样需要可被外部核对的证据。
+ *   这个计数就是那个证据: 它恒为 0 ⇔ 从来没有人往 GPIO_MASK 写过值。
+ *   一旦它非 0, 立刻说明有路径绕过了"语义未定不许写"的定案 —— 那是个必须查的 bug,
+ *   而不是"某个 feature 开始工作了"。 */
+volatile uint32_t g_safe_mask_nonzero = 0;
+
 /* state_offset 非法时的兜底槽 (S3 core0_isr.c 同款) */
 static StateEntry_t s_state_fallback;
 
@@ -57,6 +65,18 @@ static StateEntry_t s_state_fallback;
 void cold_start_reset(void)
 {
     memset(g_shm, 0, sizeof(g_shm));
+    /* ★★ 审计发现 C: 就绪标志与布局版本**必须在这里写, 而不是在 main 里写一次**。
+     *   理由: cold_start_reset 是"冷启动清零的单一入口" (本项目的既有纪律:
+     *   新增域必须登记到该函数)。所有清零路径 —— main 上电 / 0x13 RESET /
+     *   engine_fill_tables / deploy 装载 —— 都要经过它。
+     *   若把写 MAGIC 放在 main 里: 0x13 RESET 之后 MAGIC 又变回 0, 于是
+     *   "SHM 已就绪"的外部门就会在**一次普通 RESET 之后不再成立** ——
+     *   而 PC 侧只会看到"读到 0", 分不清"没就绪"与"刚被 RESET 过"。
+     *   ⇒ 写在单一入口 = 任何清零动作之后 SHM 都立刻回到"已就绪(空配置)"态。
+     *   ★ HEARTBEAT 不在这里写: 它由 ISR 在 gate&&RUN 时递增, 清零即"复位心跳",
+     *     语义正确 (RESET 后不应残留旧心跳值)。 */
+    SHM_U32(g_shm, OFF_CTRL_MAGIC)   = CTRL_MAGIC;
+    SHM_U32(g_shm, OFF_CTRL_VERSION) = SHM_LAYOUT_VERSION;
 }
 
 /* ══════════ 栈边界哨兵 (设防) ══════════
@@ -982,14 +1002,28 @@ int eng_write_allowed(uint32_t a, uint32_t v)
 void eng_outputs_safe(void)
 {
     uint32_t mask = SHM_U32(g_shm, OFF_CTRL_GPIO_MASK);
-    if (mask) {
-        /* 掩码按 16 位分到各 port: 每 port 用一支 BSRR 清位 (高 16 位写 1 = 清) */
-        for (uint32_t p = 0; p < 12u; p++) {          /* GPIOA..K (0..10), 12 留余 */
-            uint32_t m = (mask >> (p * 2u)) & 0xFFFFu;
-            if (m) GPIO_BSRR(p) = m << 16;
-        }
-    }
-    /* 执行器状态数组归零 (S3: memset ACTUATOR_STATUS) */
+    /* ★★ 审计发现 H (2026-09-11) 的处置 —— 这里原本是:
+     *      for (p = 0..11) { m = (mask >> (p*2)) & 0xFFFF; if (m) GPIO_BSRR(p) = m<<16; }
+     *   两个问题:
+     *     ① **位映射语义错**: 每 port 只从 mask 取 **2 位**, 而每个 GPIO port 有
+     *        **16 个引脚**。要清哪些引脚应该是 16 位/port, 现在等于说"每个端口只有
+     *        2 个可寻址引脚" —— 对不上。
+     *     ② 根因是 **u32 装不下**: 掩码需要覆盖 GPIOA..GPIOK 共 11 port × 16 pin
+     *        = **176 位**。S3 是单端口 u32 (位=引脚), 直搬到 H723 就不成立了。
+     *   ★ 当前**不可达**: 没有任何代码写 OFF_CTRL_GPIO_MASK (恒 0), `if (mask)`
+     *     直接短路 ⇒ 这段循环从来没执行过一次。
+     *   ★ 处置原则 (本项目"宣称必须等于实现"): **宁可不做, 不做错的**。
+     *     保留一个已知错误的位映射, 比什么都不做更危险 —— 一旦将来有人往
+     *     GPIO_MASK 写值, 它会**去清错误的引脚** (而 P1-2 的本意恰恰是"停机时
+     *     输出归零", 清错引脚 = 把安全功能变成事故源)。
+     *   ⇒ 改为: 只做**观测** (暴露"有人写了未定语义的字段"这件事), 不执行清位。
+     *     同时把"该字段语义未定"钉在 engine.h 的注释与断言里。
+     *   ★ 接真实 GPIO 执行器之前的**前置条件** (二选一, 必须先定案):
+     *       ① 扩成 u32[6] 覆盖 176 位 (语义干净, 但要改 SHM 偏移);
+     *       ② 明确"只支持 GPIOA" + 断言 `mask < (1u<<16)` (零偏移代价)。
+     *     在那之前, 这个计数应当恒为 0 —— 若它非 0, 说明有路径绕过了定案直接写字段。 */
+    if (mask) g_safe_mask_nonzero++;
+    /* 执行器状态数组归零 (S3: memset ACTUATOR_STATUS) —— 这一半是**有效**的 */
     volatile uint32_t *act = (volatile uint32_t *)(void *)(g_shm + OFF_ACTUATOR_STATUS);
     for (uint32_t i = 0; i < (uint32_t)MAX_ACTUATORS; i++) act[i] = 0u;
     __asm__ volatile("dsb" ::: "memory");

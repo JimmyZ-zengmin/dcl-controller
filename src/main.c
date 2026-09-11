@@ -555,6 +555,20 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   一旦因为 n_routes=0 而跳过整段, 这类程序会静默不推进。
          *   本实现把 seq 放在同一个 if 里但**不依赖 n_routes**, 所以两条路都通。 */
         if (g_engine_gate && g_engine_run_seen) {
+            /* ★★ 审计发现 C 的配套: HEARTBEAT = **引擎拍计数**, 写进 SHM 让 PC 可读。
+             *   为什么需要它 (而不是复用 0x38 的 samples):
+             *     0x38 的 samples = g_isr_n = **拍中断**次数 —— STOP 之后 ISR 照跑,
+             *     它继续增长。于是"引擎停了没"这件事**没有外部可读的量**:
+             *     PC 只能看到"计数值还在涨"(以为还在跑) 或"不变"(以为死了),
+             *     两种解读都可能是错的。
+             *   ⇒ HEARTBEAT 只在 gate && RUN 内递增, 语义是"引擎在推进"。
+             *     与 samples 成对读, 就能区分三种状态:
+             *       samples↑ HEARTBEAT↑  → 引擎在跑
+             *       samples↑ HEARTBEAT=停 → ISR 在跑但引擎已 STOP (正常的停机态)
+             *       samples=停            → ISR 都没了 (固件死了/未启动)
+             *   ★ 这正是 W1 的 S2 判据需要的量 —— 审计发现 B/S2 指出原判据用错了量。
+             *   ★ 放在 if 内首行: 与 seq 同门, 成本 1 次 volatile 读改写 (可忽略)。 */
+            SHM_U32(g_shm, OFF_CTRL_HEARTBEAT)++;
             g_seq_ticks++;
             uint32_t sw = engine_seq_tick(g_shm, g_tick_count);
             g_seq_wrote_last = sw;
@@ -984,6 +998,14 @@ static void h_seq_deploy(const uint8_t *p, uint32_t n)
     ack(NULL, 0);
 }
 
+/* 首次采样前的"无数据"哨兵 → 对外一律呈现 0。
+ * ★ 为什么要统一: g_*_min 在第一次采样前是 0xFFFFFFFF (表示"还没有样本")。
+ *   若直接写进 SHM, PC 侧会把它当成一个**极大的测量值**(4294967295 cyc),
+ *   而不是"尚无数值" —— 这正是"哨兵语义必须显式"的那一族问题。
+ *   ★ 与 h_engine_status 的 r[4]/r[12] 口径**必须一致**, 所以抽成一个函数,
+ *     避免两处各写一遍 `== 0xFFFFFFFFu ? 0u :` 而后某天只改了一处。 */
+static inline uint32_t pn_or_0(uint32_t v) { return (v == 0xFFFFFFFFu) ? 0u : v; }
+
 /* 0x38 ENGINE_STATUS — **前 31 字节与 S3 逐字节同布局** (上位机脚本零改动),
  * 尾部追加 H723 扩展 6B (S3 的"尾部追加保前段兼容"惯例)。
  *
@@ -996,7 +1018,18 @@ static void h_engine_status(void)
     uint8_t r[37];
     uint32_t pn = (g_per_cyc_min == 0xFFFFFFFFu) ? 0u : g_per_cyc_min;
     uint32_t en = (g_isr_cyc_min == 0xFFFFFFFFu) ? 0u : g_isr_cyc_min;
-    uint16_t nr = (uint16_t)g_active_routes;
+    /* ★★ 审计发现 D 修复: 原来读的是 C 全局 `g_active_routes`, 而它只在启动/reinit
+     *   更新 —— **deploy 路径漏了**, 于是 deploy 8 条之后这里仍报 128 (实测)。
+     *   根因是"同一个量有两个来源": SHM 的 `N_ROUTES`(ISR 真正扫的) 与 C 全局的
+     *   `g_active_routes`(只在两处更新)。它们的更新时机不同步 = 迟早不一致。
+     *   ⇒ 统一以 **SHM `N_ROUTES` 为唯一权威** (它才是 ISR 真正使用的那个,
+     *     由 engine_stage_program / reload / fill_tables 在切换表时写入)。
+     *     C 全局 `g_active_routes` 降级为**纯观测面** (供 pyocd 侧旁证),
+     *     且补上 deploy 路径的同步 (见 h_deploy 末尾) —— 使两者最终一致,
+     *     但**判据只认 SHM**。
+     *   ★ 这正是本项目在 engine.c:650 修过的同一类缺陷的另一半
+     *     (当时修的是 SHM 侧, C 全局这一半漏了)。 */
+    uint16_t nr = SHM_U16(g_shm, OFF_CTRL_N_ROUTES);
     put32(r + 0,  g_isr_n);      /* samples */
     put32(r + 4,  pn);           /* period_min */
     put32(r + 8,  g_per_cyc_max);/* period_max */
@@ -1314,12 +1347,21 @@ static void h_persist_w2(const uint8_t *p, uint32_t n)
     uint8_t r[24];
     memset(r, 0, sizeof(r));
     r[0] = (info.ab_valid != PERSIST_AB_NONE) ? 1u : 0u;
-    r[1] = (uint8_t)(g_active_routes & 0xFFu);
-    r[2] = (uint8_t)((g_active_routes >> 8) & 0xFFu);
-    uint16_t np = SHM_U16(g_shm, OFF_CTRL_N_PARAMS);
-    uint16_t ns = SHM_U16(g_shm, OFF_CTRL_N_STATES);
-    r[3] = (uint8_t)np; r[4] = (uint8_t)(np >> 8);
-    r[5] = (uint8_t)ns; r[6] = (uint8_t)(ns >> 8);
+    /* ★★ 审计发现 D 修复: 这里原本报的是 `g_active_routes` / SHM 的 N_PARAMS/N_STATES
+     *   —— 也就是**当前 ACTIVE 表**的条数。但那不是 0x43 的语义: 0x43 是
+     *   PERSIST_STATUS, 它该回答的是"**flash 里持久化了几条**"。
+     *   两者在"deploy 了新程序但还没落盘"时会**合法地不同** —— 报当前值等于
+     *   谎报持久化状态 (PC 会以为新程序已经存好了)。
+     *   ★ 更糟的是 `g_active_routes` 当时还是**陈旧**的 (只在启动/reinit 更新,
+     *     deploy 路径漏了) —— 实测 deploy 8 条后它仍报 128。两处错叠在一起。
+     *   ⇒ 改用 persist_probe 已经填好的 `info.*` —— 它直接来自 flash 头,
+     *     是"持久化内容"的**唯一权威来源**, 不依赖任何内存全局的新鲜度。 */
+    r[1] = (uint8_t)(info.n_routes & 0xFFu);
+    r[2] = (uint8_t)((info.n_routes >> 8) & 0xFFu);
+    r[3] = (uint8_t)(info.n_params & 0xFFu);
+    r[4] = (uint8_t)((info.n_params >> 8) & 0xFFu);
+    r[5] = (uint8_t)(info.n_states & 0xFFu);
+    r[6] = (uint8_t)((info.n_states >> 8) & 0xFFu);
     r[7] = (uint8_t)((g_persist_dirty ? 1u : 0u) | (save_rc == 0 ? 2u : 0u));
     put32(r + 8,  seq);
     r[12] = info.ab_valid;
@@ -1622,6 +1664,8 @@ static void obs_anchor(void)
     /* W3 免串口协议帧钩子 (不登记会被 --gc-sections 回收) */
     sink ^= g_cmd_req;         sink ^= g_cmd_req_len;
     sink ^= g_cmd_req_cnt;     sink ^= g_cmd_req_last;
+    /* 审计发现 H 的观测面 (engine.c 侧, 不读会被回收) */
+    sink ^= g_safe_mask_nonzero;
     (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
 }
 
@@ -1823,6 +1867,27 @@ int main(void)
             g_engine_gate = sv;
             g_reinit_done++;
         }
+        /* ══════════ 审计发现 C 的配套: SHM 计时镜像 + 条数旁证 ══════════
+         * ★ 这两件都刻意放在**主循环**而不是 ISR:
+         *   · TIMING 镜像: C 全局才是权威(ISR 每拍更新, 零额外代价)。往 SHM 搬
+         *     只是为了让 PC 能用一条 0x22 READ_BURST 一次取走整个计时视图。
+         *     放 ISR 里做等于给热路径加 7 次 SHM 写 —— 为一个"被轮询才需要"的
+         *     视图付每拍的代价, 不划算 (与 h_engine_status 的"按需打包"同哲学)。
+         *   · g_active_routes 重扫: 它是 SHM N_ROUTES 的**独立旁证**(真去扫表的
+         *     flags 数出来), 所以**不能**直接复制 SHM 的值 —— 那就失去校验意义。
+         *     周期性重扫 ⇒ deploy 热切表之后它会自己追上, 不需要在 deploy 里
+         *     猜"ISR 什么时候切完"(那个时机由 ISR 决定, 上层猜不准)。
+         * ★ 顺序: 先同步镜像, 再巡检哨兵 (哨兵若被踩, 说明表区已被破坏, 此时
+         *   同步过去的也可能已经是脏数据 —— 但先写后检能让"脏数据"本身成为线索)。 */
+        SHM_U32(g_shm, OFF_TIMING_SAMPLES)     = g_isr_n;
+        SHM_U32(g_shm, OFF_TIMING_PERIOD_MIN)  = pn_or_0(g_per_cyc_min);
+        SHM_U32(g_shm, OFF_TIMING_PERIOD_MAX)  = g_per_cyc_max;
+        SHM_U32(g_shm, OFF_TIMING_EXEC_MIN)    = pn_or_0(g_isr_cyc_min);
+        SHM_U32(g_shm, OFF_TIMING_EXEC_MAX)    = g_isr_cyc_max;
+        SHM_U32(g_shm, OFF_TIMING_LAST_PERIOD) = g_per_cyc_last;
+        SHM_U32(g_shm, OFF_TIMING_LAST_EXEC)   = g_isr_cyc_last;
+        g_active_routes = engine_active_routes(g_shm);
+
         /* 栈哨兵周期巡检 (廉价: 32 个字, 主循环有 100μs 一次的机会) */
         g_guard_ok = (uint32_t)shm_guard_ok();
         g_stage = 9;

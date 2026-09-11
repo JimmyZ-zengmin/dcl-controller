@@ -120,9 +120,9 @@
       <div class="sub">ESP32-S3 老线 → STM32H723 新线的可信重建　|　审计视图</div>
     </div>
     <div class="meta">
-      分支 <b class="mono">main</b>　最新提交 <b class="mono">993caef</b><br>
-      基线 <b class="mono">66f46f5</b>（W2.4）→ <b class="mono">993caef</b>（W3）<br>
-      <span class="chip ok">工作区干净 · 已推送</span>
+      分支 <b class="mono">main</b>　最新提交 <b class="mono">见仓库 / 本轮回执提交</b><br>
+      流程 <b class="mono">993caef</b>(W3) → <b class="mono">18ff974</b>(外部审计) → <b>本轮回执</b><br>
+      <span class="chip ok">审计 8 项已全部处置</span>
       <span class="chip">2026-09-11</span>
     </div>
   </div>
@@ -149,7 +149,7 @@
     <div class="card">
       <div class="k">最近回归</div>
       <div class="v ok">全绿</div>
-      <div class="d">13/13 · 守卫✓ · 26/26 · 27/27</div>
+      <div class="d">12/12 · 28/28 · 13/13 · 27/27 · 26/26</div>
     </div>
   </div>
 
@@ -172,8 +172,9 @@
       · 0x11/0x12/0x13（START / STOP / RESET）。
       <div class="ev">
         <span class="lbl">证据</span>
-        <span class="pill wip">验收未闭合</span>
-        <span style="color:var(--tx2)">代码已落地、构建零警告；<b>PC 侧串口（CH340）未接线</b>，<span class="mono">tools/h723_w1.py</span> 报链路不活 —— 归为旁路，接线后补跑</span>
+        <span class="pill ok">28 / 28 PASS</span>
+        <span class="mono" style="font-size:11.5px">h723_w1.py @ COM14（真实串口）</span>
+        <span style="color:var(--tx2);margin-left:9px">★ 外部审计发现该工具的解析器有类型 bug（<span class="mono">bytes(buf[1])</span> 对 int 求 bytes）→ T0 判据恒 FAIL → <b>六条命令此前从未被验证过</b>。修复后首次跑通</span>
       </div>
     </div>
   </div>
@@ -334,16 +335,16 @@
       <tr>
         <td class="mono">h723_proto.py</td>
         <td>协议帧 / CRC / 版本协商</td>
-        <td class="r">T1.x 组</td>
-        <td><span class="pill wip">待接线</span></td>
-        <td>串口</td>
+        <td class="r">T1.x 组 (12)</td>
+        <td><span class="pill ok">12 / 12</span></td>
+        <td>COM14</td>
       </tr>
       <tr>
         <td class="mono">h723_w1.py</td>
         <td>SHM 读写 + 运行控制</td>
-        <td class="r">W1 组</td>
-        <td><span class="pill wip">待接线</span></td>
-        <td>串口</td>
+        <td class="r">28</td>
+        <td><span class="pill ok">28 / 28</span></td>
+        <td>COM14</td>
       </tr>
       <tr>
         <td class="mono">h723_w2_probe.py</td>
@@ -370,14 +371,14 @@
         <td class="mono">h723_loopback.py</td>
         <td>串口自收（链路二分）</td>
         <td class="r">—</td>
-        <td><span class="pill wip">待接线</span></td>
+        <td><span class="pill todo">本次未复跑</span></td>
         <td>串口</td>
       </tr>
       <tr>
         <td class="mono">h723_ports.py</td>
         <td>串口枚举 / 识别</td>
-        <td class="r">—</td>
-        <td><span class="pill wip">待接线</span></td>
+        <td class="r">2 口枚举</td>
+        <td><span class="pill ok">通过</span></td>
         <td>串口</td>
       </tr>
       <tr>
@@ -405,9 +406,10 @@
   </table>
 
   <div class="note">
-    <b>"本次复跑"口径</b>：标 <span class="pill ok">通过/数字</span> 的五项（stage2 守卫 / w2_probe / persist / seq / 布局探针）是 2026-09-11 W3 收口时<b>实际执行过</b>的；
+    <b>"本次复跑"口径</b>：标 <span class="pill ok">通过/数字</span> 的项（proto 12/12 · w1 28/28 · w2_probe 13/13 · persist 26/26 · seq 27/27 · stage2 守卫 · 布局探针）是 2026-09-11 <b>实际执行过</b>的；
     标 <span class="pill todo">本次未复跑</span> 的是历史通过的既有工具，<b>未在本次收口窗口中重跑</b>，审计若需采信请自行复跑（命令见 §7）。<br>
-    <b>凡"未复跑"不得计入"已通过"</b> —— 这是本项目的防造假纪律：判据必须可复跑，且"曾经通过"≠"现在通过"。
+    <b>凡"未复跑"不得计入"已通过"</b> —— 这是本项目的防造假纪律：判据必须可复跑，且"曾经通过"≠"现在通过"。<br>
+    ★ 本图初版把 W1/协议层标为"待接线"，<b>那个归因是错的</b>（见缺口 1）；现已由实测替代。
   </div>
 
   <!-- ══════ 确定性指标 ══════ -->
@@ -430,6 +432,26 @@
 
   <!-- ══════ 关键发现 ══════ -->
   <h2><span class="n">5</span>期间抓到的真缺陷（审计重点）</h2>
+
+  <div class="find bad">
+    <div class="ti">★★ 外部审计 8 项发现（2026-09-11，全部核实为真并已处置）</div>
+    <div class="tx">
+      <b>A(P2) 工具类型 bug</b>：<span class="mono">h723_w1.py:128</span> 的 <span class="mono">bytes(buf[1])</span> 对 int 求 bytes
+      → <span class="mono">sts != STS_ACK</span> <b>恒真</b> → T0 永远 FAIL、直接 return →
+      <b>W1 六条命令此前一行判据都没执行过</b>。修复后 <b>28/28 PASS</b>。<br>
+      危害不在"工具坏了"，而在<b>它让纪律静默失效</b>，且失败信息把人引向"串口/固件"（方向相反）。<br><br>
+      <b>B(P2) 6 项判据与固件语义不符</b>：S5 预算算错（128×140=17920 &lt; 26000，与 persist T24 <b>自相矛盾</b>）、
+      S2 用错量（读的是拍中断数，STOP 不停拍）、S1b 读非对齐地址被守卫正确拒绝、
+      R2 未考虑引擎每拍覆写 WIRE_MAP、R9 地址其实没越界、R1 归因到固件。<br><br>
+      <b>C/D/E/F/G/H (P3)</b>：MAGIC 未写 · 条数双来源不一致 · 寿命注释差 10 倍 ·
+      <span class="mono">flash_lock()</span> 漏在失败路径 · 成本注释未同步 · GPIO 掩码位映射语义错。<br><br>
+      <b>★ 增量</b>：把 C 做系统化自查后，另查出 <b>10 个同类死字段</b>
+      （VERSION / HEARTBEAT / TIMING×6 / GPIO_MASK）—— "定义了却从不写入"是<b>一类</b>问题，不是孤例。<br>
+      <b>★ 采纳审计建议</b>：新增 T0c <b>工具自检闸门</b>（未实现命令必须回 NAK），
+      直接防住 A 那一族 —— 只要 sts 通道退化就当场失败，不再让 40+ 判据白跑。<br><br>
+      <span style="color:var(--tx2)">详见 <span class="mono">docs/audit/H723-W1W2W3-RESPONSE.md</span>（含我方接受的 3 处更正）</span>
+    </div>
+  </div>
 
   <div class="find">
     <div class="ti">W3 · 步号镜像初值缺失（移植遗漏，已修）</div>
@@ -471,12 +493,27 @@
   <!-- ══════ 缺口 ══════ -->
   <h2><span class="n">6</span>缺口清单（审计待办）</h2>
 
-  <div class="gap">
+  <div class="gap w">
     <div class="num">1</div>
     <div class="tx">
-      <b>PC 侧串口全程未接线</b> —— CH340 未接，导致 W1 / 协议层（<span class="mono">h723_proto.py</span>、<span class="mono">h723_w1.py</span>）的验收<b>未闭合</b>。
-      当前所有"协议路径"证据都靠 <b>pyocd 免串口帧钩子</b>取得（走真实 <span class="mono">proto_dispatch</span>，但绕过了物理链路层）。
-      ⇒ 接线后须补跑，且补跑结果<b>不得</b>与已有 pyocd 结论混为一谈。
+      <b>【已更正】串口归因错误</b> —— 本图初版写"PC 侧串口全程未接线 → W1/协议层验收未闭合"，
+      <b>该归因是错的</b>（外部审计指出，我方复核确认）。真实情况有两层：<br>
+      ① <span class="mono">h723_w1.py</span> 自身的解析器类型 bug → T0 恒 FAIL → 被误读成"链路不活"；<br>
+      ② 更早的 <b>BRR 波特率错 16 倍</b> → "LA 有波形 + PC 收到全 0x00" 被误读成接线问题。<br>
+      <b>我漏掉的第三种状态</b>：当时只考虑"通/不通"，没把"<b>通但参数不对</b>"作为并列候选。
+      ⇒ 现已修复并实测：<span class="mono">h723_proto.py</span> <b>12/12</b>（COM14）、
+      <span class="mono">h723_w1.py</span> <b>28/28</b>（COM14）。
+    </div>
+  </div>
+
+  <div class="gap w">
+    <div class="num">1b</div>
+    <div class="tx">
+      <b>【已修】外部审计 8 项发现全部核实为真并处置</b> —— 详见
+      <span class="mono">docs/audit/H723-W1W2W3-RESPONSE.md</span>。
+      其中「工具类型 bug」与「判据与固件语义不符」两项属 P2。<br>
+      ★ 把审计的单点发现（MAGIC 未写）<b>系统化自查后</b>，另查出 <b>10 个同类死字段</b>
+      （VERSION / HEARTBEAT / TIMING×6 / GPIO_MASK）—— 即"定义了却从不写入"是一类问题而非孤例。
     </div>
   </div>
 
@@ -523,6 +560,9 @@
       <tr><td>构建</td><td class="mono">bash build.sh</td><td>硬闸门：零警告（本工程源文件 + 链接器 + 汇编）</td></tr>
       <tr><td>烧录</td><td class="mono">pyocd flash -t stm32h723xx -O connect_mode=under-reset build/dcl_h723.hex</td><td><b>每次 build 后必须重烧</b>，否则 nm 符号与芯片镜像不匹配</td></tr>
       <tr><td>清持久化</td><td class="mono">python tools/h723_seq.py --wipe</td><td><b>跑任何回归前必做</b>：flash 里有有效 persist 配置时上电不走 BOOT_PROFILE</td></tr>
+      <tr><td>★ 跑串口测试前</td><td class="mono">pyocd reset -t stm32h723xx</td><td><b>必须</b>：pyocd 会话结束时核心处于 <b>halt</b>，固件不跑 → 串口 <span class="mono">T0</span> 必 FAIL。<b>那是核心停着，不是链路坏了</b>（本次实测踩到）</td></tr>
+      <tr><td>协议层</td><td class="mono">python tools/h723_proto.py</td><td>12 判据（COM14 真实串口）</td></tr>
+      <tr><td>W1</td><td class="mono">python tools/h723_w1.py</td><td>28 判据（含 T0c 工具自检闸门）</td></tr>
       <tr><td>W3 验收</td><td class="mono">python tools/h723_seq.py</td><td>27 判据（T28 灵魂 14 + T29 校验器 13）</td></tr>
       <tr><td>W2 回归</td><td class="mono">python tools/h723_w2_probe.py</td><td>13 判据</td></tr>
       <tr><td>W2.4 回归</td><td class="mono">python tools/h723_persist.py</td><td>26 判据（约 1 分 15 秒，含真擦除）</td></tr>
