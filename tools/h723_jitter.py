@@ -146,6 +146,9 @@ def main():
     ap.add_argument("--settle", type=float, default=1.0, help="每档稳定时间 s")
     ap.add_argument("--expect-fail", action="store_true",
                     help="对照构建模式: 要求量到**非 0** 极差 (证明判据能失败)")
+    ap.add_argument("--ov-expect", choices=["0", "pos"], default="0",
+                    help="超预算计数 ov 的期望: 交付档 0 (默认) / "
+                         "对照构建 -DDCL_BOOT_SEL=0 -DDCL_BOOT_PROFILE=2 用 pos")
     a = ap.parse_args()
 
     port = find_port(a.port)
@@ -167,6 +170,7 @@ def main():
                     pmax=struct.unpack_from("<I", p, 8)[0],
                     emin=struct.unpack_from("<I", p, 12)[0],
                     emax=struct.unpack_from("<I", p, 16)[0],
+                    ov=struct.unpack_from("<I", p, 27)[0] if len(p) >= 31 else None,
                     run=p[22] if len(p) > 22 else None)
 
     s, p = L.xact(CMD_GET_VERSION)
@@ -179,6 +183,18 @@ def main():
            "pmin=%s pmax=%s" % (st["pmin"], st["pmax"]) if st else "无响应")
     if not st:
         return 2
+
+    # ★★ T0d 超预算计数 (审查二级 #5) —— **在任何 RESET 之前**读, 所以它反映
+    #   "自本次上电以来"的累计值。H723 原来在 0x38 里直接填 0 冒充"没超预算",
+    #   那让 S3 套件 T9 的 `ov == 0` 那半条**不可能失败** (空判据)。
+    #   ★ "能失败"的对照: FLASH 取指 + 全表扫 的构建 (`-DDCL_BOOT_SEL=0
+    #     -DDCL_BOOT_PROFILE=2`) 上该量必然 > 0 —— 见 --ov-expect。
+    #   交付档必须恒为 0 (ITCM + 分档 ⇒ ISR 最坏 ~7.3k cyc ≪ 32000)。
+    want_pos = (a.ov_expect == "pos")
+    ok_ov = (st["ov"] is not None) and ((st["ov"] > 0) if want_pos else (st["ov"] == 0))
+    record("T0d 超预算计数 ov %s (期望 %s)" % ("非零" if want_pos else "为 0",
+                                               ">0" if want_pos else "0"),
+           ok_ov, "ov=%s (自本次上电累计) emax=%s" % (st["ov"], st["emax"]))
 
     def measure(name, deploy=None, do_start=True, hold=None, baseline=None):
         """RESET → (deploy) → START → 稳定 → 读 pmin/pmax → 判据
@@ -207,8 +223,9 @@ def main():
         if s0 is None:
             record(name, False, "读 0x38 失败"); return None
         spread = s0["pmax"] - s0["pmin"] if (s0["pmin"] and s0["pmax"]) else None
-        if spread is None:
-            record(name, False, "pmin/pmax 为空"); return s0
+        s0["spread"] = spread          # ★ 必须无条件挂上: 调用方要读它取基线,
+        if spread is None:             #   之前只在成功路径上赋值 ⇒ 失败时调用方 KeyError 崩掉
+            record(name, False, "pmin/pmax 为空 (统计刚复位或 CYCCNT 未计数?)"); return s0
         ok_stable = (TICK_CYC - 1000 < s0["pmin"]) and (s0["pmax"] < TICK_CYC + 1000)
         ok_load = True if baseline is None else (spread <= baseline + 16)
         ok = (ok_stable and ok_load) if not a.expect_fail else (spread != 0)

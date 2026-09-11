@@ -211,6 +211,19 @@ _Static_assert((OFF_TICK_STATS & 3u) == 0u, "SHM: OFF_TICK_STATS 需 4 字节对
 /* 用字面量 0x4000 而不是 OFF_SEQ_TABLE —— 后者在本文件里声明得更靠后, 此处还不可见 */
 _Static_assert(OFF_TICK_STATS + 12u <= 0x4000u, "SHM: TICK_STATS 不得压到 SEQ 区(0x4000)");
 
+/* ★ OFF_TIMING_OVERRUN —— 与范本**同址** (0x3850)。
+ *   ★ 为什么不塞进上面 0x18..0x33 那个 timing 块: 该块在 H723 已排满 (0x34 起是保留的
+ *     GPIO_MASK), 而范本把 OVERRUN 单独放在 0x3850。凡"套件或工具按绝对偏移读"的量
+ *     一律同址 (与 OFF_TICK_STATS 同理), 否则外部判据会静默读到 0。
+ *   语义 (照 S3 `core0_isr.c:365`): ISR 执行时长 > EXEC_BUDGET_CYCLES 的**次数**,
+ *   每个 RUN 段开始时清零 (S3 在 core0_engine_start 里清; 本平台在 stats_reset 里清)。
+ *   ★★ 它存在的意义 (审查二级 #5): H723 原来在 0x38 里**直接填 0** 冒充"没超预算",
+ *     而 S3 套件 T9 的判据含 `ov == 0` ⇒ 那**一半是空判据** (不可能失败, 因为没实现)。
+ *     现在它是真计数, 并配了"能失败"的对照构建 (FLASH 取指 + 全表扫 ⇒ 会超)。 */
+#define OFF_TIMING_OVERRUN   0x3850   /* u32: 本 RUN 段内 ISR 超预算的次数 */
+_Static_assert((OFF_TIMING_OVERRUN & 3u) == 0u, "SHM: OFF_TIMING_OVERRUN 需 4 字节对齐");
+_Static_assert(OFF_TIMING_OVERRUN + 4u <= OFF_TICK_STATS, "SHM: OVERRUN 与 TICK_STATS 重叠");
+
 /* ══════════ W3: 顺序域 SEQ 区 (Sequencer v0) ══════════
  * 落点 = 上面那个保留洞里的**尾部** (0x4000..0x4480, 与 S3 逐字节同偏移)。
  *
@@ -551,6 +564,18 @@ _Static_assert(_Alignof(SeqCtrl_t) == 4, "SeqCtrl_t alignment must be 4");
  * 通信域/顺序域/传感域 (阶段 4) + 安全余量。
  * 依据: S3 的同名门是 16000/24000 = 67%; 这里 26000/40000 = 65%, 口径一致。 */
 #define EXEC_DEPLOY_BUDGET   26000
+
+/* ★★ 每拍"超预算"判据的阈值 (ISR 执行时长超过它 ⇒ OVERRUN 计数 +1)。
+ *   ★ 与上面 EXEC_DEPLOY_BUDGET **不是**同一个量, 名字必须分开 (本项目踩过四次
+ *     "一常量两用": MB_MAX_FRAME / NVIC_ISER 位移 / USART1 BRR / BUCKET_DIV2_PHASES):
+ *       EXEC_DEPLOY_BUDGET = **下载期静态门**: 程序预算超它 ⇒ 拒绝 deploy (不等式, 预判)
+ *       EXEC_BUDGET_CYCLES = **运行期动态判据**: 本拍真跑超它 ⇒ OVERRUN +1 (实测, 事后)
+ *     一个管"能不能下发", 一个管"跑起来有没有超"。合并会导致: 改动其中一处会静默
+ *     改变另一处的语义, 而两处都叫"预算"。
+ *   ★ 取值: 拍长 40000 cyc，取 **80% = 32000**（留 8000 cyc = 20µs 余量给热重载那一拍
+ *     与协议/顺序/传感域）。范本 `core0_isr.c` 的同名量是 **20000/24000 = 83%** ——
+ *     同一个口径(留余量), 数值各按各的拍长。 */
+#define EXEC_BUDGET_CYCLES   32000u
 
 /* 本平台实测的**最贵原语**成本 (PID, 见 engine.c 的 k_op_cost_itcm)。
  * 改原语表/新增更重的原语时必须同步更新 —— 它参与下面那条绊线断言。 */

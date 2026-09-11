@@ -377,6 +377,9 @@ OBS uint32_t g_isr_cyc_min  = 0xFFFFFFFFu;
 OBS uint32_t g_isr_cyc_max  = 0;
 OBS uint64_t g_isr_cyc_sum  = 0;
 OBS uint32_t g_isr_n        = 0;
+OBS uint32_t g_isr_overrun  = 0;   /* 本 RUN 段内 ISR 超预算(EXEC_BUDGET_CYCLES)的次数。
+                                    * ★ 审查二级 #5: 它此前"不存在"——0x38 里直接填 0。
+                                    *   权威值在 DTCM, 主循环镜像到 SHM 0x3850 (与范本同址)。 */
 
 /* ── 拍周期 (相邻 ISR 入口 CYCCNT 差) ── */
 OBS uint32_t g_per_cyc_last = 0;
@@ -506,6 +509,8 @@ static inline void stats_reset(void)
     g_isr_cyc_max  = 0;
     g_isr_cyc_sum  = 0;
     g_isr_n        = 0;
+    g_isr_overrun  = 0;   /* ★ 与范本同语义: 超预算计数只反映**本次 RUN 段**
+                           *   (S3 在 core0_engine_start 里清 OVERRUN, 这边在 stats_reset 清) */
 
     g_eng_routes_last  = 0;
     g_eng_routes_total = 0;
@@ -716,6 +721,15 @@ ISR_PLACE void TIM2_IRQHandler(void)
             if (di > g_isr_cyc_max) g_isr_cyc_max = di;
             g_isr_cyc_sum += di;
         }
+        /* ★★ 审查二级 #5: 超预算计数 (原实现是"在 0x38 里直接填 0"冒充"没超预算")。
+         *   为什么必须有它: S3 套件 T9 的判据含 `ov == 0` —— 而"恒 0"的字段让它
+         *   **不可能失败** ⇒ 那半条是**空判据**。一个永远为 0 的观测量看起来像
+         *   "这个分支很干净", 实际是"从没被走到"(本项目对空判据的既有教训)。
+         *   ★ 判据与常量: EXEC_BUDGET_CYCLES=32000 (拍长 40000 的 80%)。
+         *     它与 EXEC_DEPLOY_BUDGET(26000, 下载期静态门) 是**两个语义不同的量**,
+         *     刻意分开命名 —— 见 engine.h 里那段"一常量两用"的说明。
+         *   ★ 成本: 一次比较 + 极少发生的自增 ⇒ 热路径可忽略。 */
+        if (di > EXEC_BUDGET_CYCLES) g_isr_overrun++;
         /* ★★ #2 修复: samples (g_isr_n) = **仅 RUN 拍** (范本语义)。
          *   范本 `core0_isr.c:358` 的 `SAMPLES += 1` 写在 `if (!run) return` **之后**
          *   —— 即 OA13 "统计只反映本次 RUN 段"; 而且 0x38 的 samples 正是取自它
@@ -1379,7 +1393,10 @@ static void h_engine_status(void)
      *   **引擎是否在跑**; 而 H723 特有的 gate 移到尾部扩展 (一个都不丢)。 */
     r[22] = SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN) ? 1u : 0u;   /* = S3 的 `run` */
     put32(r + 23, g_shm_addr);   /* SHM 地址 (供上位机发现) */
-    put32(r + 27, 0u);           /* overrun: H723 暂未实现超预算计数 (列未决) */
+    put32(r + 27, g_isr_overrun); /* ★ 审查二级 #5: 超预算次数 —— 真计数。
+                                   * 原实现是 `0u` + 注释"暂未实现", 使 S3 套件 T9 的
+                                   * `ov == 0` 那半条**不可能失败** (空判据)。
+                                   * 现在配了能失败的对照: FLASH 取指 + 全表扫 ⇒ 会超。 */
     /* ---- H723 尾部扩展 (byte 31 起; 前 31 字节布局**与语义**均与 S3 一致) ---- */
     r[31] = (uint8_t)(g_deploy_seq);  r[32] = (uint8_t)(g_deploy_seq >> 8);
     r[33] = (uint8_t)(g_applied_seq); r[34] = (uint8_t)(g_applied_seq >> 8);
@@ -1990,6 +2007,7 @@ static void obs_anchor(void)
     sink ^= g_isr_cyc_last;               sink ^= g_isr_cyc_min;
     sink ^= g_isr_cyc_max;                sink ^= (uint32_t)g_isr_cyc_sum;
     sink ^= g_isr_n;                      sink ^= g_per_cyc_last;
+    sink ^= g_isr_overrun;                /* 审计二级 #5 的观测量 (不读会被回收) */
     sink ^= g_per_cyc_min;                sink ^= g_per_cyc_max;
     sink ^= g_per_prev;                   sink ^= g_dwt_overhead;
     sink ^= g_per_glitch_n;
@@ -2395,6 +2413,9 @@ int main(void)
         SHM_U32(g_shm, OFF_TIMING_EXEC_MAX)    = g_isr_cyc_max;
         SHM_U32(g_shm, OFF_TIMING_LAST_PERIOD) = g_per_cyc_last;
         SHM_U32(g_shm, OFF_TIMING_LAST_EXEC)   = g_isr_cyc_last;
+        /* ★ 0x3850 与范本**同址** —— 它不在上面 0x18..0x33 这一块里 (那里已排满,
+         *   0x34 起是保留的 GPIO_MASK), 是照 S3 的独立位置放的。 */
+        SHM_U32(g_shm, OFF_TIMING_OVERRUN)     = g_isr_overrun;
         g_active_routes = engine_active_routes(g_shm);
 
         /* 通信域读区镜像: wire[0..63] 工程量 → MB_HOLD, **每 10ms 刷一次**。
