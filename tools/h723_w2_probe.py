@@ -36,6 +36,19 @@ h723_w2_probe.py — W2 Force 的**免串口**固件侧验证 (pyocd 单会话�
     python tools/h723_w2_probe.py --w 7          # 换被测 wire
     python tools/h723_w2_probe.py --spin 5       # 每个用例跑 5ms
 """
+
+# ★ Windows 控制台默认 GBK: 脚本自己 print 出来的个别字符 (⇒ / ✓ 等) 会以
+#   UnicodeEncodeError **直接崩掉整个脚本** —— 数据都量到了, 却崩在"打印结论"这一步,
+#   症状看起来像"脚本坏了"而不是"编码问题"。⇒ 统一在入口把 stdout 的错误策略改成
+#   "永不抛" (换成 ?), 让验收脚本不可能因为自己的输出而失败。
+#   (2026-09-11 实测: audit_m234 / w1 真的这么崩过一次, 整份结果都没打出来。)
+import sys as _sys_enc
+try:
+    _sys_enc.stdout.reconfigure(errors="replace")
+    _sys_enc.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
 import argparse
 import os
 import struct
@@ -111,7 +124,7 @@ def main():
     SPIN = args.spin
 
     syms = nm_syms()
-    need = ["g_shm", "g_eng_ticks"]
+    need = ["g_shm", "g_eng_ticks", "g_table_profile", "g_reinit"]
     missing = [s for s in need if s not in syms]
     if missing:
         print("!! 符号缺失:", missing)
@@ -155,12 +168,27 @@ def main():
         rd(A_TICKS)
         marks[tag] = (start, 5)
 
-    # ── 起手: 复位 → 让 main 跑完 → 确认上电默认态 ──
+    # ── 起手: 复位 → 让 main 跑完 → **显式建立前提** ──
+    # ★★ 为什么要"显式建立"而不是"假定上电就是这样" (2026-09-11 实测的假故障):
+    #   固件上电时: **无**持久化配置 → RUN=1 (bench 态, 表 = BOOT_PROFILE);
+    #                **有**持久化配置 → **保持 STOP** (安全语义: 执行器不许无人监督上电即动)。
+    #   所以本套件只要排在 T15/T26/persist 这些"写过 flash"的用例后面, 就会**全线失败**
+    #   (实测 13 PASS → 6 PASS), 而失败原因与它要测的 Force 语义毫无关系 —— 是前提没建立。
+    #   ⇒ 前提由脚本自己负责: 写 RUN=1 (pyocd 侧 = 0x11 START 的等价物) + 让主循环按
+    #     bench profile 重填表 (与"无持久化配置"上电态一致)。两步都走**真固件机制**
+    #     (g_reinit 是主循环的正式入口), 不是造假数据。
+    #   ★ 但"写过了" ≠ "生效了": 下面 PRE 判据要求 N_ROUTES 真的变成 bench 值,
+    #     T0 要求 ticks 真的在长 —— 与 A1 事故同一条纪律。
+    PROFILE_BENCH = 0                     # BOOT_PROFILE 默认 0 (全 DIRECT)
     cs.append("reset halt")
     cs.append("sleep 300")
     cs.append("go")
     cs.append("sleep 400")          # 足够跑完 main (时钟+表+拍+协议)
     cs.append("halt")
+    cs.append("write8  0x%08X 1" % A_RUN)       # 引擎 RUN
+    cs.append("write32 0x%08X %d" % (syms["g_table_profile"], PROFILE_BENCH))
+    cs.append("write32 0x%08X 1" % syms["g_reinit"])   # 主循环重填表
+    cs.append("go"); cs.append("sleep %d" % SPIN); cs.append("halt")
     snap("P0")                      # 上电默认态 (无 force)
 
     # ── A: 阳性对照 —— 不强制, wire[W] 必须稳定非零 (引擎在写它) ──
@@ -265,6 +293,11 @@ def main():
         return abs(x - y) < eps
 
     print("-- 判据 --")
+    record("PRE 前提: 本脚本已显式建立 (RUN=1 + bench profile 重填表)",
+           (p0_nr & 0xFFFF) == MAX_WIRES,
+           "表=%d 条 (期望 bench 的 %d)。FAIL 说明 g_reinit/g_table_profile 路线没生效; "
+           "要手工回到 bench 上电态: python tools/h723_persist.py --wipe"
+           % (p0_nr & 0xFFFF, MAX_WIRES))
     record("T0 引擎在跑 (ticks 增长)",
            d1_tk > p0_tk and p0_tk > 0,
            "P0=%d -> D1=%d" % (p0_tk, d1_tk))

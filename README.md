@@ -197,6 +197,22 @@ bash build.sh -DDCL_PA9_MODE=0           # 回退到阶段 1 的 PA9 方波 (线
 # ★ 阶段 3.2 deploy 专用
 python tools/h723_op_sweep.py --dur 0.3 --json build/op_cost.json   # 逐原语成本 (约 30s)
 bash build.sh -DDCL_DEPLOY_SELFTEST=1    # 上电跑 deploy 自检 (9 例, 用 SWD 读结果)
+
+# ★ 验收套件 (10 套, 177 PASS / 0 FAIL —— 名单见 docs/STATUS-2026-09-11.md)
+python tools/h723_audit_m234.py     # 外部审计 M2/M3/M4 + P3      12/12
+python tools/h723_proto.py          # 协议层 (需 CH340 接线)        12/12
+python tools/h723_w1.py             # 运行控制 + SHM 读写          28/28
+python tools/h723_w2_probe.py       # W2 Force (pyocd, 免串口)      14/14
+python tools/h723_seq.py            # W3 顺序域                    27/27
+python tools/h723_persist.py        # W2.4 掉电保持 (会写 flash)    26/26
+python tools/h723_modbus.py         # W4 Modbus RTU                15/15
+python tools/h723_macro.py          # W5.1 macro VM                18/18
+python tools/h723_w5.py             # W5 外设域 (DI/AI/HIL)        14/14
+python tools/h723_t26.py            # ★ PERSISTENT 落盘 (T26)      11/11
+
+# ★ A/B: 擦除期间丢拍 (证明"判据能失败")
+bash build.sh -DDCL_VTOR_ITCM=0 && pyocd flash ... && python tools/h723_tick_erase.py  # 应报缺口
+bash build.sh                  && pyocd flash ... && python tools/h723_tick_erase.py  # 应报 0
 ```
 
 ### 串口接线（PC 直连）
@@ -275,17 +291,24 @@ bash build.sh -DDCL_DEPLOY_SELFTEST=1    # 上电跑 deploy 自检 (9 例, 用 S
 1. ✅ UART + 协议帧 —— 真实串口 12/12（BRR 错 16 倍已修, 见 `docs/FIX-REPORT-usart1-brr.md`）
 2. ✅ deploy 路径 —— 成本表本平台实测 / STAGING 归组 / ISR 原子热重载 ≤1 拍 / "已生效"可观测
 3. ✅ persist —— 裸 Flash 双副本 A/B, 26/26; PERSISTENT = 运行期 0 flash 操作
-4. 🟡 **S3 回归平移（20 套, 脚本零改动）—— 21/30 通过**（提交 `c5d78c0`）
-   - 分布: **21 PASS / 7 项 S3 平台专属 N/A / 2 项真缺口**
+4. 🟢 **S3 回归平移（20 套, 脚本零改动）—— 22/30 通过**（2026-09-11 16:xx）
+   - 分布: **22 PASS / 7 项 S3 平台专属 N/A / 1 项半可修**
      - N/A: T3(DHT22) · T5 shell ×2 · T11 fs · T8/T14b/T23（都读 ESP32 GPIO 寄存器
        `0x60004004`; H723 的 GPIO 在 `0x5802xxxx` 且寄存器布局不同 —— 伪造 S3 地址 = 造假）
+     - **半可修 T15**: 落盘半段已绿（`持久化=ok`）; 重启半段需**真实复位**, 而 CH340 的 RTS
+       **没接到 NRST**（实测 RTS 翻转后 samples 20031→31602 继续增长）⇒ **手按板上 RST**
+       或补一根 RTS→RST 的线。不为过测伪造重启证据。
    - 已修: **T9** RESET 清 timing 统计 · **T17** div2 档周期 64→**100 拍 = 10ms**
      （旧值是误修, 见 `engine.h` 的 `BUCKET_DIV2_PHASES` 说明）· **T18** 补跨档速率检查
      · 新增与 S3 **同址**的 `OFF_TICK_STATS = 0x3854`
-   - ⏳ 未修: **T15 / T26** —— 根因已钉死 = H723 缺 S3 的 `persist_task`
-     （"deploy 登记 dirty → 引擎停机窗口自动落盘"; H723 只有 0x43 显式落盘与
-     `g_persist_req` 两条路）。两次尝试（定时重试 / 闩锁）都让套件 21/30 → **5/30** 并已回退
-     ⇒ 问题在"**从主循环发起 flash 擦写**"这条路径本身, 需先最小复现
+   - ✅ **T26 已修**（原 2 项真缺口 → 1 项）: 前三次"固件自己按时间猜落盘窗口"全部回退
+     （每次都 21/30 → 5/30）。本次**换掉触发权归属** —— 由上位机的**纯查询型 0x43** 登记、
+     主循环裁决（RUN 则放弃）: `g_persist_auto{,_runs,_gate}` 全部可读回。
+     ⇒ T26 11/11 聚焦验收（`tools/h723_t26.py`）; 详见 `docs/FIX-REPORT-T26-persist-flush.md`
+   - ★ 配套修掉的结构性缺陷: **中断向量表原在 FLASH** ⇒ sector erase 会 stall 取向量,
+     擦除期间中断根本进不来。搬进 ITCM + 设 `VTOR`。A/B 实测（`tools/h723_tick_erase.py`,
+     `-DDCL_VTOR_ITCM=0/1`）: **留 FLASH 丢 8153 拍 / 进 ITCM 丢 0 拍** ——
+     对照组真能报出缺口, 所以交付版的"零拍丢失"才算证据。
    - 跑法: `cd ../esp32-core0/tools && python test_dcl.py COM14`（**S3 脚本未改一行**）
 
 **阶段 4（四域补齐）**　✅ **3 / 3 完成**

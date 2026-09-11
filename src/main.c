@@ -53,6 +53,7 @@
 #include "persist.h"
 #include "modbus.h"
 #include "macro.h"
+#include "lsym.h"
 #include "adc.h"
 #include "di.h"
 #include "hil.h"
@@ -152,6 +153,13 @@ OBS uint32_t g_shm_addr    = 0;    /* g_shm 实际地址 (应为 0x2000xxxx) */
 OBS uint32_t g_scan_itcm_addr = 0; /* ITCM 版扫描函数地址 (应 < 0x10000) */
 OBS uint32_t g_scan_flash_addr= 0; /* FLASH 版扫描函数地址 (应 ≥ 0x08000000) */
 
+/* ── 向量表落位 (2026-09-11 T26 配套修复) ──
+ * 读回 SCB->VTOR。判据: 启动后应 = _vtor_itcm (ITCM 域, < 0x10000),
+ * 而**不是** 0x08000000 (flash)。外部工具用这个量证明"擦除期间拍不丢"的
+ * 前提条件成立 —— 与 g_isr_itcm 同族的"承诺必须能被读走"。 */
+OBS uint32_t g_vtor          = 0;
+OBS uint32_t g_vtor_want     = 0;  /* 期望值 = _vtor_itcm 链接符号, 供外部比对 */
+
 /* ── 运行期选择器 (pyocd 写) ── */
 OBS uint32_t g_engine_gate    = 0;
 OBS uint32_t g_engine_sel     = 0;
@@ -245,6 +253,30 @@ OBS uint32_t g_persist_loads      = 0;   /* persist_load 调用次数 */
  *     也不依赖 obs_anchor (但保险起见仍登记)。 */
 OBS volatile uint32_t g_persist_req     = 0;   /* 写 1 → 主循环执行一次 persist_save */
 OBS uint32_t          g_persist_req_cnt = 0;   /* 实际受理的请求数 (与 writes 对账) */
+
+/* ── ★ 空闲窗口自动落盘 (T15/T26 修复, 2026-09-11) ──
+ * 两段式 (登记 / 裁决分开, 这样每一段都可被外部读回):
+ *   登记 (h_persist_w2): 收到**载荷为空**的 0x43 (纯查询) 且 dirty==1 → g_persist_auto=1
+ *   裁决 (主循环):       引擎 RUN? → g_persist_auto_gate++ (放弃, dirty 保持)
+ *                        否则     → persist_save() (g_persist_auto_runs++)
+ *
+ * ★ 为什么"由上位机问出来"而不是固件自己找窗口 (前三次 ①②③ 失败的根因):
+ *   裸机上唯一知道"现在能安全阻塞 ~1.5s"的是上位机 —— 它问 0x43 就是在等这个
+ *   结果 (S3 的 wait_flush 每 20ms 轮询一次)。固件自己按时间猜窗口 = 在别的
+ *   用例正忙着收发的时刻插进 1.5s 失聪 ⇒ 实测把套件从 21/30 打到 5/30。
+ *   ★ 本方案**不做任何自由重试**: 没被问就绝不落盘; 被问一次最多落一次
+ *     (成功后 dirty 清零, 后续查询不再触发)。影响面 = 套件里全部 5 个 0x43 调用点。
+ *
+ * ★ 与"不能阻塞引擎"的关系: ENGINE_RUN==0 是**硬前提** —— 落盘只发生在引擎不跑的
+ *   窗口, 所以不存在"落盘把拍卡住"这回事。另外向量表已搬进 ITCM (见 main() 开头),
+ *   即使 ISR 在这 1.5s 里被触发也取得到向量 (g_vtor 提供可读回的判据)。
+ * ★ 实测 (2026-09-11, tools/h723_tick_erase.py, 每 100ms 采拍计数 / 标称 1000 拍每槽):
+ *   停引擎 → 请求落盘 → 全程无 Δ=0, 丢 **0** 拍;
+ *   同一方法打 -DDCL_VTOR_ITCM=0 (向量表留 flash) 的对照 → 连续 8 槽 Δ=0, 丢 **8153** 拍。
+ *   ⇒ "零缺口"是**对照出来的**, 不是"我记得改前是什么"。 */
+OBS volatile uint32_t g_persist_auto      = 0;  /* 1 = 待裁决的自动落盘请求 (h_persist_w2 置) */
+OBS uint32_t          g_persist_auto_runs = 0;  /* 自动落盘实际执行次数 */
+OBS uint32_t          g_persist_auto_gate = 0;  /* 因 RUN 而放弃的次数 (T26 "RUN 中被问" 的证据) */
 /* ★★★ 自动落盘 (S3 `persist_task` 语义) —— **已试三次, 全部回退, 别急着重做** (2026-09-11):
  *   需求: S3 的语义是 "deploy 只登记 dirty → 引擎停机窗口由**后台**落盘"。H723 原先只有
  *   0x43 显式落盘与 g_persist_req 两条路 ⇒ S3 套件 T15/T26 "deploy 后等 dirty 被清" 超时。
@@ -350,6 +382,7 @@ OBS uint32_t g_per_cyc_last = 0;
 OBS uint32_t g_per_cyc_min  = 0xFFFFFFFFu;
 OBS uint32_t g_per_cyc_max  = 0;
 OBS uint32_t g_per_prev     = 0;
+OBS uint32_t g_per_glitch_n = 0;   /* 时钟不连续 (CYCCNT 回绕/被清零) 导致的无效样本数 */
 
 /* ── 阶段 3.2: deploy / 热重载 观测量 ──
  * ★ 必须声明在 ISR **之前** (ISR 里要用) —— 这几个量构成 deploy 的可失败判据:
@@ -477,7 +510,9 @@ static inline void stats_reset(void)
     g_eng_routes_total = 0;
     g_eng_ticks        = 0;
 
-    /* 拍周期也复位 (★ 保留 g_per_prev —— 它保证复位后第一个样本仍然有效) */
+    /* 拍周期也复位 (★ 保留 g_per_prev —— 它保证"本轮内"复位后第一个样本仍然有效;
+     *  ★ 但**跨轮**(冷启动) 处调用方必须自己把 g_per_prev 也清 0, 因为 dwt_enable
+     *    刚把 CYCCNT 清零 —— 见 main() 里 "计时统计的冷启动初始化" 那段实测记录) */
     g_per_cyc_last = 0;
     g_per_cyc_min  = 0xFFFFFFFFu;
     g_per_cyc_max  = 0;
@@ -648,16 +683,38 @@ ISR_PLACE void TIM2_IRQHandler(void)
         uint32_t di = t1 - t0;
         g_isr_cyc_last = di;
         if (!g_isr_cyc_first) g_isr_cyc_first = di;    /* ★ 首样本留痕 (H5) */
-        if (di < g_isr_cyc_min) g_isr_cyc_min = di;
-        if (di > g_isr_cyc_max) g_isr_cyc_max = di;
-        g_isr_cyc_sum += di;
+        /* ★ 同族保护 (见下方 g_per_* 处的长注释): `di == 0` 意味着"整段 ISR 期间
+         *   CYCCNT 一个数都没走" —— 对真实 ISR 是不可能的, 只可能是**时钟不连续**
+         *   (CYCCNT 在本次 ISR 中间被清零/跨纪元)。并进 min 会让 emin 恒为 0
+         *   (实测就是这样), 即"最小 ISR 时长"这个量在撒谎。⇒ 单独计数。 */
+        if (di == 0u) {
+            g_per_glitch_n++;
+        } else {
+            if (di < g_isr_cyc_min) g_isr_cyc_min = di;
+            if (di > g_isr_cyc_max) g_isr_cyc_max = di;
+            g_isr_cyc_sum += di;
+        }
         g_isr_n++;
 
         if (g_per_prev) {
             uint32_t p = t0 - g_per_prev;
-            g_per_cyc_last = p;
-            if (p < g_per_cyc_min) g_per_cyc_min = p;
-            if (p > g_per_cyc_max) g_per_cyc_max = p;
+            /* ★★★ 时钟不连续保护 (2026-09-11 实测缺陷修复):
+             *   这批量住在 **DTCM, 跨复位不丢**, 而 `dwt_enable()` 会把 **CYCCNT 清零**
+             *   ⇒ 新"纪元"的第一个样本 = `t0(≈0) - g_per_prev(上一纪元的值)` = **负增量**
+             *   (无符号看是个十亿级的巨值)。原实现直接并进 max ⇒ **统计被永久污染**。
+             *   实测指纹 (冷启动后直接读 0x38, 没发任何命令):
+             *     pmin = 39992 (正常)  而  pmax = 0xFD68B1BF (= -43550622, 垃圾)
+             *   —— "pmin 正常而 pmax 垃圾"这个组合就是它。
+             *   ★ 判据: **负增量 = 时钟不连续, 不是"拍变长了"**。合法的拍变长一定是
+             *     正数 (超载也只在几十万 cyc 量级, 见 budget 表)。所以负的单独计数,
+             *     不并入 min/max —— 保留了"异常发生过"的证据, 又不让它冒充测量结果。 */
+            if (p & 0x80000000u) {
+                g_per_glitch_n++;
+            } else {
+                g_per_cyc_last = p;
+                if (p < g_per_cyc_min) g_per_cyc_min = p;
+                if (p > g_per_cyc_max) g_per_cyc_max = p;
+            }
         }
         g_per_prev = t0;
     }
@@ -1632,6 +1689,18 @@ static void h_persist_w2(const uint8_t *p, uint32_t n)
     r[15] = (uint8_t)((g_persist_last_err >> 8) & 0xFFu);
     put32(r + 16, crc);
     put32(r + 20, g_persist_writes);
+
+    /* ★ 空闲窗口自动落盘 (T15/T26): 上位机**纯查询**(mode==0)且报了 dirty ⇒ 登记一次
+     *   "落盘请求"; 真正的**裁决**在主循环 (那里才知道引擎跑不跑)。
+     *   ★★ 刻意**不在登记处**就排除 RUN 态 (第一版这么写, 结果 g_persist_auto_gate
+     *     恒为 0 —— 一个**不可能失败**的判据, 等于没测)。把裁决留给主循环之后,
+     *     T26 "RUN 中被问两次都放弃" 这件事本身就有了可读回的证据。
+     *   ★ 顺序是硬要求: 只登记, 不落盘 —— 本 ACK 必须**先完整移出**
+     *     (uart1_write 等 TC 才返回), 主循环随后才动手。反过来的顺序 (先擦再答)
+     *     会把这帧 ACK 卡在 erase 的 1.5s 里 → PC 侧第一帧就是丢帧, wait_flush 直接失败。 */
+    if (mode == 0u && g_persist_dirty) {
+        g_persist_auto = 1;
+    }
     ack(r, 24);
 }
 
@@ -1859,6 +1928,7 @@ static void obs_anchor(void)
     sink ^= g_isr_itcm;                   sink ^= g_shm_ok;
     sink ^= g_shm_addr;                   sink ^= g_scan_itcm_addr;
     sink ^= g_scan_flash_addr;            sink ^= g_reinit_done;
+    sink ^= g_vtor;                       sink ^= g_vtor_want;
     sink ^= g_table_ck;                   sink ^= g_active_routes;
     sink ^= g_guard_ok;                   sink ^= g_guard_bad_off;
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
@@ -1877,6 +1947,7 @@ static void obs_anchor(void)
     sink ^= g_isr_n;                      sink ^= g_per_cyc_last;
     sink ^= g_per_cyc_min;                sink ^= g_per_cyc_max;
     sink ^= g_per_prev;                   sink ^= g_dwt_overhead;
+    sink ^= g_per_glitch_n;
     sink ^= g_cal_n1000;                  sink ^= g_icache_req;
     sink ^= g_icache_on;                  sink ^= g_ccr_before;
     sink ^= g_ccr_after;                  sink ^= g_scan_mode;
@@ -1919,6 +1990,8 @@ static void obs_anchor(void)
     sink ^= g_persist_loaded_n; sink ^= g_persist_loaded_sec;
     sink ^= g_persist_loads;
     sink ^= g_persist_req;      sink ^= g_persist_req_cnt;
+    sink ^= g_persist_auto;     sink ^= g_persist_auto_runs;
+    sink ^= g_persist_auto_gate;
     sink ^= g_fl_err_stage;     sink ^= g_fl_err_sr1;
     sink ^= g_fl_err_cr1;       sink ^= g_fl_err_cnt;
     /* W2.4 persist 观测面 (persist.c 侧 —— 这些是 extern, 不读会被 gc-sections 回收) */
@@ -1974,7 +2047,44 @@ void SystemInit(void)
 
 int main(void)
 {
-    pin_out_init(TICK_PORT, TICK_BIT);
+    /* ★★★ 向量表搬进 ITCM + VTOR 指过去 —— **必须在使能任何中断之前** (见 ld 里的说明)。
+     *   动机 (2026-09-11 实测): VTOR 原值 = 0x08000000 (flash), 而 **sector erase 会 stall
+     *   flash 取指** ⇒ 擦除期间**中断根本进不来** —— 100μs 拍被整段吞掉。
+     *   "ISR 代码已在 ITCM"不够: **取向量这一步本身也要过 flash**。
+     *   改法: 把 flash 里的向量表 (.isr_vector, 由 _siv/_eiv 界定) 拷进 ITCM 副本区
+     *   (.itcm_vectors), 再把 SCB->VTOR 指过去 ⇒ 取向量零等待, 引擎的拍与 flash 操作解耦。
+     *
+     * ★ -DVTOR_ITCM=0 是**对照构建** (留在 flash, 即改前行为), 只为证明
+     *   "擦除期间丢拍"这个判据真能失败 —— 详见 tools/h723_t26.py 头注释里的实测数字。
+     *   交付默认恒为 1 (build.sh 每次显式传)。 */
+    pin_out_init(TICK_PORT, TICK_BIT);   /* ★ 放在 #if 之外: 两份构建都要用它点灯报错,
+                                          *   放进去会让对照组报 -Wunused-function */
+#if VTOR_ITCM
+    {
+        uint32_t n4 = (uint32_t)((LSYM_ADDR(_eiv) - LSYM_ADDR(_siv)) / 4u);
+        uint32_t cap4 = (uint32_t)((LSYM_ADDR(_evtor_itcm) - LSYM_ADDR(_vtor_itcm)) / 4u);
+        volatile uint32_t *src = (volatile uint32_t *)LSYM_ADDR(_siv);
+        volatile uint32_t *dst = (volatile uint32_t *)LSYM_ADDR(_vtor_itcm);
+        g_vtor_want = (uint32_t)LSYM_ADDR(_vtor_itcm);
+        /* ★ 判据必须能失败: 目标区装不下就点灯停机, 而不是"静默只拷一部分"
+         *   (截断的向量表 = 部分中断跑飞, 比整体不启动更难查)。TICK 脚上面已初始化。 */
+        if (n4 == 0u || n4 > cap4) {
+            g_boot_status = -100;      /* 记因: 向量表 > ITCM 副本区 */
+            g_stage = 0xFFu;
+            blink_error(100);           /* 不返回 */
+        }
+        for (uint32_t i = 0; i < n4; i++) dst[i] = src[i];
+        __asm__ volatile("dsb" ::: "memory");
+        *((volatile uint32_t *)0xE000ED08UL) = (uint32_t)LSYM_ADDR(_vtor_itcm);
+        __asm__ volatile("dsb; isb" ::: "memory");
+        g_vtor = *((volatile uint32_t *)0xE000ED08UL);   /* 观测面: 供外部读回核对 */
+    }
+#else
+    /* 对照构建: 什么都不搬, 只把 VTOR 的**实际值**读出来当观测面
+     * (默认 = 0x08000000)。这样 A/B 两份固件用同一个判据读数 —— 不是靠"我记得改前是什么"。 */
+    g_vtor_want = 0u;
+    g_vtor      = *((volatile uint32_t *)0xE000ED08UL);
+#endif
 #if PA9_MODE == 0
     pin_out_init(UARTT_PORT, UARTT_BIT);
 #endif
@@ -2054,6 +2164,22 @@ int main(void)
     /* ④ DWT 标定 */
     dwt_enable();
     calibrate();
+    /* ★★★ 计时统计的**冷启动初始化** (2026-09-11 实测缺陷修复):
+     *   这批量 (`g_isr_n` / `g_isr_cyc_*` / `g_per_cyc_*` / `g_per_prev`) 住在 **DTCM**,
+     *   而 DTCM **跨复位不丢** ⇒ 不在这里清, 它们就是**上一轮启动的残留**, 会与本轮的
+     *   数字混在一起。实测症状 (`0x38` 直接读, 没发任何命令):
+     *     pmin=39992 (正常) 但 **pmax=0xFD68B1BF (4.25e9, 垃圾)**, emin=0
+     *   —— 机制很具体: `dwt_enable()` 把 **CYCCNT 清零**, 而上一轮留下的 `g_per_prev`
+     *   是个大数, 于是本轮**第一个周期样本** = `0 - g_per_prev` = 一个巨值, 被 pmax
+     *   永久记住。**pmin 正常而 pmax 垃圾**这个组合就是它的指纹。
+     *   ★ 为什么 g_per_prev 也要清 (而 `stats_reset()` 刻意保留它):
+     *     在**一轮之内**保留它是对的 (RESET 后第一个样本仍有效); 但在**跨轮**处它必须
+     *     归零 —— 因为 CYCCNT 刚被清零, 保留的旧值属于"上一个纪元", 相减没有意义。
+     *   ⇒ 冷启动 = 两个钟一起归零 (CYCCNT 与 g_per_prev 同起点)。
+     *   ★ 顺带的好处: `samples`/`g_tick_count` 之外的统计也从每轮 0 起, 与"S3 判据
+     *     `samples` 必须小于复位前"的口径一致 (此前靠 CMD_RESET 清, 上电路径没清)。 */
+    stats_reset();
+    g_per_prev = 0;
     g_stage = 6;
 
     /* ⑤ 100μs 拍 */
@@ -2131,11 +2257,32 @@ int main(void)
             else if (rc == 0) g_persist_saves++;
             else              g_persist_nak++;
         }
-        /* ★★★ 自动落盘 (S3 persist_task 语义) —— **已试三次, 全部回退**: 见 g_persist_req_cnt
-         *   上方的完整记录。实测结论: 功能正确 (dirty 会清), 但每次落盘有 **~1.5s 的失聪窗口**
-         *   —— 因为 sector erase 会 stall 从 flash 取指, 而命令服务路径在 flash 里。
-         *   这是**结构性**问题, 不是重试策略问题 ⇒ 要做得先把擦写改成非阻塞状态机
-         *   (或把命令服务路径放进 ITCM)。别再原样重试第四次。 */
+        /* ★★★ 空闲窗口自动落盘 (S3 persist_task 语义) —— T15/T26 修复
+         *   ── 完整的三次失败记录在 g_persist_req_cnt 上方, 别原样重试第四次 ──
+         *   实测结论: 功能正确 (dirty 会清), 但每次落盘有一段失聪窗口
+         *   (sector erase stall flash 取指, 而命令服务路径在 flash)。
+         *   前三次都是**固件自己按时间猜窗口** ⇒ 猜错就打崩别的用例 (21/30 → 5/30)。
+         *   本次改成**由上位机问出来** + **裁决在这里**:
+         *     · 登记 (h_persist_w2): 收到**纯查询型** 0x43 且 dirty==1 → g_persist_auto=1
+         *       —— 那就是上位机正在等这个结果的窗口 (S3 wait_flush 每 20ms 轮询)。
+         *     · 裁决 (本处): RUN ⇒ 放弃并计数; 否则落盘。
+         *   ★ 裁决刻意不放在登记处 (第一版放那里 ⇒ "因 RUN 放弃"的计数恒为 0, 判据变空)。
+         *   ★ 位置必须在这里: proto_poll 已返回 ⇒ 那条 ACK 已完整移出 (uart1_write 等 TC),
+         *     失聪窗口落在 ACK 之后, 不会污染 PC 侧看到的第一帧。
+         *   ★ 引擎保护有两层: 这里先查一次 (为了分类计数), persist_save 内部再查一次
+         *     (PERSISTENT 硬门, 与 S3 同款) —— 不依赖调用方守规矩。 */
+        if (g_persist_auto) {
+            g_persist_auto = 0;
+            if (!g_persist_dirty || SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN)) {
+                g_persist_auto_gate++;      /* RUN 态被问到 → 放弃 (T26 的 still_pending 靠它) */
+            } else {
+                g_persist_auto_runs++;
+                int rc = persist_save(g_shm);
+                if (rc == 1)      g_persist_skip_run++;
+                else if (rc == 0) g_persist_saves++;
+                else              g_persist_nak++;
+            }
+        }
 
         /* ★ W3: 免串口**协议帧**请求 (pyocd 直写暂存区 + g_cmd_req)。
          *   走**真实的 proto_dispatch** (与串口收到的帧完全同一条路径) —— 见

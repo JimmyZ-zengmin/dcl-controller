@@ -27,6 +27,19 @@ T3  往返延迟随字节数线性增长 (参考, 不计分)
 哨兵用 (i*37+11)^0x5A 生成的伪随机序列, "恰好收到" 的概率可忽略,
 且长度 8/32/128 三轮不同, 避免把"只通了第一个字节"误判为全通。
 """
+
+# ★ Windows 控制台默认 GBK: 脚本自己 print 出来的个别字符 (⇒ / ✓ 等) 会以
+#   UnicodeEncodeError **直接崩掉整个脚本** —— 数据都量到了, 却崩在"打印结论"这一步,
+#   症状看起来像"脚本坏了"而不是"编码问题"。⇒ 统一在入口把 stdout 的错误策略改成
+#   "永不抛" (换成 ?), 让验收脚本不可能因为自己的输出而失败。
+#   (2026-09-11 实测: audit_m234 / w1 真的这么崩过一次, 整份结果都没打出来。)
+import sys as _sys_enc
+try:
+    _sys_enc.stdout.reconfigure(errors="replace")
+    _sys_enc.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
 import argparse
 import sys
 import time

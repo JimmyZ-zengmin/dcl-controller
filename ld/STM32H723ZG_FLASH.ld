@@ -32,12 +32,22 @@ MEMORY
 
 SECTIONS
 {
-  /* ---- 向量表 + 代码: 留在 FLASH (由 L1 I-cache 加速) ---- */
+  /* ---- 向量表: 实体留在 FLASH; **运行期拷进 ITCM 并把 VTOR 指过去** ----
+   * ★★ 为什么不就地留在 flash (2026-09-11 实测): VTOR 原值 = 0x08000000 (flash),
+   *   而 **sector erase 会 stall flash 取指** ⇒ 擦除期间**中断根本进不来** ——
+   *   100μs 拍被整段吞掉。"ISR 代码在 ITCM" 不够: **取向量这一步本身也在 flash**。
+   *   拷到 ITCM 后取向量零等待 ⇒ 引擎的拍与 flash 操作彻底解耦。
+   * ★ A/B 实证 (tools/h723_tick_erase.py, 擦除期间每 100ms 采拍计数, 标称 1000 拍/槽):
+   *     -DDCL_VTOR_ITCM=0 (留 flash): 第 7~14 槽 Δ=0, 累计丢 **8153** 拍
+   *     -DDCL_VTOR_ITCM=1 (本行以下): 全程无 Δ=0, 丢 **0** 拍
+   *   ⇒ 存量在 flash 的向量表就是"擦除期间整机失聪"的根因之一。 */
   .isr_vector : ALIGN(4)
   {
     . = ALIGN(4);
+    _siv = .;
     KEEP(*(.isr_vector))
     . = ALIGN(4);
+    _eiv = .;
   } >FLASH
 
   .text : ALIGN(4)
@@ -135,6 +145,20 @@ SECTIONS
     . = ALIGN(4);
     _eitcm = .;
   } >ITCM AT>FLASH
+
+  /* ---- ITCM: **向量表副本** (NOLOAD: 内容由 main() 在"使能任何中断之前"从 flash 拷入) ----
+   * VMA 紧跟 .itcm_text 之后 (128B 对齐 —— VTOR 的要求); 占 1KB
+   * (H723 有 16 系统 + ~150 IRQ 个向量 ≈ 664B, 留到 1KB 有余量)。
+   * ★ 为什么用 NOLOAD 而不是 AT>FLASH: 让**拷贝这件事在代码里显式可见**
+   *   (main() 里那几行), 而不是藏在启动文件的自动搬运循环里 —— 这段的顺序性
+   *   ("必须先拷再开中断") 是正确性要求, 值得写在一眼能看到的地方。 */
+  .itcm_vectors (NOLOAD) : ALIGN(128)
+  {
+    . = ALIGN(128);
+    _vtor_itcm = .;
+    . = . + 1024;
+    _evtor_itcm = .;
+  } >ITCM
 
   /* ---- DTCM: 已初始化数据 (.data), 装载地址在 FLASH ---- */
   .data : ALIGN(4)

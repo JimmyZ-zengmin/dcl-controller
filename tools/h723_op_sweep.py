@@ -26,6 +26,19 @@ h723_op_sweep.py — 逐原语成本实测（为 deploy 预算模型建立**本�
   python tools/h723_op_sweep.py --ops 0,5,0x12  # 指定原语
   python tools/h723_op_sweep.py --dur 0.4 --json build/op_cost.json
 """
+
+# ★ Windows 控制台默认 GBK: 脚本自己 print 出来的个别字符 (⇒ / ✓ 等) 会以
+#   UnicodeEncodeError **直接崩掉整个脚本** —— 数据都量到了, 却崩在"打印结论"这一步,
+#   症状看起来像"脚本坏了"而不是"编码问题"。⇒ 统一在入口把 stdout 的错误策略改成
+#   "永不抛" (换成 ?), 让验收脚本不可能因为自己的输出而失败。
+#   (2026-09-11 实测: audit_m234 / w1 真的这么崩过一次, 整份结果都没打出来。)
+import sys as _sys_enc
+try:
+    _sys_enc.stdout.reconfigure(errors="replace")
+    _sys_enc.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
 import argparse
 import importlib.util
 import json

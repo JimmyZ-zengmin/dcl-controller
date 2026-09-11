@@ -30,6 +30,16 @@ BUILD="$WIN_HERE/build"
 CMAKE="/c/Espressif/tools/cmake/4.0.3/bin/cmake.exe"
 NINJA="C:/Espressif/tools/ninja/1.12.1/ninja.exe"
 
+# ★★ Windows 下 GCC 的**中间文件** (.s/.o) 走 TMP/TEMP。若环境里 TEMP 指向
+#   `C:\WINDOWS` (普通权限写不进去), 构建会以**与代码完全无关**的症状失败:
+#       cc1.exe: fatal error: can't open 'C:\WINDOWS\ccXXXXXX.s' for writing: Permission denied
+#   这个症状极易被误判成"我刚改坏了代码" (2026-09-11 真的踩到一次, 排查方向被带偏)。
+#   ⇒ 显式把 TMP/TEMP 钉到工程 build/ 下: 构建结果不再依赖使用者环境的 TEMP 设置。
+#      (与本项目"每次显式传全部开关默认值"同一条纪律: 别依赖外部状态的默认值。)
+mkdir -p "$BUILD/tmp"
+export TMP="$WIN_HERE/build/tmp"
+export TEMP="$WIN_HERE/build/tmp"
+
 if [ "$1" = "clean" ]; then
     rm -rf "$HERE/build"
     echo "cleaned: $HERE/build  (含 CMakeCache —— 下次构建回到全默认)"
@@ -42,6 +52,7 @@ DEFAULTS=(
     -DDCL_BOOT_GATE=1
     -DDCL_BOOT_SEL=1
     -DDCL_BOOT_SCAN_MODE=0
+    -DDCL_VTOR_ITCM=1
     -DSCAN_FLASH_PAD=0
     -DDCL_PA9_MODE=1
     -DDCL_BOOT_BANNER=1

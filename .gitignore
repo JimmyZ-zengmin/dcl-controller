@@ -5,3 +5,8 @@ tmp_dap/
 
 # LA 导出临时文件 (h723_la_modbus.py 生成)
 tools/_la_modbus.txt
+
+# Python 字节码缓存 —— 可随时重生成, 且**每次跑套件都会被改写** ⇒ 纳入版本控制只会让
+# `git status` 永远脏, 掩盖真正的工作区改动 (本项目"零噪声"纪律的同款理由)。
+__pycache__/
+*.pyc

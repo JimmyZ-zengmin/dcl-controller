@@ -32,6 +32,10 @@ set(DCL_BOOT_GATE    "1" CACHE STRING "启动默认 engine_gate (0 骨架 / 1 �
 set(DCL_BOOT_SEL     "1" CACHE STRING "启动默认 engine_sel  (0 走FLASH / 1 走ITCM)")
 set(SCAN_FLASH_PAD   "0" CACHE STRING "engine_scan_flash 之前的填充字节数 (落位敏感实验)")
 set(DCL_BOOT_SCAN_MODE "0" CACHE STRING "启动默认 scan_mode (0 全表扫 / 1 分档调度)")
+# ★ 向量表落位 (T26 配套修复, 2026-09-11): 1 = 运行期搬进 ITCM 并设 VTOR (交付默认);
+#   0 = 留在 FLASH (改前行为) —— **只为 A/B 对照存在**: 用它证明"擦除期间丢拍"这个
+#   判据真的能失败 (同一套测量方法在 0 上必须量到缺口), 否则判据是空的。
+set(DCL_VTOR_ITCM    "1" CACHE STRING "向量表搬进 ITCM+设VTOR (1) / 留在FLASH 对照 (0)")
 
 # ---- 阶段 3.1 协议层开关 ----
 set(DCL_PA9_MODE       "1"      CACHE STRING "PA9 用途 (0 GPIO方波 / 1 USART1_TX)")
@@ -67,6 +71,7 @@ add_compile_options(
     -DBOOT_SEL=${DCL_BOOT_SEL}
     -DSCAN_FLASH_PAD=${SCAN_FLASH_PAD}
     -DBOOT_SCAN_MODE=${DCL_BOOT_SCAN_MODE}
+    -DVTOR_ITCM=${DCL_VTOR_ITCM}
     -DPA9_MODE=${DCL_PA9_MODE}
     -DBOOT_BANNER=${DCL_BOOT_BANNER}
     -DBANNER_PERIOD_MS=${DCL_BANNER_PERIOD}

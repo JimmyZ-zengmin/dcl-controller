@@ -18,6 +18,19 @@ h723_macro.py — W5 外设域: macro 字节码 VM 验收 (0x40 / 0x41 / 0x42)
     python tools/h723_macro.py            # 默认自动找 CH340 口
     python tools/h723_macro.py --port COM14
 """
+
+# ★ Windows 控制台默认 GBK: 脚本自己 print 出来的个别字符 (⇒ / ✓ 等) 会以
+#   UnicodeEncodeError **直接崩掉整个脚本** —— 数据都量到了, 却崩在"打印结论"这一步,
+#   症状看起来像"脚本坏了"而不是"编码问题"。⇒ 统一在入口把 stdout 的错误策略改成
+#   "永不抛" (换成 ?), 让验收脚本不可能因为自己的输出而失败。
+#   (2026-09-11 实测: audit_m234 / w1 真的这么崩过一次, 整份结果都没打出来。)
+import sys as _sys_enc
+try:
+    _sys_enc.stdout.reconfigure(errors="replace")
+    _sys_enc.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
 import argparse
 import struct
 import sys
