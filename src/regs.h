@@ -264,6 +264,30 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
 #define USART_TDR(u)    REG32((u) + 0x28)
 #define USART_PRESC(u)  REG32((u) + 0x2C)
 
+/* ───────────────────── USART2 (APB1, 0x40004400) — W4 Modbus 物理口 ─────────────────────
+ * ★ 只加"基址 + 时钟位 + IRQ", USART_* 的**寄存器宏一个都不重定义** ——
+ *   它们本来就是参数化的 (收基址), 直接复用 (见上面 USART1 段)。
+ *   "同一个寄存器两套宏"是这类文件的经典腐化方式, 从源头避免。
+ *
+ * 导出的依据 (RM0468 / stm32h723xx.h):
+ *   APB1PERIPH_BASE = 0x40000000, USART2_BASE = APB1PERIPH_BASE + 0x4400 → 0x40004400
+ *   RCC_APB1LENR_USART2EN = bit17
+ *   USART2_IRQn = 38
+ * ★ 本项目**只用轮询、不开 USART2 中断** (照 S3: "ISR 内直接轮询 FIFO, 确定性最好"),
+ *   所以 IRQ_USART2 只作记录 —— 但本文件已有 A1 事故 (NVIC 位移溢出) 的教训,
+ *   凡出现 IRQ 号就必须同时给出 < 64 的编译期断言 (见文件末尾 IRQ 断言段)。
+ *
+ * ★ BRR 必须按权威定义算, 不许照抄常数 (本项目吃过 16 倍错, 代价 = 一整轮协议不可用):
+ *   OVER8=0 ⇒ BRR = fCK / baud (整数部分即可, 无小数位)
+ *   本平台 PCLK1 = 100 MHz, baud = 115200 ⇒ BRR = 100e6/115200 = 868.05 → **868 = 0x364**
+ *   ✗ 错误写法 (曾经真实发生在 USART1 上): round(fCK × 16 / baud) = 13889 = 0x3641
+ *     —— 数字算得没错, 但那是 16 倍分频的值 ⇒ 实际波特率 7200 而非 115200。
+ */
+#define USART2_BASE     0x40004400UL
+#define RCC_APB1LENR_USART2EN  (1u << 17)
+#define IRQ_USART2      38
+#define USART2_BRR_115200  868u    /* = PCLK1(100MHz)/115200, OVER8=0 */
+
 /* CR1 (L20896 起) */
 #define USART_CR1_UE      (1u << 0)    /* 使能 USART */
 #define USART_CR1_RE      (1u << 2)    /* 接收使能 */

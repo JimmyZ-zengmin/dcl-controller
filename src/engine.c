@@ -24,6 +24,7 @@
 #include <string.h>
 #include "regs.h"
 #include "engine.h"
+#include "modbus.h"
 #include "lsym.h"
 #include "primitives.h"
 
@@ -77,6 +78,13 @@ void cold_start_reset(void)
      *     语义正确 (RESET 后不应残留旧心跳值)。 */
     SHM_U32(g_shm, OFF_CTRL_MAGIC)   = CTRL_MAGIC;
     SHM_U32(g_shm, OFF_CTRL_VERSION) = SHM_LAYOUT_VERSION;
+    /* ★ W4: 通信域配置重建。
+     *   本函数的 memset 把 MB 控制块一起清了 ⇒ 必须显式重建默认配置, 否则
+     *   一次 RESET 就让通信域变成"enabled=0 / slave_addr=0"的死状态 ——
+     *   而 PC 侧只会看到 0x60 永远 NAK, 查不出是"没配置"还是"坏了"。
+     *   (S3 不需要这一步是因为它的 cold_start_reset 不整段 memset; 差异已记在
+     *    modbus.h 的 mb_config 说明里。) */
+    mb_config(g_shm, MB_DEFAULT_ADDR, MB_DEFAULT_USE_UART);
 }
 
 /* ══════════ 栈边界哨兵 (设防) ══════════

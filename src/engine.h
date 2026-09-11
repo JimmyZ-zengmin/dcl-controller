@@ -251,6 +251,70 @@
 #define OFF_MB_HOLD          0x4D60   /* 读区 64 WORD = 128B (wire 镜像, 只读) */
 #define OFF_MB_END           0x4DE0   /* 通信域结束 */
 
+/* ---- 通信域状态机常量 (与 S3 同名同值) ----
+ * ★ MB_SILENT_TICKS 的推导必须写清, 否则后来人不知道它是怎么来的:
+ *   3.5 个字符时间 @115200 8N1 = 3.5 × (10/115200) s = **304 μs**;
+ *   本平台拍长 100 μs ⇒ 304/100 = 3.04 拍 ⇒ 取 **4** (向上保守)。
+ *   ★ 若将来改拍长或波特率, 这个数**必须重算** —— 它是"帧边界"的唯一判据,
+ *     算小会把一帧劈成两帧, 算大只是延迟一点响应 (后者无害, 前者致命)。 */
+#define MB_ST_IDLE   0    /* 等帧 (RX 缓冲空) */
+#define MB_ST_RX     1    /* 收字节中 (等 3.5 字符静默判帧尾) */
+#define MB_ST_EXEC   2    /* 解析请求 (轻量) → 置构建上下文, 转 BUILD */
+#define MB_ST_TX     3    /* 发响应 (限速逐字节) */
+#define MB_ST_BUILD  4    /* 逐字节组装响应 + 增量 CRC, 每拍 ≤budget 字节 */
+#define MB_EX_ILLEGAL_FUNC  0x01
+#define MB_EX_ILLEGAL_ADDR  0x02
+#define MB_EX_ILLEGAL_VAL   0x03
+#define MB_EX_SLAVE_FAIL    0x04
+#define MB_MAX_FRAME   128    /* 单帧最大字节 (RTU 规约 256, 取 128 够用) */
+#define MB_TICK_BUDGET 4      /* 每拍最多处理字节数 (限速, WCET 上界) */
+#define MB_SILENT_TICKS 4     /* 静默拍数 ≥ 3.5 字符 (见上方推导) */
+
+/* ---- 通信域控制块 (40B, OFF_MB_CTRL) ----
+ * ISR 每拍推进状态机; PC 侧可用 0x22 读本块观察通信域状态与统计。
+ * ★ 布局与 S3 **逐字节相同** (这是本区唯一与 S3 严格对齐的东西 —— 偏移可以不同,
+ *   但结构体必须同, 因为 PC 工具会按字段偏移解析 0x61 的返回)。 */
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  state;        /* MB_ST_* 状态机当前态 */
+    uint8_t  slave_addr;   /* 从站地址 (1-247; 0=广播不响应) */
+    uint8_t  rx_len;       /* RX 缓冲已收字节 */
+    uint8_t  rx_pos;       /* RX 已消费偏移 (隧道模式逐拍推进, EXEC 后归零) */
+    uint8_t  tx_len;       /* TX 缓冲待发字节 */
+    uint8_t  tx_sent;      /* TX 已发出字节 */
+    uint8_t  silent;       /* 连续无新字节的拍数 (3.5 字符判定) */
+    uint8_t  enabled;      /* 1=通信域使能 */
+    uint8_t  tick_budget;  /* 每拍字节上限 (限速, 默认 MB_TICK_BUDGET) */
+    uint32_t frames_rx;    /* 统计: 完整帧数 */
+    uint32_t frames_tx;    /* 统计: 发出响应数 */
+    uint32_t err_crc;      /* 统计: CRC 校验失败 */
+    uint32_t err_exc;      /* 统计: 异常响应数 */
+    uint8_t  src;          /* RX 源: 0=UART FIFO, 1=隧道注入(0x60) */
+    uint8_t  tx_uart;      /* TX 去向: 0=TX 缓冲(0x61 读回), 1=物理口
+                            * (LA 验证用: 注入走隧道 + 响应真发 → 抓 PA2) */
+    /* ---- 响应构建上下文 (组装+CRC 分摊到多拍, 不再单拍完成) ---- */
+    uint8_t  b_func;       /* 本次响应对应的请求功能码 (0x80 位=异常) */
+    uint16_t b_start;      /* 请求起始地址 (或 06/16 的回显地址) */
+    uint16_t b_qty;        /* 请求寄存器数 (或 06 的回显值 / 异常的异常码) */
+    uint16_t b_pos;        /* 响应构建进度 (字节, 0..b_len+2) */
+    uint16_t b_len;        /* 响应主体长度 (不含 CRC 2 字节) */
+    uint16_t crc_acc;      /* 增量 CRC16 累加器 (跨拍) */
+    uint8_t  rsv[2];       /* 补齐到 40B (packed 下不自动补, 需显式) */
+} MbCtrl_t;
+_Static_assert(sizeof(MbCtrl_t) == 40, "MbCtrl_t must be 40 bytes (PC 侧按字段偏移解析)");
+
+/* ★ MB 区布局断言。
+ * ★★ 这里第一条**用 <= 而刻意不用 ==** (与 S3 同): MB_CTRL 是**预留 64B**,
+ *   而当前 MbCtrl_t 只有 40B —— 留的 24B 是明确的"结构体增长余量", 不是无人区。
+ *   (本项目在其它区坚持用 == 是因为那些区**不允许**有缝; 这一处有缝是设计意图,
+ *    所以要把"缝"本身也钉死 —— 见下面第二条断言。)
+ *   ★ 踩坑记录: 第一版照抄其它区的 == 写法, 于是编译期直接失败
+ *     ("static assertion failed: MbCtrl_t 必须紧接 RX 缓冲") —— 这正是断言的价值:
+ *     它没让一个"预留与结构体尺寸不符"的布局悄悄过去。 */
+_Static_assert(OFF_MB_CTRL + sizeof(MbCtrl_t) <= OFF_MB_RX, "SHM: MbCtrl_t 超出 MB_CTRL 预留");
+_Static_assert(OFF_MB_RX - OFF_MB_CTRL == 64u, "SHM: MB_CTRL 预留必须恰好 64B (S3 同口径)");
+_Static_assert(OFF_MB_RX   + 256             == OFF_MB_TX, "SHM: MB RX 256B 必须紧接 TX 缓冲");
+_Static_assert(OFF_MB_TX   + 256             == OFF_MB_HOLD, "SHM: MB TX 256B 必须紧接 HOLD 区");
+
 /* ---- W3 免串口协议帧暂存区 (原落在 0x4B20 = OFF_MB_CTRL, W4 落地后必须让位) ----
  * ★ 挪到 MB_END 之后: 它是"调试器直写 + 主循环消费"的暂存区, 与通信域无耦合,
  *   放在通信域尾部既保持独立, 又让 MB 区成为一整块连续区域 (便于断言与理解)。

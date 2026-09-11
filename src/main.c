@@ -51,6 +51,7 @@
 #include "uart.h"
 #include "flash.h"
 #include "persist.h"
+#include "modbus.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -289,6 +290,12 @@ OBS uint32_t g_seq_max_cur    = 0;   /* 历史最大步号 (证明真的走到�
  *     于是删掉了自创的"已 RUN 不清零"分支 (它会让 PC 补发的 0x11 把正在执行的
  *     顺序程序打回第一步, 与 S3 语义不符), 这个量随之改成纯计数器。 */
 OBS uint32_t g_seq_armed      = 0;
+/* ══════════ W4: 通信域观测面 ══════════
+ * ★ 判据要点: "注入了"与"响应对了"是两件事 —— 必须分开计数, 否则
+ *   "全部被拒"与"全部受理"在看总数时无法区分 (同 0x44 观测面的设计理由)。 */
+OBS uint32_t g_mb_inject_ok   = 0;   /* 0x60 成功受理次数 */
+OBS uint32_t g_mb_nak         = 0;   /* 0x60/0x62 被拒次数 */
+OBS uint32_t g_mb_ticks       = 0;   /* mb_tick 被调用拍数 (证明状态机在推进) */
 
 /* ── 引擎扫描: 统计 (CPU 周期) ── */
 OBS uint32_t g_eng_cyc_last = 0;
@@ -590,6 +597,19 @@ ISR_PLACE void TIM2_IRQHandler(void)
                 g_seq_steps_sum += sw;
             }
         }
+
+        /* ══════════ W4: 通信域 Modbus (ISR 每拍推进) ══════════
+         * ★★★ 必须放在 **run 门之外** —— 这是 S3 的事故修复 (OA17), 必须照搬:
+         *   原实现把它放在 `if (run)` 门内, 后果是 **STOP 态注入一帧 → 状态机
+         *   卡在 RX 无法推进 → 通信域永久 busy** (后续 0x60 全部 NAK, 只能靠
+         *   START 或断电恢复) —— 一条从"停机"通往"死锁"的路径。
+         *   移到门外之后: STOP 态也能收帧/响应。"停机时 HMI 仍可通信"(读状态/
+         *   写配方) 是 PLC 的标准能力, 不是附加功能。
+         * ★ 确定性影响: STOP 态本就不做计时统计; RUN 态它仍在 t1 之前,
+         *   所以 mb_tick 的开销**照常计入 isr_cyc_max** —— 对外可见, 不隐藏。
+         *   (本项目铁律: 热路径成本必须可观测, 不能靠"放在计时之外"来装便宜。) */
+        mb_tick(g_shm);
+        g_mb_ticks++;
 
         uint32_t t1 = DWT_CYCCNT;
         uint32_t di = t1 - t0;
@@ -1008,6 +1028,77 @@ static void h_seq_deploy(const uint8_t *p, uint32_t n)
  *   ★ 与 h_engine_status 的 r[4]/r[12] 口径**必须一致**, 所以抽成一个函数,
  *     避免两处各写一遍 `== 0xFFFFFFFFu ? 0u :` 而后某天只改了一处。 */
 static inline uint32_t pn_or_0(uint32_t v) { return (v == 0xFFFFFFFFu) ? 0u : v; }
+
+/* ══════════ W4: 通信域 Modbus (0x60 / 0x61 / 0x62) ══════════
+ * 三条命令的载荷格式与语义**逐字照搬 S3** (main.c:588/608/630), 因为 PC 侧工具
+ * (verify_modbus.py / verify_hmi.py) 按这个格式写, 改了就等于改了协议。
+ *
+ * ★ 隧道模式的战略意义 (S3 原设计, 这里原样保留):
+ *   0x60 把一帧原始 Modbus RTU 请求**注入 SHM 的 RX 缓冲**, 状态机照常跑完整
+ *   协议栈 (CRC 校验/功能码分发/响应组装/异常码) —— 只是"字节来源"不同。
+ *   于是 **协议栈可以完全脱离物理层验证** (零硬件)。硬件到位只换字节源 (0x62 的 src)。
+ *   ★ 本次的硬件状况正是它要解决的: TTL 转 485 模块已到、USB 转 485 还在路上 ⇒
+ *     协议栈先跑通, 物理层后接, 互不阻塞。
+ *
+ * 状态机推进在 ISR 里 (mb_tick), 本文件只负责"注入/读回/配置"三个入口。 */
+
+/* 0x60 MB_INJECT — 帧: [Modbus RTU 请求原始字节] (含 CRC)
+ * → 响应进 TX 缓冲 → PC 用 0x61 读回。
+ * 状态机/协议栈与真实 UART 路径完全相同 (见 modbus.c 的 src 分支)。*/
+static void h_mb_inject(const uint8_t *p, uint32_t n)
+{
+    if (n < 4 || n > MB_MAX_FRAME) { g_mb_nak++; nak("mb: bad frame len"); return; }
+    int rc = mb_inject(g_shm, p, (uint16_t)n);
+    if (rc != 0) {
+        /* ★ 把"为什么拒"分开报: 忙碌与长度非法是两种完全不同的现场问题
+         *   (忙碌 = 上一帧还没处理完, 长度 = PC 发错了)。合并成一句会让排查失去方向。 */
+        g_mb_nak++;
+        nak(rc == -2 ? "mb: busy" : "mb: bad frame");
+        return;
+    }
+    g_mb_inject_ok++;
+    ack(NULL, 0);
+}
+
+/* 0x61 MB_RESP — 读响应帧 + 通信域状态
+ * 响应: [state u8][tx_len u8][tx 字节…][frames_rx u32][frames_tx u32]
+ *       [err_crc u32][err_exc u32] */
+static void h_mb_resp(void)
+{
+    MbCtrl_t *c = (MbCtrl_t *)SHM_PTR(g_shm, OFF_MB_CTRL);
+    uint8_t r[2 + MB_MAX_FRAME + 16];
+    r[0] = c->state;
+    r[1] = c->tx_len;
+    if (c->tx_len) {
+        const uint8_t *tx = (const uint8_t *)SHM_PTR(g_shm, OFF_MB_TX);
+        for (uint32_t i = 0; i < c->tx_len; i++) r[2 + i] = tx[i];
+    }
+    uint32_t off = 2u + c->tx_len;
+    put32(r + off, c->frames_rx); off += 4;
+    put32(r + off, c->frames_tx); off += 4;
+    put32(r + off, c->err_crc);   off += 4;
+    put32(r + off, c->err_exc);   off += 4;
+    ack(r, off);
+    /* 缓冲模式: 响应已被 PC 取走 → 清缓冲 (物理口模式发完已清, 无需处理) */
+    if (!c->tx_uart) { c->tx_len = 0; c->tx_sent = 0; }
+}
+
+/* 0x62 MB_CFG — 配置通信域: [src u8][tx_uart u8][budget u8] (后两字节可选)
+ *   src    : 0=RX 走物理口 FIFO, 1=RX 走隧道注入(0x60)
+ *   tx_uart: 0=响应留缓冲(0x61 读回), 1=响应从物理口发 (★ LA 可抓)
+ * 典型 LA 验证: 0x62 [1][1] → 注入走隧道、响应从 PA2 真发 → 抓 USART2_TX 波形。 */
+static void h_mb_cfg(const uint8_t *p, uint32_t n)
+{
+    if (n < 1) { g_mb_nak++; nak("mb cfg: need src"); return; }
+    MbCtrl_t *c = (MbCtrl_t *)SHM_PTR(g_shm, OFF_MB_CTRL);
+    c->src = p[0];
+    if (n >= 2) c->tx_uart = p[1];
+    if (n >= 3 && p[2]) c->tick_budget = p[2];
+    uint8_t r[3];
+    r[0] = c->src; r[1] = c->tx_uart; r[2] = c->tick_budget;
+    __asm__ volatile("dsb" ::: "memory");
+    ack(r, 3);
+}
 
 /* 0x38 ENGINE_STATUS — **前 31 字节与 S3 逐字节同布局** (上位机脚本零改动),
  * 尾部追加 H723 扩展 6B (S3 的"尾部追加保前段兼容"惯例)。
@@ -1508,6 +1599,10 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_PERSIST:       h_persist_w2(p, n); break;
         /* ---- W3: 顺序域 ---- */
         case CMD_SEQ_DEPLOY:    h_seq_deploy(p, n); break;
+        /* ---- W4: 通信域 (Modbus RTU 从站) ---- */
+        case CMD_MB_INJECT:     h_mb_inject(p, n); break;
+        case CMD_MB_RESP:       h_mb_resp(); break;
+        case CMD_MB_CFG:        h_mb_cfg(p, n); break;
         /* ★ 未实现的命令**显式拒绝**(NAK 带原因), 而不是静默丢弃或假装成功。
          *   静默丢弃的后果是 PC 端只能看到 TIMEOUT —— 分不清"固件挂了"还是
          *   "这命令没实现", 正是 S3 审计里 N2 记录过的那类缺陷。 */
@@ -1669,6 +1764,9 @@ static void obs_anchor(void)
     sink ^= g_cmd_req_cnt;     sink ^= g_cmd_req_last;
     /* 审计发现 H 的观测面 (engine.c 侧, 不读会被回收) */
     sink ^= g_safe_mask_nonzero;
+    /* W4 通信域 */
+    sink ^= g_mb_inject_ok;    sink ^= g_mb_nak;
+    sink ^= g_mb_ticks;
     (void)sink;                            /* 只要求"被引用", 不要求有意义的和 */
 }
 
@@ -1726,6 +1824,11 @@ int main(void)
      *       **之前** (恢复要写 ACTIVE 表, 此刻无 ISR 扫描 = 无撕裂风险)。 */
     cold_start_reset();
     shm_guard_paint();
+#if MB_DEFAULT_USE_UART
+    /* W4: 通信域物理口 (USART2 PA2/PA3) —— **只调一次**, 不随冷启动重复。
+     * 与 mb_config 的分工见 modbus.h。 */
+    mb_uart_enable();
+#endif
     g_persist_loads++;
     int restored = persist_load(g_shm);
 
@@ -1890,6 +1993,13 @@ int main(void)
         SHM_U32(g_shm, OFF_TIMING_LAST_PERIOD) = g_per_cyc_last;
         SHM_U32(g_shm, OFF_TIMING_LAST_EXEC)   = g_isr_cyc_last;
         g_active_routes = engine_active_routes(g_shm);
+
+        /* 通信域读区镜像: wire[0..63] 工程量 → MB_HOLD, **每 10ms 刷一次**。
+         * ★ 为什么不是每拍: 它是一块 64×u16 的搬运 + 64 次浮点乘, 每拍做等于给
+         *   热路径白加成本; 而外部主站读 40001-40064 的周期远长于 100μs。
+         * ★ 为什么放主循环不放 ISR: 同上 —— 它不参与拍内时序 (§S3 也是放 ISR,
+         *   但它那边是 core1 独立核, 本平台单核必须更省)。 */
+        if ((g_tick_count % 100u) == 0u) mb_refresh_hold(g_shm);
 
         /* 栈哨兵周期巡检 (廉价: 32 个字, 主循环有 100μs 一次的机会) */
         g_guard_ok = (uint32_t)shm_guard_ok();

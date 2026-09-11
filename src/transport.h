@@ -125,7 +125,6 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
  *   DCL_CAP_STATE_COLD(0x0008) — RESET(0x13) 命令**已存在**, 但"状态冷启动"语义
  *                                (deploy 时清 state 表) 由 engine_reload_active 的
  *                                M2 清零实现 —— 待 W2 收口时与 S3 口径核对后决定是否声明
- *   DCL_CAP_COMM      (0x0100) — Modbus RTU 从站未移植 (W4)
  *   DCL_CAP_HMI       (0x0200) — SRC_HMI 是**留位**(engine.c 显式 case, 恒返 0)
  *   DCL_CAP_AI        (0x0400) — ADC 未接 (W5)
  * ★ 这份清单同时是**上线检查表的雏形**: 每落地一项就在这里删一行、在上面的
@@ -134,11 +133,15 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
  *     "实现了却不报"。评审提醒: 这类漏改**没有任何编译期保护**, 只能靠纪律 +
  *     上面的清单与下面的宏**在同一屏内可见**(所以刻意放在一起)。
  *   ★ W3 (2026-09-11): DCL_CAP_SEQ 已从上面的未声明清单**删除并加入下面的宏**
- *     —— tools/h723_seq.py 27 项全绿 (T28 灵魂测试 14 + T29 校验器 13) 为凭据。 */
+ *     —— tools/h723_seq.py 27 项全绿 (T28 灵魂测试 14 + T29 校验器 13) 为凭据。
+ *   ★ W4 (2026-09-11): DCL_CAP_COMM 同样已移入下面的宏 (0x0040→0x00F7→0x01F7)
+ *     —— Modbus RTU 从站 (0x60/0x61/0x62) 落地; 证据见 tools/h723_modbus.py。
+ *   ★★ 纪律提醒 (已在 W3 吃过一次): **改能力位必须同步 tools/h723_proto.py 的
+ *     EXPECT_CAP** —— 那里是第二个手工副本, 曾经停在 0x0033 三轮未同步。 */
 #define DCL_CAP_H723_IMPL   (DCL_CAP_MULTICYCLE | DCL_CAP_HOTRELOAD | \
                              DCL_CAP_PERSISTENT | DCL_CAP_WIRE2_FLAG | \
                              DCL_CAP_VERINFO | DCL_CAP_FORCE | \
-                             DCL_CAP_SEQ)                            /* = 0x00F7 */
+                             DCL_CAP_SEQ | DCL_CAP_COMM)              /* = 0x01F7 */
 
 /* ★ 上线的各项说明 (写清楚"为什么现在可以报"):
  *   DCL_CAP_HOTRELOAD (0x0002) — 阶段 3.2: engine_reload_active() 在 ITCM 内
@@ -155,7 +158,7 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
  *     两半都在 (engine_tick / DEFINE_ENGINE_SCAN), 且 FORCE_VAL 列入 float 区。
  *     ★ 验收证据必须是**非零强制值** (OA9 事故的判据盲区修正)。 */
 #define DCL_CAP_H723_NOTYET (DCL_CAP_STATE_COLD | \
-                             DCL_CAP_COMM | DCL_CAP_HMI | DCL_CAP_AI)
+                             DCL_CAP_HMI | DCL_CAP_AI)
 _Static_assert((DCL_CAP_H723_IMPL & DCL_CAP_H723_NOTYET) == 0u,
                "cap bitmap contradiction: bit present in BOTH impl and not-yet lists");
 
