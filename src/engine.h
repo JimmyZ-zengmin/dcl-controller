@@ -160,7 +160,19 @@
 #define OFF_ROUTE_BUCKETS_ST   0x4638
 #define OFF_ROUTE_BUCKETS_END  0x47F0
 #define BUCKET_DIV1_PHASES     10
-#define BUCKET_DIV2_PHASES     64   /* ★ 与 period 的 6 位 phase 字段严格一致 */
+#define BUCKET_DIV2_PHASES     100  /* ★★ H9 的**第二次修正** (2026-09-11, 由 S3 回归 T17 发现):
+                                     *   S3 的 div2 档周期 = **100 拍 = 10ms**。四条独立证据:
+                                     *     ① S3 套件 T17 的期望值 (1 快 + 60 慢 ⇒ cnt2/cnt0≈0.6)
+                                     *     ② `DT_SLOW = 0.01f` 的注释写着 10ms
+                                     *     ③ 能力位宣称 "多周期 div 档 (100μs/1ms/10ms)"
+                                     *     ④ 桶表尺寸 —— off2/cnt2 各 100 槽 (0x4638..0x47F0 本就够)
+                                     *   ★ 上一次 H9 改动把**周期**改成了 64 拍 (6.4ms) —— 改错了方向:
+                                     *     真问题是"路由的 phase 字段只有 6 位 ⇒ 相位 64..99 不可达",
+                                     *     不是"周期该是 64"。周期一短, 档位语义就与宣称不符 (宣称≠实现),
+                                     *     而 DT_SLOW 还按 10ms 算 ⇒ div2 上跑 TIMER/LPF 的原语 dt 也是错的。
+                                     *   ⇒ 现在: 周期 = 100 拍 (10ms) ✓; phase 字段仍 6 位 (0..63),
+                                     *     相位 64..99 恒空 —— 这正是 S3 的真实形态。 */
+#define BUCKET_DIV2_PHASE_MAX  63   /* 路由 phase 字段上限 (6 位) —— 死槽判据与构造器都用它 */
 
 /* ---- 未落地保留区 (显式命名, 不留"无名字的空洞") ----
  * ★ 审计 H3/A7 指出: 下面两段既没有名字也没有断言, 将来往这里放新域不会报错,
@@ -169,6 +181,18 @@
  *   谁把邻区改大/改小, 这里立刻编译失败。 */
 #define OFF_RSVD_DSL_DOMAIN     0x3840   /* 保留洞: 开头给 SEQ 区, 尾部仍未落地 */
 #define OFF_RSVD_DSL_DOMAIN_SZ  (OFF_ROUTE_BUCKETS - OFF_RSVD_DSL_DOMAIN)   /* 0xC40 */
+
+/* ---- 档级触发统计 (多周期) —— ★★ 偏移与 S3 **同址** (0x3854) ----
+ * ★ 为什么不搬: S3 回归套件 (test_dcl.py 的 T17) **直接按 0x3854 读这三个计数**,
+ *   而"脚本零改动"是迁移验收的硬条件 ⇒ 凡套件依赖的偏移一律保持同址。
+ *   (0x3854 落在本平台 DSL 保留洞的前段, 与 SEQ 区 0x4000 不重叠, 天然可用。)
+ * ★ 语义 (照 S3 core0_isr.c): 每个 u32 = 该档**累计执行的路由条次**(不是拍数)。
+ *   为什么是"条次": 1 秒内 "1 条快档 + 60 条慢档" 应得 cnt0≈10000 / cnt2≈6000,
+ *   比值 0.6 —— 这正是"分档真的按档跑"的可失败证据 (拍数比会是 0.01, 无区分力)。 */
+#define OFF_TICK_STATS       0x3854   /* u32[3]: cnt0(100μs档) cnt1(1ms档) cnt2(10ms档) */
+_Static_assert((OFF_TICK_STATS & 3u) == 0u, "SHM: OFF_TICK_STATS 需 4 字节对齐");
+/* 用字面量 0x4000 而不是 OFF_SEQ_TABLE —— 后者在本文件里声明得更靠后, 此处还不可见 */
+_Static_assert(OFF_TICK_STATS + 12u <= 0x4000u, "SHM: TICK_STATS 不得压到 SEQ 区(0x4000)");
 
 /* ══════════ W3: 顺序域 SEQ 区 (Sequencer v0) ══════════
  * 落点 = 上面那个保留洞里的**尾部** (0x4000..0x4480, 与 S3 逐字节同偏移)。
@@ -481,9 +505,9 @@ _Static_assert(_Alignof(SeqCtrl_t) == 4, "SeqCtrl_t alignment must be 4");
 /* ---- period 字段位定义 ---- */
 #define PERIOD_DIV_IDX_FAST  0   /* 1×: 每 100μs */
 #define PERIOD_DIV_IDX_MID   1   /* 10×: 每 1ms */
-#define PERIOD_DIV_IDX_SLOW  2   /* ★ H9 修正后是 **64×** (6.4ms), 不是 100× ——
-                                  *   `period` 的 phase 字段只有 6 位, 相位数只能是 64。
-                                  *   S3 声称 100 却只有 64 个可达相位 (见 AUDIT §12)。 */
+#define PERIOD_DIV_IDX_SLOW  2   /* 100×: 每 10ms (★★ H9 第二次修正 —— 旧值 64×(6.4ms) 是误修,
+                                  *   见 BUCKET_DIV2_PHASES 的说明。真问题是 phase 字段只有 6 位,
+                                  *   不是周期该是 64。) */
 #define PERIOD_DIV_MASK      0x03
 #define PERIOD_PHASE_SHIFT   2
 

@@ -364,11 +364,14 @@ uint32_t engine_bucket_checksum(const uint8_t *base)
 
 uint32_t engine_bucket_dead_slots(const uint8_t *base)
 {
-    /* 槽 64..99 在**两个**数组里: off2[64..99] 与 cnt2[64..99] */
+    /* 死槽 = 相位 64..99 (路由的 6 位 phase 字段到不了那里) —— 在**两个**数组里:
+     * off2[64..99] 与 cnt2[64..99]。
+     * ★ H9 第二次修正: 判据的本体没变 (这 72 个槽必须恒 0), 变的只是它的边界来源 ——
+     *   现在用 BUCKET_DIV2_PHASE_MAX (phase 字段上限) 而不是整个表长。 */
     const uint16_t *bkt = (const uint16_t *)(base + OFF_ROUTE_BUCKETS);
     const uint16_t *off2 = bkt + 20, *cnt2 = bkt + 120;
     uint32_t bad = 0;
-    for (int p = BUCKET_DIV2_PHASES; p < 100; p++) {
+    for (int p = BUCKET_DIV2_PHASE_MAX + 1; p < BUCKET_DIV2_PHASES; p++) {
         if (off2[p]) bad++;
         if (cnt2[p]) bad++;
     }
@@ -541,19 +544,22 @@ ATTR_ITCM uint32_t engine_tick(uint8_t *base, uint32_t tick, engine_scan_fn impl
 {    const uint16_t *bkt  = (const uint16_t *)(base + OFF_ROUTE_BUCKETS);
     const uint16_t *off1 = bkt, *cnt1 = bkt + BUCKET_DIV1_PHASES;
     const uint16_t *off2 = bkt + 20, *cnt2 = bkt + 120;
+    /* ★ 档级触发统计 (与 S3 同址 0x3854): 每档按"本拍执行的路由条次"累加 —— 见 engine.h。
+     *   成本: 每拍最多 3 次 DTCM 读-改-写 (且只在桶非空时), 相对 40000 cyc 的拍长可忽略。 */
+    uint32_t *ts = (uint32_t *)(void *)(base + OFF_TICK_STATS);
 
     uint32_t ph1 = tick % (uint32_t)BUCKET_DIV1_PHASES;
     uint32_t ph2 = tick % (uint32_t)BUCKET_DIV2_PHASES;
     uint32_t nrun = 0, ck = 0;
 
     uint32_t n0 = off1[0];                       /* div0 段: [0, n0) 每拍全跑 */
-    if (n0) { ck ^= impl(base, 0, n0); nrun += n0; }
+    if (n0) { ck ^= impl(base, 0, n0); nrun += n0; ts[0] += n0; }
 
     uint32_t b1 = off1[ph1], c1 = cnt1[ph1];     /* div1: 本拍 phase 桶 */
-    if (c1) { ck ^= impl(base, b1, c1); nrun += c1; }
+    if (c1) { ck ^= impl(base, b1, c1); nrun += c1; ts[1] += c1; }
 
     uint32_t b2 = off2[ph2], c2 = cnt2[ph2];     /* div2: 本拍 phase 桶 */
-    if (c2) { ck ^= impl(base, b2, c2); nrun += c2; }
+    if (c2) { ck ^= impl(base, b2, c2); nrun += c2; ts[2] += c2; }
 
     if (nrun_out) *nrun_out = nrun;
     return ck;

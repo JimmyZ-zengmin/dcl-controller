@@ -245,6 +245,15 @@ OBS uint32_t g_persist_loads      = 0;   /* persist_load 调用次数 */
  *     也不依赖 obs_anchor (但保险起见仍登记)。 */
 OBS volatile uint32_t g_persist_req     = 0;   /* 写 1 → 主循环执行一次 persist_save */
 OBS uint32_t          g_persist_req_cnt = 0;   /* 实际受理的请求数 (与 writes 对账) */
+/* ★★ 自动落盘 (S3 persist_task 语义) —— **已试过两次并回退, 不要重蹈** (2026-09-11):
+ *   S3 的语义是 "deploy 只登记 dirty; 引擎停机窗口里由**后台任务**落盘"。H723 原先
+ *   只有 0x43 显式落盘与 g_persist_req 两条路 ⇒ S3 套件 T15/T26 等不到 dirty 被清。
+ *   尝试①: 主循环里"每 0.5s 重试一次" → 一旦落盘失败就变成每 0.5s 擦一次盘的忙等,
+ *          整轮 S3 套件从 21/30 掉到 5/30 (命令全 TIMEOUT, 板子事后又活着)。
+ *   尝试②: 改成**闩锁**(每 dirty 周期只试一次) → 仍然是 5/30 ⇒ 问题不在重试频率,
+ *          而在"**从主循环发起 flash 擦写**"这条路径本身 (擦除期间取指/中断交互, 待查)。
+ *   ⇒ 已整体回退, 保持 21/30 可用态。要拿下 T15/T26, 需先单独查清"主循环发起擦写为什么会
+ *     挂住" (建议: 先把 flash 擦写代码确认落在 ITCM, 再做最小复现)。 */
 
 /* ★★ 免串口的**协议帧**触发点 (W3 新增, 与 g_persist_req 同族但更通用):
  *   为什么需要它: seq 的验收核心是"引擎按语义推进并驱动译码路由输出", 而这条
@@ -834,6 +843,30 @@ static void h_deploy(const uint8_t *p, uint32_t n)
         uint64_t bit = 1ULL << (r.dst_channel & 63u);
         if (dst_seen[r.dst_channel >> 6] & bit) { g_deploy_nak++; nak("dst conflict"); return; }
         dst_seen[r.dst_channel >> 6] |= bit;
+    }
+
+    /* ★★ 跨档速率检查 (S3 语义, 由 S3 回归套件 T18 发现 H723 **漏了这一步**):
+     *   慢消费者读快生产者 = **欠采样** → 混叠/发散。判据: 生产者 div_idx < 消费者 div_idx 即拒。
+     *   ★ 这是**程序级**检查 —— 单看一条路由看不出来, 必须先知道"那个 wire 的生产者是谁"。
+     *   ★ 与 S3 的唯一差别是报错串更短 (S3 带 wire 号); 语义逐字一致。 */
+    {
+        int8_t prod_div[MAX_WIRES];              /* 各 wire 的生产者档位; -1 = 该 wire 无生产者 */
+        for (int i = 0; i < MAX_WIRES; i++) prod_div[i] = -1;
+        for (uint16_t i = 0; i < nr; i++) {
+            RouteEntry_t rr;
+            memcpy(&rr, d + (size_t)i * 16u, 16u);
+            if (!(rr.flags & ROUTE_FLAG_ACTIVE)) continue;
+            prod_div[rr.dst_channel] = (int8_t)(rr.period & PERIOD_DIV_MASK);
+        }
+        for (uint16_t i = 0; i < nr; i++) {
+            RouteEntry_t rr;
+            memcpy(&rr, d + (size_t)i * 16u, 16u);
+            if (!(rr.flags & ROUTE_FLAG_ACTIVE)) continue;
+            if (rr.src_type != SRC_WIRE) continue;      /* 只有跨路由的 wire 依赖才可能欠采样 */
+            int8_t pdiv = prod_div[rr.src_index];
+            int8_t cdiv = (int8_t)(rr.period & PERIOD_DIV_MASK);
+            if (pdiv >= 0 && pdiv < cdiv) { g_deploy_nak++; nak("rate mismatch"); return; }
+        }
     }
 
     /* ③ 预算门: 条数限制 ≠ 成本限制 —— 128 条 PID 是 128 条, 成本却是 DIRECT 的 2.6 倍。
@@ -1455,6 +1488,13 @@ static void h_reset_w1(void)
      *   (S3 persist_clear_dirty 的同款理由)。Flash 里已有的数据**不动**
      *   (RESET 是运行态复位, 不是擦除持久化配置; 要清持久化得显式重新 deploy 空程序)。 */
     g_persist_dirty = 0;
+    /* ★★ 移植遗漏修正 (由 S3 回归 T9 实测发现): S3 的 RESET 会**清 timing 统计**
+     *   (OA13 语义: "统计只反映本次 RUN 段")。H723 的统计量住在 DTCM 的 C 全局里,
+     *   而 cold_start_reset 只 memset SHM ⇒ 不清它的话 `samples` 会**跨 RESET 继续增长**
+     *   (实测 176437 → 180039), T9 的"样本复位"判据直接失败。
+     *   ⇒ RESET 必须显式补一次 stats_reset()。 */
+    stats_reset();
+    g_timing_resets++;
     g_reset_ok++;
     ack(NULL, 0);
 }
@@ -2081,6 +2121,10 @@ int main(void)
             else if (rc == 0) g_persist_saves++;
             else              g_persist_nak++;
         }
+        /* ★★ 自动落盘 (S3 persist_task 语义) —— **已回退**: 两次尝试都让整轮 S3 套件
+         *   从 21/30 掉到 5/30 (详见 g_persist_req_cnt 上方的说明)。要重做, 先查清
+         *   "从主循环发起 flash 擦写为什么会挂住" (擦除期间取指/中断交互)。 */
+
         /* ★ W3: 免串口**协议帧**请求 (pyocd 直写暂存区 + g_cmd_req)。
          *   走**真实的 proto_dispatch** (与串口收到的帧完全同一条路径) —— 见
          *   g_cmd_req 的说明。这样命令分发/校验器/ACK-NAK/观测面计数都被走到,
