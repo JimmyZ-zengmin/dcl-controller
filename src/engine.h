@@ -370,6 +370,17 @@ typedef struct __attribute__((packed, aligned(4))) {
 } MacroCtrl_t;
 _Static_assert(sizeof(MacroCtrl_t) == 16, "MacroCtrl_t must be 16 bytes");
 
+/* ---- W5 观测面 (macro 区之后, 仍在 MB_TAIL 备用空间内) ----
+ * ★★ 为什么必须有它 (本项目铁律"凡'写过了就算'的状态必须补一个能被外部读走的量"):
+ *   HIL 的输出臂把占空比写进 **TIM3_CCR1 硬件寄存器** —— 协议侧读不到, 于是
+ *   "PWM 真的按 u 变了"就成了**不可验证的宣称**。这里给它一个 SHM 镜像,
+ *   使输出臂在**零外部仪器**下也能被逐值核对 (PC 用 0x22 burst 读回)。
+ *   ★ 与 S3 的差异: S3 的 LEDC 占空比同样不可读, 这是本平台补的观测。 */
+#define OFF_HIL_DUTY        0x6E00   /* u32: 最近写入 TIM3_CCR1 的计数值 (0..ARR+1) */
+#define OFF_W5_OBS_END      0x6E04
+_Static_assert(OFF_MACRO_END <= OFF_HIL_DUTY, "SHM: W5 观测区与 MACRO 区重叠");
+_Static_assert(OFF_HIL_DUTY + 4u <= SHM_SIZE, "SHM: W5 观测区越出 SHM 末尾");
+
 
 /* ══════════ 路由条目 (16B packed) —— 与 S3 逐字节相同 ══════════ */
 typedef struct __attribute__((packed, aligned(4))) {

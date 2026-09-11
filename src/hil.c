@@ -64,7 +64,11 @@ void hil_tick(uint8_t *base, uint32_t tick_now)
     if (!(u > 0.0f)) u = 0.0f;
     if (u > (float)HIL_PWM_RES) u = (float)HIL_PWM_RES;
     uint32_t arr1 = TIM_ARR(TIM3) + 1u;
-    TIM_CCR1(TIM3) = (uint32_t)((u / (float)HIL_PWM_RES) * (float)arr1);
+    uint32_t duty = (uint32_t)((u / (float)HIL_PWM_RES) * (float)arr1);
+    TIM_CCR1(TIM3) = duty;
+    /* ★ 观测镜像: 把"实际写进 TIM3_CCR1 的值"回写 SHM —— 否则"PWM 按 u 变了"这句
+     *   话在协议侧不可核对 (只写进硬件寄存器 = 不可验证的宣称)。PC 用 0x22 读回。 */
+    *(volatile uint32_t *)(base + OFF_HIL_DUTY) = duty;
 
     /* 反馈眼: ADC 多次平均 (无 RC 时采到方波 → 平均≈占空比×VDDA) → SENSOR[2] (V) */
     uint32_t acc = 0;

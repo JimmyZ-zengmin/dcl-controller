@@ -41,6 +41,7 @@ CMD_PIN_SELFTEST = 0x36
 
 OFF_SENSOR_MAP = 0x0040
 OFF_WIRE_MAP   = 0x0240
+OFF_HIL_DUTY   = 0x6E00   # u32: 固件实际写入 TIM3_CCR1 的计数值 (engine.h)
 AI_SENSOR_BASE = 8      # SENSOR[8..10] = PA0/PA1/PA4
 DI_SENSOR_BASE = 3      # SENSOR[3..6]  = PC0..PC3
 HIL_FB_SENSOR  = 2      # SENSOR[2]     = PA5 反馈
@@ -173,8 +174,26 @@ def main():
                      "PA0=%.3fV PA1=%.3fV → 未接" % (ai_v[0], ai_v[1]))
                 skip("A-2 ★AI 满量程跨度", "同上")
 
-        # ══════════ ③ HIL 回环 (主动变占空比, 看反馈是否跟随) ══════════
-        print("\n── ③ HIL 回环 (PA6 PWM → PA5 ADC) ──")
+        # ══════════ ③ HIL ══════════
+        print("\n── ③ HIL (PWM 输出 PA6 ← WIRE[20]; 反馈 PA5 → SENSOR[2]) ──")
+
+        def set_u(val):
+            L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, f32(val)))
+            time.sleep(0.15)
+            p = rd_burst(shm + OFF_HIL_DUTY, 1)
+            return struct.unpack("<I", p)[0] if p and len(p) >= 4 else None
+
+        def duty_exp(u):                      # ARR+1 = 1000 (1MHz / 1kHz)
+            return int(round(u * 1000.0 / 1024.0))
+
+        # H-0 **零接线**: 输出臂 —— 镜像值必须等于按公式算出的计数值
+        d512, dfull, d0 = set_u(512.0), set_u(1024.0), set_u(0.0)
+        ok_d = (d512 is not None and dfull is not None and d0 is not None
+                and abs(d512 - duty_exp(512)) <= 2 and abs(dfull - duty_exp(1024)) <= 2 and d0 == 0)
+        record("H-0 ★HIL 输出臂(零接线): WIRE[20] → TIM3 占空比镜像符合公式",
+               ok_d, "u=512→%s(期望500) u=1024→%s(期望1000) u=0→%s" % (d512, dfull, d0))
+
+        # H-1 物理回环 (需 PA6→PA5 跳线)
         L.xact(CMD_WRITE, struct.pack("<II", shm + OFF_WIRE_MAP + HIL_U_WIRE * 4, f32(512.0)))
         time.sleep(0.3)
         v50 = rd_f32(shm + OFF_SENSOR_MAP + HIL_FB_SENSOR * 4)
@@ -186,7 +205,7 @@ def main():
                    (1.2 <= v50 <= 2.1) and (v0 is not None and v0 <= 0.5),
                    "50%%=%.3fV 0%%=%.3fV (期望 1.65 / 0.00)" % (v50, v0 or -1))
         else:
-            skip("H-1 ★HIL 回环 (需 PA6→PA5 跳线)",
+            skip("H-1 ★HIL 物理回环 (需 PA6→PA5 跳线)",
                  "反馈未跟随 (50%%=%.3fV 0%%=%.3fV) → 跳线未接" % (v50 or -1, v0 or -1))
 
         L.xact(CMD_RESET); time.sleep(0.1)
