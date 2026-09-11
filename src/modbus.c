@@ -282,10 +282,16 @@ void ATTR_ITCM mb_tick(uint8_t *base)
         break;
 
     case MB_ST_BUILD: {                        /* 逐字节组装 + 增量 CRC (不单拍) */
-        uint16_t total = (uint16_t)(c->b_len + 2);   /* + CRC16 两字节 */
+        uint16_t total = (uint16_t)(c->b_len + 2);   /* + CRC16 两字节 (≤255) */
         uint8_t n = 0;
         uint8_t *tx = mb_tx(base);
-        while (n < budget && c->b_pos < total && c->b_pos < MB_MAX_FRAME) {
+        /* ★★ 界限用 MB_TX_SIZE(256, 响应缓冲), **不是** MB_MAX_FRAME(128, 请求上限)。
+         *   这是外部审计 W4 的 M1 (P1) 的修复本体: 旧写法 `c->b_pos < MB_MAX_FRAME`
+         *   让 qty≥62 (total=2qty+5>128) 时 b_pos 永远到不了 total ⇒ 状态死在 BUILD
+         *   ⇒ mb_inject 的 `state != IDLE` 守卫恒真 ⇒ 之后所有注入 NAK busy,
+         *   一条**完全合法**的读请求即可让通信域永久不可用 (只能 RESET/断电)。
+         *   total ≤ 2×125+5 = 255 < 256, 天然安全。 */
+        while (n < budget && c->b_pos < total && c->b_pos < MB_TX_SIZE) {
             uint8_t b;
             if (c->b_pos < c->b_len) {
                 b = mb_resp_byte(base, c->b_pos);
@@ -303,6 +309,15 @@ void ATTR_ITCM mb_tick(uint8_t *base)
             c->tx_len = (uint8_t)total;
             c->tx_sent = 0;
             c->state = MB_ST_TX;
+        } else if (c->b_pos >= MB_TX_SIZE) {
+            /* ★ 未完成保护 (同 OA17 原则: 宁可丢一帧响应, 也不让通信域永久 busy)。
+             *   正常路径**不会**到这里 (total ≤ 255 < 256); 一旦触发说明界限/长度
+             *   算法出了新错 —— 静默丢弃该帧并计一次异常, 保持通信域可用,
+             *   而不是把状态机永久钉死在 BUILD (那正是 M1 的故障形态)。 */
+            c->err_exc++;
+            c->tx_len = 0; c->tx_sent = 0;
+            c->rx_len = 0; c->rx_pos = 0;
+            c->state = MB_ST_IDLE;
         }
         break;
     }

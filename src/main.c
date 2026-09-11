@@ -1066,7 +1066,12 @@ static void h_mb_inject(const uint8_t *p, uint32_t n)
 static void h_mb_resp(void)
 {
     MbCtrl_t *c = (MbCtrl_t *)SHM_PTR(g_shm, OFF_MB_CTRL);
-    uint8_t r[2 + MB_MAX_FRAME + 16];
+    /* ★★ 缓冲必须按 **MB_TX_SIZE**(256) 开, 不能按 MB_MAX_FRAME(128):
+     *   M1 修复后 tx_len 可达 255 (0x03 qty=125 → 3+250+2), 下面的拷贝循环
+     *   `for (i < c->tx_len) r[2+i] = tx[i]` 会**写穿栈** —— 这是 M1 修复的
+     *   连带项 (审计只点了 modbus.c, 但读取端不一起改就是拿栈溢出换卡死)。
+     *   2 + 255 + 16 = 273 ≤ 2 + 256 + 16 = 274 ✓ */
+    uint8_t r[2 + MB_TX_SIZE + 16];
     r[0] = c->state;
     r[1] = c->tx_len;
     if (c->tx_len) {

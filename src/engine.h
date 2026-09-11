@@ -266,7 +266,15 @@
 #define MB_EX_ILLEGAL_ADDR  0x02
 #define MB_EX_ILLEGAL_VAL   0x03
 #define MB_EX_SLAVE_FAIL    0x04
-#define MB_MAX_FRAME   128    /* 单帧最大字节 (RTU 规约 256, 取 128 够用) */
+#define MB_MAX_FRAME   128    /* **请求帧**上限 (RX 接收缓冲上限; RTU 规约 256, 取 128 够用) */
+/* ★★ MB_TX_SIZE: **响应帧**缓冲大小 = RTU ADU 上限 (256)。
+ *   ★ 外部审计 W4 的 M1 (P1) 是"把这两个量当成同一个"造成的:
+ *     响应长度由 qty 决定 (0x03: 3 + 2*qty + 2, qty≤125 ⇒ 最大 255),
+ *     与**请求帧**长度无关。BUILD 若拿 MB_MAX_FRAME(128) 当组装界限,
+ *     qty≥62 时 b_pos 永远到不了 total ⇒ 通信域永久 busy (合法读请求即可触发)。
+ *   ★ 物理大小 = OFF_MB_TX 区 256B (见下方布局断言); 0x61 读取端缓冲
+ *     (main.c h_mb_resp) 也必须按本值开, 否则 tx_len>128 会写穿栈。 */
+#define MB_TX_SIZE     256
 #define MB_TICK_BUDGET 4      /* 每拍最多处理字节数 (限速, WCET 上界) */
 #define MB_SILENT_TICKS 4     /* 静默拍数 ≥ 3.5 字符 (见上方推导) */
 

@@ -233,13 +233,39 @@ def main():
                resp is not None and len(resp) == 5 and resp[1] == 0x83 and resp[2] == 0x03
                and mb_check(resp), "resp=%s" % (resp.hex() if resp else None))
 
+        # ⑨b ★ M1 回归 (外部审计 W4 的 P1): **合法大 qty 区** (62..125)
+        #   旧缺陷: BUILD 的组装界限用了 MB_MAX_FRAME(128, 请求帧上限) —— 而这里组装的是
+        #   响应帧, 长度 = 3+2*qty+2 由 qty 决定, 与请求长度无关。qty≥62 时 total>128,
+        #   b_pos 永远到不了 total ⇒ 状态死在 BUILD ⇒ 之后所有注入 NAK "mb: busy"
+        #   (通信域永久不可用, 只能 RESET/断电)。
+        #   ★ 判据可失败: 旧代码下 inject 直接 NAK busy → ok=False, 本项必 FAIL。
+        #   ★ 官方 ⑨ 只测了"超上限 (200>125)", 漏掉了这段**合法区** —— 那正是 M1 的盲区。
+        m1_ok, m1_det = True, []
+        for q in (62, 63, 100, 125):
+            st, resp, rc = inject(mb_frame(1, 0x03, struct.pack(">HH", 40001, q)), wait=0.30)
+            wl = 3 + q * 2 + 2
+            ok = (resp is not None and len(resp) == wl
+                  and resp[1] == 0x03 and resp[2] == q * 2 and mb_check(resp))
+            m1_ok = m1_ok and ok
+            m1_det.append("q%d=%s(len=%s)" % (
+                q, "OK" if ok else "FAIL", len(resp) if resp is not None else "NAK"))
+        record("⑨b ★M1: 合法大 qty 62/63/100/125 → 完整响应 + CRC 独立复核",
+               m1_ok, " ".join(m1_det))
+
+        # ⑨c ★ M1 的"未卡死"判据: 大 qty 之后通信域必须仍能正常应答一帧。
+        #   没有这一条, ⑨b 可能被"状态残留恰好返回"骗过 —— 必须证明域是活的。
+        st, resp, rc = inject(mb_frame(1, 0x03, struct.pack(">HH", 40065, 1)))
+        record("⑨c ★M1: 大 qty 后通信域仍活 (再注入一帧正常响应)",
+               resp is not None and len(resp) == 7 and mb_check(resp),
+               "resp=%s" % (resp.hex() if resp else None))
+
         # ⑩ 统计对账 (frames_rx 应 = 注入次数, 且 err_crc/err_exc 与用例相符)
         st, r = L.xact(CMD_MB_RESP)
         if st == 0 and len(r) >= 2:
             tl = r[1]
             frx, ftx, ecrc, eexc = struct.unpack("<IIII", r[2 + tl:2 + tl + 16])
-            record("⑩ 统计对账: frames_rx=10, err_crc≥1, err_exc≥4",
-                   frx == 10 and ecrc >= 1 and eexc >= 4,
+            record("⑩ 统计对账: frames_rx=15 (10 基础 + ⑨b×4 + ⑨c×1), err_crc≥1, err_exc≥4",
+                   frx == 15 and ecrc >= 1 and eexc >= 4,
                    "rx=%d tx=%d ecrc=%d eexc=%d" % (frx, ftx, ecrc, eexc))
         else:
             record("⑩ 统计对账", False, "0x61 读取失败")
