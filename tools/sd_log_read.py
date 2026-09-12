@@ -329,17 +329,17 @@ def main():
     show = [i for i, l in enumerate(labels) if not l.startswith("SPARE")][:6]
     for w in recs[-3:]:
         ctl = w[3]
-        print("  tick=%-9d seq=%-9d run=%d routes=%d seq_step=%d" %
-              (w[1], w[2], (ctl >> 24) & 0xFF, (ctl >> 16) & 0xFF, ctl & 0xFFFF))
+        print("  tick=%-9d seq=%-9d run=%d n_routes=%d ctrl=0x%08X" %
+              (w[1], w[2], (ctl >> 24) & 0xFF, ctl & 0xFFFF, ctl))
         print("     " + "  ".join("%s=%.5g" % (labels[i], f32(w[4 + i])) for i in show))
 
     if csv_path:
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             cw = csv.writer(f)
-            cw.writerow(["tick", "seq", "run", "routes", "seq_step"] + list(labels))
+            cw.writerow(["tick", "seq", "run", "n_routes", "ctrl"] + list(labels))
             for w in recs:
                 ctl = w[3]
-                cw.writerow([w[1], w[2], (ctl >> 24) & 0xFF, (ctl >> 16) & 0xFF, ctl & 0xFFFF]
+                cw.writerow([w[1], w[2], (ctl >> 24) & 0xFF, ctl & 0xFFFF, ctl]
                             + [f32(x) for x in w[4:64]])
         print("\n[+] CSV 已导出: %s (%d 行, 每行带 tick, 列名来自卡上映射表)" % (csv_path, len(recs)))
     return 0 if ok else 1
