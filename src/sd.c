@@ -163,22 +163,29 @@ volatile uint32_t g_sd_blocks = 0;
  *   [28] 读失败时的 STA      [26] 回读校验 (0=256块逐字全对)
  *   [30] 数据期 CLKCR        [31] CMD6(HS) 的 R1   [32] 用的 CLKDIV
  *   [33] 落盘耗时(拍,100us)  [34] 写成块数        [35] 累计块数
+ *   [37] sd_cmd(25) 返回码    [38] CMD25 后的 STA   [39] 数据等待结束 STA
+ *   [40] CMD12 后的 STA        [41] 卡在第几批      [42] 性能模式标志
+ *   [43] CMD23 的 R1           [44] 1=走CMD12收尾 (0=CMD23 已限长)
  *   [24] 识别用了几轮(1..3)   [25] sd_identify 返回码
  *   [26] 回读不符块数(0=全对)  [27] 回读失败 (块号<<8)|错误码
  *   [16..19] 分频自检: (CLKDIV<<8) | 结果码 (0=OK)
  *   结果码: 1=CMD0 无 CMDSENT  2=CMD8 失败  3=CMD8 回显不符
  */
-#define SD_DIAG  ((volatile uint32_t *)0x24030000u)
+#define SD_DIAG  ((volatile uint32_t *)0x24000200u)
 
 /* ★★ 实验配置字 (2026-09-12, 提速研究用): 调试器**在复位前预写**, 固件读一次即清。
  *   好处: 换 CLKDIV / 开关 High Speed 不需要重新编译烧录 (项目"非侵入式交互"纪律)。
  *   [0] 数据期 CLKDIV (0 / 未写 ⇒ 用默认 SD_DATA_CLKDIV)
  *   [1] =1 ⇒ 识别后发 CMD6 把卡切到 High Speed (50MHz 前必须; 25MHz 不需要)
- *   [2] =1 ⇒ **只测写** (跳过回读校验) —— 测吞吐时必须置, 否则 256 次单块读
- *            会把耗时算进去, 量出来的不是写速度(判据必须只反映被测对象)
+ * ★★ AXI SRAM 布局 (2026-09-12 重排, 空出整块冻结区):
+ *   0x24000000 低 16KB 预留   0x24000200 SD_DIAG   0x24000300 BB_DIAG
+ *   0x24000400 SD_CFG         0x24001000 SD 校验 scratch(512B)
+ *   0x24003000/0x24003100     do.c 锁存快照 / MDMA 链表节点 (勿动)
+ *   0x24004000 + 128KB        黑匣子 RAM 环 (512 槽 × 256B)
+ *   0x24024000 + 128KB        **SD 冻结区** (落盘前把环整体拷过来, 见 sd_dump_write)
  *   读完清零 ⇒ 不会悄悄改变下次上电的行为。 */
-#define SD_CFG      ((volatile uint32_t *)0x24002000u)
-#define SD_DATA_CLKDIV_DEF  2u      /* 100MHz/(2*2) = 25MHz */
+#define SD_CFG      ((volatile uint32_t *)0x24000400u)
+#define SD_DATA_CLKDIV_DEF  1u      /* 100MHz/(2*1) = 50MHz (实测 5.63MB/s) */
 #define SD_HS_ARG           0x80FFFFF1u  /* CMD6 SET, group1(Access Mode) = 1 (High Speed) */
 
 static uint32_t s_sd_ready = 0;
@@ -354,6 +361,10 @@ static int sd_identify(uint32_t chosen)
         uint32_t hs   = SD_CFG[1];
         SD_CFG[0] = 0u; SD_CFG[1] = 0u;                  /* 一次性 */
         if (cdiv == 0u) cdiv = SD_DATA_CLKDIV_DEF;
+        /* HS 默认规则: cdiv==1(50MHz) 时默认开 (50MHz 正式档是 High Speed);
+         * [1]==2 可强制关掉做对照, [1]==1 强制开。 */
+        if (hs == 2u) hs = 0u;
+        else if (hs == 0u) hs = (cdiv == 1u) ? 1u : 0u;
         SD_DIAG[32] = cdiv;
         if (hs != 0u) {
             /* CMD6 SWITCH_FUNC: 把 Access Mode 切到 High Speed (50MHz 前必须)。
@@ -370,12 +381,12 @@ static int sd_identify(uint32_t chosen)
 }
 
 /* 落盘耗时/吞吐自观测 (由调用方计时后回填; 用拍数 100us/拍, 不依赖 DWT) */
-void sd_set_perf(uint32_t elapsed_ticks)
+void sd_set_perf(uint32_t write_ticks, uint32_t verify_ticks, uint32_t verify_res)
 {
-    SD_DIAG[33] = elapsed_ticks;          /* 总耗时 (拍) */
+    SD_DIAG[33] = write_ticks;            /* 写耗时 (拍, 100us/拍) */
     SD_DIAG[34] = SD_DIAG[14];            /* 写成块数 */
-    SD_DIAG[35] = SD_DIAG[3];             /* 累计块数 */
-    SD_DIAG[36] = 0u;                     /* 保留 */
+    SD_DIAG[35] = verify_ticks;           /* 校验耗时 (拍) */
+    SD_DIAG[36] = verify_res;             /* 校验结果 */
 }
 
 int sd_init(void)
@@ -387,7 +398,7 @@ int sd_init(void)
      * ★ 2026-09-12 教训: 不清零时"没写过"和"写成了垃圾"外观完全一样 ——
      *   上一轮把没写的字读成"合法值", 据此编出了两个错误结论。
      *   清零后每个字的语义唯一: 0 = 未到达, 非 0 = 到达并有结论。 */
-    for (k = 0; k < 40u; k++) SD_DIAG[k] = 0u;
+    for (k = 0; k < 56u; k++) SD_DIAG[k] = 0u;
 
     /* ① 时钟: SDMMC1 在 D1 域 AHB3; 内核时钟 = PLL1Q (D1CCIPR.SDMMCSEL=0) */
     *(volatile uint32_t *)0x580244D4u |= (1u << 16);   /* RCC_AHB3ENR.SDMMC1EN */
@@ -552,34 +563,23 @@ int sd_read_block(uint32_t lba, uint8_t *buf)
     }
 }
 
-/* 回读 256 块并逐字比对。
- * @retval 低 16 位 = 内容不符块数; bit16 置位 = 中途读失败, (块号<<8)|错误码 在低 16 位 */
-static uint32_t sd_verify(const uint8_t *src, uint8_t *scratch, uint32_t lba0)
-{
-    uint32_t i, j, mism = 0;
-    for (i = 0; i < 256u; i++) {
-        int rr = sd_read_block(lba0 + i, scratch);
-        if (rr != 0) return 0x10000u | ((i << 8) & 0xFF00u) | (uint32_t)(-rr);
-        {
-            const uint32_t *a = (const uint32_t *)(src + i * SD_BLK_SZ);
-            const uint32_t *b = (const uint32_t *)scratch;
-            for (j = 0; j < (SD_BLK_SZ / 4u); j++) {
-                if (a[j] != b[j]) { mism++; break; }
-            }
-        }
-    }
-    return mism;
-}
+#define SD_BURST_BLKS 64u    /* 每批块数: 小一点便于失败定位 */
+#define SD_RING    ((const uint8_t *)0x24004000u)   /* 黑匣子 RAM 环 (活的) */
+#define SD_FREEZE  ((uint8_t *)0x24024000u)         /* 128KB 冻结区 (紧接环之后) */
 
-/* 多块写 (CMD25 + CMD12 STOP) —— 单块 CMD24 的根本问题是"每块都要一次命令+响应+
- * 等卡内部编程", 实测只有 ~0.3 MB/s。多块把 N 个 512B 块挂在**一条命令**下,
- * 由 IDMA 连续喂数据, 卡自己流水编程 —— 吞吐由总线/卡决定, 不再由命令开销决定。
- * ★ 关闭方式照 HAL: 发 CMD12 时必须 **CMDSTOP=1 且 CMDTRANS=0**
- *   (`SDMMC_CmdStopTransfer`, stm32h7xx_ll_sdmmc.c:754-783)。
- * @param buf 4 字节对齐的 SRAM 源; nblk 块数 (1..1024); 建议 ≤64 便于失败定位 */
+/* 多块写 (CMD23 限长 + CMD25 多块写) —— 单块 CMD24 的根本问题是"每块都要一次命令+
+ * 响应+等卡内部编程", 实测只有 ~0.3 MB/s; 多块写实测 **2.95MB/s@25MHz / 5.63@50MHz**。
+ * ★★ 必须先用 **CMD23 (SET_BLOCK_COUNT)** 把块数告诉卡:
+ *   实测 (2026-09-12) 不告诉卡时, 主机侧 DLEN 到点就 DATAEND 收工, 而**卡仍在等它
+ *   以为没发完的数据** ⇒ 它不响应 CMD12 (STA=0x0004 CTIMEOUT) ⇒ 卡永久卡在
+ *   "接收数据"状态, 后续命令全失联。卡支持 CMD23 (R1=0x900 无错位) ⇒ 不再需要 CMD12。
+ *   ★ CMD23 必须在 **CMDTRANS 置位之前**发 —— 否则 CPSM 会把它当数据命令。
+ *   ★ 若卡不支持 CMD23 (R1 有错位) ⇒ 自动退回"发完再 CMD12"的 HAL 路径。
+ * @param buf 4 字节对齐的 SRAM 源; nblk 块数 (1..1024); 每批建议 ≤64 便于失败定位 */
 int sd_write_multi(uint32_t lba, const uint8_t *buf, uint32_t nblk)
 {
-    uint32_t g, st;
+    uint32_t g, st = 0u, r1 = 0u;
+    int rc, use_cmd12;
 
     if (!s_sd_ready) return -1;
     if (nblk == 0u || nblk > 1024u) return -1;
@@ -590,82 +590,111 @@ int sd_write_multi(uint32_t lba, const uint8_t *buf, uint32_t nblk)
     SD_DLEN   = nblk * SD_BLK_SZ;
     SD_DCTRL  = (SD_BLK_BITS << 4) | (0u << 1) | (0u << 2);   /* 512B/写/块/DTEN=0 */
     SD_ICR    = STA_STATIC;
+
+    rc = sd_cmd(23, nblk, CMD_WAITRESP_S, &r1, 1);            /* SET_BLOCK_COUNT */
+    SD_DIAG[43] = r1;
+    use_cmd12 = ((rc != 0) || ((r1 & 0xFDFFE008u) != 0u)) ? 1 : 0;
+    SD_DIAG[44] = (uint32_t)use_cmd12;
+
     SD_CMD   |= CMD_CMDTRANS;
     SD_IDMABASE0 = (uint32_t)buf;
     SD_IDMACTRL  = 1u;
 
-    if (sd_cmd(25, lba, CMD_WAITRESP_S, 0, 1) != 0) {         /* CMD25 WRITE_MULTIPLE_BLOCK */
-        SD_DIAG[13] = SD_STA;
-        SD_CMD &= ~CMD_CMDTRANS; SD_IDMACTRL = 0u;
-        return -2;
-    }
+    rc = sd_cmd(25, lba, CMD_WAITRESP_S, 0, 1);               /* WRITE_MULTIPLE_BLOCK */
+    SD_DIAG[37] = (uint32_t)rc;
+    SD_DIAG[38] = SD_STA;
+    if (rc != 0) { SD_DIAG[13] = SD_STA; goto fail; }
 
     /* ★ 多块写**只能等 DATAEND**: DBCKEND 是"每块结束"都会置位
-     *   (单块写用它没问题, 多块写用它 ⇒ 第 1 块结束就误判成功)。
-     *   DCRCFAIL/DCRCFAIL/DTIMEOUT 由 STA_DATAERR 覆盖。 */
-    st = 0u;
+     *   (单块写用它没问题, 多块写用它 ⇒ 第 1 块结束就误判成功)。 */
     for (g = 0; g < SD_TMOUT_DATA; g++) {
         st = SD_STA;
         if (st & STA_DATAERR) break;
         if (st & STA_DATAEND) break;
     }
+    SD_DIAG[39] = st;
     SD_CMD &= ~CMD_CMDTRANS;
     SD_IDMACTRL = 0u;
 
-    /* ★ STOP_TRANSMISSION (CMD12): CMDSTOP=1, CMDTRANS=0 */
-    SD_CMD &= ~(CMD_CMDTRANS | CMD_CMDSTOP);
-    SD_CMD |= CMD_CMDSTOP | 12u | CMD_WAITRESP_S | CMD_CPSMEN;
-    for (g = 0; g < SD_TMOUT_CMD; g++) {
-        uint32_t s2 = SD_STA;
-        if ((s2 & (STA_CMDREND | STA_CCRCFAIL | STA_CTIMEOUT)) && !(s2 & STA_CPSMACT)) break;
+    if (use_cmd12) {
+        SD_ICR = STA_STATIC;
+        SD_CMD &= ~(CMD_CMDTRANS | CMD_CMDSTOP);
+        SD_CMD |= CMD_CMDSTOP | 12u | CMD_WAITRESP_S | CMD_CPSMEN;
+        for (g = 0; g < SD_TMOUT_CMD; g++) {
+            uint32_t s2 = SD_STA;
+            if ((s2 & (STA_CMDREND | STA_CCRCFAIL | STA_CTIMEOUT)) && !(s2 & STA_CPSMACT)) break;
+        }
+        SD_DIAG[40] = SD_STA;
+        SD_CMD &= ~CMD_CMDSTOP;
+        SD_ICR = STA_STATIC;
     }
-    SD_CMD &= ~CMD_CMDSTOP;
-    SD_ICR = STA_STATIC;
 
-    if (st & STA_DATAERR)    { SD_DIAG[13] = st; return -4; }
-    if (!(st & STA_DATAEND)) { SD_DIAG[13] = st; return -5; }
-    if (sd_wait_ready() != 0) { SD_DIAG[13] = SD_STA; return -7; }
+    if (st & STA_DATAERR)    { SD_DIAG[13] = st; goto fail; }
+    if (!(st & STA_DATAEND)) { SD_DIAG[13] = st; goto fail; }
+    if (sd_wait_ready() != 0) { SD_DIAG[13] = SD_STA; goto fail; }
     g_sd_blocks += nblk;
     return 0;
+
+fail:
+    /* ★ 失败必须**把卡和数据通路收干净**, 否则 DPSM 挂着会把后续操作全毒掉
+     *   (实测: 失败后 CMD13 直接 CTIMEOUT)。 */
+    SD_CMD &= ~CMD_CMDTRANS;
+    SD_IDMACTRL = 0u;
+    SD_CMD &= ~(CMD_CMDTRANS | CMD_CMDSTOP);
+    SD_CMD |= CMD_CMDSTOP | 12u | CMD_WAITRESP_S | CMD_CPSMEN;
+    { uint32_t gg; for (gg = 0; gg < 200000u; gg++) { if (!(SD_STA & STA_CPSMACT)) break; } }
+    SD_CMD &= ~CMD_CMDSTOP;
+    SD_ICR = STA_STATIC;
+    SD_DCTRL = 0u;
+    return -8;
 }
 
-
-/* 把 AXI 黑匣子缓冲 (BB_TOTAL = 128KB = 256 块) 写到卡上, 然后**回读校验**。
- * ★ 为什么不以"写命令返回 0"为判据: 写成功只说明主机侧协议走完了,
- *   不说明卡真的把数据存住了 (写保护/坏块/寻址容错都可能吞掉)。
- *   真正的对端证据是 **读回来的字节**: 256 块逐字比对, 不符块数记进 [26]。
- *   回读缓冲放在 AXI 低 16KB 预留区 (0x24001000), 与黑匣子区不重叠。
- * ★ 写路径走 **多块 CMD25**, 每批 SD_BURST_BLKS 块 (便于失败定位);
- *   耗时由调用方计时后交回 sd_set_perf() 记进诊断区 (见 [33..36])。 */
-#define SD_BURST_BLKS 64u
-void sd_dump_blackbox(void)
+/* 黑匣子落盘: **写**与**回读校验**拆成两个入口, 由调用方分别计时。
+ * ★ 为什么拆: 目标是量"写吞吐", 而 256 次单块读的回读校验耗时会混进总耗时 ——
+ *   量出来的就不是写速度了。判据只能反映被测对象。 */
+void sd_dump_write(void)
 {
-    uint32_t i;
-    const uint8_t *src = (const uint8_t *)0x24004000u;   /* AXI 黑匣子区 */
-    uint8_t *scratch   = (uint8_t *)0x24001000u;         /* AXI 低 16KB 预留区 */
-    const uint32_t base_lba = 3000000u;                  /* 约 1.46GB 处, 避开盘头 */
-
+    uint32_t i, k;
+    uint32_t *fr = (uint32_t *)SD_FREEZE;
+    const uint32_t *rg = (const uint32_t *)SD_RING;
     if (!s_sd_ready) return;
+    /* ⓪ ★★ 先把环整体**冻结**到 0x24024000。
+     *   环是活的 (引擎每 100us 覆写), 直接"边写边比对活环"等于拿会动的靶子当判据 ——
+     *   实测因此报过 182/256 块"不符"(假警报)。冻结后写与校验对着同一份静止数据。
+     *   这也是"每拍连续落盘"必须的机制: 落盘内容必须是某一时刻的一致快照。 */
+    for (k = 0; k < (256u * SD_BLK_SZ) / 4u; k++) fr[k] = rg[k];
     (void)sd_wait_ready();
-
-    /* ① 写 256 块: 4 批 × 64 块 (多块写) */
     for (i = 0; i < 256u; i += SD_BURST_BLKS) {
-        if (sd_write_multi(base_lba + i, src + i * SD_BLK_SZ, SD_BURST_BLKS) != 0) break;
+        SD_DIAG[41] = i;                     /* 卡在第几批 */
+        if (sd_write_multi(3000000u + i, SD_FREEZE + i * SD_BLK_SZ, SD_BURST_BLKS) != 0) break;
         SD_DIAG[14] = i + SD_BURST_BLKS;
     }
     SD_DIAG[3] = g_sd_blocks;
+}
 
-    /* ★ 性能模式: 只测写 (跳过回读校验)。测吞吐必须走这支 ——
-     *   否则 256 次单块读的耗时会混进来, 量出来的不是写速度。 */
-    if (SD_CFG[2] != 0u) {
-        SD_CFG[2] = 0u;
-        SD_DIAG[26] = 0u;
-        SD_DIAG[20] = (SD_DIAG[14] == 256u) ? 0x600D : 0x600E;
-        return;
+uint32_t sd_dump_verify(void)
+{
+    uint8_t *scratch = (uint8_t *)0x24001000u;           /* AXI 低 16KB 预留区 */
+    uint32_t i, j, mism = 0;
+    if (!s_sd_ready) return 0xFFFFFFFFu;
+    for (i = 0; i < 256u; i++) {
+        int rr = sd_read_block(3000000u + i, scratch);
+        if (rr != 0) { mism = 0x10000u | ((i << 8) & 0xFF00u) | (uint32_t)(-rr); break; }
+        {
+            const uint32_t *a = (const uint32_t *)(SD_FREEZE + i * SD_BLK_SZ);
+            const uint32_t *b = (const uint32_t *)scratch;
+            for (j = 0; j < (SD_BLK_SZ / 4u); j++) {
+                if (a[j] != b[j]) { mism++; break; }
+            }
+        }
     }
+    SD_DIAG[26] = mism;      /* 低 16 位 = 不符块数; bit16 = 中途读失败 */
+    SD_DIAG[20] = (SD_DIAG[14] == 256u && mism == 0u) ? 0x600D : 0x600E;
+    return mism;
+}
 
-    /* ② 回读逐字比对 (对端证据; 低 16 位 = 不符块数, bit16 = 中途读失败) */
-    SD_DIAG[26] = sd_verify(src, scratch, base_lba);
-
-    SD_DIAG[20] = (SD_DIAG[14] == 256u && SD_DIAG[26] == 0u) ? 0x600D : 0x600E;
+void sd_dump_blackbox(void)          /* 兼容入口: 写 + 校验 */
+{
+    sd_dump_write();
+    (void)sd_dump_verify();
 }

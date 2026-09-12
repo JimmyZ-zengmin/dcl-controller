@@ -43,6 +43,8 @@ void hil_tick(uint8_t *base, uint32_t tick_now);   /* 主循环版 (A/B 对照�
  *     超出 Thumb `BL` 的 ±16MB ⇒ 必须走 BLX (详见 main.c 里 s_io_in 的证据链)。 */
 __attribute__((long_call)) void hil_out_poll(uint8_t *base, uint32_t tick_now);
 
+extern volatile uint32_t g_hil_out_n;   /* hil_out_poll 活性计数 (obs_anchor 登记) */
+
 /** @brief HIL 物理输出的**安全态** —— 由 engine 的物理输出面注册表在 STOP/RESET 时调用。
  *  ★ 语义: 把 PWM 占空比压到 0 (输出归零), 并回写 `OFF_HIL_DUTY` 镜像。
  *  ★ 为什么必须回写镜像: `OFF_HIL_DUTY` 的契约是"最近写入 TIM3_CCR1 的值"。

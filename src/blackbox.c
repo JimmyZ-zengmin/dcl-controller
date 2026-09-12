@@ -61,7 +61,7 @@
  *   固定版本寄存器 IPVR 都读回 0 ⇒ 那是读失败不是真值)。所以 MDMA 的状态
  *   只能由**固件自己**读出来放进 SRAM, 再让 pyocd 读 SRAM。
  *   布局见文件末尾 bb_diag_dump 注释。 */
-#define BB_DIAG  ((volatile uint32_t *)0x24030100u)
+#define BB_DIAG  ((volatile uint32_t *)0x24000300u)
 
 /* SHM 紧凑快照区 (SHM 尾部, 256B) */
 /* OFF_BB_SNAP 在 engine.h 定义 */

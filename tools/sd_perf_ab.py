@@ -19,8 +19,8 @@ import subprocess
 import sys
 
 TARGET = "stm32h723xx"
-CFG = 0x24002000
-DIAG = 0x24030000
+CFG = 0x24000400
+DIAG = 0x24000200
 
 VARIANTS = [
     ("1-bit @25MHz 默认速  (基线)", 2, 0),

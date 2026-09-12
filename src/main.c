@@ -2448,8 +2448,10 @@ int main(void)
          *   阈值足够分辨 128KB 多块写 (几十 ms)。结果回填进 sd 诊断区 [33..35]。
          *   吞吐 = 块数×512B / (耗时×100us)。 */
         uint32_t t0 = g_tick_count;
-        sd_dump_blackbox();
-        sd_set_perf(g_tick_count - t0);
+        sd_dump_write();                        /* 只写 */
+        uint32_t t1 = g_tick_count;
+        uint32_t vres = sd_dump_verify();       /* 只校验 */
+        sd_set_perf(t1 - t0, g_tick_count - t1, vres);
     }
 #if HIL_SAFE
     eng_register_output_surface(do_outputs_safe);

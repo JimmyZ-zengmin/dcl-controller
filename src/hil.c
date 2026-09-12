@@ -14,6 +14,7 @@
 static uint8_t *s_hil_base = 0;
 /* ★ P1: TIM_ARR+1 的缓存 —— 由 hil_init 写入, 输出臂只读 (见 hil_init 里赋值处的理由)。 */
 static uint32_t s_arr1 = 0;
+volatile uint32_t g_hil_out_n = 0;   /* hil_out_poll 活性计数 (此前无观测面, 补) */
 /* ★★ P1 修复 (2026-09-12): "硬件已初始化" 门。
  *   起因是一次**整机卡死** (排查了很久, 证据链见 main.c 里 s_io_in 那段):
  *   拍中断在 **阶段 8** (`tick_timer_init`) 就开跑了, 而 TIM3 的时钟要到
@@ -170,5 +171,6 @@ void hil_outputs_safe(void)
 void hil_out_poll(uint8_t *base, uint32_t tick_now)
 {
     (void)tick_now;          /* 输出臂每拍都做, 不需要相位 */
+    g_hil_out_n++;           /* 活性计数 (每拍+1; 防空判据) */
     hil_out_apply(base);
 }
