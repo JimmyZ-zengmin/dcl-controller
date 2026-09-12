@@ -167,6 +167,55 @@ def board_tx_burst(proto_port, link_port, seconds):
     return 0
 
 
+def loopback_test(proto_port, cycles=4):
+    """★ PA2 ↔ PA3 外部短接时的**自环**测试: 板子自己发、自己收。
+
+    这是"USART2 收发硬件 + 固件物理通路"唯一可靠的功能性验证 ——
+    因为本机 pyocd **读不了外设寄存器**(GPIOA 读回 0xABFFFFFF = 陈旧 SRAM;
+    USART2 读回 0 = 读失败), 所以只能让硬件**真的走一遍数据**。
+
+    ★★ 时序要点 (不这么做就一定失败): `0x60` 注入会把 `src` 置成**隧道模式**,
+       而回环回来的字节只有在 `src=0`(物理口) 时才会被状态机读走。
+       办法: 请求用 **qty=125** ⇒ 应答长达 255 字节, 固件按 ≤4 字节/拍推,
+       要 ~6.4 ms 才推完 ⇒ **注入后立刻把 src 切回物理口, 就能抢到应答的尾巴**。
+    ★★ 判据只能用 err_crc / err_exc, **不能用 frames_rx** —— 这一条是负对照抓出来的:
+       `frames_rx` **两种字节源都计数**(隧道注入 + 物理口各算一帧), 所以"每轮 +1"
+       只是**我注入的那一帧自己**, 与回环毫无关系 (第一版就这么报了假成功)。
+       而**注入的请求是合法帧** ⇒ 它永远不会产生 err_crc/err_exc。
+       回环回来的应答被当成"请求"解析 ⇒ 要么片段 CRC 失败 (err_crc++),
+       要么完整但地址非法/长度不足 (err_exc++) ⇒ **这两个量只要动, 就一定来自物理口**。
+    """
+    proto = serial.Serial(proto_port, 115200, timeout=0.3)
+    long_req = mb_frame(1, [0x03, 0x9C, 0x41, 0x00, 0x7D])   # qty=125 → 255B 应答
+    tot = 0
+    print("自环测试: PA2↔PA3 应已短接; 注入长应答(255B) 并在途中把 src 切回物理口")
+    print("(判据 = Δerr_crc + Δerr_exc; frames_rx 两种字节源都算, 不作数)")
+    for k in range(cycles):
+        xfer(proto, dcl_frame(0x62, bytes([0, 1])), 0.05)
+        base, err = read_counters_via_proto(proto)
+        if err:
+            print("  [X] 读计数失败: %s" % err)
+            break
+        xfer(proto, dcl_frame(0x60, long_req), 0.004)        # 只等 4ms → 应答还在推
+        xfer(proto, dcl_frame(0x62, bytes([0, 1])), 0.03)    # 抢在推完前切回物理口
+        time.sleep(0.15)
+        now, err = read_counters_via_proto(proto)
+        if err:
+            continue
+        df = now[0] - base[0]
+        de = now[2] - base[2]
+        dx = now[3] - base[3]
+        tot += de + dx
+        print("  第%d轮: Δframes_rx=%+d(忽略)  Δerr_crc=%+d  Δerr_exc=%+d  state=%d rx_len=%d"
+              % (k + 1, df, de, dx, now[4], now[5]))
+    proto.close()
+    print("\n判定: %s" % ("**自环成功** ⇒ USART2 收发硬件 + 固件物理通路都正常 ⇒ "
+                        "问题一定在 485 链路 (模块/A-B/线)" if tot > 0 else
+                        "**自环失败** ⇒ 若 PA2↔PA3 **确实已短接**, 则板子侧有问题 "
+                        "(USART2 硬件/引脚配置/固件路径); 若还没短接, 这一条只是负对照 (本就该失败)"))
+    return 0 if tot > 0 else 1
+
+
 def main():
     argv = sys.argv[1:]
     if serial is None:
@@ -175,6 +224,13 @@ def main():
     port = argv[argv.index("--port") + 1] if "--port" in argv else None
     proto = argv[argv.index("--proto") + 1] if "--proto" in argv else None
     use_pyocd = "--pyocd" in argv
+
+    if "--loopback" in argv:                     # 自环只需协议口, 不需要 --port
+        if not proto:
+            print("[X] --loopback 需要 --proto COMxx (协议口, 用它注入/查计数)")
+            return 2
+        return loopback_test(proto)
+
     if not port:
         print(__doc__)
         return 2
