@@ -57,6 +57,7 @@
 #include "adc.h"
 #include "di.h"
 #include "hil.h"
+#include "do.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -785,6 +786,7 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   ★ 这条值得记住: **ARMv7-M 只要求 VTOR 128 对齐**, 所以 256 是**实测**出来的
          *     经验值, 不是 spec 要求 —— 换板子/换型号要重新验。 */
         hil_out_poll(g_shm, g_tick_count);
+        do_poll(g_shm, g_tick_count);        /* ★ P3-A: DO 输出面 ACTUATOR → GPIOE (BSRR 原子写) */
 #endif
 
         uint32_t t1 = DWT_CYCCNT;
@@ -2163,6 +2165,8 @@ static void obs_anchor(void)
      *   g_adc_sm_timeout : 状态机超时数 (应恒 0; 与上面那个成对读才分得清"没坏"与"没跑") */
     sink ^= g_safe_mask_oob;
     sink ^= g_adc_sm_done;     sink ^= g_adc_sm_timeout;
+    /* ★ P3-A DO 输出面观测面 (不读会被 --gc-sections 回收) */
+    sink ^= g_do_poll_n;
     /* 审计 #1 的观测面: 物理输出面 登记数 / 上次实际执行数 */
     sink ^= g_out_surfaces;    sink ^= g_safe_surfaces_ran;
     /* W4 通信域 */
@@ -2418,6 +2422,13 @@ int main(void)
      * ⇒ eng_outputs_safe() 清不到任何物理面 ⇒ 复现"STOP 后 PWM 保持最后占空比"。
      * 交付构建永远走上面那支。 */
     g_stage = 25;
+#endif
+    /* ⑦b DO 输出面 (P3-A, 2026-09-12): init + 安全态登记。
+     * ★ 登记后 `eng_outputs_safe` 停机时会调 `do_outputs_safe()` ⇒ GPIOE 的管辖位
+     *   **第一次被真正清零** (之前它只有计数、没有动作 —— 定案②的欠账在此收清)。 */
+    g_stage = 26; do_init(g_shm);
+#if HIL_SAFE
+    eng_register_output_surface(do_outputs_safe);
 #endif
     g_out_surfaces = eng_output_surface_count();
     g_w5_ready = 1;
