@@ -43,7 +43,7 @@ void do_latch_init(void);
  *   硬件锁存 (输出沿与计算时长解耦); =0 时 do_poll 直接写 BSRR (P3-A 行为, 对照档)。
  *   放这里用 #ifndef 兜底, 可被 CMake -DDCL_DO_LATCH=0 覆盖。 */
 #ifndef DCL_DO_LATCH
-#define DCL_DO_LATCH 0   /* ★ 暂回 P3-A 直写 (P3-B 影子模式 TEIF 未解, 见 09-12 日志) */
+#define DCL_DO_LATCH 1   /* ★ 影子模式开启 (软触发验证 ODR=0xFF; TSEL 触发待调) */
 #endif
 
 extern volatile uint32_t g_do_poll_n;    /* 活性计数 (就绪门后每拍+1) */

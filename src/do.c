@@ -160,7 +160,12 @@ void do_latch_init(void)
     __asm__ volatile("dsb; isb");
     *(volatile uint32_t *)MDMA_CH0_CCR   = 1u;               /* EN */
     __asm__ volatile("dsb; isb");
-    /* CTBR: TSEL=8(DMA2_S0_TC) + SBUS(bit16)=源在 DTCM (走 TCM 端口) */
+    /* CTBR: TSEL=8(DMA2_S0_TC) + SBUS(bit16)=源在 DTCM (走 TCM 端口)
+ * ★★ SBUS/DBUS 语义 (软触发实验定谳 2026-09-12):
+ *   SBUS(bit16)=源在 DTCM/TCM 路径; DBUS(bit17)=目的在 DTCM/TCM 路径。
+ *   首版误写 DBUS(1<<17) ⇒ MDMA 从 TCM 端口去写 GPIOE(AHB4) ⇒ CESR=0x28
+ *   (TEA=40=SAR 低 7 位, TED=0=读错误) ⇒ ODR 永远收到 0。
+ *   修为 SBUS 后软触发验证: pyocd 写 shadow=0xFFF ⇒ ODR=0xFF ✅ (byte 尺寸锁存低 8 位) */
     *(volatile uint32_t *)MDMA_CH0_CTBR  = MDMA_REQ_DMA2S0_TC | (1u << 16);
     __asm__ volatile("dsb; isb");
     *(volatile uint32_t *)MDMA_CH0_CCR   = 1u;               /* EN */
