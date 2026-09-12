@@ -44,6 +44,7 @@
  */
 #include "sd.h"
 #include "regs.h"
+#include "blackbox.h"   /* 记录格式 BB_SLOT_SZ / bb_slots_produced() */
 
 /* ── SDMMC1 (D1 域, 0x52007000) ── */
 #define SDMMC1_BASE   0x52007000u
@@ -186,9 +187,38 @@ volatile uint32_t g_sd_blocks = 0;
  *   读完清零 ⇒ 不会悄悄改变下次上电的行为。 */
 #define SD_CFG      ((volatile uint32_t *)0x24000400u)
 #define SD_DATA_CLKDIV_DEF  1u      /* 100MHz/(2*1) = 50MHz (实测 5.63MB/s) */
+#define SD_RING    ((const uint8_t *)0x24004000u)   /* 黑匣子 RAM 环 (活的, 512×256B) */
+#define SD_STAGE   ((uint8_t *)0x24024000u)         /* 128KB 冻结/暂存区 (紧接环之后) */
 #define SD_HS_ARG           0x80FFFFF1u  /* CMD6 SET, group1(Access Mode) = 1 (High Speed) */
 
 static uint32_t s_sd_ready = 0;
+
+volatile uint32_t g_sd_capacity_blocks = 0;   /* 卡容量 (512B 块数, 由 CSD 解析) */
+static uint32_t g_sd_csd[4];
+
+/* ── SD 日志 (专用裸介质): LBA0 = 头部, LBA1.. = 数据区 (环形回卷) ──
+ * 为什么专用裸介质: 要"每拍连续落盘 + 无限增长 + 回卷", 就不可能和文件系统共存
+ * (写进数据区会把文件写坏)。PC 端用 tools/sd_read_raw.py / sd_log_read.py 直读。 */
+#define LOG_HDR_MAGIC   0x474F4C44u   /* "DLOG" */
+#define LOG_VERSION     1u
+#define LOG_BATCH_SLOTS 256u          /* 每批 256 条 = 64KB = 128 块 (小批延迟吃掉带宽) */
+#define LOG_HDR_EVERY   32u           /* 每 32 批刷一次头部 (≈1MB) */
+
+static uint32_t s_log_ready = 0;
+static uint32_t s_log_slot_base = 0;  /* ★ 环消费游标: 下一条要落盘的记录是 bb 的第几条 */
+static uint32_t s_log_total = 0;      /* 落到卡上的记录总数 (跨上电累计) */
+static uint32_t s_log_blk = 0;        /* 数据区内的块游标 (0 起) */
+static uint32_t s_log_batches = 0;
+static uint32_t s_log_hdr_flush = 0;
+static uint32_t s_log_dropped = 0;
+static uint32_t s_log_wrapped = 0;
+static uint32_t s_log_last_rc = 0;
+static uint32_t s_log_last_seq = 0;
+static uint32_t s_log_last_tick = 0;
+static uint32_t s_log_polls = 0;        /* poll 调用次数 (自观测) */
+static uint32_t s_log_max_avail = 0;    /* 见过的最大待落盘条数 (判据: 是否接近 512) */
+static uint32_t s_log_drop_open = 0;    /* 开日志时的丢包基线 ⇒ 可算本次上电丢包 */
+static uint32_t s_log_blk_open = 0;     /* 开日志时的块基线 ⇒ 可算本次上电写了多少 */
 
 #define SD_PWRUP_DLY   60000u       /* ~1ms @400MHz (HAL 用 HAL_Delay(1)) */
 #define SD_TMOUT_CMD   4000000u     /* 命令/RESP 等待上限 (循环计数) */
@@ -336,6 +366,14 @@ static int sd_identify(uint32_t chosen)
     if (sd_cmd(9, g_sd_rca << 16, CMD_WAITRESP_L, 0, 1) != 0) {   /* CMD9 SEND_CSD (R2) */
         SD_DIAG[0] = 12; SD_DIAG[1] = SD_STA; SD_DIAG[20] = 0xBA09; return -11;
     }
+    /* ★ CSD 四字留档 → 供卡容量解析 (日志回卷要用) */
+    g_sd_csd[0] = r; g_sd_csd[1] = SD_RESP2; g_sd_csd[2] = SD_RESP3; g_sd_csd[3] = SD_RESP4;
+    {   /* CSD v2 (SDHC/SDXC): C_SIZE = CSD[69:48]; 容量 = (C_SIZE+1) × 512KB */
+        uint32_t csize = ((g_sd_csd[1] & 0x3Fu) << 16) | ((g_sd_csd[2] >> 16) & 0xFFFFu);
+        g_sd_capacity_blocks = (csize + 1u) * 1024u;
+        SD_DIAG[46] = csize;
+        SD_DIAG[54] = g_sd_capacity_blocks;
+    }
     g_sd_init_stage = 9;
     if (sd_cmd(7, g_sd_rca << 16, CMD_WAITRESP_S, 0, 1) != 0) {   /* CMD7 SELECT (R1b) */
         SD_DIAG[0] = 13; SD_DIAG[1] = SD_STA; SD_DIAG[20] = 0xBA07; return -12;
@@ -398,7 +436,7 @@ int sd_init(void)
      * ★ 2026-09-12 教训: 不清零时"没写过"和"写成了垃圾"外观完全一样 ——
      *   上一轮把没写的字读成"合法值", 据此编出了两个错误结论。
      *   清零后每个字的语义唯一: 0 = 未到达, 非 0 = 到达并有结论。 */
-    for (k = 0; k < 56u; k++) SD_DIAG[k] = 0u;
+    for (k = 0; k < 64u; k++) SD_DIAG[k] = 0u;
 
     /* ① 时钟: SDMMC1 在 D1 域 AHB3; 内核时钟 = PLL1Q (D1CCIPR.SDMMCSEL=0) */
     *(volatile uint32_t *)0x580244D4u |= (1u << 16);   /* RCC_AHB3ENR.SDMMC1EN */
@@ -564,8 +602,6 @@ int sd_read_block(uint32_t lba, uint8_t *buf)
 }
 
 #define SD_BURST_BLKS 64u    /* 每批块数: 小一点便于失败定位 */
-#define SD_RING    ((const uint8_t *)0x24004000u)   /* 黑匣子 RAM 环 (活的) */
-#define SD_FREEZE  ((uint8_t *)0x24024000u)         /* 128KB 冻结区 (紧接环之后) */
 
 /* 多块写 (CMD23 限长 + CMD25 多块写) —— 单块 CMD24 的根本问题是"每块都要一次命令+
  * 响应+等卡内部编程", 实测只有 ~0.3 MB/s; 多块写实测 **2.95MB/s@25MHz / 5.63@50MHz**。
@@ -649,13 +685,173 @@ fail:
     return -8;
 }
 
+
+/* ═══════════ SD 日志 (专用裸介质, 每拍连续落盘, 环形回卷) ═══════════
+ * 布局:  LBA0 = 头部块 (512B)      LBA1 .. 容量-1 = 数据区 (环形)
+ * 数据:  每 512B 块放 2 条 256B 记录, 每条自带 magic/tick/seq (见 blackbox.h)
+ * 语义:  写指针到末端就回卷覆盖最旧; PC 端凭头部 magic 找到日志, 凭每条记录的
+ *        seq 找最新、按 tick 对齐时间 —— **不依赖文件系统**。
+ * 时序:  ISR 每拍写 256B 进 RAM 环 (512 槽 = 51.2ms 缓冲); 主循环调 sd_log_poll()
+ *        成批冻结+落盘。**批量要够大**: 16KB/批 时命令+编程延迟把吞吐压到追不上产量
+ *        (实测每 15s 丢 1.8 万条); 64KB/批 才能吃到 5.6MB/s 的量级。 */
+
+uint32_t sd_cfg_take(uint32_t idx)
+{
+    uint32_t v;
+    if (idx > 3u) return 0u;
+    v = SD_CFG[idx];
+    SD_CFG[idx] = 0u;
+    return v;
+}
+
+/* 刷新头部 (单块写) */
+static int sd_log_flush_header(void)
+{
+    uint32_t *h = (uint32_t *)SD_STAGE;
+    uint32_t i, sum = 0;
+    if (!s_log_ready) return -1;
+    for (i = 0; i < 16u; i++) h[i] = 0u;
+    h[0]  = LOG_HDR_MAGIC;
+    h[1]  = LOG_VERSION;
+    h[2]  = BB_SLOT_SZ;                                  /* 记录 256B */
+    h[3]  = 2u;                                          /* 每块 2 条 */
+    h[4]  = SD_BLK_SZ;
+    h[5]  = 1u;                                          /* 数据区起始 LBA */
+    h[6]  = g_sd_capacity_blocks - 1u;                   /* 数据区块数 */
+    h[7]  = 1u + s_log_blk;                              /* 下一块写哪 */
+    h[8]  = s_log_total;
+    h[9]  = s_log_last_tick;
+    h[10] = s_log_last_seq;
+    h[11] = s_log_dropped;
+    h[12] = s_log_wrapped;
+    h[13] = s_log_batches;
+    h[14] = s_log_hdr_flush;
+    for (i = 0; i < 15u; i++) sum += h[i];
+    h[15] = sum;                                         /* 简单校验和 */
+    s_log_hdr_flush++;
+    return sd_write_block(0u, (const uint8_t *)h);
+}
+
+/* 打开日志: 读头部, 能对上就续写, 否则新建 */
+int sd_log_open(void)
+{
+    uint32_t *h = (uint32_t *)SD_STAGE;
+    int rc;
+    if (!s_sd_ready || g_sd_capacity_blocks < 1024u) { SD_DIAG[53] = 0xE001u; return -1; }
+    rc = sd_read_block(0u, (uint8_t *)SD_STAGE);
+    if (rc == 0 && h[0] == LOG_HDR_MAGIC && h[1] == LOG_VERSION
+        && h[2] == BB_SLOT_SZ && h[6] == (g_sd_capacity_blocks - 1u)) {
+        s_log_blk         = (h[7] >= 1u) ? (h[7] - 1u) : 0u;   /* 续写: 接着上次的指针 */
+        s_log_total       = h[8];
+        s_log_last_tick   = h[9];
+        s_log_last_seq    = h[10];
+        s_log_dropped     = h[11];
+        s_log_wrapped     = h[12];
+        s_log_batches     = h[13];
+        s_log_hdr_flush   = h[14];
+        SD_DIAG[45] = 1u;                                      /* 1 = 续写旧日志 */
+    } else {
+        s_log_blk = 0u; s_log_total = 0u; s_log_last_tick = 0u; s_log_last_seq = 0u;
+        s_log_dropped = 0u; s_log_wrapped = 0u; s_log_batches = 0u; s_log_hdr_flush = 0u;
+        SD_DIAG[45] = 2u;                                      /* 2 = 新建日志 */
+    }
+    s_log_ready = 1;
+    (void)sd_log_flush_header();
+    /* ★ 只记录"从此刻起"新产出的快照: 环里已有的要么是陈旧 SRAM, 要么是上一轮已经
+     *   落过盘的 (续写场景) —— 重复落盘只会把日志写乱。 */
+    s_log_slot_base = bb_slots_produced();
+    s_log_drop_open = s_log_dropped;
+    s_log_blk_open = s_log_total;
+    s_log_polls = 0; s_log_max_avail = 0;
+    SD_DIAG[44] = s_log_blk;
+    SD_DIAG[47] = 1u + s_log_blk;
+    SD_DIAG[48] = s_log_total;
+    SD_DIAG[50] = s_log_wrapped;
+    return 0;
+}
+
+/* 写一批 (最多 LOG_BATCH_SLOTS 条)。@retval 本次落盘条数 (0 = 暂时没什么可写) */
+static uint32_t sd_log_one_batch(void)
+{
+    uint32_t p, avail, n, i, k, nblk, rc, cap_data;
+    cap_data = g_sd_capacity_blocks - 1u;
+    p = bb_slots_produced();
+    avail = p - s_log_slot_base;
+    if (avail > s_log_max_avail) s_log_max_avail = avail;
+    if (avail == 0u) return 0u;
+    if (avail > 512u) {                        /* 环已被覆盖 ⇒ 这一段真的丢了 */
+        s_log_dropped += avail - 512u;
+        s_log_slot_base = p - 512u;
+        avail = 512u;
+    }
+    /* ★ 攒批: 不满一批就等下一轮 (小批的命令开销会把带宽吃掉);
+     *   但**落后到 3/4 环时立刻写**, 否则环被覆盖就真丢数据。 */
+    if (avail < LOG_BATCH_SLOTS && avail <= 384u) return 0u;
+    n = avail & ~1u;                           /* 必须成对 (2 条 = 1 块) */
+    if (n > LOG_BATCH_SLOTS) n = LOG_BATCH_SLOTS;
+    if (n == 0u) return 0u;
+
+    /* ① 冻结这一批 (逐槽搬 ⇒ 天然处理环形回绕) */
+    for (i = 0; i < n; i++) {
+        const uint32_t *src = (const uint32_t *)(SD_RING + (((s_log_slot_base + i) & 511u) * BB_SLOT_SZ));
+        uint32_t *dst = (uint32_t *)(SD_STAGE + i * BB_SLOT_SZ);
+        for (k = 0; k < (BB_SLOT_SZ / 4u); k++) dst[k] = src[k];
+    }
+    {   /* 记下这一批最后一条的 tick/seq (写进头部, PC 端可快速定位最新) */
+        const uint32_t *last = (const uint32_t *)(SD_STAGE + (n - 1u) * BB_SLOT_SZ);
+        s_log_last_tick = last[1];
+        s_log_last_seq  = last[2];
+    }
+    /* ② 分块写; 绝不跨过数据区末端 (到末端就回卷) */
+    nblk = n / 2u;
+    if (s_log_blk + nblk > cap_data) nblk = cap_data - s_log_blk;
+    if (nblk == 0u) { s_log_blk = 0u; s_log_wrapped = 1u; return 0u; }
+
+    rc = sd_write_multi(1u + s_log_blk, SD_STAGE, nblk);
+    s_log_last_rc = (uint32_t)rc;
+    if (rc != 0u) return 0u;                   /* 失败: 不推进游标, 下轮重试同一批 */
+    s_log_blk += nblk;
+    if (s_log_blk >= cap_data) { s_log_blk = 0u; s_log_wrapped = 1u; }
+    s_log_slot_base += nblk * 2u;
+    s_log_total     += nblk * 2u;
+    s_log_batches++;
+    if (((s_log_batches % LOG_HDR_EVERY) == 0u) || s_log_wrapped) (void)sd_log_flush_header();
+    return nblk * 2u;
+}
+
+/* 主循环调用: 把 RAM 环里新产出的快照成批冻结 + 追加(回卷)落盘。
+ * ★★ 必须**连续追到追平**再返回: 单批只有 64 条(=6.4ms 产量) 却要 ~3ms 才写完,
+ *    每轮只写一批的话消费速率 ~2.1MB/s < 产量 2.56MB/s ⇒ 环被周期性覆盖。
+ *    实测: 每轮一批 ⇒ 每 12s 丢 1.2 万条; 连续追平后应接近 0。
+ *    上限 8 批/轮 (≈24ms) 防止把主循环饿死。 */
+void sd_log_poll(void)
+{
+    uint32_t iter;
+    if (!s_log_ready) return;
+    s_log_polls++;
+    for (iter = 0; iter < 8u; iter++) {
+        if (sd_log_one_batch() == 0u) break;
+    }
+    SD_DIAG[47] = 1u + s_log_blk;
+    SD_DIAG[48] = s_log_total;
+    SD_DIAG[49] = s_log_dropped;
+    SD_DIAG[50] = s_log_wrapped;
+    SD_DIAG[51] = s_log_batches;
+    SD_DIAG[52] = s_log_hdr_flush;
+    SD_DIAG[53] = s_log_last_rc;
+    SD_DIAG[55] = s_log_polls;
+    SD_DIAG[56] = s_log_max_avail;
+    SD_DIAG[57] = s_log_dropped - s_log_drop_open;
+    SD_DIAG[58] = (s_log_total - s_log_blk_open) / 2u;   /* 本次上电写了多少块 */
+}
+
 /* 黑匣子落盘: **写**与**回读校验**拆成两个入口, 由调用方分别计时。
  * ★ 为什么拆: 目标是量"写吞吐", 而 256 次单块读的回读校验耗时会混进总耗时 ——
  *   量出来的就不是写速度了。判据只能反映被测对象。 */
 void sd_dump_write(void)
 {
     uint32_t i, k;
-    uint32_t *fr = (uint32_t *)SD_FREEZE;
+    uint32_t *fr = (uint32_t *)SD_STAGE;
     const uint32_t *rg = (const uint32_t *)SD_RING;
     if (!s_sd_ready) return;
     /* ⓪ ★★ 先把环整体**冻结**到 0x24024000。
@@ -666,7 +862,7 @@ void sd_dump_write(void)
     (void)sd_wait_ready();
     for (i = 0; i < 256u; i += SD_BURST_BLKS) {
         SD_DIAG[41] = i;                     /* 卡在第几批 */
-        if (sd_write_multi(3000000u + i, SD_FREEZE + i * SD_BLK_SZ, SD_BURST_BLKS) != 0) break;
+        if (sd_write_multi(3000000u + i, SD_STAGE + i * SD_BLK_SZ, SD_BURST_BLKS) != 0) break;
         SD_DIAG[14] = i + SD_BURST_BLKS;
     }
     SD_DIAG[3] = g_sd_blocks;
@@ -681,7 +877,7 @@ uint32_t sd_dump_verify(void)
         int rr = sd_read_block(3000000u + i, scratch);
         if (rr != 0) { mism = 0x10000u | ((i << 8) & 0xFF00u) | (uint32_t)(-rr); break; }
         {
-            const uint32_t *a = (const uint32_t *)(SD_FREEZE + i * SD_BLK_SZ);
+            const uint32_t *a = (const uint32_t *)(SD_STAGE + i * SD_BLK_SZ);
             const uint32_t *b = (const uint32_t *)scratch;
             for (j = 0; j < (SD_BLK_SZ / 4u); j++) {
                 if (a[j] != b[j]) { mism++; break; }

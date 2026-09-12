@@ -2444,14 +2444,17 @@ int main(void)
      *   放在启动期末尾 (允许几百 ms); 失败不阻塞启动 (内部有超时保护)。 */
     g_stage = 27;
     if (sd_init() == 0) {
-        /* ★ 落盘耗时用**拍计数**测 (100us/拍), 不依赖 DWT ——
-         *   阈值足够分辨 128KB 多块写 (几十 ms)。结果回填进 sd 诊断区 [33..35]。
-         *   吞吐 = 块数×512B / (耗时×100us)。 */
-        uint32_t t0 = g_tick_count;
-        sd_dump_write();                        /* 只写 */
-        uint32_t t1 = g_tick_count;
-        uint32_t vres = sd_dump_verify();       /* 只校验 */
-        sd_set_perf(t1 - t0, g_tick_count - t1, vres);
+        /* 一次性吞吐/回读自检 (调试器预写 SD_CFG[3]=1 才跑; 平时不占用启动时间) */
+        if (sd_cfg_take(3u) != 0u) {
+            uint32_t t0 = g_tick_count;          /* 拍计数计时 (100us/拍), 不依赖 DWT */
+            sd_dump_write();                     /* 只写 */
+            uint32_t t1 = g_tick_count;
+            uint32_t vres = sd_dump_verify();    /* 只校验 (对冻结副本) */
+            sd_set_perf(t1 - t0, g_tick_count - t1, vres);
+        }
+        /* ★ 打开日志: 之后由**主循环**每轮 sd_log_poll() 把新产出的快照
+         *   (RAM 环) 成批冻结并追加落盘, 卡满则回卷覆盖最旧。 */
+        (void)sd_log_open();
     }
 #if HIL_SAFE
     eng_register_output_surface(do_outputs_safe);
@@ -2494,6 +2497,10 @@ int main(void)
             else if (rc == 0) g_persist_saves++;
             else              g_persist_nak++;
         }
+        /* ★★★ 每拍连续落盘 (2026-09-12): 把 RAM 环里新产出的快照成批落盘。
+         *   放在 proto_poll 之后 ⇒ 协议优先被服务; 单批 64 条(=6.4ms 产量) 约 3ms 写完。
+         *   卡满则回卷覆盖最旧 (专用裸介质, 见 sd.c 的日志段注释)。 */
+        sd_log_poll();
         /* ★★★ 空闲窗口自动落盘 (S3 persist_task 语义) —— T15/T26 修复
          *   ── 完整的三次失败记录在 g_persist_req_cnt 上方, 别原样重试第四次 ──
          *   实测结论: 功能正确 (dirty 会清), 但每次落盘有一段失聪窗口

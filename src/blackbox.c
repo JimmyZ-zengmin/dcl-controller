@@ -69,7 +69,8 @@
 static volatile uint8_t *s_bb_shm = 0;
 static volatile uint32_t s_bb_widx = 0;    /* 当前写入槽号 */
 static volatile uint8_t s_bb_ready = 0;
-static volatile uint32_t s_bb_kicks = 0;   /* kick 次数 (自观测) */
+static volatile uint32_t s_bb_kicks = 0;   /* kick 次数 = 已产出条数 (单调) */
+static volatile uint32_t s_bb_seq = 0;     /* 记录序号 (与 kick 同步) */
 static volatile uint32_t s_last_dst = 0;   /* 上一拍的目的地址 (用于"数据有没有落地") */
 
 void bb_init(uint8_t *shm_base)
@@ -140,24 +141,26 @@ void bb_kick(uint32_t tick)
 
     /* ① CPU 拷贝分散数据 → SHM 紧凑快照区 (SHM+0x6F20, 256B) */
     volatile uint32_t *snap = (volatile uint32_t *)(s_bb_shm + OFF_BB_SNAP);
-    snap[0] = tick;
+    /* ★ 每条记录自带"是哪一拍"的标注: magic + tick + seq + ctrl */
+    snap[0] = BBLOG_REC_MAGIC;
+    snap[1] = tick;
+    snap[2] = s_bb_seq;
+    {   uint32_t run = *(volatile uint32_t *)(s_bb_shm + 0x0Du) & 0xFFu;
+        uint32_t nr  = *(volatile uint32_t *)(s_bb_shm + 0x0Eu) & 0xFFFFu;
+        snap[3] = (run << 24) | (nr & 0xFFFFu); }
     {   /* SENSOR[0..15] @ SHM+0x40 */
         volatile uint32_t *src = (volatile uint32_t *)(s_bb_shm + 0x40u);
-        for (uint32_t i = 0; i < 16u; i++) snap[1 + i] = src[i];
+        for (uint32_t i = 0; i < 16u; i++) snap[4 + i] = src[i];
     }
     {   /* WIRE[0..15] @ SHM+0x240 */
         volatile uint32_t *src = (volatile uint32_t *)(s_bb_shm + 0x240u);
-        for (uint32_t i = 0; i < 16u; i++) snap[17 + i] = src[i];
+        for (uint32_t i = 0; i < 16u; i++) snap[20 + i] = src[i];
     }
     {   /* ACTUATOR[0..15] @ SHM+0x140 */
         volatile uint32_t *src = (volatile uint32_t *)(s_bb_shm + 0x140u);
-        for (uint32_t i = 0; i < 16u; i++) snap[33 + i] = src[i];
+        for (uint32_t i = 0; i < 16u; i++) snap[36 + i] = src[i];
     }
-    {   /* 控制状态 */
-        uint32_t run = *(volatile uint32_t *)(s_bb_shm + 0x0Du) & 0xFFu;
-        uint32_t nr  = *(volatile uint32_t *)(s_bb_shm + 0x0Eu) & 0xFFFFu;
-        snap[49] = (run << 24) | (nr & 0xFFFFu);
-    }
+    s_bb_seq++;
 
     /* ② ★★ 每拍必须"关通道 → 改寄存器 → 使能 → 触发"。
      *
@@ -218,6 +221,7 @@ void bb_kick(uint32_t tick)
 }
 
 uint32_t bb_write_idx(void) { return s_bb_widx; }
+uint32_t bb_slots_produced(void) { return s_bb_kicks; }
 
 uint32_t bb_tick_last(void)
 {

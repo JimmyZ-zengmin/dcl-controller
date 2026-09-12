@@ -26,4 +26,9 @@ void sd_dump_write(void);                            /* 只写 (供吞吐计时)
 uint32_t sd_dump_verify(void);                       /* 只回读校验 (供吞吐计时) */
 void sd_set_perf(uint32_t write_ticks, uint32_t verify_ticks, uint32_t verify_res);
 
+/* ── 每拍连续落盘日志 (专用裸介质, 环形回卷) ── */
+int  sd_log_open(void);              /* 读/建头部块, 0 = 成功 */
+void sd_log_poll(void);              /* 主循环调: 成批冻结 + 追加(回卷)落盘 */
+uint32_t sd_cfg_take(uint32_t idx);  /* 取走一次性配置字并清零 */
+
 #endif /* DCL_SD_H */
