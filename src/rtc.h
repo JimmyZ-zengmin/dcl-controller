@@ -26,6 +26,9 @@
 
 void rtc_init(uint8_t *base);
 void rtc_snapshot(void);
+/* ★ 拍中断里周期调用: 自带降频, 让 SHM 的 SSR/TR/DR 镜像随真实时间走。
+ *   (原来镜像只在上电时拍一次 ⇒ 黑匣子记它只会记到常数。) */
+void rtc_latch(void);
 uint32_t rtc_ssr(void);
 void event_log(uint32_t code);
 

@@ -93,8 +93,9 @@ static volatile uint32_t s_last_dst = 0;   /* 上一拍的目的地址 (用于"�
  * 记录里 4 字头 + 60 数据字 = 64 字 = 256B。**哪一槽是哪一路通道**由此表决定,
  * 表随日志头写到卡上 ⇒ 数据自带"这一列是哪一路通道"。
  *
- * ★ 默认表 = 旧的 16/16/16 硬切布局 ⇒ **逐字节相同的记录** (零行为变化)。
- *   改通道 = 只改这张表 (再烧一次), 记录尺寸/环/块结构/PC 解析全不动。
+ * ★ 默认表 = 前 48 槽仍是旧的 16/16/16 布局 (**前 48 槽逐字节不变**), 后 12 槽从
+ *   "白扔的预留"改成绝对时间/通信/DO/强制的标量。改通道只改这张表 (再烧一次),
+ *   记录尺寸/环/块结构/PC 解析全不动。
  * ★ 为什么不做"放大记录装下 256 通道": 缓冲条数 = 环字节/记录字节, 丢包风险 =
  *   一次卡内写抖动窗口内产出的条数 > 槽数。256B→1040B 使槽数 960→236 (÷4),
  *   且通道多则活跃度升、产出也升 —— 双重恶化 (220ms 最坏卡顿下会重新丢包)。
@@ -115,16 +116,40 @@ static const uint32_t s_bb_map_def[BB_MAP_N] = {
     BB_ME(2,  4), BB_ME(2,  5), BB_ME(2,  6), BB_ME(2,  7),
     BB_ME(2,  8), BB_ME(2,  9), BB_ME(2, 10), BB_ME(2, 11),
     BB_ME(2, 12), BB_ME(2, 13), BB_ME(2, 14), BB_ME(2, 15),
-    /* [48..59] 空槽 (旧的 12 个预留字) —— 不再白扔 */
-    BB_ME(3,  0), BB_ME(3,  1), BB_ME(3,  2), BB_ME(3,  3),
-    BB_ME(3,  4), BB_ME(3,  5), BB_ME(3,  6), BB_ME(3,  7),
-    BB_ME(3,  8), BB_ME(3,  9), BB_ME(3, 10), BB_ME(3, 11),
+    /* [48..49] 绝对时间 —— 让 PC 能把 tick 换算成挂钟, 且**每条记录最多隔 1 秒**
+     *          (TR 每秒必变 ⇒ "变化才记"至少每秒落一条 = 天然的秒级心跳) */
+    BB_ME(4,  0), BB_ME(4,  1),
+    /* [50..54] 通信域 Modbus —— 帧数/响应数/CRC错/异常/状态机首字 */
+    BB_ME(5,  0), BB_ME(5,  1), BB_ME(5,  2), BB_ME(5,  3), BB_ME(5,  4),
+    /* [55]     DO 打包位图 (= 真正锁存到引脚的电平, 与"引擎算出的输出"互为佐证) */
+    BB_ME(6,  0),
+    /* [56..59] 强制位图 128 bit —— 哪几路被强制过, 一次说清 */
+    BB_ME(7,  0), BB_ME(7,  1), BB_ME(7,  2), BB_ME(7,  3),
 };
 
 /* ★ 绑定结果: 每槽一个**预解析好的源指针**。为什么不全在拍里查表:
  *   快照填充在 10kHz 拍内跑, 一次查表 + 分支比一次取数贵; 绑定只在 init 做一次。 */
 static volatile uint32_t *s_map_p[BB_MAP_N];
 static volatile uint32_t s_map_zero = 0u;   /* 空槽的源: 恒 0 */
+
+/* ★★ 通信域被记录的量 —— 偏移用 offsetof **从结构体类型取**, 不手写数字:
+ *   结构体一改, 编译期就断 (下面有断言), 不会静默错位。
+ *   ★ MbCtrl_t 是 `packed` ⇒ 这四个 u32 落在偏移 9/13/17/21 (**非 4 的倍数**)。
+ *     裸 u32 读在 Cortex-M7 上允许 (UNALIGN_TRP 默认关), 本文件早有先例
+ *     (读 SHM+0x0D 的 u32 取 ENGINE_RUN)。 */
+#define BB_COM_N 5u
+static const uint32_t s_bb_com_off[BB_COM_N] = {
+    (uint32_t)__builtin_offsetof(MbCtrl_t, frames_rx),   /* 0 完整帧数 */
+    (uint32_t)__builtin_offsetof(MbCtrl_t, frames_tx),   /* 1 发出响应数 */
+    (uint32_t)__builtin_offsetof(MbCtrl_t, err_crc),     /* 2 CRC 校验失败 */
+    (uint32_t)__builtin_offsetof(MbCtrl_t, err_exc),     /* 3 异常响应数 */
+    0u,                                                  /* 4 首字 state|slave|rx_len|rx_pos */
+};
+_Static_assert(sizeof(MbCtrl_t) == 40, "MbCtrl_t 尺寸变了 => 通信域记录偏移必须重核");
+_Static_assert((uint32_t)__builtin_offsetof(MbCtrl_t, frames_rx) == 9u,
+               "MbCtrl_t.frames_rx 偏移变了 => PC 端 COMM0 标签要同步");
+_Static_assert((uint32_t)__builtin_offsetof(MbCtrl_t, err_exc) == 21u,
+               "MbCtrl_t.err_exc 偏移变了 => PC 端 COMM3 标签要同步");
 
 static void bb_map_bind(const uint32_t *map)
 {
@@ -138,6 +163,14 @@ static void bb_map_bind(const uint32_t *map)
             p = (volatile uint32_t *)(s_bb_shm + OFF_WIRE_MAP) + idx;
         } else if (seg == BB_MAP_SEG_ACT && idx < 64u) {
             p = (volatile uint32_t *)(s_bb_shm + OFF_ACTUATOR_STATUS) + idx;
+        } else if (seg == BB_MAP_SEG_TIME && idx <= 1u) {
+            p = (volatile uint32_t *)(s_bb_shm + (idx ? OFF_RTC_DR : OFF_RTC_TR));
+        } else if (seg == BB_MAP_SEG_COMM && idx < BB_COM_N) {
+            p = (volatile uint32_t *)(s_bb_shm + OFF_MB_CTRL + s_bb_com_off[idx]);
+        } else if (seg == BB_MAP_SEG_DO && idx == 0u) {
+            p = (volatile uint32_t *)(s_bb_shm + OFF_DO_SHADOW);
+        } else if (seg == BB_MAP_SEG_FORCE && idx < 4u) {
+            p = (volatile uint32_t *)(s_bb_shm + OFF_FORCE_MASK + idx * 4u);
         }
         s_map_p[i] = p;
     }
@@ -164,10 +197,10 @@ void bb_init(uint8_t *shm_base)
     /* ⓪ 自观测区清零 */
     { uint32_t i; for (i = 0; i < 40u; i++) BB_DIAG[i] = 0u; }
 
-    /* ★ 映射绑定自检 (必须放在 ⓪ 清零之后): 默认表应绑到 48 路 (12 个空槽) */
+    /* ★ 映射绑定自检 (必须放在 ⓪ 清零之后): 默认表 60 槽**全部有效** (0 个空槽) */
     {   uint32_t i, n = 0u;
         for (i = 0; i < BB_MAP_N; i++) if (s_map_p[i] != &s_map_zero) n++;
-        BB_DIAG[36] = n;                     /* 实际绑到的通道数 (默认表应为 48) */
+        BB_DIAG[36] = n;                     /* 实际绑到的槽数 (默认表应为 60) */
         BB_DIAG[37] = bb_map_sum(s_bb_map_def);
     }
 

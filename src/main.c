@@ -830,6 +830,7 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   已隔 ~97µs (建立时间), 采样开关动作不再与输出沿同瞬 (自导自演消除)。
          *   成本计入 isr 统计 (在 t1 之前)。 */
         adc_poll_kick();
+        rtc_latch();                 /* ★ 刷新 RTC 镜像 (自带降频) ⇒ 黑匣子才记得到挂钟 */
         bb_kick(g_tick_count);       /* ★ 黑匣子: 拍尾快照 → AXI 环形缓冲 (MDMA 后台搬运) */
 
         if (g_per_prev) {

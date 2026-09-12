@@ -37,8 +37,10 @@
  *     实测最坏卡顿 220ms, 变化率 15% 时 236 槽只够 157ms ⇒ 丢包立刻回来。
  *     **保持小记录才是鲁棒性来源**; 扩通道靠"选得准", 不靠"装得下"。
  *
- *   ★ 默认映射 = SENSOR[0..15] / WIRE[0..15] / ACTUATOR[0..15] / 12 空槽,
- *     与"没有映射表"时的旧布局**逐字节相同** ⇒ 默认零行为变化 (可 A/B 证)。
+ *   ★ 默认映射 = SENSOR[0..15] / WIRE[0..15] / ACTUATOR[0..15] (前 48 槽, 与旧布局
+ *     **逐字节相同**) + 12 个"非 I/O 标量"槽: 绝对时间 TR/DR、通信域 5 个量、
+ *     DO 影子位图、强制位图 4 字。⇒ 记录不只记"引擎的输入输出", 还能回答
+ *     "这是几点 / 通信通不通 / 引脚上是什么电平 / 谁被强制过"。
  */
 #ifndef DCL_BLACKBOX_H
 #define DCL_BLACKBOX_H
@@ -63,7 +65,15 @@
 #define BB_MAP_SEG_SENSOR 0u
 #define BB_MAP_SEG_WIRE   1u
 #define BB_MAP_SEG_ACT    2u
-#define BB_MAP_SEG_NONE   3u
+#define BB_MAP_SEG_NONE   3u          /* 空槽 (恒 0) */
+/* ★★ 以下四段 "非 I/O 量" (2026-09-12): 记录不只有输入输出, 还要能回答
+ *   "这是什么时刻 / 通信通不通 / 引脚上的电平是什么 / 谁被强制过"。
+ *   它们都指向现有的**权威位置** (RTC 镜像 / MbCtrl_t / DO 影子 / 强制位图),
+ *   不新建状态、不复制 —— 避免"两份真值互相漂移"。 */
+#define BB_MAP_SEG_TIME   4u          /* idx 0 = RTC_TR(时分秒 BCD), 1 = RTC_DR(年月日 BCD) */
+#define BB_MAP_SEG_COMM   5u          /* idx 0=帧数 1=响应数 2=CRC错 3=异常 4=状态机首字 */
+#define BB_MAP_SEG_DO     6u          /* idx 0 = DO 打包位图 (真正锁存到引脚的电平) */
+#define BB_MAP_SEG_FORCE  7u          /* idx 0..3 = 强制位图 128bit 的 4 个字 */
 #define BB_ME(seg, idx) (((uint32_t)(seg) << 16) | (uint32_t)(idx))
 
 /* 卡上日志头里的映射区位置 (头块 512B = 128 字, h[0..15] 是原有字段) */

@@ -273,8 +273,20 @@ _Static_assert(OFF_TIMING_OVERRUN + 4u <= OFF_TICK_STATS, "SHM: OVERRUN 与 TICK
 #define FORCE_MASK_WORDS     (MAX_WIRES / 32)          /* 4 */
 #define OFF_FORCE_MASK       0x47F0                    /* u32[4]: 128 bit 强制位图 */
 #define OFF_FORCE_VAL        0x4800                    /* f32[128]: 强制值 (★ OA9 的核心) */
-#define OFF_RSVD_EXEC_TAIL   0x4A00                    /* 剩余 0xA0 备用 */
+#define OFF_RSVD_EXEC_TAIL   0x4A00                    /* 剩余 0xA0 备用 (头部 16B 给 RTC 诊断) */
 #define OFF_RSVD_EXEC_TAIL_SZ (OFF_MB_SET - OFF_RSVD_EXEC_TAIL)   /* 0xA0 */
+
+/* ---- RTC 初始化诊断 (2026-09-12) 占预留尾区头部 16B ----
+ * ★ 为什么必须有: "日历是不是每次上电都被重建"在固件里**看不见** —— INITS/BDCR
+ *   只有代码知道。按铁律"凡'写一次就算'的状态必须补一个能被外部读走的量",
+ *   把决策点的原始事实摆出来, 就不用靠 "TR ≈ 上电时长" 这种间接指纹去猜机制。
+ *   [0] = 步骤③之后 BDCR 回读    [1] = 判 INITS 时的 RTC_ISR 回读
+ *   [2] = **被清掉之前** TR 的值   [3] = 1 复用旧日历 / 2 全新初始化 */
+#define OFF_RTC_DIAG        0x4A00   /* u32[4] */
+#define OFF_RTC_DIAG_SZ     16u
+/* ★ 这里用字面量 0x4AA0 而不是 OFF_MB_SET: 那个宏定义在本文件更靠后的通信域小节,
+ *   在这一行还没展开 (第一版就踩了: "'OFF_MB_SET' undeclared")。 */
+_Static_assert(OFF_RTC_DIAG + OFF_RTC_DIAG_SZ <= 0x4AA0u, "SHM: RTC 诊断区越出预留尾区");
 
 /* ══════════ W4: 通信域 Modbus 区 (0x4AA0..0x4DE0) ══════════
  *

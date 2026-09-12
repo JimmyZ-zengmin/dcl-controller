@@ -50,10 +50,78 @@ MAP_N = 60
 MAP_OFF = 16
 MAP_SUM_OFF = MAP_OFF + MAP_N + 1        # 77
 SEG_NAME = {0: "SENSOR", 1: "WIRE", 2: "ACT", 3: ""}
+# ★ 与固件 bb_map_bind() 的上限**逐条对应** (见 src/blackbox.c)。
+SEG_LIM = {0: 64, 1: 128, 2: 64, 4: 2, 5: 5, 6: 1, 7: 4}
+# 非 I/O 槽的名字 (这些槽**不是浮点**, 是整数位图/BCD/计数器 ⇒ 导出按整数格式化)
+SEG_NAMED = {
+    (4, 0): "RTC_TR", (4, 1): "RTC_DR",
+    (5, 0): "MB_RX_FRAMES", (5, 1): "MB_TX_FRAMES", (5, 2): "MB_ERR_CRC",
+    (5, 3): "MB_ERR_EXC", (5, 4): "MB_HEAD",
+    (6, 0): "DO_SHADOW",
+}
+INT_SEGS = (3, 4, 5, 6, 7)          # 这些段的槽按十进制整数导出/比较, 不按浮点
 DEF_LABELS = (["SENSOR%d" % i for i in range(16)]
               + ["WIRE%d" % i for i in range(16)]
               + ["ACT%d" % i for i in range(16)]
               + ["SPARE%d" % i for i in range(12)])   # 无映射表时的旧布局标签
+
+
+def _label(seg, idx, slot):
+    if (seg, idx) in SEG_NAMED:
+        return SEG_NAMED[(seg, idx)]
+    if seg == 7:
+        return "FORCE_MASK%d" % idx
+    if seg == 3:
+        return "SPARE%d" % (slot - 48 if slot >= 48 else slot)
+    return "%s%d" % (SEG_NAME.get(seg, "S%d_" % seg), idx)
+
+
+def bcd_tr(v):
+    """RTC_TR (BCD) → (时, 分, 秒)。位域按 RM0433: HT[21:20] HU[19:16] MNT[14:12] MNU[11:8] ST[6:4] SU[3:0]"""
+    return (((v >> 20) & 3) * 10 + ((v >> 16) & 0xF),
+            ((v >> 12) & 7) * 10 + ((v >> 8) & 0xF),
+            ((v >> 4) & 7) * 10 + (v & 0xF))
+
+
+def bcd_dr(v):
+    """RTC_DR (BCD) → (年, 月, 日)"""
+    return (2000 + ((v >> 20) & 0xF) * 10 + ((v >> 16) & 0xF),
+            ((v >> 12) & 1) * 10 + ((v >> 8) & 0xF),
+            ((v >> 4) & 3) * 10 + (v & 0xF))
+
+
+def slot_segs(mapv):
+    """每个槽属于哪一段 (决定它按浮点还是整数解释)。无映射表 ⇒ 旧的 16/16/16 + 12 预留。"""
+    if mapv is None:
+        return [0] * 16 + [1] * 16 + [2] * 16 + [3] * 12
+    return [e >> 16 for e in mapv]
+
+
+def slot_str(raw, seg):
+    """按槽的**类型**给规范字符串。
+
+    ★ 为什么必须分类型: I/O 段放的是 f32, 而新段 (时间/通信/DO/强制) 放的是
+      **整数/BCD/位图**。一律按 f32 解释会输出 7e-45 这种垃圾, 而且 u32→f32 在
+      2^24 以上会丢低位 ⇒ 两个不同的帧计数会被判成"相同"。
+    ★ 返回字符串而非数值: 判据 [2] 直接比字符串 ⇒ 精确、可离线复算、不丢精度。"""
+    if seg in INT_SEGS:
+        return str(raw)
+    return repr(struct.unpack("<f", struct.pack("<I", raw))[0])
+
+
+def show_wall_clock(recs, labels):
+    """把记录里的 RTC_TR/RTC_DR 解出来 —— 这是"这一拍是几点"的直接答案。"""
+    if "RTC_TR" not in labels or "RTC_DR" not in labels:
+        return
+    it, idd = labels.index("RTC_TR"), labels.index("RTC_DR")
+    for tag, w in (("最早一条", recs[0]), ("最新一条", recs[-1])):
+        y, mo, d = bcd_dr(w[4 + idd])
+        hh, mm, ss = bcd_tr(w[4 + it])
+        print("  [时钟] %s: %04d-%02d-%02d %02d:%02d:%02d  (tick=%d)"
+              % (tag, y, mo, d, hh, mm, ss, w[1]))
+    y, mo, d = bcd_dr(recs[-1][4 + idd])
+    if (y, mo, d) == (2000, 1, 0):
+        print("  [时钟] ⚠ RTC 年月日未设 (仍是复位默认值 2000-01-00) —— 时分秒有效, 但**不是真实日期**")
 
 
 def map_sum(mapv):
@@ -76,14 +144,14 @@ def make_labels(h):
     if map_sum(mapv) != h[MAP_SUM_OFF]:
         print("  [!] 通道映射表校验和不符 ⇒ 退回默认 16/16/16 标签")
         return list(DEF_LABELS), None
-    lim = {0: 64, 1: 128, 2: 64}                # 与固件 bb_map_bind 的上限一致
+    lim = SEG_LIM                              # 与固件 bb_map_bind 的上限一致
     out, nbad = [], 0
     for i, e in enumerate(mapv):
         seg, idx = e >> 16, e & 0xFFFF
         if seg in lim and idx < lim[seg]:
-            out.append("%s%d" % (SEG_NAME[seg], idx))
+            out.append(_label(seg, idx, i))
         elif seg == 3:
-            out.append("SPARE%d" % (i - 48 if i >= 48 else i))
+            out.append(_label(3, idx, i))
         else:
             out.append("BAD%d_seg%d_idx%d" % (i, seg, idx))
             nbad += 1
@@ -140,29 +208,29 @@ def looks_like_card(d):
 
 
 def _bits(vals):
-    """把通道值打成位串 —— 与固件里 uint32 逐位比较**等价**。
+    """把一行的槽值合成一把可比对的"位串" —— 与固件里 uint32 逐位比较**等价**。
 
-    为什么不用字符串/浮点比: 固件比的是 RAW 位 (snap[4+i] != s_prev[i])。
-    -0.0 与 +0.0 数值相等但位不同; NaN 更不用说。走位串才和固件同一把尺子。"""
-    return struct.pack("<%df" % len(vals), *vals)
+    ★ 历史版本用 struct.pack("<%df") 把所有槽都当浮点: 那时 60 槽全是 f32 才成立。
+      现在后 12 槽是整数/BCD/位图, 一律按 f32 会丢精度 (>2^24 的不同帧计数会被
+      判成相同)。⇒ 改成比较 slot_str() 产出的**规范字符串**, 既精确又与 CSV 一致。"""
+    return "\x1f".join(vals)
 
 
 def load_csv_rows(path):
-    """从 sd_log_read.py --csv 导出的文件里恢复 (tick, seq, vals)。
+    """从 sd_log_read.py --csv 导出的文件里恢复 (表头, [(tick, seq, vals)])。
 
     ★ 不排序: CSV 已按**物理顺序**落行, 而物理顺序就是时间顺序。
       历史版本曾按 seq 排 —— 那是错的, 见 split_boots() 的说明。
-    ★ 列数自适应: 旧 CSV 是 48 列 (无映射表), 新 CSV 是 60 列 (带映射表)。"""
+    ★ 值保持**原样字符串**: 与 _bits() 同一把尺子, 且不引入浮点往返误差。"""
     rows = []
     with open(path, newline="", encoding="utf-8-sig") as f:
         rd = csv.reader(f)
-        next(rd, None)                              # 表头
+        hdr = next(rd, [])
         for r in rd:
             if len(r) < 53:
                 continue
-            rows.append((int(r[0]), int(r[1]),
-                         tuple(float(x) for x in r[5:])))
-    return rows
+            rows.append((int(r[0]), int(r[1]), tuple(r[5:])))
+    return hdr, rows
 
 
 def split_boots(rows):
@@ -237,9 +305,17 @@ def main():
     do_verify = "--verify" in argv
 
     if csv_in:
-        rows = load_csv_rows(csv_in)
+        hdr, rows = load_csv_rows(csv_in)
+        labels = hdr[5:]
         print("=== 离线核对 CSV: %s  (%d 行) ===" % (csv_in, len(rows)))
-        return 0 if verify_rows(rows, csv_in) else 1
+        okc = verify_rows(rows, csv_in)
+        if "RTC_TR" in labels and "RTC_DR" in labels and rows:
+            it, idd = labels.index("RTC_TR"), labels.index("RTC_DR")
+            for tag, r in (("最早一条", rows[0]), ("最新一条", rows[-1])):
+                y, mo, d = bcd_dr(int(r[2][idd]))
+                hh, mm, ss = bcd_tr(int(r[2][it]))
+                print("  [时钟] %s: %04d-%02d-%02d %02d:%02d:%02d" % (tag, y, mo, d, hh, mm, ss))
+        return 0 if okc else 1
 
     print("=== 扫描物理盘找日志头 (magic DLOG @LBA0) ===")
     d = None
@@ -264,6 +340,7 @@ def main():
     if sum(h[0:15]) != h[15]:
         print("[!] 头部校验和不符 (可能正被写入) —— 仍继续读")
     labels, mapv = make_labels(h)
+    sgs = slot_segs(mapv)                        # 每槽的段号 ⇒ 决定按浮点还是整数解释
     print("\n=== 日志头 ===")
     print("  版本=%d  记录=%dB  每块%d条  块=%dB" % (h[1], h[2], h[3], h[4]))
     print("  数据区 LBA %d .. %d  (共 %d 块 = %.2f GB)" % (h[5], h[5] + h[6] - 1, h[6], h[6] * 512 / 1e9))
@@ -313,7 +390,7 @@ def main():
         return 1
     print("  有效记录 %d 条   seq %d..%d   tick %d..%d"
           % (len(recs), recs[0][2], recs[-1][2], recs[0][1], recs[-1][1]))
-    rows = [(w[1], w[2], struct.unpack("<60f", struct.pack("<60I", *w[4:64])))
+    rows = [(w[1], w[2], tuple(slot_str(w[4 + i], sgs[i]) for i in range(MAP_N)))
             for w in recs]
     ok = verify_rows(rows, "卡上最近 %d 块" % nblk) if do_verify else True
     # 只导出**本次上电**那一段: 混段 CSV 会把两个上电的 seq 揉在一起, 无法判读
@@ -325,13 +402,14 @@ def main():
         recs = recs[keep:]
 
     print("\n=== 最后 3 条 (带 tick 标注) ===")
-    f32 = lambda x: struct.unpack_from("<f", struct.pack("<I", x))[0]
     show = [i for i, l in enumerate(labels) if not l.startswith("SPARE")][:6]
     for w in recs[-3:]:
         ctl = w[3]
         print("  tick=%-9d seq=%-9d run=%d n_routes=%d ctrl=0x%08X" %
               (w[1], w[2], (ctl >> 24) & 0xFF, ctl & 0xFFFF, ctl))
-        print("     " + "  ".join("%s=%.5g" % (labels[i], f32(w[4 + i])) for i in show))
+        print("     " + "  ".join("%s=%s" % (labels[i], slot_str(w[4 + i], sgs[i]))
+                                  for i in show))
+    show_wall_clock(recs, labels)
 
     if csv_path:
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -340,7 +418,7 @@ def main():
             for w in recs:
                 ctl = w[3]
                 cw.writerow([w[1], w[2], (ctl >> 24) & 0xFF, ctl & 0xFFFF, ctl]
-                            + [f32(x) for x in w[4:64]])
+                            + [slot_str(w[4 + i], sgs[i]) for i in range(MAP_N)])
         print("\n[+] CSV 已导出: %s (%d 行, 每行带 tick, 列名来自卡上映射表)" % (csv_path, len(recs)))
     return 0 if ok else 1
 
