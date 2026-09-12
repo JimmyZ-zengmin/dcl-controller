@@ -695,13 +695,27 @@ fail:
  *        成批冻结+落盘。**批量要够大**: 16KB/批 时命令+编程延迟把吞吐压到追不上产量
  *        (实测每 15s 丢 1.8 万条); 64KB/批 才能吃到 5.6MB/s 的量级。 */
 
-uint32_t sd_cfg_take(uint32_t idx)
+/* ★★ SD_CFG 在 **AXI SRAM**, 而 AXI 段是 (NOLOAD) —— **上电不清零, 内容是随机垃圾**。
+ *   ⇒ 必须用**魔数门**: 只有 [15] == SD_CFG_MAGIC 时才认这些配置字, 否则一律当 0。
+ *   实测血证 (2026-09-12): 没加魔数门时, `BB_CFG[7]` 随机非零 ⇒ 每一拍随机走 MDMA
+ *   路径(只搬 16 字)而不是 CPU 拷贝; `BB_CFG[4]` 随机 ⇒ CTCR 扫描扫的全是随机值,
+ *   得出一整套无意义的"与配置无关"结论。**随机 SRAM 会伪装成"配置没效果"。**
+ *   调试器预写: [15]=魔数 + 需要的字; 固件用 sd_cfg_take() 逐个取走 (读一次即清)。 */
+#define SD_CFG_MAGIC 0xF00DBEEFu
+static uint32_t sd_cfg_take_raw(uint32_t idx)
 {
     uint32_t v;
-    if (idx > 3u) return 0u;
+    if (SD_CFG[15] != SD_CFG_MAGIC) return 0u;    /* ★ 门 */
+    if (idx > 14u) return 0u;
     v = SD_CFG[idx];
-    SD_CFG[idx] = 0u;
+    SD_CFG[idx] = 0u;                            /* 取走即清, 只生效一次 */
     return v;
+}
+
+uint32_t sd_cfg_take(uint32_t idx)
+{
+    if (idx > 3u) return 0u;
+    return sd_cfg_take_raw(idx);
 }
 
 /* 刷新头部 (单块写) */

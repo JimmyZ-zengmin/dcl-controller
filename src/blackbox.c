@@ -12,6 +12,7 @@
  *   ⇒ 新固件启动时读 BB_BASE 处的 magic 判断是否有未读数据。
  *   BB_MAGIC 位置 = BB_AXI_BASE (每槽 [0] 的 tick 位置 = 槽起始)。 */
 #include "blackbox.h"
+#include "sd.h"   /* sd_cfg_take: 带魔数门的一次性配置字 */
 #include "engine.h"
 #include "regs.h"
 
@@ -63,6 +64,13 @@
  *   布局见文件末尾 bb_diag_dump 注释。 */
 #define BB_DIAG  ((volatile uint32_t *)0x24000300u)
 
+/* ★ 诊断钩子 (SD_CFG @0x24000400, 调试器复位前预写, 读一次即清):
+ *   [4] = CTCR 覆盖值 (0 ⇒ 用默认) —— 用来扫出"一次请求到底能搬多少字节"的正确配置
+ *   [5] = 1 ⇒ 上电先把 RAM 环整片填 0xDEADBEEF 哨兵, 之后数"有多少字变了" = 传输长度
+ */
+#define BB_CFG   ((volatile uint32_t *)0x24000400u)
+#define BB_SENT  0xDEADBEEFu
+
 /* SHM 紧凑快照区 (SHM 尾部, 256B) */
 /* OFF_BB_SNAP 在 engine.h 定义 */
 
@@ -111,10 +119,19 @@ void bb_init(uint8_t *shm_base)
      *   CTCR: SWRM(软触发) + **TRGM=01 block** + TLEN=127(≤128, 仅占位)
      *         + SINC/DINC=按 word 递增 + SSIZE/DSIZE=word
      *   CBNDTR: BNDT = 256 字节 ⇒ **一次 SWRQ 搬完一整个槽** (见上方 CTCR 注释的实测结论) */
-    *(volatile uint32_t *)BB_M_CTCR = BB_CTCR_SWRM | BB_CTCR_TRGM_BLK
-                                    | BB_CTCR_TLEN(128u)
-                                    | BB_CTCR_DSIZE_W | BB_CTCR_SSIZE_W
-                                    | BB_CTCR_DINC_W | BB_CTCR_SINC_W;
+    {   uint32_t ctcr_ov = sd_cfg_take(4u);
+        *(volatile uint32_t *)BB_M_CTCR = (ctcr_ov != 0u) ? ctcr_ov
+            : (BB_CTCR_SWRM | BB_CTCR_TRGM_BLK | BB_CTCR_TLEN(128u)
+               | BB_CTCR_DSIZE_W | BB_CTCR_SSIZE_W | BB_CTCR_DINC_W | BB_CTCR_SINC_W);
+        BB_DIAG[30] = *(volatile uint32_t *)BB_M_CTCR;   /* 生效的 CTCR 回读 */
+    }
+    {   uint32_t sent = sd_cfg_take(5u);
+        if (sent != 0u) {   /* 哨兵填充: 数"变了几个字" 就是每拍实际搬运长度 */
+            uint32_t i; volatile uint32_t *r = (volatile uint32_t *)BB_AXI_BASE;
+            for (i = 0; i < (BB_TOTAL / 4u); i++) r[i] = BB_SENT;
+            BB_DIAG[31] = 1u;
+        }
+    }
     *(volatile uint32_t *)BB_M_CBNDTR = BB_SLOT_SZ;       /* BNDT = 256 字节 */
     *(volatile uint32_t *)BB_M_CTBR = BB_CTBR_SBUS;       /* 源=DTCM ⇒ SBUS */
     __asm__ volatile("dsb; isb" ::: "memory");
@@ -162,6 +179,16 @@ void bb_kick(uint32_t tick)
     }
     s_bb_seq++;
 
+    /* ② ★★ 快照搬运 = **CPU 字拷贝** (默认)。
+     *
+     * 为什么放弃 MDMA ch1: 实测 (tools/mdma_ctcr_sweep.py) 它**每拍只搬 64 字节 / 256**
+     *   —— 用哨兵法数"变了几个字"扫了 10 组 CTCR (TRGM 00/01/10/11 × TLEN 0/63/127/255),
+     *   结果与配置几乎无关, 一律 32~64 字节 ⇒ 槽的 3/4 永远是陈旧 SRAM。
+     *   而 256B 的 CPU 字拷贝只要 ~130 拍, 占 100us 拍预算 **0.3%** ——
+     *   为一个 256 字节的搬运留一条语义含糊的 MDMA 通道 + 一堆未定语义的 CTCR 位域,
+     *   收益为负。**判据: 能简单做对的, 不要用复杂做错。**
+     * MDMA 路径保留, SD_CFG[7]=1 时启用 (供对照)。 */
+    if (sd_cfg_take(7u) != 0u) {
     /* ② ★★ 每拍必须"关通道 → 改寄存器 → 使能 → 触发"。
      *
      * 实测 (2026-09-12, 由固件自观测取得, 因为 pyocd 读不了 0x5200_xxxx 外设区):
@@ -205,6 +232,16 @@ void bb_kick(uint32_t tick)
     *(volatile uint32_t *)BB_M_CCR |= (1u << 16);         /* SWRQ */
     __asm__ volatile("dsb; isb" ::: "memory");
 
+    s_last_dst = dst;
+    }
+    else
+    {
+        /* ★ CPU 字拷贝: 快照区 → 环槽 (64 字 = 256B) */
+        volatile uint32_t *d32 = (volatile uint32_t *)(BB_AXI_BASE + s_bb_widx * BB_SLOT_SZ);
+        uint32_t i;
+        for (i = 0; i < (BB_SLOT_SZ / 4u); i++) d32[i] = snap[i];
+    }
+
     /* ★ 自观测 (采样点 B): 触发瞬间的状态 */
     if (samp) {
         BB_DIAG[12] = *(volatile uint32_t *)BB_M_CISR;
@@ -213,7 +250,6 @@ void bb_kick(uint32_t tick)
         BB_DIAG[15] = *(volatile uint32_t *)BB_M_CBNDTR;
         BB_DIAG[16] = *(volatile uint32_t *)BB_M_CTCR;
     }
-    s_last_dst = dst;
 
     /* ④ 环形递增 */
     s_bb_widx++;
