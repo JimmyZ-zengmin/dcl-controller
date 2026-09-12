@@ -37,9 +37,17 @@
  *   拍抖动风险; 轮询让 Modbus 的 WCET 有上界, 且不引入新中断。
  */
 #define MB_UART_BAUD     115200
-#define MB_UART_GPIO_PORT   'A'   /* 仅文档用途 */
-#define MB_UART_TX_PIN      2     /* PA2 = USART2_TX */
-#define MB_UART_RX_PIN      3     /* PA3 = USART2_RX (本批次不接收, 见下) */
+/* ★★ 引脚**只能有一处真值** (2026-09-13)。原来这里还有三个"文档宏":
+ *      MB_UART_GPIO_PORT 'A'  /  MB_UART_TX_PIN 2  /  MB_UART_RX_PIN 3
+ *    它们有三个问题, 全部撤掉:
+ *      ① 与 modbus.c 里的引脚宏**重名** ⇒ 编译期 "MB_UART_GPIO_PORT redefined";
+ *      ② `'A'` 是**字符常量 65**, 看着像端口号、真拿去用就是错的 (陷阱);
+ *      ③ 引脚现在**可在编译期切换** (PD5/PD6 ↔ PA2/PA3, 见 CMakeLists 的
+ *         DCL_MB_UART_ALT), 任何写死的值迟早是错的。
+ *    ⇒ 真值统一在 `modbus.c` 的 MB_UART_ALT / MB_UART_GPIO_PORT / MB_UART_TX_BIT /
+ *      MB_UART_RX_BIT 一处。
+ *  ★ 顺带更正一句过时注释: 原 RX_PIN 处写着"本批次不接收" —— **早就不成立**,
+ *    `mb_pull_rx()` 在物理口模式下每拍都轮询 USART2 的 RDR。 */
 
 /** @brief 建立通信域配置 (写控制块默认值 + 清零各缓冲)。**不含 UART 初始化**。
  *  @param base      SHM 基址 (显式传, 不依赖全局 —— 与 engine_seq_tick 同风格)

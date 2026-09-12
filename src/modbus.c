@@ -392,23 +392,62 @@ int mb_inject(uint8_t *base, const uint8_t *frame, uint16_t n)
     return 0;
 }
 
-/* ---- 物理口使能 (USART2: PA2=TX / PA3=RX, 8N1, 轮询) ---- */
+/* ---- 物理口引脚选择 (2026-09-13) ----------------------------------------
+ * 同一路 USART2, 只是换一对脚 —— 用来切开"PA2/PA3 本身有问题"这个可能
+ * (引脚损伤 / 板上丝印认错 / 被别的片上功能占用)。两档都是 **AF7**,
+ * 所以波特率 / 协议语义 / 状态机**一个字都不用改**。
+ *   1 = PD5(TX) / PD6(RX)  —— 交付默认 (备用脚)
+ *   0 = PA2(TX) / PA3(RX)  —— 原方案 (对照档)
+ * 依据: 官方手册 DS13313 Rev 5 第 68 页 AF7 列 ——
+ *   PD3=USART2_CTS, PD4=USART2_RTS, **PD5=USART2_TX, PD6=USART2_RX**, PD7=USART2_CK;
+ *   PA2=USART2_TX / PA3=USART2_RX (同手册 p60, FT_ha = 5V 容忍)。 */
+#ifndef MB_UART_ALT
+#define MB_UART_ALT 1
+#endif
+#if MB_UART_ALT
+#  define MB_UART_GPIO_PORT 3u   /* GPIOD */
+#  define MB_UART_TX_BIT    5u   /* PD5 */
+#  define MB_UART_RX_BIT    6u   /* PD6 */
+#else
+#  define MB_UART_GPIO_PORT 0u   /* GPIOA */
+#  define MB_UART_TX_BIT    2u   /* PA2 */
+#  define MB_UART_RX_BIT    3u   /* PA3 */
+#endif
+
+/* ---- 物理口使能 (USART2: AF7, 8N1, 轮询) ---- */
 void mb_uart_enable(void)
 {
-    /* ① 时钟 */
+    /* ① 时钟: **USART2 本体 + 它自己那对 GPIO 的时钟**。
+     *   ★★ 为什么必须自己开 GPIO 时钟: 对**未开时钟的外设**写入会被硬件**静默丢弃**,
+     *     寄存器读回 0, 不报任何错 —— 现象就是"通信完全不通"。
+     *     原方案(PA2/PA3)碰巧成立: GPIOA 的时钟被 `pin_out_init(PA8)` 在 main.c:2228
+     *     就打开了。而 **GPIOD 的时钟只在 sd_init 里开, sd_init 在 mb_uart_enable
+     *     之后** ⇒ 换到 PD5/PD6 后不自己开就必然失败。这种坑不该靠"碰巧"。 */
     RCC_APB1LENR |= RCC_APB1LENR_USART2EN;
+    RCC_AHB4ENR  |= (1u << MB_UART_GPIO_PORT);
 
-    /* ② GPIO: PA2/PA3 → AF7 (读-改-写, 绝不整寄存器赋值 —— uart.c 的既有纪律:
-     *    PA8(拍输出) 就在同一个 MODER 里, 整赋值会把拍输出打掉) */
-    uint32_t mod = GPIO_MODER(0);
-    mod &= ~(3u << (2 * 2));  mod |= (2u << (2 * 2));   /* PA2 = AF (10b) */
-    mod &= ~(3u << (3 * 2));  mod |= (2u << (3 * 2));   /* PA3 = AF (10b) */
-    GPIO_MODER(0) = mod;
+    /* ② GPIO → AF (读-改-写, 绝不整寄存器赋值 —— uart.c 的既有纪律:
+     *    同一个 MODER 里还有别的脚, 整赋值会把它们打掉) */
+    uint32_t mod = GPIO_MODER(MB_UART_GPIO_PORT);
+    mod &= ~(3u << (MB_UART_TX_BIT * 2u));  mod |= (2u << (MB_UART_TX_BIT * 2u));
+    mod &= ~(3u << (MB_UART_RX_BIT * 2u));  mod |= (2u << (MB_UART_RX_BIT * 2u));
+    GPIO_MODER(MB_UART_GPIO_PORT) = mod;
 
-    uint32_t afr = GPIO_AFRL(0);                        /* PA0..PA7 在 AFRL */
-    afr &= ~(0xFu << (2 * 4));  afr |= (7u << (2 * 4)); /* PA2 → AF7 (USART2) */
-    afr &= ~(0xFu << (3 * 4));  afr |= (7u << (3 * 4)); /* PA3 → AF7 (USART2) */
-    GPIO_AFRL(0) = afr;
+    /* ★ RX 加上拉: 线上没有驱动时读成**空闲(高)**, 而不是悬空拾噪。
+     *   (与 uart.c 对 USART1_RX=PA10 的处理同口径; TX 是推挽输出, 不需要。) */
+    uint32_t pup = GPIO_PUPDR(MB_UART_GPIO_PORT);
+    pup &= ~(3u << (MB_UART_RX_BIT * 2u));  pup |= (1u << (MB_UART_RX_BIT * 2u));
+    GPIO_PUPDR(MB_UART_GPIO_PORT) = pup;
+
+    /* AFRL 管 pin0..7, AFRH 管 pin8..15 —— 条件在编译期定死, 无运行期开销 */
+    {   uint32_t tx = MB_UART_TX_BIT, rx = MB_UART_RX_BIT;
+        if (tx < 8u && rx < 8u) {
+            uint32_t a = GPIO_AFRL(MB_UART_GPIO_PORT);
+            a &= ~(0xFu << (tx * 4u));  a |= (7u << (tx * 4u));
+            a &= ~(0xFu << (rx * 4u));  a |= (7u << (rx * 4u));
+            GPIO_AFRL(MB_UART_GPIO_PORT) = a;
+        }
+    }
 
     /* ③ 波特率: BRR = PCLK1/baud = 100e6/115200 = 868 (OVER8=0)
      *    ★ 不照抄常数 —— 见 regs.h 里 USART2_BRR_115200 的 16 倍错教训 */

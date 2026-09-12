@@ -39,6 +39,12 @@ set(DCL_VTOR_ITCM    "1" CACHE STRING "向量表搬进 ITCM+设VTOR (1) / 留在
 
 # ---- 阶段 3.1 协议层开关 ----
 set(DCL_PA9_MODE       "1"      CACHE STRING "PA9 用途 (0 GPIO方波 / 1 USART1_TX)")
+# ---- 通信域 (Modbus) 物理口引脚 (2026-09-13) ----
+#   1 = **PD5(TX)/PD6(RX)** —— 交付默认。USART2 的备用脚, 用来切开
+#       "PA2/PA3 本身有问题"(引脚损伤 / 板上丝印认错 / 被别的东西占用)这个一直没排除的可能。
+#   0 = PA2(TX)/PA3(RX) 原方案 —— 对照档: 同一套判据在两档上各跑一遍才有意义。
+#   ★ 两档都是 **同一路 USART2 的 AF7**, 所以波特率/协议/状态机一个字都不改。
+set(DCL_MB_UART_ALT "1" CACHE STRING "Modbus 物理口: 1=PD5/PD6 备用脚 / 0=PA2/PA3 原方案")
 set(DCL_BOOT_BANNER    "1"      CACHE STRING "上电发一帧版本响应 (LA 免 PC 验协议)")
 set(DCL_BANNER_PERIOD  "0"      CACHE STRING "横幅重播周期 ms (0=只发一次; >0 仅供 LA 抓取)")
 set(DCL_UART_SELFTEST  "0"      CACHE STRING "上电回环自检 (1 需 PA9↔PA10 短接)")
@@ -93,6 +99,7 @@ add_compile_options(
     -DBOOT_SCAN_MODE=${DCL_BOOT_SCAN_MODE}
     -DVTOR_ITCM=${DCL_VTOR_ITCM}
     -DPA9_MODE=${DCL_PA9_MODE}
+    -DMB_UART_ALT=${DCL_MB_UART_ALT}
     -DBOOT_BANNER=${DCL_BOOT_BANNER}
     -DBANNER_PERIOD_MS=${DCL_BANNER_PERIOD}
     -DUART_SELFTEST=${DCL_UART_SELFTEST}
