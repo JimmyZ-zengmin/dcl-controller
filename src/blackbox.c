@@ -27,17 +27,41 @@
 #define BB_M_CDAR   (BB_M + 0x1Cu)
 #define BB_M_CTBR   (BB_M + 0x28u)
 
-/* MDMA CCR: EN=bit0, SWRQ=bit16 */
+/* MDMA CCR: EN=bit0, SWRQ=bit16 (权威: stm32h723xx.h MDMA_CCR_EN_Pos=0 / _SWRQ_Pos=16) */
 #define MDMA_CCR_EN     1u
 #define MDMA_CCR_SWRQ   (1u << 16)
-/* CTCR: SWRM=bit30, TLEN[7:0]=bits[25:18], SINC_1=bit16, SINCOS_1=bit15,
- *        DINC_1=bit18, DINCOS_1=bit17, PSIZE/MSIZE 按 RM0468 */
-#define BB_CTCR_SWRM    (1u << 30)   /* 软件请求模式 */
-#define BB_CTCR_TLEN(n) (((n) - 1u) << 18)  /* buffer transfer length: bits[25:18], 值=n-1 */
-#define BB_CTCR_DINC_2  (2u << 2)    /* 目的地址按 size 递增 (bits[3:2]=10) */
-#define BB_CTCR_SINC_2  2u           /* 源地址按 size 递增 (bits[1:0]=10) */
+
+/* ── CTCR 位域 (全部逐条核过 stm32h723xx.h 的 *_Pos/_Msk) ──
+ *   SINC[1:0]  = bits[1:0]     DINC[1:0] = bits[3:2]     (2 = 按 size 递增)
+ *   SSIZE[1:0] = bits[5:4]     DSIZE[1:0] = bits[7:6]    (2 = word)
+ *   TLEN[6:0]  = bits[24:18]   ★ 单位是**字节数-1**, 只有 7 位 ⇒ **上限 128 字节**
+ *   TRGM[1:0]  = bits[29:28]   ★ 不是在 [17:16] (旧注释写错)
+ *   SWRM       = bit30
+ * ----------------------------------------------------------------
+ * ★★ 实测 (2026-09-12) 定位到的真因:
+ *  ① **TRGM 从未设置** ⇒ TRGM=00。查 ST HAL: `MDMA_BUFFER_TRANSFER = 0`
+ *     是"每请求搬一个 buffer"(=TLEN+1 字节), 所以 00 本身不违规;
+ *  ② **但 TLEN 我们写的 255<<18 只有低 7 位有效** (mask 0x7F) ⇒ 实际 TLEN=127
+ *     ⇒ 每次请求只搬 **128 字节**, 而一个槽是 256 字节 ⇒ 槽永远填不满一半;
+ *  ③ 要"一次请求搬完 256B", 正确模式是 **TRGM=01 = MDMA_BLOCK_TRANSFER**
+ *     (每个请求搬一整个 block = CBNDTR.BNDT 字节)。
+ * ⇒ 本版: TRGM=01 + BNDT=256 + word 尺寸 + SINC/DINC 按 size 递增。
+ */
+#define BB_CTCR_SWRM      (1u << 30)   /* 软件请求模式 */
+#define BB_CTCR_TRGM_BLK  (1u << 28)   /* TRGM=01: 每请求搬一个 block (=BNDT 字节) */
+#define BB_CTCR_TLEN(n)   (((n) - 1u) << 18)  /* n 字节, n ≤ 128 (7 位字段) */
+#define BB_CTCR_DINC_W    (2u << 2)    /* 目的按 size 递增 */
+#define BB_CTCR_SINC_W    2u           /* 源按 size 递增 */
+#define BB_CTCR_DSIZE_W   (2u << 6)    /* 目的数据尺寸 = word */
+#define BB_CTCR_SSIZE_W   (2u << 4)    /* 源数据尺寸   = word */
 /* CTBR: SBUS(bit16)=源走 DTCM/TCM 端口; DBUS(bit17)=目的走 DTCM/TCM 端口 */
 #define BB_CTBR_SBUS    (1u << 16)
+
+/* ★★ MDMA 自观测区 (pyocd **读不了** 0x5200_xxxx 外设区 —— 实测连 SDMMC1 的
+ *   固定版本寄存器 IPVR 都读回 0 ⇒ 那是读失败不是真值)。所以 MDMA 的状态
+ *   只能由**固件自己**读出来放进 SRAM, 再让 pyocd 读 SRAM。
+ *   布局见文件末尾 bb_diag_dump 注释。 */
+#define BB_DIAG  ((volatile uint32_t *)0x24030100u)
 
 /* SHM 紧凑快照区 (SHM 尾部, 256B) */
 /* OFF_BB_SNAP 在 engine.h 定义 */
@@ -45,33 +69,56 @@
 static volatile uint8_t *s_bb_shm = 0;
 static volatile uint32_t s_bb_widx = 0;    /* 当前写入槽号 */
 static volatile uint8_t s_bb_ready = 0;
+static volatile uint32_t s_bb_kicks = 0;   /* kick 次数 (自观测) */
+static volatile uint32_t s_last_dst = 0;   /* 上一拍的目的地址 (用于"数据有没有落地") */
 
 void bb_init(uint8_t *shm_base)
 {
     s_bb_shm = shm_base;
 
-    /* ① MDMA 时钟 (AHB3ENR bit0, h723-core0 实测地址) */
+    /* ⓪ 自观测区清零 */
+    { uint32_t i; for (i = 0; i < 40u; i++) BB_DIAG[i] = 0u; }
+
+    /* ① MDMA 时钟 (AHB3ENR bit0) */
     *(volatile uint32_t *)0x580244D4u |= 1u;
     __asm__ volatile("dsb; isb" ::: "memory");
+
+    /* ★★ MDMA 寄存器**活性自检** (写-读回)。
+     * 判据必须能失败: 外设时钟没开 / 基址错时, 对外设寄存器的读写会全部丢失
+     * (读回 0)。写两个可辨识值再读回, 结果记进 BB_DIAG[20..23]:
+     *   [20] CBNDTR 写 0xABCD 后回读 (期望 0xABCD)
+     *   [21] CTBR   写 0x00010000 后回读 (期望 0x00010000)
+     *   [22] AHB3ENR 回读 (期望 bit0=1 ⇒ MDMAEN)
+     *   [23] ch 基址回读 (BB_M 本身不是寄存器, 用 CTCR 掩码校验) */
+    {
+        volatile uint32_t *bnd = (volatile uint32_t *)BB_M_CBNDTR;
+        volatile uint32_t *tbr = (volatile uint32_t *)BB_M_CTBR;
+        *bnd = 0x0000ABCDu; __asm__ volatile("dsb; isb" ::: "memory");
+        BB_DIAG[20] = *bnd;
+        *tbr = 0x00010000u; __asm__ volatile("dsb; isb" ::: "memory");
+        BB_DIAG[21] = *tbr;
+        BB_DIAG[22] = *(volatile uint32_t *)0x580244D4u;   /* AHB3ENR */
+        BB_DIAG[23] = *(volatile uint32_t *)BB_M_CTCR;     /* 上电应为 0 */
+    }
 
     /* ② 清 ch1 标志 + 禁用 */
     *(volatile uint32_t *)BB_M_CIFCR = 0x1Fu;
     *(volatile uint32_t *)BB_M_CCR = 0u;
     __asm__ volatile("dsb; isb" ::: "memory");
 
-    /* ③ 配置 MDMA ch1 (照 h723-core0 mdma_kick4 实测配方, 改 BNDT/SINC/DINC/CTBR)
-     *   CTCR: SWRM(软触发) + TLEN=255(=256B) + SINC/DINC=按 size 递增(word 递增)
-     *   ★ byte 尺寸+TLEN 模式 (旧项目实测: word 尺寸会 BSE);
-     *     TLEN=(256-1) ⇒ 每次触发搬 256 字节 ⇒ 64 次 word(32bit) 传输 */
-    /* CTCR = SWRM(软触发) | TLEN=(256-1)<<18 (256B 传输) | SINC/DINC=按size递增
-     * ★ 位域引自 h723-core0 实测配方 CTCR_4B_SW = 0x40000000|(3<<18)|(2<<2)|2
-     *   (TLEN 在 bits[25:18], DINC 在 bits[3:2], SINC 在 bits[1:0]);
-     *   首版把 SINC 写在 bit16/DINC 写在 bit18 —— 与 TLEN 重叠, 全错 */
-    *(volatile uint32_t *)BB_M_CTCR = BB_CTCR_SWRM | BB_CTCR_TLEN(BB_SLOT_SZ)
-                                    | BB_CTCR_DINC_2 | BB_CTCR_SINC_2;
+    /* ③ 配置 MDMA ch1
+     *   CTCR: SWRM(软触发) + **TRGM=01 block** + TLEN=127(≤128, 仅占位)
+     *         + SINC/DINC=按 word 递增 + SSIZE/DSIZE=word
+     *   CBNDTR: BNDT = 256 字节 ⇒ **一次 SWRQ 搬完一整个槽** (见上方 CTCR 注释的实测结论) */
+    *(volatile uint32_t *)BB_M_CTCR = BB_CTCR_SWRM | BB_CTCR_TRGM_BLK
+                                    | BB_CTCR_TLEN(128u)
+                                    | BB_CTCR_DSIZE_W | BB_CTCR_SSIZE_W
+                                    | BB_CTCR_DINC_W | BB_CTCR_SINC_W;
     *(volatile uint32_t *)BB_M_CBNDTR = BB_SLOT_SZ;       /* BNDT = 256 字节 */
     *(volatile uint32_t *)BB_M_CTBR = BB_CTBR_SBUS;       /* 源=DTCM ⇒ SBUS */
     __asm__ volatile("dsb; isb" ::: "memory");
+    BB_DIAG[10] = *(volatile uint32_t *)BB_M_CTCR;        /* 回读 CTCR 确认落地 */
+    BB_DIAG[11] = *(volatile uint32_t *)BB_M_CBNDTR;
 
     /* ④ 清环形缓冲 magic (标记"没有未读数据") */
     *(volatile uint32_t *)BB_AXI_BASE = 0u;
@@ -84,7 +131,12 @@ void bb_init(uint8_t *shm_base)
 
 void bb_kick(uint32_t tick)
 {
+    int samp;
     if (!s_bb_ready || !s_bb_shm) return;
+
+    s_bb_kicks++;
+    /* ★ 自观测闸门: 前 3 次 + 每 1024 次采样。成本 ~100 cyc/次被采样拍, 可忽略。 */
+    samp = (s_bb_kicks <= 3u) || ((s_bb_kicks & 0x3FFu) == 0u);
 
     /* ① CPU 拷贝分散数据 → SHM 紧凑快照区 (SHM+0x6F20, 256B) */
     volatile uint32_t *snap = (volatile uint32_t *)(s_bb_shm + OFF_BB_SNAP);
@@ -107,20 +159,58 @@ void bb_kick(uint32_t tick)
         snap[49] = (run << 24) | (nr & 0xFFFFu);
     }
 
-    /* ② 更新 MDMA ch1 源/目的地址
-     * ★ 源地址也必须每次重写 —— SINC=按 size 递增 ⇒ 首次传输后 CSAR 已漂移,
-     *   不重写的话后续 kick 读的是漂移后的错误地址 ⇒ 垃圾数据 (实测撞到) */
+    /* ② ★★ 每拍必须"关通道 → 改寄存器 → 使能 → 触发"。
+     *
+     * 实测 (2026-09-12, 由固件自观测取得, 因为 pyocd 读不了 0x5200_xxxx 外设区):
+     *   · 首版只在 bb_init 写过一次 CBNDTR; `bb_init→bb_kick(0)` 的**第一次**搬运
+     *     是成功的 —— 这正是环里只有第 0 槽是真快照 (tick=0) 的原因;
+     *   · 但 **CBNDTR 被上一次传输减到 0 后不会自动重装**, 而 EN=1 期间
+     *     CSAR/CDAR/CBNDTR 的新值**不被接受**(影子寄存器) ⇒
+     *     **之后每一次 kick 都搬 0 字节**, 环永远只写过第 0 槽。
+     *   证据: 自观测读到 `CBNDTR=0`、`CISR=0`(无完成标志)、`CESR=0`(无错误)、
+     *        `CCR=1`(EN 挂着), 而 CDAR 停留在 512 拍之前 widx=1 时的旧值
+     *        ⇒ 写进去的地址被忽略。 */
+    *(volatile uint32_t *)BB_M_CCR = 0u;                  /* ★ 关通道: 之后再改寄存器 */
+    __asm__ volatile("dsb" ::: "memory");
+    *(volatile uint32_t *)BB_M_CIFCR = 0x1Fu;             /* 清标志 */
     *(volatile uint32_t *)BB_M_CSAR = (uint32_t)(s_bb_shm + OFF_BB_SNAP);
     uint32_t dst = BB_AXI_BASE + s_bb_widx * BB_SLOT_SZ;
     *(volatile uint32_t *)BB_M_CDAR = dst;
-
-    /* ③ 软触发: EN + SWRQ (h723-core0 kick4 同款序列) */
-    *(volatile uint32_t *)BB_M_CIFCR = 0x1Fu;             /* 清标志 */
+    *(volatile uint32_t *)BB_M_CBNDTR = BB_SLOT_SZ;       /* ★ 每拍重装 BNDT=256 */
     __asm__ volatile("dsb; isb" ::: "memory");
+
+    /* ★ 自观测 (采样点 A): 上一拍结束后的状态 —— CISR 的 CTCIF 能告诉我们
+     *   "上一次到底搬完没有", CESR 给出错误类别, [17] 是上一拍目的地首字
+     *   (从 SRAM 读回, 直接证明数据有没有落到 AXI)。 */
+    if (samp) {
+        BB_DIAG[0] = s_bb_kicks;
+        BB_DIAG[1] = *(volatile uint32_t *)BB_M_CISR;
+        BB_DIAG[2] = *(volatile uint32_t *)BB_M_CESR;
+        BB_DIAG[3] = *(volatile uint32_t *)BB_M_CCR;
+        BB_DIAG[4] = *(volatile uint32_t *)BB_M_CBNDTR;
+        BB_DIAG[5] = *(volatile uint32_t *)BB_M_CSAR;
+        BB_DIAG[6] = *(volatile uint32_t *)BB_M_CDAR;
+        BB_DIAG[7] = *(volatile uint32_t *)BB_M_CTBR;
+        BB_DIAG[8] = tick;
+        BB_DIAG[9] = s_bb_widx;
+        BB_DIAG[17] = (s_last_dst != 0u) ? *(volatile uint32_t *)s_last_dst : 0u;
+    }
+
+    /* ③ 软触发: 使能 + SWRQ (标志与寄存器已在 ② 里就位) */
     *(volatile uint32_t *)BB_M_CCR = 1u;                  /* EN */
     __asm__ volatile("dsb; isb" ::: "memory");
     *(volatile uint32_t *)BB_M_CCR |= (1u << 16);         /* SWRQ */
     __asm__ volatile("dsb; isb" ::: "memory");
+
+    /* ★ 自观测 (采样点 B): 触发瞬间的状态 */
+    if (samp) {
+        BB_DIAG[12] = *(volatile uint32_t *)BB_M_CISR;
+        BB_DIAG[13] = *(volatile uint32_t *)BB_M_CESR;
+        BB_DIAG[14] = *(volatile uint32_t *)BB_M_CCR;
+        BB_DIAG[15] = *(volatile uint32_t *)BB_M_CBNDTR;
+        BB_DIAG[16] = *(volatile uint32_t *)BB_M_CTCR;
+    }
+    s_last_dst = dst;
 
     /* ④ 环形递增 */
     s_bb_widx++;
