@@ -60,6 +60,7 @@
 #include "do.h"
 #include "rtc.h"
 #include "blackbox.h"
+#include "sd.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -2439,6 +2440,10 @@ int main(void)
     do_latch_init();                    /* ★ P3-B: 影子 + MDMA 定时锁存链 (须在 do_init 后) */
     rtc_init(g_shm);                     /* ★ RTC: LSE 32.768kHz 时基 + 事件时间戳 */
     bb_init(g_shm);                      /* ★ 黑匣子: MDMA ch1 每拍 256B 快照 → AXI 环形缓冲 */
+    /* ★ SD 卡 (2026-09-12): 初始化 + 把黑匣子缓冲写到卡上。
+     *   放在启动期末尾 (允许几百 ms); 失败不阻塞启动 (内部有超时保护)。 */
+    g_stage = 27;
+    if (sd_init() == 0) { sd_dump_blackbox(); }
 #if HIL_SAFE
     eng_register_output_surface(do_outputs_safe);
 #endif

@@ -124,12 +124,27 @@ int clock_init(void)
      *           ★DIVP1EN = 1 —— 使能 pll1_p_ck 输出。**漏此位 → 切换被静默拒绝**
      *             (SWS 永不跟随, 固件报 CLK_ERR_SWITCH), 是本次排掉的最大一颗雷。
      *             必须在 PLL1ON=0 时写 (RM0468) —— 本函数此处 PLL1 确实未开 ✓ */
+    /* ★★★ 2026-09-12 重大缺陷修复: PLL1 的 **每个输出都有独立使能位, 且都在
+     *   RCC_PLLCFGR** (不是 RCC_CR!) —— 见商家 CMSIS stm32h723xx.h:
+     *     RCC_PLLCFGR_DIVP1EN_Pos (16U) / DIVQ1EN (17U) / DIVR1EN (18U) / DIVP2EN (19U) ...
+     *   原代码**只置了 DIVP1EN** (PLL1P → CPU 能跑), **DIVQ1EN 从未置位** ⇒
+     *   **PLL1Q 一直没有输出** ⇒ SDMMC 的 sdmmc_ker_ck 为 0 ⇒ CPSM 永远卡在
+     *   "等时钟" (STA 只剩 CPSMACT), 表现为 SD 卡完全无响应, 且**所有 CLKDIV
+     *   值都失败**(因为根本没有输入时钟)。
+     *   ★ 之前的回读校验只查 DIVP1EN+RGE ⇒ 这个缺陷躲过了校验 (校验项不全会漏)。
+     *   (注: RCC_CR 的 bit16/17 是 HSEON/HSERDY, 与 PLL 输出使能无关 —— 曾误读。) */
     RCC_PLLCFGR = ((uint32_t)CLK_PLL1_RGE << RCC_PLLCFGR_PLL1RGE_Pos)
-                | RCC_PLLCFGR_DIVP1EN;
-    /* 回读确认 (写入被静默忽略时立刻暴露, 而不是等到切换失败) */
-    if ((RCC_PLLCFGR & (RCC_PLLCFGR_DIVP1EN | (3u << RCC_PLLCFGR_PLL1RGE_Pos)))
-        != (RCC_PLLCFGR_DIVP1EN | ((uint32_t)CLK_PLL1_RGE << RCC_PLLCFGR_PLL1RGE_Pos)))
-        return CLK_ERR_PLLCFGR_RB;
+                | RCC_PLLCFGR_DIVP1EN
+                | RCC_PLLCFGR_DIVQ1EN    /* ★ PLL1Q (SDMMC/UART 等外设内核时钟) */
+                | RCC_PLLCFGR_DIVR1EN;   /* ★ PLL1R (备用) */
+    /* 回读确认 (写入被静默忽略时立刻暴露; ★ 校验必须覆盖**用到的每个**输出使能位,
+     *   否则"漏置位"类缺陷会像本次一样躲过校验) */
+    {
+        const uint32_t want = RCC_PLLCFGR_DIVP1EN | RCC_PLLCFGR_DIVQ1EN
+                            | RCC_PLLCFGR_DIVR1EN
+                            | ((uint32_t)CLK_PLL1_RGE << RCC_PLLCFGR_PLL1RGE_Pos);
+        if ((RCC_PLLCFGR & want) != want) return CLK_ERR_PLLCFGR_RB;
+    }
 
     RCC_PLLCKSELR = ((uint32_t)CLK_PLL1_DIVM1 << RCC_PLLCKSELR_DIVM1_Pos)
                   | (RCC_PLLCKSELR_PLLSRC_HSE << RCC_PLLCKSELR_PLLSRC_Pos);
