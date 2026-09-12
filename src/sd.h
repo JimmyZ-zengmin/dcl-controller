@@ -23,7 +23,6 @@ int  sd_write_multi(uint32_t lba, const uint8_t *buf, uint32_t nblk);  /* CMD25 
 int  sd_read_block(uint32_t lba, uint8_t *buf);         /* CMD17 单块读 */
 void sd_dump_blackbox(void);                         /* 落盘 = 写 + 回读校验 */
 void sd_dump_write(void);                            /* 只写 (供吞吐计时) */
-uint32_t sd_dump_verify(void);                       /* 只回读校验 (供吞吐计时) */
 void sd_set_perf(uint32_t write_ticks, uint32_t verify_ticks, uint32_t verify_res);
 
 /* ── 每拍连续落盘日志 (专用裸介质, 环形回卷) ── */

@@ -182,13 +182,15 @@ volatile uint32_t g_sd_blocks = 0;
  *   0x24000000 低 16KB 预留   0x24000200 SD_DIAG   0x24000300 BB_DIAG
  *   0x24000400 SD_CFG         0x24001000 SD 校验 scratch(512B)
  *   0x24003000/0x24003100     do.c 锁存快照 / MDMA 链表节点 (勿动)
- *   0x24004000 + 128KB        黑匣子 RAM 环 (512 槽 × 256B)
- *   0x24024000 + 128KB        **SD 冻结区** (落盘前把环整体拷过来, 见 sd_dump_write)
+ *   0x24004000 + 192KB        黑匣子 RAM 环 (**768** 槽 × 256B = 76.8ms 缓冲)
+ *   0x24034000 + 64KB         **SD 冻结区** (落盘前把这一批拷过来, 见 sd_log_one_batch)
+ * ★ 环做大的唯一理由: 丢包判据是"落后量 > 槽数"(avail > BB_SLOTS)。
+ *   增大槽数 = 提高对**瞬时卡顿**(SD 卡编程尾巴变长)的吸收量。
  *   读完清零 ⇒ 不会悄悄改变下次上电的行为。 */
 #define SD_CFG      ((volatile uint32_t *)0x24000400u)
 #define SD_DATA_CLKDIV_DEF  1u      /* 100MHz/(2*1) = 50MHz (实测 5.63MB/s) */
 #define SD_RING    ((const uint8_t *)0x24004000u)   /* 黑匣子 RAM 环 (活的, 512×256B) */
-#define SD_STAGE   ((uint8_t *)0x24024000u)         /* 128KB 冻结/暂存区 (紧接环之后) */
+#define SD_STAGE   ((uint8_t *)0x24034000u)         /* 64KB 冻结/暂存区 (紧接 192KB 环之后) */
 #define SD_HS_ARG           0x80FFFFF1u  /* CMD6 SET, group1(Access Mode) = 1 (High Speed) */
 
 static uint32_t s_sd_ready = 0;
@@ -219,6 +221,7 @@ static uint32_t s_log_polls = 0;        /* poll 调用次数 (自观测) */
 static uint32_t s_log_max_avail = 0;    /* 见过的最大待落盘条数 (判据: 是否接近 512) */
 static uint32_t s_log_drop_open = 0;    /* 开日志时的丢包基线 ⇒ 可算本次上电丢包 */
 static uint32_t s_log_blk_open = 0;     /* 开日志时的块基线 ⇒ 可算本次上电写了多少 */
+static uint32_t s_log_hdr_pend = 0;     /* 有亟待刷新的日志头 (见 sd_log_one_batch 注释) */
 
 #define SD_PWRUP_DLY   60000u       /* ~1ms @400MHz (HAL 用 HAL_Delay(1)) */
 #define SD_TMOUT_CMD   4000000u     /* 命令/RESP 等待上限 (循环计数) */
@@ -809,7 +812,7 @@ static uint32_t sd_log_one_batch(void)
 
     /* ① 冻结这一批 (逐槽搬 ⇒ 天然处理环形回绕) */
     for (i = 0; i < n; i++) {
-        const uint32_t *src = (const uint32_t *)(SD_RING + (((s_log_slot_base + i) & 511u) * BB_SLOT_SZ));
+        const uint32_t *src = (const uint32_t *)(SD_RING + (((s_log_slot_base + i) % BB_SLOTS) * BB_SLOT_SZ));
         uint32_t *dst = (uint32_t *)(SD_STAGE + i * BB_SLOT_SZ);
         for (k = 0; k < (BB_SLOT_SZ / 4u); k++) dst[k] = src[k];
     }
@@ -831,7 +834,10 @@ static uint32_t sd_log_one_batch(void)
     s_log_slot_base += nblk * 2u;
     s_log_total     += nblk * 2u;
     s_log_batches++;
-    if (((s_log_batches % LOG_HDR_EVERY) == 0u) || s_log_wrapped) (void)sd_log_flush_header();
+    /* ★ 刷日志头移出关键路径: 它是**单块写**, 要等一整段卡编程(几 ms) ——
+     *   若在追赶途中插进去, 正好把 avail 推过环容量 ⇒ 丢包。
+     *   改成"攒够次数 + 且此刻没有积压"才刷 (积压时优先保证数据不丢)。 */
+    if (((s_log_batches % LOG_HDR_EVERY) == 0u) || s_log_wrapped) s_log_hdr_pend = 1u;
     return nblk * 2u;
 }
 
@@ -856,12 +862,16 @@ int sd_reopen_log(void)
  *    上限 8 批/轮 (≈24ms) 防止把主循环饿死。 */
 void sd_log_poll(void)
 {
-    uint32_t iter;
+    uint32_t iter, wrote = 0u;
     if (!s_log_ready) return;
     s_log_polls++;
     for (iter = 0; iter < 8u; iter++) {
-        if (sd_log_one_batch() == 0u) break;
+        uint32_t n = sd_log_one_batch();
+        if (n == 0u) break;
+        wrote += n;
     }
+    /* ★ 只在"这一轮没写出去东西"时才刷头 ⇒ 永远不与追赶抢卡 */
+    if (s_log_hdr_pend != 0u && wrote == 0u) { (void)sd_log_flush_header(); s_log_hdr_pend = 0u; }
     SD_DIAG[47] = 1u + s_log_blk;
     SD_DIAG[48] = s_log_total;
     SD_DIAG[49] = s_log_dropped;
@@ -875,52 +885,26 @@ void sd_log_poll(void)
     SD_DIAG[58] = (s_log_total - s_log_blk_open) / 2u;   /* 本次上电写了多少块 */
 }
 
-/* 黑匣子落盘: **写**与**回读校验**拆成两个入口, 由调用方分别计时。
- * ★ 为什么拆: 目标是量"写吞吐", 而 256 次单块读的回读校验耗时会混进总耗时 ——
- *   量出来的就不是写速度了。判据只能反映被测对象。 */
+/* 一次性吞吐自检: 从冻结区(当 scratch)连续写 256 块, **只测写速度**。
+ * ★ 不再做"回读逐字比对": 那条判据已被"日志 + PC 端读卡"取代 ——
+ *   自校验只能证明"搬运没坏", 证明不了"内容对"; 内容对必须拿第三方源 (SHM 原文) 比。
+ *   而拿活环当靶子更糟: 环每 100us 被覆写, 比对必然报假不符 (实测 182/256)。 */
 void sd_dump_write(void)
 {
     uint32_t i, k;
-    uint32_t *fr = (uint32_t *)SD_STAGE;
-    const uint32_t *rg = (const uint32_t *)SD_RING;
+    volatile uint32_t *st = (volatile uint32_t *)SD_STAGE;
     if (!s_sd_ready) return;
-    /* ⓪ ★★ 先把环整体**冻结**到 0x24024000。
-     *   环是活的 (引擎每 100us 覆写), 直接"边写边比对活环"等于拿会动的靶子当判据 ——
-     *   实测因此报过 182/256 块"不符"(假警报)。冻结后写与校验对着同一份静止数据。
-     *   这也是"每拍连续落盘"必须的机制: 落盘内容必须是某一时刻的一致快照。 */
-    for (k = 0; k < (256u * SD_BLK_SZ) / 4u; k++) fr[k] = rg[k];
+    for (k = 0; k < (SD_BURST_BLKS * SD_BLK_SZ) / 4u; k++) st[k] = 0xA5A50000u + k;
     (void)sd_wait_ready();
     for (i = 0; i < 256u; i += SD_BURST_BLKS) {
-        SD_DIAG[41] = i;                     /* 卡在第几批 */
-        if (sd_write_multi(3000000u + i, SD_STAGE + i * SD_BLK_SZ, SD_BURST_BLKS) != 0) break;
+        SD_DIAG[41] = i;
+        if (sd_write_multi(3000000u + i, SD_STAGE, SD_BURST_BLKS) != 0) break;
         SD_DIAG[14] = i + SD_BURST_BLKS;
     }
     SD_DIAG[3] = g_sd_blocks;
 }
 
-uint32_t sd_dump_verify(void)
-{
-    uint8_t *scratch = (uint8_t *)0x24001000u;           /* AXI 低 16KB 预留区 */
-    uint32_t i, j, mism = 0;
-    if (!s_sd_ready) return 0xFFFFFFFFu;
-    for (i = 0; i < 256u; i++) {
-        int rr = sd_read_block(3000000u + i, scratch);
-        if (rr != 0) { mism = 0x10000u | ((i << 8) & 0xFF00u) | (uint32_t)(-rr); break; }
-        {
-            const uint32_t *a = (const uint32_t *)(SD_STAGE + i * SD_BLK_SZ);
-            const uint32_t *b = (const uint32_t *)scratch;
-            for (j = 0; j < (SD_BLK_SZ / 4u); j++) {
-                if (a[j] != b[j]) { mism++; break; }
-            }
-        }
-    }
-    SD_DIAG[26] = mism;      /* 低 16 位 = 不符块数; bit16 = 中途读失败 */
-    SD_DIAG[20] = (SD_DIAG[14] == 256u && mism == 0u) ? 0x600D : 0x600E;
-    return mism;
-}
-
-void sd_dump_blackbox(void)          /* 兼容入口: 写 + 校验 */
+void sd_dump_blackbox(void)
 {
     sd_dump_write();
-    (void)sd_dump_verify();
 }

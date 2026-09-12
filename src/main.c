@@ -2447,10 +2447,8 @@ int main(void)
         /* 一次性吞吐/回读自检 (调试器预写 SD_CFG[3]=1 才跑; 平时不占用启动时间) */
         if (sd_cfg_take(3u) != 0u) {
             uint32_t t0 = g_tick_count;          /* 拍计数计时 (100us/拍), 不依赖 DWT */
-            sd_dump_write();                     /* 只写 */
-            uint32_t t1 = g_tick_count;
-            uint32_t vres = sd_dump_verify();    /* 只校验 (对冻结副本) */
-            sd_set_perf(t1 - t0, g_tick_count - t1, vres);
+            sd_dump_write();                     /* 只测写 (256 块) */
+            sd_set_perf(g_tick_count - t0, 0u, 0u);
         }
         /* ★ 打开日志: 之后由**主循环**每轮 sd_log_poll() 把新产出的快照
          *   (RAM 环) 成批冻结并追加落盘, 卡满则回卷覆盖最旧。 */
