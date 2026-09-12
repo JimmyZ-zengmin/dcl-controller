@@ -1339,6 +1339,17 @@ static void h_mb_resp(void)
     if (!c->tx_uart) { c->tx_len = 0; c->tx_sent = 0; }
 }
 
+/* 0x63 MB_DIAG — 把通信域诊断区整块吐出来 (128B)。
+ * ★★ 为什么必须走协议口、不能用 pyocd 读: 实测 **pyocd 每次连接都会复位本板**
+ *   (AXI 里的启动计数器: 6 次读取 → 启动次数 1..6, 一一对应), 而 SHM 诊断区在
+ *   DTCM 上、上电会被清零 ⇒ **用 pyocd 读它 = 读一个刚被自己复位清零的值**:
+ *   观测动作本身把证据毁了, 而且**看不出来**(读数看着很正常)。
+ *   这正是"非侵入式交互"要解决的那类问题 —— 能走协议就别走调试器。 */
+static void h_mb_diag(void)
+{
+    ack((const uint8_t *)SHM_PTR(g_shm, OFF_MB_DIAG), OFF_MB_DIAG_SZ);
+}
+
 /* 0x62 MB_CFG — 配置通信域: [src u8][tx_uart u8][budget u8] (后两字节可选)
  *   src    : 0=RX 走物理口 FIFO, 1=RX 走隧道注入(0x60)
  *   tx_uart: 0=响应留缓冲(0x61 读回), 1=响应从物理口发 (★ LA 可抓)
@@ -1995,6 +2006,7 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_MB_INJECT:     h_mb_inject(p, n); break;
         case CMD_MB_RESP:       h_mb_resp(); break;
         case CMD_MB_CFG:        h_mb_cfg(p, n); break;
+        case 0x63:              h_mb_diag(); break;   /* 通信域诊断区整块读回 */
         /* ---- W5: macro 字节码 VM ---- */
         case CMD_MACRO:         h_macro(p, n); break;
         case CMD_MACRO_UPLOAD:  h_macro_upload(p, n); break;
@@ -2275,6 +2287,23 @@ int main(void)
 #endif
     g_isr_itcm = ISR_ITCM;      /* ★ 在代码里写一次, 否则会被 --gc-sections 回收 */
     g_stage = 1;
+
+    /* ★★ 复位取证 (2026-09-13) —— 485 联机排障里反复出现"计数器倒退", 必须先分清
+     *   是"我的调试动作复位了它"还是"它自己复位": **一块会在观测时被复位的板子,
+     *   做不了可靠通信, 别的问题都会被它掩盖。**
+     *   做法: 把"启动次数 + 复位原因"写进 **AXI (NOLOAD, 跨复位保留)** ——
+     *   即使 pyocd 会复位它, 也能从 AXI 里数出它到底启动了几次、每次为什么。
+     *   布局: [0]=启动次数 [1]="RCLK" 首次标记 [2]=RCC_RSR [3]=RCC_BDCR
+     *   RCC_RSR(0xD0) 的位: 0=LPWRRSTF 1=WWDG1RSTF 2=IWDG1RSTF 3=SFTRSTF(BOR?)
+     *     16=PORR 17=SFTRSTF 18=IWDG1RSTF 19=WWDG1RSTF 20=LPWRRSTF 21=BORR 22=PINR
+     *   ⇒ 读出来就能判"是外部复位脚 / 看门狗 / 掉电 / 软件"哪一种。 */
+    {   volatile uint32_t *rc = (volatile uint32_t *)0x24000500u;
+        if (rc[1] != 0x52434C4Bu) { rc[1] = 0x52434C4Bu; rc[0] = 0u; }
+        rc[0]++;
+        rc[2] = REG32(0x580244D0u);                  /* RCC_RSR 复位状态 */
+        rc[3] = REG32(0x58024470u);                  /* RCC_BDCR */
+        REG32(0x580244D0u) |= (1u << 24);            /* RMVF: 清标志, 下次只见下次的 */
+    }
 
     /* ① 时钟 */
     int err = clock_init();
