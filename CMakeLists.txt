@@ -18,10 +18,18 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # ★ 独立的"最小固件"开关: 1 = 只编 src/min_uart.c (与 DCL 引擎/中断/协议全无关)。
 #   排障用: 当"串口不通"时, 用它把自研代码整体排除, 先证明 USART 通路本身可用。
 set(DCL_MIN_UART "0" CACHE STRING "1 = 只编最小 UART 固件 (src/min_uart.c), 与引擎无关")
+# ★★ 第二个最小固件 (2026-09-13): 把"485 收不到"这件事从自研代码里彻底摘出来。
+#   与 DCL_MIN_UART 的区别: 那一档只测 USART1 (观察窗), 这一档测的是**被测口**
+#   —— USART2 @ PD5/PD6, 并且额外做一次"整口逐脚活动扫描", 用来回答
+#   "模块的 TXD 那根线到底插在 GPIOD 的哪个脚上" (485 排障里最费轮次的问题)。
+#   ★ 必须与 DCL_MIN_UART 互斥: 两个文件都定义 main()。
+set(DCL_MIN_UART2 "0" CACHE STRING "1 = 只编最小 485/USART2 接收固件 (src/min_uart485.c)")
 set(DCL_MIN_STRESS "0" CACHE STRING "最小固件: 1 = TX 不停发 (压力模式, 便于判 TX 通路)")
 
 if(DCL_MIN_UART)
     set(TARGET min_uart)
+elseif(DCL_MIN_UART2)
+    set(TARGET min_uart485)
 else()
     set(TARGET dcl_h723)
 endif()
@@ -135,6 +143,12 @@ if(DCL_MIN_UART)
     # 最小固件: 只要一个 C 文件 + 启动文件 (不用 newlib, 不用 syscalls/sysmem)
     set(SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/src/min_uart.c
+        ${STARTUP}
+    )
+elseif(DCL_MIN_UART2)
+    # 最小 485 固件: 同上, 但测的是 USART2 @ PD5/PD6 + 整口扫描
+    set(SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/min_uart485.c
         ${STARTUP}
     )
 else()

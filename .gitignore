@@ -13,3 +13,6 @@ tools/_la_modbus.txt
 # `git status` 永远脏, 掩盖真正的工作区改动 (本项目"零噪声"纪律的同款理由)。
 __pycache__/
 *.pyc
+
+# 最小固件的独立构建目录 (DCL_MIN_UART2 档) —— 与 build/ 同理, 可复跑
+build_min485/

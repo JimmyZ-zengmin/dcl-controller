@@ -491,8 +491,17 @@ void mb_line_test(uint8_t *base)
     __asm__ volatile("dsb" ::: "memory");
     { volatile uint32_t i = 60000u; while (i--) { } }    /* 等电平建立 (~1ms @240MHz) */
     d[6] = GPIO_IDR(3);                       /* ★ 位图: 1 = 被外部驱动为高 */
-    GPIO_MODER(3) = m0;  GPIO_PUPDR(3) = p0;  /* 原样恢复 */
-    GPIO_AFRL(3)  = a0;  GPIO_AFRH(3)  = h0;
+    /* ★★ 复原顺序 (2026-09-13 由 min_uart485.c 抓出的真缺陷):
+     *   原来写的是 `MODER = m0; PUPDR = p0;` —— 即先接回 AF7 而 PUPDR 仍停在下拉,
+     *   那一瞬 RX 脚被下拉成低 = 一个 **break 条件** ⇒ USART 必然收到一个 0x00 + FE。
+     *   症状: 每跑一次本检, `erracc` 就多一个 FE、字节计数也多 1 —— **观测动作自己
+     *   造出了一个"到过字节"的假证据**, 而它看起来正像"真有数据来了"。
+     *   (干净固件里同一处错序被直接看到: 每轮扫描固定多 1 字节 0x00 + 1 次 FE。)
+     *   ⇒ 正确顺序: 先 AF 选择 → 再 PUPDR 回上拉 → **最后**才接 AF7。 */
+    GPIO_AFRL(3)  = a0;
+    GPIO_AFRH(3)  = h0;
+    GPIO_PUPDR(3) = p0;
+    GPIO_MODER(3) = m0;
     __asm__ volatile("dsb" ::: "memory");
     d[7] = 0xC0DEF00Du;                       /* 完成标记 (读的人凭它判断结果有效) */
 }
@@ -520,8 +529,13 @@ void mb_line_probe(uint8_t *base)
         if ((GPIO_IDR(3) & (1u << 6)) == 0u) low++;
         n++;
     }
-    GPIO_MODER(3) = m0;  GPIO_PUPDR(3) = p0;        /* 立即恢复 */
+    /* ★ 立即恢复 —— 顺序与 mb_line_test 同一条纪律 (先 PUPDR 再 MODER):
+     *   本函数把 PD6 设成"输入+上拉", 原来恢复时先写 MODER(→AF7) 时 PUPDR 还停在
+     *   上拉 —— 这一处恰好**不会**造出 break (上拉下接 AF 是高位, 与空闲态一致),
+     *   但为免"两处顺序不一致"在下一次改动时变成坑, 统一成同一顺序。 */
     GPIO_AFRL(3)  = a0;
+    GPIO_PUPDR(3) = p0;
+    GPIO_MODER(3) = m0;
     __asm__ volatile("dsb" ::: "memory");
     d[12] = low; d[13] = n; d[14] = 0xA5A50001u;    /* 12=低电平次数 13=总采样 14=完成标记 */
 }

@@ -62,6 +62,7 @@ DEFAULTS=(
     -DDCL_UART_BAUD=115200
     -DDCL_DEPLOY_SELFTEST=0
     -DDCL_MIN_UART=0
+    -DDCL_MIN_UART2=0
     -DDCL_HIL_SAFE=1
     -DDCL_IO_IN_ISR=1
 )
@@ -113,7 +114,10 @@ echo "✓ 零警告 (本工程源文件 + 链接器 + 汇编)"
 # ── 打印**实际生效**的开关 (不是"我以为传了什么") ──
 echo
 echo "── 生效开关 (读自 CMakeCache) ──"
-grep -E "^(DCL_[A-Z_]*|SCAN_FLASH_PAD):(STRING|BOOL)=" "$HERE/build/CMakeCache.txt" \
+# ★ 正则必须含数字: 原来写 `^DCL_[A-Z_]*:` —— `DCL_MIN_UART2` 因为结尾是 2 而**不在
+#   这个清单里**, 也就是说"看上去列全了, 其实漏了一个"。这一段的唯一目的就是
+#   "别被缓存骗", 漏列一个开关等于给它留了一个静默洞。⇒ 改成 [A-Z0-9_]*。
+grep -E "^(DCL_[A-Z0-9_]*|SCAN_FLASH_PAD):(STRING|BOOL)=" "$HERE/build/CMakeCache.txt" \
     | sed 's/:[A-Z]*=/ = /' | sed 's/^/   /'
 echo
 echo "产物: $HERE/build/dcl_h723 (ELF, 无扩展名) + .bin + .hex + .map"
