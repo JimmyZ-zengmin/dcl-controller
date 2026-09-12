@@ -79,6 +79,11 @@ static volatile uint32_t s_bb_widx = 0;    /* 当前写入槽号 */
 static volatile uint8_t s_bb_ready = 0;
 static volatile uint32_t s_bb_kicks = 0;   /* kick 次数 = 已产出条数 (单调) */
 static volatile uint32_t s_bb_seq = 0;     /* 记录序号 (与 kick 同步) */
+/* ★ "变化率"统计 (2026-09-12): 决定黑匣子该"缩记录"还是"变化才记"。
+ *   s_chg_ticks = 至少有一个通道变了的拍数; s_chg_vals = 变化通道总数。
+ *   ⇒ 变化率 = s_chg_ticks/总拍数; 平均每次变几个 = s_chg_vals/s_chg_ticks。 */
+static volatile uint32_t s_prev[48];
+static volatile uint32_t s_chg_ticks = 0, s_chg_vals = 0;
 static volatile uint32_t s_last_dst = 0;   /* 上一拍的目的地址 (用于"数据有没有落地") */
 
 void bb_init(uint8_t *shm_base)
@@ -178,6 +183,17 @@ void bb_kick(uint32_t tick)
         for (uint32_t i = 0; i < 16u; i++) snap[36 + i] = src[i];
     }
     s_bb_seq++;
+    {   /* 变化率统计: 与上一拍比 48 个通道值 (≈100 拍, 可忽略) */
+        uint32_t i, n = 0u;
+        for (i = 0; i < 48u; i++) {
+            uint32_t v = snap[4 + i];
+            if (v != s_prev[i]) { n++; s_prev[i] = v; }
+        }
+        if (n != 0u) { s_chg_ticks++; s_chg_vals += n; }
+        BB_DIAG[33] = s_chg_ticks;
+        BB_DIAG[34] = s_chg_vals;
+        BB_DIAG[35] = s_bb_kicks;
+    }
 
     /* ② ★★ 快照搬运 = **CPU 字拷贝** (默认)。
      *
