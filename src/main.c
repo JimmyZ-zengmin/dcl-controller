@@ -2166,7 +2166,8 @@ static void obs_anchor(void)
     sink ^= g_safe_mask_oob;
     sink ^= g_adc_sm_done;     sink ^= g_adc_sm_timeout;
     /* ★ P3-A DO 输出面观测面 (不读会被 --gc-sections 回收) */
-    sink ^= g_do_poll_n;
+    sink ^= g_do_poll_n;     sink ^= g_do_write_n;
+    sink ^= g_hil_out_n;
     /* 审计 #1 的观测面: 物理输出面 登记数 / 上次实际执行数 */
     sink ^= g_out_surfaces;    sink ^= g_safe_surfaces_ran;
     /* W4 通信域 */
@@ -2427,6 +2428,7 @@ int main(void)
      * ★ 登记后 `eng_outputs_safe` 停机时会调 `do_outputs_safe()` ⇒ GPIOE 的管辖位
      *   **第一次被真正清零** (之前它只有计数、没有动作 —— 定案②的欠账在此收清)。 */
     g_stage = 26; do_init(g_shm);
+    do_latch_init();                    /* ★ P3-B: 影子 + MDMA 定时锁存链 (须在 do_init 后) */
 #if HIL_SAFE
     eng_register_output_surface(do_outputs_safe);
 #endif

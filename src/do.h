@@ -35,6 +35,18 @@ void do_poll(uint8_t *base, uint32_t tick_now);
  *  受 HIL_SAFE 同一个编译开关控制 (HIL_SAFE=0 的对照档不登记, 复现"停机不清输出")。 */
 void do_outputs_safe(void);
 
-extern volatile uint32_t g_do_poll_n;   /* do_poll 执行过的拍数 (obs_anchor 必须登记) */
+/** @brief 锁存链初始化 (P3-B): DMA2 哑传输(TIM2_UP 触发) + MDMA(shadow→GPIOE_ODR)。
+ *  依赖 do_init 先行 (用 s_do_base)。调用后 do_poll 走影子模式 (需 DCL_DO_LATCH=1)。 */
+void do_latch_init(void);
+
+/* ★ 影子模式开关 (默认开): =1 时 do_poll 只写 shadow, GPIOE_ODR 由 MDMA 在拍边界
+ *   硬件锁存 (输出沿与计算时长解耦); =0 时 do_poll 直接写 BSRR (P3-A 行为, 对照档)。
+ *   放这里用 #ifndef 兜底, 可被 CMake -DDCL_DO_LATCH=0 覆盖。 */
+#ifndef DCL_DO_LATCH
+#define DCL_DO_LATCH 0   /* ★ 暂回 P3-A 直写 (P3-B 影子模式 TEIF 未解, 见 09-12 日志) */
+#endif
+
+extern volatile uint32_t g_do_poll_n;    /* 活性计数 (就绪门后每拍+1) */
+extern volatile uint32_t g_do_write_n;   /* 实际写 BSRR 次数 (mask≠0 时) */
 
 #endif /* DCL_DO_H */

@@ -20,7 +20,50 @@
  *   必须自带就绪门, 不依赖"调用顺序恰好排在我后面"。 */
 static uint8_t *s_do_base = 0;
 static uint32_t s_do_ready = 0;
-volatile uint32_t g_do_poll_n = 0;   /* do_poll 实际执行过的拍数 (观测面, 须进 obs_anchor) */
+volatile uint32_t g_do_poll_n = 0;    /* 活性计数: 就绪即计 (每拍+1) —— 防空判据 */
+volatile uint32_t g_do_write_n = 0;   /* 实际写 BSRR 的次数 (区分"活着"与"在干活") */
+
+/* ══════════ P3-B: 影子 + MDMA 定时锁存链 (2026-09-12) ══════════
+ * 数据流: do_poll 打包 → 写 shadow(SHM 尾) → TIM2 上溢(拍边界) → DMAMUX1 C8(TIM2_UP=22)
+ *         → DMA2 S0 哑传输(读 TIM2_CNT 快照, 1 字) → TC 脉冲 → MDMA ch0 触发
+ *         → 读 shadow(4B) → 写 GPIOE_ODR。CPU 零参与锁存, 输出沿硬件锚定。
+ *
+ * 触发桥的原因 (ST 官方确认): MDMA 的请求源是**固定表**(DMA1/2 的 TC、LTDC、JPEG、
+ * QSPI、DMA2D、SDMMC、软件) —— **没有任何 TIM 请求**。⇒ 用 DMA2 哑传输当桥:
+ * TIM2_UP 触发 DMA2 (经 DMAMUX1 C8, 请求号 22), DMA2 完成(TC)恰好是 MDMA 的合法请求。
+ * 哑传输源故意指向 **TIM2_CNT** —— 锁存瞬间的定时器计数被顺手抄进内存,
+ * 输出沿的实测证据免费白送 (旧项目 SCK1 自检的精神)。
+ *
+ * 配方来源: h723-core0 `dcl_out_dma_start` (真机验证, <4.17ns), 本处三处适配:
+ *   ① 触发请求 TIM1_UP(15) → **TIM2_UP(22)** (9.10 的拍定时器是 TIM2);
+ *   ② MDMA 源 = DTCM 的 shadow (h723-core0 因 DMA1/2 不可达 DTCM 而被迫把源放
+ *      AXI; **MDMA 经 AHBS 可读 DTCM** —— 这是路线 2 保住"SHM 单总线"公理的钥匙);
+ *   ③ 哑传输源 = TIM2_CNT (原为 SRAM 固定字) —— 兼作锁存时刻记录。
+ * ★ 坑位备忘 (h723-core0 的血泪, 全部规避): DMA2 时钟位=AHB1ENR bit1(曾错 bit2);
+ *   DMAMUX 通道归属 0-7=DMA1 / 8-15=DMA2 (C8 = DMA2 S0); 输出源 M0AR 用 0x24003000
+ *   (原 0x30004000 是 H723 reserved 区)。 */
+#define MDMA_BASE        0x52000000u   /* ★ H723 的 MDMA 在 0x52000000 (h723-core0 实测);
+                                          * 首版误写 0x58000000(H743 地址, H723 reserved) ⇒ 寄存器全 0 */
+#define MDMA_CH0_CISR    (MDMA_BASE + 0x40u)
+#define MDMA_CH0_CIFCR   (MDMA_BASE + 0x44u)
+#define MDMA_CH0_CCR     (MDMA_BASE + 0x4Cu)
+#define MDMA_CH0_CTCR    (MDMA_BASE + 0x50u)
+#define MDMA_CH0_CBNDTR  (MDMA_BASE + 0x54u)
+#define MDMA_CH0_CSAR    (MDMA_BASE + 0x58u)
+#define MDMA_CH0_CDAR    (MDMA_BASE + 0x5Cu)
+#define MDMA_CH0_CLAR    (MDMA_BASE + 0x64u)
+#define MDMA_CH0_CTBR    (MDMA_BASE + 0x68u)
+#define DMA2S0_CR     0x40020410u
+#define DMA2S0_NDTR   0x40020414u
+#define DMA2S0_PAR    0x40020418u
+#define DMA2S0_M0AR   0x4002041Cu
+#define DMA2S0_FCR    0x40020424u
+#define DMA2_LIFCR    0x40020408u
+#define DMAMUX1_C8    0x40020820u
+#define DMAMUX_REQ_TIM2_UP  22u     /* DMAMUX1 请求 22 = TIM2_UP (三源核对) */
+#define MDMA_REQ_DMA2S0_TC  8u      /* MDMA_REQUEST_DMA2_Stream0_TC */
+#define LATCH_SNAP_ADDR     0x24003000u  /* AXI: 锁存时刻 TIM2_CNT 快照落点 */
+#define LNODE_ADDR          0x24003100u  /* AXI: MDMA 链表节点 (32B 对齐) */
 
 /* PEi = ACTUATOR[i] > 0.5。返回本拍要写进 ODR 的 16 位值 (只含管辖位)。 */
 static uint32_t do_pack(uint8_t *base, uint32_t mask)
@@ -42,27 +85,122 @@ void do_init(uint8_t *base)
     GPIO_MODER(DO_GPIO_PORT) = 0x55555555u;
     GPIO_BSRR(DO_GPIO_PORT) = 0xFFFF0000u;              /* 高 16 位写 1 = 全部清 0 */
     __asm__ volatile("dsb" ::: "memory");
+    /* 影子模式: shadow 初值 = 0 (与 PE 电平一致, MDMA 使能后无跳变) */
+#if DCL_DO_LATCH
+    *(volatile uint32_t *)(base + OFF_DO_SHADOW) = 0u;
+    *(volatile uint32_t *)(base + OFF_DO_SHADOW_SEQ) = 0u;
+#endif
+    __asm__ volatile("dsb" ::: "memory");
     s_do_ready = 1;
+}
+
+void do_latch_init(void)
+{
+    /* ── 时钟: MDMA 在 AHB3, DMA2/DMAMUX1 在 AHB1 ── */
+    *(volatile uint32_t *)0x580244D4u |= 1u;            /* RCC_AHB3ENR(@0x580244D4).MDMAEN ——
+                                          * 地址经 h723-core0 实测代码核实 (0x1C 是 D2CFGR, 首版写错) */
+    RCC_AHB1ENR |= (1u << 1) | (1u << 2);               /* DMA2EN(bit1) + DMAMUX1EN(bit2) */
+    __asm__ volatile("dsb" ::: "memory");
+
+    /* ── DMA2 S0: TIM2_UP 触发的哑传输 (TC 脉冲 = MDMA 触发源) ── */
+    *(volatile uint32_t *)DMAMUX1_C8 = DMAMUX_REQ_TIM2_UP;   /* 请求 22 = TIM2_UP */
+    *(volatile uint32_t *)DMA2S0_CR = 0u;                    /* 先禁 */
+    __asm__ volatile("dsb; isb");
+    *(volatile uint32_t *)DMA2_LIFCR = 0x3Du;                /* 清 S0 全部标志 */
+    *(volatile uint32_t *)DMA2S0_PAR  = LATCH_SNAP_ADDR - 4u; /* 源 = AXI 固定字 (SRAM→SRAM 自环,
+                                          * **绝不碰外设寄存器**) —— 首版两次踩坑:
+                                          * ① DIR=M2P 未改 ⇒ DMA 把 AXI 内容写进 TIM2_CNT ⇒
+                                          *   CNT 被写花成 0x663F331D ⇒ 32 位自由计数不再上溢
+                                          *   ⇒ UIF 消失 ⇒ 拍中断永久死亡 (tick 冻结 24); */
+    *(volatile uint32_t *)DMA2S0_M0AR = LATCH_SNAP_ADDR;     /* 目的 = AXI 快照槽 */
+    *(volatile uint32_t *)DMA2S0_NDTR = 1u;                  /* 1 个字 */
+    *(volatile uint32_t *)DMA2S0_FCR  = 0u;
+    /* TCIE + M2P + CIRC + PSIZE/MSIZE=word (h723-core0 配方; TC 信号硬件连 MDMA, 无需中断) */
+    /* TCIE + **DIR=P2M(bit6=0)** + CIRC + word —— DIR=M2P 是首版致命错:
+     * 它让哑传输把 AXI 内容写进 TIM2_CNT (见上), 拍定时器被谋杀 */
+    *(volatile uint32_t *)DMA2S0_CR = (1u << 4) | (1u << 8)
+                                    | (2u << 11) | (2u << 13);
+    __asm__ volatile("dsb; isb");
+    *(volatile uint32_t *)DMA2S0_CR |= 1u;                   /* EN */
+    __asm__ volatile("dsb; isb");
+
+    /* ── MDMA ch0: **链表循环模式** (h723-core0 'LLOK' 同款) ──
+     * ★ 为什么必须链表: BUFFER/BLOCK 单发模式传输完成 ⇒ **EN 自动清零** ⇒
+     *   之后每次 DMA2 TC 触发都被忽略 (实测 CISR=0x1E 但 ODR 不再更新)。
+     *   链表循环模式: **EN 保持**, 每次请求触发整个链表(单节点=4B 锁存), 永续。
+     * ★ 节点 8 word (32B 对齐): CTCR/CBNDTR/CSAR/CDAR/CBRUR/CLAR/CTBR/保留。
+     *   CTCR=TRGM=FULL(11)<<17 | byte 尺寸 | 地址固定; CLAR **指回节点自身** = 循环。 */
+    *(volatile uint32_t *)LNODE_ADDR + 0u;   /* (占位保持行结构) */
+    {
+        volatile uint32_t *nd = (volatile uint32_t *)LNODE_ADDR;
+        nd[0] = 0x00020000u;                 /* CTCR: TRGM=BLOCK(01)<<17 + byte 尺寸 + 地址固定 */
+        nd[1] = 4u;                          /* CBNDTR: BNDT=4 字节 */
+        nd[2] = (uint32_t)(s_do_base + OFF_DO_SHADOW);   /* CSAR = shadow */
+        nd[3] = 0x58021014u;                 /* CDAR = GPIOE_ODR */
+        nd[4] = 0u;                          /* CBRUR */
+        nd[5] = LNODE_ADDR;                  /* CLAR 指回自身 ⇒ 循环 */
+        nd[6] = MDMA_REQ_DMA2S0_TC | (1u << 16);         /* CTBR: TSEL=DMA2_S0_TC + SBUS */
+        nd[7] = 0u;
+    }
+    __asm__ volatile("dsb; isb");
+    /* MDMA ch0 主寄存器 = 节点同款配置 + CLAR 指向节点 */
+    *(volatile uint32_t *)MDMA_CH0_CIFCR = 0x1Fu;
+    *(volatile uint32_t *)MDMA_CH0_CTCR  = 0x00020000u;      /* TRGM=BLOCK + byte + 地址固定 */
+    *(volatile uint32_t *)MDMA_CH0_CBNDTR = 4u;
+    *(volatile uint32_t *)MDMA_CH0_CSAR  = (uint32_t)(s_do_base + OFF_DO_SHADOW);
+    *(volatile uint32_t *)MDMA_CH0_CDAR  = 0x58021014u;
+    *(volatile uint32_t *)MDMA_CH0_CLAR  = LNODE_ADDR;       /* 链表头 */
+    *(volatile uint32_t *)MDMA_CH0_CTBR  = MDMA_REQ_DMA2S0_TC | (1u << 16);
+    __asm__ volatile("dsb; isb");
+    *(volatile uint32_t *)MDMA_CH0_CCR   = 1u;               /* EN */
+    __asm__ volatile("dsb; isb");
+    /* CTBR: TSEL=8(DMA2_S0_TC) + SBUS(bit16)=源在 DTCM (走 TCM 端口) */
+    *(volatile uint32_t *)MDMA_CH0_CTBR  = MDMA_REQ_DMA2S0_TC | (1u << 16);
+    __asm__ volatile("dsb; isb");
+    *(volatile uint32_t *)MDMA_CH0_CCR   = 1u;               /* EN */
+    __asm__ volatile("dsb; isb");
+
+    /* ── TIM2 DIER |= UDE: 拍上溢发 DMA 请求 (|= 保护已有 UIE) ── */
+    TIM_DIER(TIM2_BASE) |= (1u << 8);
+    __asm__ volatile("dsb" ::: "memory");
 }
 
 void do_poll(uint8_t *base, uint32_t tick_now)
 {
     (void)tick_now;          /* 输出面每拍都做, 不需要相位 */
     if (!s_do_ready) return;
+    g_do_poll_n++;               /* ★ 活性计数在就绪门之后、mask 判别之前:
+                                    第一版放在 mask==0 早退之后 ⇒ 上电 GPIO_MASK=0
+                                    时它恒 0, 看起来"DO 没工作"—— 空判据翻车 (项目
+                                    已知教训, 自己代码里又踩了一次)。 */
     uint32_t mask = SHM_U32(base, OFF_CTRL_GPIO_MASK) & 0xFFFFu;
     if (mask == 0u) return;      /* 没登记任何管辖位 ⇒ 整口不碰 (且省 40 cyc) */
     uint32_t bits = do_pack(base, mask);
+#if DCL_DO_LATCH
+    /* ★★ 影子模式 (P3-B): 只写 shadow, 锁存由 MDMA 在拍边界硬件完成。
+     *   非管辖位保持: 读 ODR 现值, 仅改管辖位 —— BSRR 直写模式的"不碰"语义
+     *   在这里靠软件保持 (多一次 ODR 读, ~5 cyc, 可忽略)。 */
+    uint32_t odr = GPIO_ODR(DO_GPIO_PORT) & 0xFFFFu;
+    *(volatile uint32_t *)(base + OFF_DO_SHADOW) = (odr & ~mask) | bits;
+    *(volatile uint32_t *)(base + OFF_DO_SHADOW_SEQ) = g_do_poll_n;
+#else
     /* BSRR 一次写完成"置位 + 清零", 对 ODR 是原子覆盖; 非管辖位因为 bits 里
      * 相应为 0、mask 相应为 0 ⇒ 写的是 "清 0" —— 但我们**不该清非管辖位**!
      * ⇒ 所以只对管辖位下发: 置位 = bits, 清零 = (mask & ~bits)。 */
     GPIO_BSRR(DO_GPIO_PORT) = bits | ((mask & ~bits) << 16);
-    g_do_poll_n++;
+#endif
+    g_do_write_n++;
 }
 
 void do_outputs_safe(void)
 {
     if (!s_do_ready) return;
     uint32_t mask = SHM_U32(s_do_base, OFF_CTRL_GPIO_MASK) & 0xFFFFu;
-    /* 管辖位全部清 0 (BSRR 高 16 位写 1 = 清); 非管辖位不下发 */
+#if DCL_DO_LATCH
+    /* 影子模式: 清 shadow 的管辖位 (MDMA 下个拍边界锁存 0) —— 与 do_poll 同款保持语义 */
+    uint32_t odr = GPIO_ODR(DO_GPIO_PORT) & 0xFFFFu;
+    *(volatile uint32_t *)(s_do_base + OFF_DO_SHADOW) = (odr & ~mask);
+#else
     GPIO_BSRR(DO_GPIO_PORT) = (mask << 16);
+#endif
 }

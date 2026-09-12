@@ -455,7 +455,13 @@ _Static_assert(sizeof(MacroCtrl_t) == 16, "MacroCtrl_t must be 16 bytes");
 #define OFF_HIL_DUTY        0x6E00   /* u32: 最近写入 TIM3_CCR1 的计数值 (0..ARR+1) */
 #define OFF_HIL_FB_RAW      0x6E04   /* u32: HIL 反馈**最近一次** ADC 原始码 (排障用:
                                       * 与 0x37 扫描同一通道的读数直接对照) */
-#define OFF_W5_OBS_END      0x6E08
+/* ---- P3-B: DO 影子缓冲 (MDMA 定时锁存链的源, 2026-09-12) ----
+ * do_poll 打包后写 shadow; TIM2 上溢(拍边界)经 DMAMUX→DMA2 哑传输→TC 触发
+ * MDMA 把 shadow 单字锁存进 GPIOE_ODR —— 输出沿与计算时长解耦。
+ * 位置: SHM 尾部空闲区, 与 WIRE/ACTUATOR 物理分离 (覆盖分析见 MEMORY-LAYOUT.md §4)。 */
+#define OFF_DO_SHADOW       0x6E08   /* u32: DO 打包位图 (MDMA 锁存源) */
+#define OFF_DO_SHADOW_SEQ   0x6E0C   /* u32: shadow 写序号 (诊断"电平对应哪一拍") */
+#define OFF_W5_OBS_END      0x6E10
 _Static_assert(OFF_MACRO_END <= OFF_HIL_DUTY, "SHM: W5 观测区与 MACRO 区重叠");
 _Static_assert(OFF_HIL_FB_RAW + 4u <= SHM_SIZE, "SHM: W5 观测区越出 SHM 末尾");
 
