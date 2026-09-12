@@ -467,6 +467,7 @@ _Static_assert(sizeof(MacroCtrl_t) == 16, "MacroCtrl_t must be 16 bytes");
 #define OFF_EVT_HEAD        0x6E1C   /* u32: 事件环形缓冲写指针 (单调递增) */
 #define OFF_EVT_BUF         0x6E20   /* 32 条 × 8B = 256B 事件环形缓冲 ([ssr, code] × 32) */
 #define OFF_EVT_END         0x6F20   /* 事件区结束 */
+#define OFF_BB_SNAP         0x6F20   /* u8[256]: 黑匣子紧凑快照区 (CPU 拷贝源, MDMA 源) */
 #define OFF_W5_OBS_END      0x6F20
 _Static_assert(OFF_MACRO_END <= OFF_HIL_DUTY, "SHM: W5 观测区与 MACRO 区重叠");
 _Static_assert(OFF_HIL_FB_RAW + 4u <= SHM_SIZE, "SHM: W5 观测区越出 SHM 末尾");

@@ -143,6 +143,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/di.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/do.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/rtc.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/blackbox.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/hil.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/uart.c
