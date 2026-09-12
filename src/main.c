@@ -2498,7 +2498,20 @@ int main(void)
         /* ★★★ 每拍连续落盘 (2026-09-12): 把 RAM 环里新产出的快照成批落盘。
          *   放在 proto_poll 之后 ⇒ 协议优先被服务; 单批 64 条(=6.4ms 产量) 约 3ms 写完。
          *   卡满则回卷覆盖最旧 (专用裸介质, 见 sd.c 的日志段注释)。 */
-        sd_log_poll();
+        {   /* ★ 卡顿归因: 量"两次落盘之间的间隔"与"落盘内部耗时" */
+            static uint32_t s_last = 0, s_gapmax = 0, s_inmax = 0, s_slow = 0;
+            uint32_t t0 = g_tick_count;
+            if (s_last != 0u) {
+                uint32_t g = t0 - s_last;
+                if (g > s_gapmax) s_gapmax = g;
+                if (g > 200u) s_slow++;              /* >20ms 记一次慢轮询 */
+            }
+            sd_log_poll();
+            {   uint32_t d = g_tick_count - t0;
+                if (d > s_inmax) s_inmax = d; }
+            s_last = t0;
+            sd_log_diag_gap(s_gapmax, s_inmax, s_slow);
+        }
         /* ★★ 上位机触发的"重新开日志" (卡插晚了 / 换卡): 调试器预写 SD_CFG[8]=1
          *   + 魔数 [15]=0xF00DBEEF。★ 必须外部触发, 别让固件自己定时猜窗口。 */
         if (sd_cfg_take(8u) != 0u) { (void)sd_reopen_log(); }

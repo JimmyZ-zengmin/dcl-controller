@@ -28,9 +28,12 @@
 
 #define BB_AXI_BASE     0x24004000u   /* AXI 黑匣子区起始 (避开低 16KB) */
 #define BB_SLOT_SZ      256u          /* 每拍快照 256B */
-#define BB_SLOTS        768u          /* ★ 512->768 槽: 丢包判据是"落后量 > 槽数",
-                                       *   51.2ms -> 76.8ms 的卡顿吸收量 (2026-09-12)
-                                       *   占 AXI 192KB, 冻结区 64KB, 见 sd.c 的布局注释 */
+#define BB_SLOTS        960u          /* ★ 512->768->960 槽 (2026-09-12)。
+                                       *   丢包判据 = "落后量 > 槽数", 而卡顿实测来自
+                                       *   **SD 卡自身块编程抖动**([60] 单批最长 68.4ms,
+                                       *   30s 内 35 次 >20ms) ⇒ 唯一解法是加大吸收量。
+                                       *   960 槽 = 96ms, 占 AXI 240KB, 冻结区 64KB,
+                                       *   正好把 0x24004000..0x24050000 用满。 */
 #define BB_TOTAL        (BB_SLOT_SZ * BB_SLOTS)  /* 128KB */
 #define BB_MAGIC        0x42424B42u   /* "BBKB" (环首字, 旧) */
 #define BBLOG_REC_MAGIC 0x4B424C44u   /* "DLBK" 每条记录的魔数 */

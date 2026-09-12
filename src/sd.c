@@ -182,15 +182,15 @@ volatile uint32_t g_sd_blocks = 0;
  *   0x24000000 低 16KB 预留   0x24000200 SD_DIAG   0x24000300 BB_DIAG
  *   0x24000400 SD_CFG         0x24001000 SD 校验 scratch(512B)
  *   0x24003000/0x24003100     do.c 锁存快照 / MDMA 链表节点 (勿动)
- *   0x24004000 + 192KB        黑匣子 RAM 环 (**768** 槽 × 256B = 76.8ms 缓冲)
- *   0x24034000 + 64KB         **SD 冻结区** (落盘前把这一批拷过来, 见 sd_log_one_batch)
+ *   0x24004000 + 240KB        黑匣子 RAM 环 (**960** 槽 × 256B = 96ms 缓冲)
+ *   0x24040000 + 64KB         **SD 冻结区** (落盘前把这一批拷过来, 见 sd_log_one_batch)
  * ★ 环做大的唯一理由: 丢包判据是"落后量 > 槽数"(avail > BB_SLOTS)。
  *   增大槽数 = 提高对**瞬时卡顿**(SD 卡编程尾巴变长)的吸收量。
  *   读完清零 ⇒ 不会悄悄改变下次上电的行为。 */
 #define SD_CFG      ((volatile uint32_t *)0x24000400u)
 #define SD_DATA_CLKDIV_DEF  1u      /* 100MHz/(2*1) = 50MHz (实测 5.63MB/s) */
 #define SD_RING    ((const uint8_t *)0x24004000u)   /* 黑匣子 RAM 环 (活的, 512×256B) */
-#define SD_STAGE   ((uint8_t *)0x24034000u)         /* 64KB 冻结/暂存区 (紧接 192KB 环之后) */
+#define SD_STAGE   ((uint8_t *)0x24040000u)         /* 64KB 冻结/暂存区 (紧接 240KB 环之后) */
 #define SD_HS_ARG           0x80FFFFF1u  /* CMD6 SET, group1(Access Mode) = 1 (High Speed) */
 
 static uint32_t s_sd_ready = 0;
@@ -222,6 +222,10 @@ static uint32_t s_log_max_avail = 0;    /* 见过的最大待落盘条数 (判�
 static uint32_t s_log_drop_open = 0;    /* 开日志时的丢包基线 ⇒ 可算本次上电丢包 */
 static uint32_t s_log_blk_open = 0;     /* 开日志时的块基线 ⇒ 可算本次上电写了多少 */
 static uint32_t s_log_hdr_pend = 0;     /* 有亟待刷新的日志头 (见 sd_log_one_batch 注释) */
+static uint32_t s_log_batch_err = 0;   /* 批写失败次数 (含 wait_ready 超时) */
+static uint32_t s_log_batch = LOG_BATCH_SLOTS;  /* 本批槽数 (可由 SD_CFG[9] 覆盖, 供扫批大小) */
+#define LOG_BATCH_MIN 32u
+#define LOG_BATCH_MAX LOG_BATCH_SLOTS          /* 上限 = 冻结区能装下的槽数 (64KB/256B) */
 
 #define SD_PWRUP_DLY   60000u       /* ~1ms @400MHz (HAL 用 HAL_Delay(1)) */
 #define SD_TMOUT_CMD   4000000u     /* 命令/RESP 等待上限 (循环计数) */
@@ -717,6 +721,16 @@ static uint32_t sd_cfg_take_raw(uint32_t idx)
 
 /* ★ 用到的下标是 0..8 (含 blackbox.c 的 4/5/7 与 main 的 8), 上限必须留够 ——
  *   第一版写 `idx > 3 → 0` 把 4/5/7/8 全挡死, 是"加了保护反而废掉功能"的典型。 */
+/* ★ 卡顿归因观测 (由主循环喂进来): [59] 两次落盘最大间隔 / [60] 落盘内部最长耗时 /
+ *   [61] 慢轮询(>20ms)次数。两个数一对比就能把"卡顿"劈成两半:
+ *   [59] 大而 [60] 小 ⇒ 主循环被别的事占住; [60] 大 ⇒ 就是 SD 卡写得慢。 */
+void sd_log_diag_gap(uint32_t gap_ticks, uint32_t inpoll_ticks, uint32_t slow_cnt)
+{
+    SD_DIAG[59] = gap_ticks;
+    SD_DIAG[60] = inpoll_ticks;
+    SD_DIAG[61] = slow_cnt;
+}
+
 uint32_t sd_cfg_take(uint32_t idx)
 {
     if (idx > 14u) return 0u;
@@ -775,13 +789,19 @@ int sd_log_open(void)
         SD_DIAG[45] = 2u;                                      /* 2 = 新建日志 */
     }
     s_log_ready = 1;
+    {   /* ★ 批大小可由 SD_CFG[9] 覆盖 (扫"批大小 vs 单批卡顿"用; 有魔数门) */
+        uint32_t b = sd_cfg_take_raw(9u);
+        if (b >= LOG_BATCH_MIN && b <= LOG_BATCH_MAX) s_log_batch = b & ~1u;
+        else s_log_batch = LOG_BATCH_SLOTS;
+        SD_DIAG[62] = s_log_batch;
+    }
     (void)sd_log_flush_header();
     /* ★ 只记录"从此刻起"新产出的快照: 环里已有的要么是陈旧 SRAM, 要么是上一轮已经
      *   落过盘的 (续写场景) —— 重复落盘只会把日志写乱。 */
     s_log_slot_base = bb_slots_produced();
     s_log_drop_open = s_log_dropped;
     s_log_blk_open = s_log_total;
-    s_log_polls = 0; s_log_max_avail = 0;
+    s_log_polls = 0; s_log_max_avail = 0; s_log_batch_err = 0;
     SD_DIAG[44] = s_log_blk;
     SD_DIAG[47] = 1u + s_log_blk;
     SD_DIAG[48] = s_log_total;
@@ -805,9 +825,9 @@ static uint32_t sd_log_one_batch(void)
     }
     /* ★ 攒批: 不满一批就等下一轮 (小批的命令开销会把带宽吃掉);
      *   但**落后到 3/4 环时立刻写**, 否则环被覆盖就真丢数据。 */
-    if (avail < LOG_BATCH_SLOTS && avail <= 384u) return 0u;
+    if (avail < s_log_batch && avail <= (BB_SLOTS * 3u / 4u)) return 0u;
     n = avail & ~1u;                           /* 必须成对 (2 条 = 1 块) */
-    if (n > LOG_BATCH_SLOTS) n = LOG_BATCH_SLOTS;
+    if (n > s_log_batch) n = s_log_batch;
     if (n == 0u) return 0u;
 
     /* ① 冻结这一批 (逐槽搬 ⇒ 天然处理环形回绕) */
@@ -828,7 +848,7 @@ static uint32_t sd_log_one_batch(void)
 
     rc = sd_write_multi(1u + s_log_blk, SD_STAGE, nblk);
     s_log_last_rc = (uint32_t)rc;
-    if (rc != 0u) return 0u;                   /* 失败: 不推进游标, 下轮重试同一批 */
+    if (rc != 0u) { s_log_batch_err++; return 0u; }   /* 失败: 不推进游标, 下轮重试同一批 */
     s_log_blk += nblk;
     if (s_log_blk >= cap_data) { s_log_blk = 0u; s_log_wrapped = 1u; }
     s_log_slot_base += nblk * 2u;
@@ -883,6 +903,7 @@ void sd_log_poll(void)
     SD_DIAG[56] = s_log_max_avail;
     SD_DIAG[57] = s_log_dropped - s_log_drop_open;
     SD_DIAG[58] = (s_log_total - s_log_blk_open) / 2u;   /* 本次上电写了多少块 */
+    SD_DIAG[63] = s_log_batch_err;                       /* ★ 批写失败次数 */
 }
 
 /* 一次性吞吐自检: 从冻结区(当 scratch)连续写 256 块, **只测写速度**。
