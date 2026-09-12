@@ -653,7 +653,8 @@ ISR_PLACE void TIM2_IRQHandler(void)
 #if IO_IN_ISR
         /* 这两个函数声明带 `long_call` ⇒ 编译器生成 BLX, 不走 veneer (见上方长注释) */
         di_poll(g_shm, g_tick_count);    /* DI: 每 100 拍相位锚定采样 + 去抖 → SENSOR[3..6] */
-        adc_poll(g_shm, g_tick_count);   /* AI/HIL反馈: 非阻塞状态机 → SENSOR[8..10] / [2] */
+        adc_poll_reclaim(g_shm);         /* ★ P3-C: 只回收 (上拍尾启动的转换已完成 ⇒ 孔径
+                                          *   与输出沿隔了 ~97µs); 启动挪到 ISR 末尾 */
 #endif
 
         g_engine_run_seen = SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN);
@@ -822,6 +823,10 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *     "引擎真的推进过的拍数", 而不是"中断进来过几次"。
          *   ★ 副作用(正面): STOP 后 samples 冻结 —— 这正是"0x12 STOP 可失败判据"的一半。 */
         if (g_engine_gate && g_engine_run_seen) g_isr_n++;
+        /* ★★ P3-C: 拍尾启动新采样 —— 采样孔径从拍尾开始, 距本拍头的输出沿
+         *   已隔 ~97µs (建立时间), 采样开关动作不再与输出沿同瞬 (自导自演消除)。
+         *   成本计入 isr 统计 (在 t1 之前)。 */
+        adc_poll_kick();
 
         if (g_per_prev) {
             uint32_t p = t0 - g_per_prev;

@@ -66,6 +66,10 @@ void ai_tick(uint8_t *base, uint32_t tick_now);   /* 主循环: 每 10ms 采一�
  *     相距 128MB, 超出 Thumb `BL` 的 ±16MB ⇒ 必须走 BLX。实测: 靠链接器 veneer
  *     会整机卡进 Default_Handler (详见 main.c 里 s_io_in 那段证据链, 或 di.h)。 */
 __attribute__((long_call)) void adc_poll(uint8_t *base, uint32_t tick_now);
+/* ★ P3-C 拆分版: 回收(拍头, 紧跟输出沿后读已完成转换) / 启动(拍尾, 躲开输出沿
+ *   97µs 后才开采样孔径) —— 交付档 ISR 分两处调; 对照档仍用 adc_poll 整体。 */
+void adc_poll_reclaim(uint8_t *base);
+void adc_poll_kick(void);
 
 extern volatile uint32_t g_adc_sm_done;
 extern volatile uint32_t g_adc_sm_timeout;

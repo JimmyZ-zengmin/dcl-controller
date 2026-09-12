@@ -237,30 +237,39 @@ static void adc_sm_start(uint32_t ch)
     ADC_CR(ADC1) |= ADC_CR_ADSTART;
 }
 
-void adc_poll(uint8_t *base, uint32_t tick_now)
+/* ══════════ P3-C (2026-09-12): adc_poll 拆两半 —— 回收(拍头)/启动(拍尾) ══════════
+ * ★ 为什么拆: 采样孔径(转换期间)不能与输出沿重叠 —— 输出沿的 di/dt(地弹/串扰)
+ *   会混进采样。启动挪到 **ISR 末尾**(拍尾) ⇒ 孔径从拍尾开始, 距上一个输出沿
+ *   (拍头 MDMA 锁存)已隔 ~97µs —— 采样开关动作不再与输出沿同瞬。
+ * ★ 拆分后节奏加快: 转换 4µs << 拍长 100µs ⇒ 每 2 拍完成一个通道
+ *   (拍尾 kick → 下拍头 reclaim ⇒ 同拍尾 kick 下一通道), 4 通道 = 8 拍 = 0.8ms
+ *   (原 16 拍 = 1.6ms, 快一倍; HIL 反馈均值跨度 25.6ms → 12.8ms)。
+ * ★ 握手: pend=1 表示"有转换在跑"; kick 只在 pend==0 时启动 (否则 ADC busy)。
+ *   对照档 (IO_IN_ISR=0) 走 adc_poll() 整体 (reclaim+kick 顺序调), 语义不变。 */
+void adc_poll_reclaim(uint8_t *base)
 {
-    (void)tick_now;                     /* 状态机自带节律 (按拍推进), 不需要额外相位 */
     if (!s_adc_ready) return;
-
-    if (s_sm.pend) {
-        if (s_sm.wait < ADC_SM_START_WAIT) { s_sm.wait++; return; }   /* 起跑阶段: 不查 */
-        if (ADC_ISR(ADC1) & ADC_ISR_EOC) {
-            uint16_t raw = (uint16_t)(ADC_DR(ADC1) & 0xFFFFu);        /* 读 DR 同时清 EOC */
-            adc_sm_store(s_sm.idx, raw, base);
+    if (!s_sm.pend) return;    /* 无转换在跑 (上拍尾没 kick) ⇒ 无事 */
+    if (s_sm.wait < ADC_SM_START_WAIT) { s_sm.wait++; return; }   /* 起跑阶段: 不查 */
+    if (ADC_ISR(ADC1) & ADC_ISR_EOC) {
+        uint16_t raw = (uint16_t)(ADC_DR(ADC1) & 0xFFFFu);        /* 读 DR 同时清 EOC */
+        adc_sm_store(s_sm.idx, raw, base);
+        s_sm.pend = 0;
+        g_adc_sm_done++;
+    } else {
+        s_sm.wait++;
+        if (s_sm.wait >= ADC_SM_TIMEOUT) {
+            g_adc_sm_timeout++;     /* ★ 显式计数, 不静默 (见上方长注释) */
             s_sm.pend = 0;
-            g_adc_sm_done++;
-        } else {
-            s_sm.wait++;
-            if (s_sm.wait >= ADC_SM_TIMEOUT) {
-                g_adc_sm_timeout++;     /* ★ 显式计数, 不静默 (见上方长注释) */
-                s_sm.pend = 0;
-            } else {
-                return;                 /* 还在等, 本拍不做别的 */
-            }
         }
+        /* 还在等: 本拍不回收 (下拍头再查) */
     }
+}
 
-    /* 启动下一通道 (与"取结果"同拍进行 —— 省掉一拍空转) */
+void adc_poll_kick(void)
+{
+    if (!s_adc_ready) return;
+    if (s_sm.pend) return;     /* 还有转换在跑 ⇒ 不启动 (等回收), ADC 单次模式 busy */
     uint32_t next = (uint32_t)s_sm.idx;
     uint32_t ch   = (next < (uint32_t)AI_NCH) ? AI_CHS[next] : HIL_FB_CH_PA5;
     adc_sm_start(ch);
@@ -268,4 +277,12 @@ void adc_poll(uint8_t *base, uint32_t tick_now)
     if (s_sm.idx >= (uint8_t)ADC_SM_NCH) s_sm.idx = 0;
     s_sm.pend = 1;
     s_sm.wait = 0;
+}
+
+/* 完整版 (对照档/兼容): 回收+启动顺序调 —— 与拆分前行为逐拍一致 */
+void adc_poll(uint8_t *base, uint32_t tick_now)
+{
+    (void)tick_now;
+    adc_poll_reclaim(base);
+    adc_poll_kick();
 }
