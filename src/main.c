@@ -2443,7 +2443,14 @@ int main(void)
     /* ★ SD 卡 (2026-09-12): 初始化 + 把黑匣子缓冲写到卡上。
      *   放在启动期末尾 (允许几百 ms); 失败不阻塞启动 (内部有超时保护)。 */
     g_stage = 27;
-    if (sd_init() == 0) { sd_dump_blackbox(); }
+    if (sd_init() == 0) {
+        /* ★ 落盘耗时用**拍计数**测 (100us/拍), 不依赖 DWT ——
+         *   阈值足够分辨 128KB 多块写 (几十 ms)。结果回填进 sd 诊断区 [33..35]。
+         *   吞吐 = 块数×512B / (耗时×100us)。 */
+        uint32_t t0 = g_tick_count;
+        sd_dump_blackbox();
+        sd_set_perf(g_tick_count - t0);
+    }
 #if HIL_SAFE
     eng_register_output_surface(do_outputs_safe);
 #endif

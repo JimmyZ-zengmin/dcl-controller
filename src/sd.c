@@ -161,13 +161,24 @@ volatile uint32_t g_sd_blocks = 0;
  *   [20] marker (0xBAxx=失败点 / 0x600D=全通)  ← 原放 [8]
  *   [21] 最近一次 RESP1      [22] CID[127:96]  [23] CID[95:64]
  *   [28] 读失败时的 STA      [26] 回读校验 (0=256块逐字全对)
- *   [31] 保留               [32] 保留
+ *   [30] 数据期 CLKCR        [31] CMD6(HS) 的 R1   [32] 用的 CLKDIV
+ *   [33] 落盘耗时(拍,100us)  [34] 写成块数        [35] 累计块数
  *   [24] 识别用了几轮(1..3)   [25] sd_identify 返回码
  *   [26] 回读不符块数(0=全对)  [27] 回读失败 (块号<<8)|错误码
  *   [16..19] 分频自检: (CLKDIV<<8) | 结果码 (0=OK)
  *   结果码: 1=CMD0 无 CMDSENT  2=CMD8 失败  3=CMD8 回显不符
  */
 #define SD_DIAG  ((volatile uint32_t *)0x24030000u)
+
+/* ★★ 实验配置字 (2026-09-12, 提速研究用): 调试器**在复位前预写**, 固件读一次即清。
+ *   好处: 换 CLKDIV / 开关 High Speed 不需要重新编译烧录 (项目"非侵入式交互"纪律)。
+ *   [0] 数据期 CLKDIV (0 / 未写 ⇒ 用默认 SD_DATA_CLKDIV)
+ *   [1] =1 ⇒ 识别后发 CMD6 把卡切到 High Speed (50MHz 前必须; 25MHz 不需要)
+ *   [2] =1 ⇒ 只跑性能测试 (sd_dump_blackbox 里写满 + 回读, 由调用方计时)
+ *   读完清零 ⇒ 不会悄悄改变下次上电的行为。 */
+#define SD_CFG      ((volatile uint32_t *)0x24002000u)
+#define SD_DATA_CLKDIV_DEF  2u      /* 100MHz/(2*2) = 25MHz */
+#define SD_HS_ARG           0x80FFFFF1u  /* CMD6 SET, group1(Access Mode) = 1 (High Speed) */
 
 static uint32_t s_sd_ready = 0;
 
@@ -326,7 +337,7 @@ static int sd_identify(uint32_t chosen)
         SD_DIAG[0] = 14; SD_DIAG[1] = SD_STA; SD_DIAG[20] = 0xBA10; return -13;
     }
 
-    /* 数据期总线宽度 = **1-bit**, 提频到 25MHz。
+    /* 数据期总线宽度 = **1-bit**, 时钟由实验配置字决定 (默认 25MHz)。
      *
      * ★★ 为什么不做 ACMD6 切 4-bit (HAL 会做) —— 实测证据 (2026-09-12):
      *   · 4-bit @25MHz: 写 256/256 块全过, 但**回读第 0 块即 DCRCFAIL**
@@ -334,17 +345,36 @@ static int sd_identify(uint32_t chosen)
      *   · ACMD6(arg=2) 的 R1 = 0x920, 逐位与 SDMMC_OCR_ERRORBITS(0xFDFFE008)
      *     相与为 0 ⇒ **卡声称接受了 4-bit**;
      *   · 但双端一起回到 1-bit 后, 回读 256/256 块**逐字完全一致** (校验不符 = 0)。
-     *   ⇒ 机制: 卡实际只在 DAT0 上驱动数据。写方向主机驱 4 条线、卡只采 DAT0,
-     *     所以写全对; 读方向卡只驱 DAT0, 主机按 4-bit 采样 DAT1..3 得悬空高电平
-     *     ⇒ 数据块 CRC16 必错, 且与频率无关。
-     *   ⇒ 判定为**卡侧 DAT1..3 不工作** (该卡 CID = 0x00343253_44313647:
-     *     厂家 ID = 0x00、OID = "42", 都不是 SD 协会分配的正规值, 疑似非原厂卡)。
-     *   1-bit @25MHz = 3.125MB/s, 128KB 只需 41ms, 对本用途足够。
-     *   ⇒ 因此**不发 ACMD6**, 数据期固定 1-bit; 这比"照抄 HAL 发 ACMD6 却读不回来"诚实。 */
-    SD_CLKCR = 2u | CLKCR_WIDBUS_1B;
-    sd_delay(SD_PWRUP_DLY);
+     *   ⇒ 现象是"主机→卡"方向 4 条线都通(否则卡的 CRC 会失败), 只有"卡→主机"方向
+     *     的多通道采样不成 —— **这是我们的问题, 不是卡的问题**(卡为正品, 用户确认)。
+     *     嫌疑: CLKCR.SELCLKRX 接收时钟选择 / 多通道采样余量。
+     *   ⏳ 待查清后再开 4-bit; 在此之前用 1-bit + 提高时钟 + 多块写达到带宽。 */
+    {   uint32_t cdiv = SD_CFG[0];
+        uint32_t hs   = SD_CFG[1];
+        SD_CFG[0] = 0u; SD_CFG[1] = 0u;                  /* 一次性 */
+        if (cdiv == 0u) cdiv = SD_DATA_CLKDIV_DEF;
+        SD_DIAG[32] = cdiv;
+        if (hs != 0u) {
+            /* CMD6 SWITCH_FUNC: 把 Access Mode 切到 High Speed (50MHz 前必须)。
+             * 在**当前低速**下发, 成功后再提频。 */
+            (void)sd_cmd(6, SD_HS_ARG, CMD_WAITRESP_S, &r, 1);
+            SD_DIAG[31] = r;                             /* R1 留档 */
+        }
+        SD_CLKCR = cdiv | CLKCR_WIDBUS_1B;
+        sd_delay(SD_PWRUP_DLY);
+        SD_DIAG[30] = SD_CLKCR;
+    }
     (void)r;
     return 0;
+}
+
+/* 落盘耗时/吞吐自观测 (由调用方计时后回填; 用拍数 100us/拍, 不依赖 DWT) */
+void sd_set_perf(uint32_t elapsed_ticks)
+{
+    SD_DIAG[33] = elapsed_ticks;          /* 总耗时 (拍) */
+    SD_DIAG[34] = SD_DIAG[14];            /* 写成块数 */
+    SD_DIAG[35] = SD_DIAG[3];             /* 累计块数 */
+    SD_DIAG[36] = 0u;                     /* 保留 */
 }
 
 int sd_init(void)
@@ -540,11 +570,73 @@ static uint32_t sd_verify(const uint8_t *src, uint8_t *scratch, uint32_t lba0)
     return mism;
 }
 
-/* 把 AXI 黑匣子缓冲 (BB_TOTAL = 128KB = 256 块) 写到卡末尾区, 然后**回读校验**。
+/* 多块写 (CMD25 + CMD12 STOP) —— 单块 CMD24 的根本问题是"每块都要一次命令+响应+
+ * 等卡内部编程", 实测只有 ~0.3 MB/s。多块把 N 个 512B 块挂在**一条命令**下,
+ * 由 IDMA 连续喂数据, 卡自己流水编程 —— 吞吐由总线/卡决定, 不再由命令开销决定。
+ * ★ 关闭方式照 HAL: 发 CMD12 时必须 **CMDSTOP=1 且 CMDTRANS=0**
+ *   (`SDMMC_CmdStopTransfer`, stm32h7xx_ll_sdmmc.c:754-783)。
+ * @param buf 4 字节对齐的 SRAM 源; nblk 块数 (1..1024); 建议 ≤64 便于失败定位 */
+int sd_write_multi(uint32_t lba, const uint8_t *buf, uint32_t nblk)
+{
+    uint32_t g, st;
+
+    if (!s_sd_ready) return -1;
+    if (nblk == 0u || nblk > 1024u) return -1;
+    if (((uint32_t)buf & 3u) != 0u) return -1;
+
+    SD_DCTRL = 0u;
+    SD_DTIMER = 0xFFFFFFFFu;
+    SD_DLEN   = nblk * SD_BLK_SZ;
+    SD_DCTRL  = (SD_BLK_BITS << 4) | (0u << 1) | (0u << 2);   /* 512B/写/块/DTEN=0 */
+    SD_ICR    = STA_STATIC;
+    SD_CMD   |= CMD_CMDTRANS;
+    SD_IDMABASE0 = (uint32_t)buf;
+    SD_IDMACTRL  = 1u;
+
+    if (sd_cmd(25, lba, CMD_WAITRESP_S, 0, 1) != 0) {         /* CMD25 WRITE_MULTIPLE_BLOCK */
+        SD_DIAG[13] = SD_STA;
+        SD_CMD &= ~CMD_CMDTRANS; SD_IDMACTRL = 0u;
+        return -2;
+    }
+
+    /* ★ 多块写**只能等 DATAEND**: DBCKEND 是"每块结束"都会置位
+     *   (单块写用它没问题, 多块写用它 ⇒ 第 1 块结束就误判成功)。
+     *   DCRCFAIL/DCRCFAIL/DTIMEOUT 由 STA_DATAERR 覆盖。 */
+    st = 0u;
+    for (g = 0; g < SD_TMOUT_DATA; g++) {
+        st = SD_STA;
+        if (st & STA_DATAERR) break;
+        if (st & STA_DATAEND) break;
+    }
+    SD_CMD &= ~CMD_CMDTRANS;
+    SD_IDMACTRL = 0u;
+
+    /* ★ STOP_TRANSMISSION (CMD12): CMDSTOP=1, CMDTRANS=0 */
+    SD_CMD &= ~(CMD_CMDTRANS | CMD_CMDSTOP);
+    SD_CMD |= CMD_CMDSTOP | 12u | CMD_WAITRESP_S | CMD_CPSMEN;
+    for (g = 0; g < SD_TMOUT_CMD; g++) {
+        uint32_t s2 = SD_STA;
+        if ((s2 & (STA_CMDREND | STA_CCRCFAIL | STA_CTIMEOUT)) && !(s2 & STA_CPSMACT)) break;
+    }
+    SD_CMD &= ~CMD_CMDSTOP;
+    SD_ICR = STA_STATIC;
+
+    if (st & STA_DATAERR)    { SD_DIAG[13] = st; return -4; }
+    if (!(st & STA_DATAEND)) { SD_DIAG[13] = st; return -5; }
+    if (sd_wait_ready() != 0) { SD_DIAG[13] = SD_STA; return -7; }
+    g_sd_blocks += nblk;
+    return 0;
+}
+
+
+/* 把 AXI 黑匣子缓冲 (BB_TOTAL = 128KB = 256 块) 写到卡上, 然后**回读校验**。
  * ★ 为什么不以"写命令返回 0"为判据: 写成功只说明主机侧协议走完了,
  *   不说明卡真的把数据存住了 (写保护/坏块/寻址容错都可能吞掉)。
  *   真正的对端证据是 **读回来的字节**: 256 块逐字比对, 不符块数记进 [26]。
- *   回读缓冲放在 AXI 低 16KB 预留区 (0x24001000), 与黑匣子区不重叠。 */
+ *   回读缓冲放在 AXI 低 16KB 预留区 (0x24001000), 与黑匣子区不重叠。
+ * ★ 写路径走 **多块 CMD25**, 每批 SD_BURST_BLKS 块 (便于失败定位);
+ *   耗时由调用方计时后交回 sd_set_perf() 记进诊断区 (见 [33..36])。 */
+#define SD_BURST_BLKS 64u
 void sd_dump_blackbox(void)
 {
     uint32_t i;
@@ -555,10 +647,10 @@ void sd_dump_blackbox(void)
     if (!s_sd_ready) return;
     (void)sd_wait_ready();
 
-    /* ① 写 256 块 (1-bit @25MHz) */
-    for (i = 0; i < 256u; i++) {
-        if (sd_write_block(base_lba + i, src + i * SD_BLK_SZ) != 0) break;
-        SD_DIAG[14] = i + 1u;
+    /* ① 写 256 块: 4 批 × 64 块 (多块写) */
+    for (i = 0; i < 256u; i += SD_BURST_BLKS) {
+        if (sd_write_multi(base_lba + i, src + i * SD_BLK_SZ, SD_BURST_BLKS) != 0) break;
+        SD_DIAG[14] = i + SD_BURST_BLKS;
     }
     SD_DIAG[3] = g_sd_blocks;
 
