@@ -50,18 +50,23 @@ void adc_init(void)
      *      症状正是"读数完全不跟随输入"(本项目 2026-09-11 实测撞到: AI/HIL 都读不到)。
      *      ⇒ 取最保守组合: PRESC=/8 → 3.125MHz, BOOST=0 (≤6.25MHz), 彻底避开该风险。
      *        采样时间 810.5 周期 @3.125MHz ≈ 259µs/次 —— ai_tick 3 次/10ms 完全够。 */
-    ADC_CCR = (0u << ADC_CCR_CKMODE_SHIFT) | (3u << ADC_CCR_PRESC_SHIFT);
-    ADC_CR(ADC1) &= ~ADC_CR_BOOST;                        /* BOOST=0: 匹配 3.125MHz */
+    /* ★★ 2026-09-12 优化: PRESC /8 → /2 ⇒ fADC = 25/2 = **12.5MHz** (BOOST=1 档极限:
+     *   H723 的 BOOST 字段只有 bit8 一位, bit9 写不进 ⇒ 上限 12.5MHz, /2 恰好到限)。
+     *   单次转换 259µs → **≈4µs** (32.5 周期采样 + 16.5 转换) ⇒ 一拍装下一次转换,
+     *   采样孔径从此远离输出沿 (拍内 t≈几 µs 完成, 输出沿在拍边界)。 */
+    ADC_CCR = (0u << ADC_CCR_CKMODE_SHIFT) | (1u << ADC_CCR_PRESC_SHIFT);
 
-    /* ★★ ③ 通道预选 (PCSEL) —— **漏了它 ADC 就看不到任何引脚**。
-     *   依据: LL_ADC_SetChannelPreselection() (HAL 每配一个通道写一次)。
-     *   这里全开 20 个通道, 让 0x37 全通道扫描能覆盖所有 INP。 */
-    ADC_PCSEL(ADC1) = 0x000FFFFFu;
-
-    /* ③ 上电: 退出深睡眠 + 使能内部稳压器 (★ 这两位在 ADC_CR 上, 不是 ADC_CCR) */
+    /* ③ 上电: 退出深睡眠 + 稳压器 + BOOST + **PCSEL 通道预选** */
     ADC_CR(ADC1) &= ~ADC_CR_DEEPPWD;
     ADC_CR(ADC1) |=  ADC_CR_ADVREGEN;
+    ADC_CR(ADC1) = (ADC_CR(ADC1) & ~ADC_CR_BOOST) | ADC_CR_BOOST;  /* BOOST=1 档 (≤12.5MHz) */
     adc_delay(200000u);                                   /* tADC 稳压器稳定 (~ms 级余量) */
+
+    /* ★★ 通道预选 (PCSEL) —— **漏了它 ADC 就看不到任何引脚**。
+     * ★★ 位置教训 (2026-09-12): PCSEL 原写在**深睡眠态**(DEEPPWD=1) ⇒ **写不生效**
+     *   (读回 PCSEL=0 ⇒ ADC 读数全是"未定义值"~0.18V)。移到退出深睡眠之后才可靠。
+     *   全开 20 个通道, 让 0x37 全通道扫描覆盖所有 INP。 */
+    ADC_PCSEL(ADC1) = 0x000FFFFFu;
 
     /* ④ 校准 (照 HAL 口径: 先禁能再校准; ADVREGEN 必须在) */
     ADC_CR(ADC1) |= ADC_CR_ADDIS;
@@ -72,8 +77,11 @@ void adc_init(void)
     /* ⑤ 配置 (禁用态): 16bit / 单次 / 软件触发; 所有通道给最长采样时间
      *   (810.5 周期 @25MHz ≈ 32µs) —— 本自检用内部 40kΩ 上拉驱动, 高阻源必须长采样。 */
     ADC_CFGR(ADC1)  = 0u;                                 /* RES=000 → 16bit, CONT=0 */
-    ADC_SMPR1(ADC1) = 0x3FFFFFFFu;                        /* SMP0..SMP9  = 810.5 周期 */
-    ADC_SMPR2(ADC1) = 0x3FFFFFFFu;                        /* SMP10..SMP19= 810.5 周期 */
+    /* ★ SMP = 32.5 周期(编码4) @12.5MHz = 2.6µs —— 40kΩ 源的 16 位充电需求
+     *   (tS ≥ ln(2^18)×(Rsrc+Radc)×Csample ≈ 2.5µs) 刚好满足; 810.5 周期是
+     *   百倍保守 (3.125MHz 时代的产物)。每通道 3 位字段 = 100b ⇒ 0x24924924。 */
+    ADC_SMPR1(ADC1) = 0x24924924u;                        /* SMP0..SMP9  = 32.5 周期 */
+    ADC_SMPR2(ADC1) = 0x24924924u;                        /* SMP10..SMP19= 32.5 周期 */
 
     /* ⑥ 使能, 等 ADRDY */
     ADC_CR(ADC1) |= ADC_CR_ADEN;

@@ -140,7 +140,13 @@ void do_latch_init(void)
         nd[4] = 0u;                          /* CBRUR */
         nd[5] = LNODE_ADDR;                  /* CLAR 指回自身 ⇒ 循环 */
         nd[6] = MDMA_REQ_DMA2S0_TC | (1u << 16);         /* CTBR: TSEL=DMA2_S0_TC + SBUS */
-        nd[7] = 0u;
+        nd[7] = 0u;                          /* Reserved */
+        /* ★★ 节点必须含 **CMAR/CMDR** (Mask 寄存器字段, 偏移 0x20/0x24) ——
+         * 节点总大小 = **40 字节** 而非 32B! 首版只给 8 word ⇒ MDMA 加载时把
+         * 节点区之外的 .bss 数据当 Mask 读 ⇒ TEMD=1 (写 Mask Data 出错)
+         * ⇒ TEIF ⇒ 整链停止。CMAR/CMDR=0 = 不启用数据掩码。 */
+        nd[8] = 0u;                          /* CMAR = 0 (mask 地址, 不启用) */
+        nd[9] = 0u;                          /* CMDR = 0 (mask 数据) */
     }
     __asm__ volatile("dsb; isb");
     /* MDMA ch0 主寄存器 = 节点同款配置 + CLAR 指向节点 */
