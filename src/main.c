@@ -2516,6 +2516,10 @@ int main(void)
         /* ★★ 上位机触发的"重新开日志" (卡插晚了 / 换卡): 调试器预写 SD_CFG[8]=1
          *   + 魔数 [15]=0xF00DBEEF。★ 必须外部触发, 别让固件自己定时猜窗口。 */
         if (sd_cfg_take(8u) != 0u) { (void)sd_reopen_log(); }
+        /* 排障: GPIOD 口线检 (SD_CFG[10]=1 + 魔数) —— 回答"对方那根线插在哪个脚上" */
+        if (sd_cfg_take(10u) != 0u) mb_line_test(g_shm);
+        /* 排障: 在 PD6 上量波形 (SD_CFG[11]=1 + 魔数) */
+        if (sd_cfg_take(11u) != 0u) mb_line_probe(g_shm);
         /* ★★★ 空闲窗口自动落盘 (S3 persist_task 语义) —— T15/T26 修复
          *   ── 完整的三次失败记录在 g_persist_req_cnt 上方, 别原样重试第四次 ──
          *   实测结论: 功能正确 (dirty 会清), 但每次落盘有一段失聪窗口

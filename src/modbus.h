@@ -69,6 +69,10 @@ void mb_config(uint8_t *base, uint8_t slave_addr, int use_uart);
 /** @brief 使能 USART2 物理口 (RCC + GPIO AF + BRR + CR1)。**只应调用一次**。
  *  ★ 不开 RXNEIE: 本平台用轮询 (见本文件上方说明), 不引入新中断源。 */
 void mb_uart_enable(void);
+/* 排障: GPIOD 口线检 (哪一脚被外部驱动着) —— 见 modbus.c 的说明 */
+void mb_line_test(uint8_t *base);
+/* 排障: 在 PD6 上直接量波形 (固件当示波器, 统计低电平采样数) */
+void mb_line_probe(uint8_t *base);
 
 /** @brief ISR 每拍推进状态机 (RX 收字节 / EXEC 解析 / BUILD 组装 / TX 发送) */
 void mb_tick(uint8_t *base);

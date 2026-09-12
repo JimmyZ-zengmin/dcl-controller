@@ -49,6 +49,24 @@ static inline uint8_t *mb_tx(uint8_t *base)    { return (uint8_t *)MB_PTR(base, 
 static inline uint16_t *mb_hold(uint8_t *base) { return (uint16_t *)MB_PTR(base, OFF_MB_HOLD); }
 static inline uint16_t *mb_set(uint8_t *base)  { return (uint16_t *)MB_PTR(base, OFF_MB_SET); }
 
+/* ★★ 字节级观测面 (见 engine.h 的 OFF_MB_DIAG 说明)。
+ *   起因: frames_rx/err_crc 只统计**完整帧**, 而"1~3 字节被静默丢弃"这条路径不计数
+ *   ⇒ "线上死寂" 与 "字节到了但框不成帧" 读数一样, 判据分不清"没坏"与"没跑"。 */
+#define MB_DIAG_BYTES   0u   /* 累计从物理口拉到的字节数 */
+#define MB_DIAG_MAXRX   1u   /* 见过的最大 rx_len */
+#define MB_DIAG_SHORT   2u   /* 因太短(<4B)被丢弃的次数 */
+#define MB_DIAG_LASTISH 3u   /* 最近一次 USART2 ISR 原值 */
+#define MB_DIAG_ERRACC  4u   /* ISR 错误位累加 (PE|FE|NE|ORE) */
+#define MB_DIAG_LASTBYT 5u   /* 最近拉到的字节值 */
+#define MB_DIAG_CFGMOD  8u   /* GPIOD MODER 实际读回 */
+#define MB_DIAG_CFGAFR  9u   /* GPIOD AFRL 实际读回 */
+#define MB_DIAG_CFGPUP 10u   /* GPIOD PUPDR 实际读回 */
+#define MB_DIAG_CFGMK  11u   /* 配置读回标记 */
+static inline volatile uint32_t *mb_diag(uint8_t *base)
+{
+    return (volatile uint32_t *)(base + OFF_MB_DIAG);
+}
+
 /* ---- CRC16 (Modbus 多项式 0xA001) ---- */
 static uint16_t ATTR_ITCM mb_crc16(const uint8_t *buf, uint16_t len)
 {
@@ -98,9 +116,19 @@ static int ATTR_ITCM mb_pull_rx(uint8_t *base, uint8_t *dst, int max_n)
     }
     /* 物理口: 轮询 (不开中断 —— 见 modbus.h 的说明) */
     int n = 0;
+    volatile uint32_t *d = mb_diag(base);
     while (n < max_n) {
-        if (!(USART_ISR(USART2_BASE) & USART_ISR_RXNE)) break;
+        uint32_t isr = USART_ISR(USART2_BASE);
+        if (!(isr & USART_ISR_RXNE)) break;
         dst[n++] = (uint8_t)(USART_RDR(USART2_BASE) & 0xFFu);
+        /* ★★ 每拉到一个字节就记一笔 (见 engine.h 的 OFF_MB_DIAG 说明):
+         *   这条路径原来**只体现在 rx_len 上**, 而 rx_len 会在 400us 静默后归零
+         *   ⇒ 外部读不到"曾经有字节到过"任何证据。 */
+        d[MB_DIAG_BYTES]  += 1u;
+        d[MB_DIAG_LASTISH] = isr;
+        d[MB_DIAG_ERRACC] |= (isr & (USART_ISR_PE | USART_ISR_FE
+                                     | USART_ISR_NE | USART_ISR_ORE));
+        d[MB_DIAG_LASTBYT] = (uint32_t)dst[n - 1];
         /* ★ 读 RDR 同时清 RXNE/ORE; S3 那边由 uart_ll_read_rxfifo 完成同样的事 */
     }
     return n;
@@ -257,6 +285,27 @@ void ATTR_ITCM mb_tick(uint8_t *base)
 
     uint8_t budget = c->tick_budget ? c->tick_budget : MB_TICK_BUDGET;
     uint8_t *rx = mb_rx(base);
+    /* ★★ 首个 tick 把 GPIOD 的**实际配置**读回来发布 (一次性)。
+     *   起因: 调试器读不了外设, 而"引脚写过了就算"是著名的静默失败族 ——
+     *   未开时钟时写入被丢弃 / 后面的 init 整寄存器覆盖, 两者都不报错。
+     *   有了它, "PD6 到底是不是 AF7"就是读出来的事实, 不再是推断。 */
+    {   volatile uint32_t *d = mb_diag(base);
+        if (d[MB_DIAG_CFGMK] != 0xCF600001u) {
+            d[MB_DIAG_CFGMOD] = GPIO_MODER(3) & 0xFFFFu;
+            d[MB_DIAG_CFGAFR] = GPIO_AFRL(3);
+            d[MB_DIAG_CFGPUP] = GPIO_PUPDR(3) & 0xFFFFu;
+            /* ★ 连 USART2 自己的寄存器也读回来 —— "引脚对了但外设没使能"是同一族静默失败,
+             *   而调试器读不了外设区, 只能靠固件自报。 */
+            d[16] = USART_CR1(USART2_BASE);
+            d[17] = USART_CR2(USART2_BASE);
+            d[18] = USART_CR3(USART2_BASE);
+            d[19] = USART_BRR(USART2_BASE);
+            d[20] = USART_ISR(USART2_BASE);
+            d[21] = USART_PRESC(USART2_BASE);
+            d[22] = 0x05E20001u;
+            d[MB_DIAG_CFGMK]  = 0xCF600001u;
+        }
+    }
 
     switch (c->state) {
     case MB_ST_IDLE:
@@ -268,11 +317,19 @@ void ATTR_ITCM mb_tick(uint8_t *base)
                 rx[c->rx_len++] = tmp[i];
             c->silent = 0;
             c->state = MB_ST_RX;
+            {   /* ★ 记下"到过多少字节" —— 这是"字节到了但框不成帧"的唯一指纹 */
+                volatile uint32_t *d = mb_diag(base);
+                if (c->rx_len > d[MB_DIAG_MAXRX]) d[MB_DIAG_MAXRX] = c->rx_len;
+            }
         } else if (c->state == MB_ST_RX) {
             /* 隧道注入的帧: rx_pos 已达 rx_len (视为收满) → pull 返回 0 → 累计静默 */
             if (++c->silent >= MB_SILENT_TICKS) {
                 if (c->rx_len >= 4) { c->state = MB_ST_EXEC; }
-                else { c->rx_len = 0; c->rx_pos = 0; c->silent = 0; c->state = MB_ST_IDLE; }
+                else {
+                    /* ★ 这条"太短就丢"的路径原来**不计数** ⇒ 判据里是个盲区 */
+                    if (c->rx_len > 0u) mb_diag(base)[MB_DIAG_SHORT] += 1u;
+                    c->rx_len = 0; c->rx_pos = 0; c->silent = 0; c->state = MB_ST_IDLE;
+                }
             }
         }
         break;
@@ -413,6 +470,61 @@ int mb_inject(uint8_t *base, const uint8_t *frame, uint16_t n)
 #  define MB_UART_TX_BIT    2u   /* PA2 */
 #  define MB_UART_RX_BIT    3u   /* PA3 */
 #endif
+
+/* ---- 排障用: "这根线到底接在哪个脚上?" 的口线检 (2026-09-13) --------------
+ * 原理: 被**外部推挽驱动**的脚, 即使片内开下拉也仍读 1; 而**没接东西**的脚会被下拉成 0。
+ *   ⇒ 把整口设成"输入 + 下拉", 读一次 IDR: **位图里为 1 的位就是被外部驱动着的脚**。
+ *   这恰好回答"模块 TXD 接在哪个脚上" —— 它空闲时就是 5V 推挽高。
+ * 动机: 485 联机排障里, "板子侧代码/引脚全部有证据, 但对方那根线插在哪"始终只能靠猜,
+ *   来回换脚位试了多次。**能用一次读数解决的, 不该靠试。**
+ * 用法: 调试器预写 SD_CFG[10]=1 + 魔数 [15] (AXI 不跨复位, 沿用既有机制),
+ *   主循环取走后执行一次; 结果写进 MbDiag[6] = 位图, [7] = 0xC0DEF00D 完成标记。
+ * ★ 测完**原样恢复**该口全部寄存器 (MODER/PUPDR/AFRL/AFRH), 不留副作用。 */
+void mb_line_test(uint8_t *base)
+{
+    volatile uint32_t *d = mb_diag(base);
+    uint32_t m0 = GPIO_MODER(3), p0 = GPIO_PUPDR(3);
+    uint32_t a0 = GPIO_AFRL(3),  h0 = GPIO_AFRH(3);
+    RCC_AHB4ENR |= (1u << 3);                 /* 确保 GPIOD 时钟在 (写入才不被丢弃) */
+    GPIO_MODER(3) = 0u;                       /* 全部输入 */
+    GPIO_PUPDR(3) = 0xAAAAAAAAu;              /* 每脚 2 位 = 10b ⇒ 全部下拉 */
+    __asm__ volatile("dsb" ::: "memory");
+    { volatile uint32_t i = 60000u; while (i--) { } }    /* 等电平建立 (~1ms @240MHz) */
+    d[6] = GPIO_IDR(3);                       /* ★ 位图: 1 = 被外部驱动为高 */
+    GPIO_MODER(3) = m0;  GPIO_PUPDR(3) = p0;  /* 原样恢复 */
+    GPIO_AFRL(3)  = a0;  GPIO_AFRH(3)  = h0;
+    __asm__ volatile("dsb" ::: "memory");
+    d[7] = 0xC0DEF00Du;                       /* 完成标记 (读的人凭它判断结果有效) */
+}
+
+/* ---- 排障用: 直接在 PD6 上"量波形" —— 固件当示波器 (2026-09-13) ------------
+ * 起因: 485 联机里出现了一个真矛盾 ——
+ *   引脚配置**读回确认**是 AF7、线检确认 PD6 上挂着外部驱动、状态机也确认在 IDLE 轮询,
+ *   可 UART 就是收不到。此时只剩一种问法: **PD6 上到底有没有在动的信号?**
+ *   LA 要在插着线的排针脚上夹探针很别扭 ⇒ 那就让固件自己采样。
+ * 做法: 把 PD6 临时配成"输入 + 上拉", 紧循环采样其 IDR 位, 统计**低电平次数**;
+ *   - lowCount > 0 ⇒ 线上确实有**在翻转**的信号 (对方在发数据)
+ *   - lowCount == 0 ⇒ 一直是高 ⇒ 对方要么没发、要么根本没接到这根线上
+ * 用完**立即恢复 PD6 为 AF7**, 不留副作用。结果写 MbDiag[12..14]。 */
+void mb_line_probe(uint8_t *base)
+{
+    volatile uint32_t *d = mb_diag(base);
+    uint32_t m0 = GPIO_MODER(3), p0 = GPIO_PUPDR(3);
+    uint32_t a0 = GPIO_AFRL(3);
+    uint32_t low = 0, n = 0;
+    RCC_AHB4ENR |= (1u << 3);                       /* 确保 GPIOD 时钟在 */
+    GPIO_MODER(3) = (m0 & ~(3u << (6u * 2u)));      /* 只把 PD6 改成输入, 别的不动 */
+    GPIO_PUPDR(3) = (p0 & ~(3u << (6u * 2u))) | (1u << (6u * 2u));  /* PD6 上拉 */
+    __asm__ volatile("dsb" ::: "memory");
+    for (uint32_t i = 0; i < 400000u; i++) {        /* ~几十 ms 的采样窗 */
+        if ((GPIO_IDR(3) & (1u << 6)) == 0u) low++;
+        n++;
+    }
+    GPIO_MODER(3) = m0;  GPIO_PUPDR(3) = p0;        /* 立即恢复 */
+    GPIO_AFRL(3)  = a0;
+    __asm__ volatile("dsb" ::: "memory");
+    d[12] = low; d[13] = n; d[14] = 0xA5A50001u;    /* 12=低电平次数 13=总采样 14=完成标记 */
+}
 
 /* ---- 物理口使能 (USART2: AF7, 8N1, 轮询) ---- */
 void mb_uart_enable(void)
