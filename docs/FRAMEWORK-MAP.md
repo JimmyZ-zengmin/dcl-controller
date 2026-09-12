@@ -66,8 +66,11 @@ TIM2 每 100µs → ISR (ITCM):
 - **ITCM 余量**: 代码 `_eitcm=0x1808`, 向量表钉在 `0xFC00`, 中间 58KB 可长。
   **加新 ISR 调用函数**: 放 flash + `__attribute__((long_call))`(跨区必须 BLX);
   **不要用函数指针数组**(被 -O2 常量传播回直接 BL)。
-- **拍预算**: `isr_max` 现约 1475 cyc (含 do_poll), 上限 `EXEC_BUDGET_CYCLES=32000`。
+- **拍预算**: `isr_max` 现约 **1509~1655 cyc**, 上限 `EXEC_BUDGET_CYCLES=32000`。
   新增功能后看 ④ 是否仍为 0。
+- **采样-输出时序契约 (P3-C)**: 输出沿=拍头(MDMA 锁存) ⇒ 采样启动=拍尾(adc_poll_kick)
+  ⇒ 两者间隔 ~97µs 建立时间。"自导自演"(输出沿紧贴采样孔径)已消除。
+  **回收(拍头 reclaim)与启动(拍尾 kick)必须分处两处**, 不要合并回 adc_poll 整体。
 
 ### 3.2 参数旋钮 (按组件)
 | 旋钮 | 位置 | 现值 | 说明 |
@@ -76,8 +79,10 @@ TIM2 每 100µs → ISR (ITCM):
 | DI 去抖 | `di.h DI_DEBOUNCE` | 3 次 | =30ms |
 | DI 引脚 | `di.h DI_PIN_*` | PC0-3 | 改脚+改 di_init 的时钟使能 |
 | ADC 通道表 | `adc.c AI_CHS` | 16/17/18 | + `AI_PINS` 配 analog |
-| ADC 采样时间 | `adc.c SMPR` | 810.5 周期 | 为 40kΩ 高阻源设的; **BOOST=0 时 fADC≤6.25MHz, 勿乱提时钟** |
-| ADC 状态机 | `adc.h ADC_SM_*` | 起跑 3 拍/超时 8 拍 | 更新率=16 拍/通道轮 |
+| ADC 时钟 | `adc.c PRESC` | **/2 ⇒ 12.5MHz** (BOOST=1 档极限) | fADC 上限 12.5MHz (H723 BOOST bit9 写不进) |
+| ADC 采样时间 | `adc.c SMPR` | **32.5 周期 = 2.6µs** | 40kΩ 源 16 位需求 2.5µs 刚好满足; 勿再缩 |
+| ADC 状态机 | `adc.h ADC_SM_*` | 起跑 3 拍/超时 8 拍 | 更新率=**2 拍/通道** (转换 4µs < 拍长, 流水线) |
+| DO 影子/锁存 | `do.c DCL_DO_LATCH` | **0 (直写)** | =1 走 MDMA 锁存链 (P3-B: DMA2 哑桥已通, TEIF 待查) |
 | HIL PWM | `hil.h HIL_PWM_HZ/RES` | 1kHz/1000 | `s_arr1` 由 init 缓存 |
 | HIL 输入槽 | `hil.h HIL_U_WIRE` | 20 | WIRE[20] |
 | DO 阈值/端口 | `do.c` | 0.5 / GPIOE | macro **不许**碰 PE |
