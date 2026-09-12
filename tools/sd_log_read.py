@@ -30,7 +30,7 @@
 ★★ 判据设计 (为什么不能只看 tick 连号率):
   "tick 连号率低" 在变化才记下**是设计如此**, 所以它**不可能失败** ——
   一个不可能失败的判据等于没有判据。真正能失败的是下面这条:
-    [判据A] 相邻两条记录"48 通道值(按位比)"全同的对数必须 == 0
+    [判据A] 相邻两条记录"60 个数据槽(按位比)"全同的对数必须 == 0
             若 > 0 ⇒ 固件里"没变就不写"没生效 (或这是逐拍全量的旧数据)
   对照 (证明判据A 真的能失败): 逐拍全量数据上这个数应 ≈ 92%
      python sd_log_read.py --csvin <旧数据.csv> --verify   ==> 期望 FAIL (数千对)
@@ -43,8 +43,64 @@ import sys
 
 REC_MAGIC = 0x4B424C44   # "DLBK"
 HDR_MAGIC = 0x474F4C44   # "DLOG"
+MAP_MAGIC = 0x50414D42   # "BMAP"
 REC = 256
 BLK = 512
+MAP_N = 60
+MAP_OFF = 16
+MAP_SUM_OFF = MAP_OFF + MAP_N + 1        # 77
+SEG_NAME = {0: "SENSOR", 1: "WIRE", 2: "ACT", 3: ""}
+DEF_LABELS = (["SENSOR%d" % i for i in range(16)]
+              + ["WIRE%d" % i for i in range(16)]
+              + ["ACT%d" % i for i in range(16)]
+              + ["SPARE%d" % i for i in range(12)])   # 无映射表时的旧布局标签
+
+
+def map_sum(mapv):
+    """与固件 bb_map_sum() 同算法 (FNV-1a 32)。"""
+    h = 2166136261
+    for v in mapv:
+        h = ((h ^ (v & 0xFFFFFFFF)) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def make_labels(h):
+    """从日志头取出通道映射 → 60 个列名。返回 (labels, map_or_None)。
+
+    ★★ 必须与固件 bb_map_bind() 做**同一套越界判定**: 固件把越界的 (seg, idx)
+       当成空槽(恒 0)。若 PC 端照抄标签, 就会出现"PC 说这列是 WIRE200, 实际恒 0"
+       —— 宣称与实现不一致。越界一律标 BAD* 并报警。"""
+    mapv = list(h[MAP_OFF:MAP_OFF + MAP_N])
+    if h[MAP_OFF + MAP_N] != MAP_MAGIC:
+        return list(DEF_LABELS), None
+    if map_sum(mapv) != h[MAP_SUM_OFF]:
+        print("  [!] 通道映射表校验和不符 ⇒ 退回默认 16/16/16 标签")
+        return list(DEF_LABELS), None
+    lim = {0: 64, 1: 128, 2: 64}                # 与固件 bb_map_bind 的上限一致
+    out, nbad = [], 0
+    for i, e in enumerate(mapv):
+        seg, idx = e >> 16, e & 0xFFFF
+        if seg in lim and idx < lim[seg]:
+            out.append("%s%d" % (SEG_NAME[seg], idx))
+        elif seg == 3:
+            out.append("SPARE%d" % (i - 48 if i >= 48 else i))
+        else:
+            out.append("BAD%d_seg%d_idx%d" % (i, seg, idx))
+            nbad += 1
+    if nbad:
+        print("  [!] 映射表里有 %d 个越界槽 (固件按空槽处理, 恒 0) —— 见 BAD* 列" % nbad)
+    return out, mapv
+
+
+def describe_map(labels, mapv):
+    used = [l for l in labels if not l.startswith("SPARE")]
+    print("  通道映射 = %s (共 %d 槽, 其中 %d 路有效)"
+          % ("随头落卡的映射表" if mapv else "默认 16/16/16 (旧头, 无映射表)",
+             len(labels), len(used)))
+    from collections import Counter
+    c = Counter(l.rstrip("0123456789") for l in used)
+    print("    组成: %s" % ", ".join("%s x%d" % (k, v) for k, v in sorted(c.items())))
+    print("    槽序: %s" % " ".join(labels))
 
 k = ctypes.WinDLL("kernel32", use_last_error=True)
 k.CreateFileW.restype = wt.HANDLE
@@ -83,16 +139,20 @@ def looks_like_card(d):
         return False
 
 
-def _bits48(vals):
-    """把 48 个通道值打成位串 —— 与固件里 uint32 逐位比较**等价**。
+def _bits(vals):
+    """把通道值打成位串 —— 与固件里 uint32 逐位比较**等价**。
 
     为什么不用字符串/浮点比: 固件比的是 RAW 位 (snap[4+i] != s_prev[i])。
     -0.0 与 +0.0 数值相等但位不同; NaN 更不用说。走位串才和固件同一把尺子。"""
-    return struct.pack("<48f", *vals)
+    return struct.pack("<%df" % len(vals), *vals)
 
 
 def load_csv_rows(path):
-    """从 sd_log_read.py --csv 导出的文件里恢复 (tick, seq, vals48)。"""
+    """从 sd_log_read.py --csv 导出的文件里恢复 (tick, seq, vals)。
+
+    ★ 不排序: CSV 已按**物理顺序**落行, 而物理顺序就是时间顺序。
+      历史版本曾按 seq 排 —— 那是错的, 见 split_boots() 的说明。
+    ★ 列数自适应: 旧 CSV 是 48 列 (无映射表), 新 CSV 是 60 列 (带映射表)。"""
     rows = []
     with open(path, newline="", encoding="utf-8-sig") as f:
         rd = csv.reader(f)
@@ -101,14 +161,36 @@ def load_csv_rows(path):
             if len(r) < 53:
                 continue
             rows.append((int(r[0]), int(r[1]),
-                         tuple(float(x) for x in r[5:53])))
-    rows.sort(key=lambda x: x[1])
+                         tuple(float(x) for x in r[5:])))
     return rows
 
 
-def verify_rows(rows, label):
-    """跑"变化才记"判据。返回 True=全部通过。"""
-    print("\n=== 判据 ===")
+def split_boots(rows):
+    """按"seq 回减"把物理顺序的记录切成若干段, 一段 = 一次上电。
+
+    ★★ 为什么必须切: `seq` 是**每次上电从 0 重新计数**的 (bb_seq 是 RAM 静态量)。
+       卡上的历史横跨多次上电 ⇒ "相邻两条 seq 差 1" 这个不变量**只在上电段内成立**。
+       2026-09-12 曾因此报假 FAIL: 读窗口越过了上电边界, 多带进 512 条上一轮的记录,
+       按 seq 排序后插进本轮序列 ⇒ 报"512 处跳变 + 512 处 tick 倒退"。
+       **判据没错, 是我喂给它的数据混了两个上电。**"""
+    segs, s = [], 0
+    for i in range(1, len(rows)):
+        if rows[i][1] <= rows[i - 1][1]:             # seq 不回增 ⇒ 新上电
+            segs.append(rows[s:i])
+            s = i
+    segs.append(rows[s:])
+    return segs
+
+
+def verify_rows(rows, label, max_boots=8):
+    """先切上电段, 再对**最后一段(=本次上电)**跑判据。返回 True=全通过。"""
+    segs = split_boots(rows)
+    if len(segs) > 1:
+        print("  [i] 窗口跨 %d 个上电段 (段长 %s) ⇒ 只判最后一段"
+              % (min(len(segs), max_boots), [len(x) for x in segs[-max_boots:]]))
+    rows = segs[-1]
+
+    print("\n=== 判据 (最后一段 = 本次上电) ===")
     if len(rows) < 3:
         print("  [!] 记录太少 (%d), 无法判" % len(rows))
         return False
@@ -120,23 +202,24 @@ def verify_rows(rows, label):
     if noninc:
         bad.append("tick 不严格递增")
 
-    # [判据 1] seq 连续 (无丢包; 回卷边界会表现为 1 处跳变)
+    # [判据 1] seq 逐条 +1 (丢包会表现为前跳, 不是回减)
     gaps = sum(1 for a, b in zip(rows, rows[1:]) if b[1] != a[1] + 1)
-    print("  [1] seq 连续 (丢包/回卷)   : 跳变 %d 处 %s" % (gaps, "OK" if gaps <= 1 else "FAIL"))
-    if gaps > 1:
-        bad.append("seq 跳变 %d 处 (丢包或回卷)" % gaps)
+    print("  [1] seq 逐条 +1 (丢包)     : 跳变 %d 处 %s" % (gaps, "OK" if gaps == 0 else "FAIL"))
+    if gaps:
+        bad.append("seq 跳变 %d 处 (丢包)" % gaps)
 
-    # ★ [判据 2] 变化才记生效性 —— 这是唯一"能失败"的判据
-    same = sum(1 for a, b in zip(rows, rows[1:]) if _bits48(a[2]) == _bits48(b[2]))
+    # ★ [判据 2] 变化才记生效性 —— 唯一"能失败"的判据
+    same = sum(1 for a, b in zip(rows, rows[1:]) if _bits(a[2]) == _bits(b[2]))
     ratio = 100.0 * same / (len(rows) - 1)
-    print("  [2] 相邻记录 48 通道全同   : %d/%d = %.2f%% %s"
+    print("  [2] 相邻记录 60 槽全同     : %d/%d = %.2f%% %s"
           % (same, len(rows) - 1, ratio, "OK" if same == 0 else "FAIL"))
     if same:
         bad.append("有 %d 对相邻记录内容完全相同 ⇒ 变化才记没生效" % same)
 
     cov = (rows[-1][0] - rows[0][0]) / max(1, len(rows) - 1)
     print("  [i] 平均每条覆盖 %.2f 拍 (压缩比 %.1fx)" % (cov, cov))
-    print("  [i] tick %d..%d  记录 %d 条  源: %s" % (rows[0][0], rows[-1][0], len(rows), label))
+    print("  [i] tick %d..%d  记录 %d 条 (seq %d..%d)  源: %s"
+          % (rows[0][0], rows[-1][0], len(rows), rows[0][1], rows[-1][1], label))
 
     if bad:
         print("  ==> 判定: FAIL  (%s)" % "; ".join(bad))
@@ -177,15 +260,18 @@ def main():
         print("[X] 没找到日志头。卡没插? 或还没跑过带日志的固件? (可 --disk N 指定)")
         return 2
 
-    h = struct.unpack_from("<16I", d.read(0, 512), 0)
+    h = struct.unpack_from("<128I", d.read(0, 512), 0)
     if sum(h[0:15]) != h[15]:
         print("[!] 头部校验和不符 (可能正被写入) —— 仍继续读")
+    labels, mapv = make_labels(h)
     print("\n=== 日志头 ===")
     print("  版本=%d  记录=%dB  每块%d条  块=%dB" % (h[1], h[2], h[3], h[4]))
     print("  数据区 LBA %d .. %d  (共 %d 块 = %.2f GB)" % (h[5], h[5] + h[6] - 1, h[6], h[6] * 512 / 1e9))
     print("  已落盘记录 = %d   下一块 = LBA %d" % (h[8], h[7]))
     print("  最后一条: tick=%d seq=%d" % (h[9], h[10]))
-    print("  丢包 = %d 条   已回卷 = %s   批次数 = %d" % (h[11], "是" if h[12] else "否", h[13]))
+    print("  丢包(跨上电累计) = %d 条   已回卷 = %s   批次数 = %d"
+          % (h[11], "是" if h[12] else "否", h[13]))
+    describe_map(labels, mapv)
 
     data_lba0, data_n = h[5], h[6]
     wp = h[7] - data_lba0                       # 数据区内的写指针 (0 起的块)
@@ -214,40 +300,48 @@ def main():
         done += cnt
     d.close()
 
-    recs.sort(key=lambda w: w[2])                # 按 seq 排序 = 时间顺序
+    # ★★ 绝不排序! 读取顺序**已经**是时间顺序:
+    #   start = 写指针 - nblk, 然后**正向**按模推进 ⇒ 跨回卷点也是时间顺序。
+    #   历史版本在这里 recs.sort(key=seq) —— **是个陷阱**: seq 每次上电归零,
+    #   卡上历史跨多次上电, 按 seq 排会把两个上电的记录揉在一起, 于是
+    #   ① split_boots 只能在"重复 seq"处切段, 切出全是长度 2 的假段;
+    #   ② 判据 [0][1][2] 拿到的是混段数据, 报假 FAIL。
+    #   2026-09-12 实测: 保留排序 ⇒ 307239 条的一段里 seq 跨度 2,576,442 (自相矛盾);
+    #   去掉排序 ⇒ 物理序 = 时间序, 段内 seq 逐条 +1 成立。
     if not recs:
         print("[!] 这些块里没有有效记录。")
         return 1
-    print("  有效记录 %d 条   seq %d..%d   tick %d..%d" %
-          (len(recs), recs[0][2], recs[-1][2], recs[0][1], recs[-1][1]))
-    rows = [(w[1], w[2], struct.unpack("<48f", struct.pack("<48I", *w[4:52])))
+    print("  有效记录 %d 条   seq %d..%d   tick %d..%d"
+          % (len(recs), recs[0][2], recs[-1][2], recs[0][1], recs[-1][1]))
+    rows = [(w[1], w[2], struct.unpack("<60f", struct.pack("<60I", *w[4:64])))
             for w in recs]
     ok = verify_rows(rows, "卡上最近 %d 块" % nblk) if do_verify else True
+    # 只导出**本次上电**那一段: 混段 CSV 会把两个上电的 seq 揉在一起, 无法判读
+    segs = split_boots(rows)
+    keep = len(recs) - len(segs[-1])
+    if keep:
+        print("  [i] CSV 只导出本次上电段 (%d 条, 丢弃前 %d 条跨上电记录)"
+              % (len(segs[-1]), keep))
+        recs = recs[keep:]
 
     print("\n=== 最后 3 条 (带 tick 标注) ===")
+    f32 = lambda x: struct.unpack_from("<f", struct.pack("<I", x))[0]
+    show = [i for i, l in enumerate(labels) if not l.startswith("SPARE")][:6]
     for w in recs[-3:]:
         ctl = w[3]
         print("  tick=%-9d seq=%-9d run=%d routes=%d seq_step=%d" %
               (w[1], w[2], (ctl >> 24) & 0xFF, (ctl >> 16) & 0xFF, ctl & 0xFFFF))
-        print("     SENSOR  [0:4]=%s" % ["%.5g" % struct.unpack_from("<f", struct.pack("<I", x))[0] for x in w[4:8]])
-        print("     WIRE    [0:4]=%s" % ["%.5g" % struct.unpack_from("<f", struct.pack("<I", x))[0] for x in w[20:24]])
-        print("     ACTUATOR[0:4]=%s" % ["%.5g" % struct.unpack_from("<f", struct.pack("<I", x))[0] for x in w[36:40]])
+        print("     " + "  ".join("%s=%.5g" % (labels[i], f32(w[4 + i])) for i in show))
 
     if csv_path:
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             cw = csv.writer(f)
-            cw.writerow(["tick", "seq", "run", "routes", "seq_step"]
-                        + ["SENSOR%d" % i for i in range(16)]
-                        + ["WIRE%d" % i for i in range(16)]
-                        + ["ACT%d" % i for i in range(16)])
-            f32 = lambda x: struct.unpack_from("<f", struct.pack("<I", x))[0]
+            cw.writerow(["tick", "seq", "run", "routes", "seq_step"] + list(labels))
             for w in recs:
                 ctl = w[3]
                 cw.writerow([w[1], w[2], (ctl >> 24) & 0xFF, (ctl >> 16) & 0xFF, ctl & 0xFFFF]
-                            + [f32(x) for x in w[4:20]]
-                            + [f32(x) for x in w[20:36]]
-                            + [f32(x) for x in w[36:52]])
-        print("\n[+] CSV 已导出: %s (%d 行, 每行带 tick)" % (csv_path, len(recs)))
+                            + [f32(x) for x in w[4:64]])
+        print("\n[+] CSV 已导出: %s (%d 行, 每行带 tick, 列名来自卡上映射表)" % (csv_path, len(recs)))
     return 0 if ok else 1
 
 

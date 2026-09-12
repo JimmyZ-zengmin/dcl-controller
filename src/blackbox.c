@@ -84,17 +84,92 @@ static volatile uint32_t s_bb_seq = 0;     /* 记录序号 (与 kick 同步) */
 /* ★ "变化率"统计 (2026-09-12): 决定黑匣子该"缩记录"还是"变化才记"。
  *   s_chg_ticks = 至少有一个通道变了的拍数; s_chg_vals = 变化通道总数。
  *   ⇒ 变化率 = s_chg_ticks/总拍数; 平均每次变几个 = s_chg_vals/s_chg_ticks。 */
-static volatile uint32_t s_prev[48];       /* 上一条**已写出**记录的 48 个值 */
+static volatile uint32_t s_prev[BB_MAP_N];  /* 上一条**已写出**记录的 60 个槽 */
 static volatile uint32_t s_prev_ctrl = 0;  /* 上一条已写出记录的控制字 */
 static volatile uint32_t s_bb_have_prev = 0;
 static volatile uint32_t s_last_dst = 0;   /* 上一拍的目的地址 (用于"数据有没有落地") */
+
+/* ══════════════ ★★ 通道映射 (2026-09-12) ══════════════
+ * 记录里 4 字头 + 60 数据字 = 64 字 = 256B。**哪一槽是哪一路通道**由此表决定,
+ * 表随日志头写到卡上 ⇒ 数据自带"这一列是哪一路通道"。
+ *
+ * ★ 默认表 = 旧的 16/16/16 硬切布局 ⇒ **逐字节相同的记录** (零行为变化)。
+ *   改通道 = 只改这张表 (再烧一次), 记录尺寸/环/块结构/PC 解析全不动。
+ * ★ 为什么不做"放大记录装下 256 通道": 缓冲条数 = 环字节/记录字节, 丢包风险 =
+ *   一次卡内写抖动窗口内产出的条数 > 槽数。256B→1040B 使槽数 960→236 (÷4),
+ *   且通道多则活跃度升、产出也升 —— 双重恶化 (220ms 最坏卡顿下会重新丢包)。
+ */
+static const uint32_t s_bb_map_def[BB_MAP_N] = {
+    /* [0..15]  SENSOR[0..15]  —— 与旧布局的 [4..19] 逐字节对应 */
+    BB_ME(0,  0), BB_ME(0,  1), BB_ME(0,  2), BB_ME(0,  3),
+    BB_ME(0,  4), BB_ME(0,  5), BB_ME(0,  6), BB_ME(0,  7),
+    BB_ME(0,  8), BB_ME(0,  9), BB_ME(0, 10), BB_ME(0, 11),
+    BB_ME(0, 12), BB_ME(0, 13), BB_ME(0, 14), BB_ME(0, 15),
+    /* [16..31] WIRE[0..15]    —— 旧 [20..35] */
+    BB_ME(1,  0), BB_ME(1,  1), BB_ME(1,  2), BB_ME(1,  3),
+    BB_ME(1,  4), BB_ME(1,  5), BB_ME(1,  6), BB_ME(1,  7),
+    BB_ME(1,  8), BB_ME(1,  9), BB_ME(1, 10), BB_ME(1, 11),
+    BB_ME(1, 12), BB_ME(1, 13), BB_ME(1, 14), BB_ME(1, 15),
+    /* [32..47] ACTUATOR[0..15] —— 旧 [36..51] */
+    BB_ME(2,  0), BB_ME(2,  1), BB_ME(2,  2), BB_ME(2,  3),
+    BB_ME(2,  4), BB_ME(2,  5), BB_ME(2,  6), BB_ME(2,  7),
+    BB_ME(2,  8), BB_ME(2,  9), BB_ME(2, 10), BB_ME(2, 11),
+    BB_ME(2, 12), BB_ME(2, 13), BB_ME(2, 14), BB_ME(2, 15),
+    /* [48..59] 空槽 (旧的 12 个预留字) —— 不再白扔 */
+    BB_ME(3,  0), BB_ME(3,  1), BB_ME(3,  2), BB_ME(3,  3),
+    BB_ME(3,  4), BB_ME(3,  5), BB_ME(3,  6), BB_ME(3,  7),
+    BB_ME(3,  8), BB_ME(3,  9), BB_ME(3, 10), BB_ME(3, 11),
+};
+
+/* ★ 绑定结果: 每槽一个**预解析好的源指针**。为什么不全在拍里查表:
+ *   快照填充在 10kHz 拍内跑, 一次查表 + 分支比一次取数贵; 绑定只在 init 做一次。 */
+static volatile uint32_t *s_map_p[BB_MAP_N];
+static volatile uint32_t s_map_zero = 0u;   /* 空槽的源: 恒 0 */
+
+static void bb_map_bind(const uint32_t *map)
+{
+    uint32_t i;
+    for (i = 0; i < BB_MAP_N; i++) {
+        uint32_t e = map[i], seg = e >> 16, idx = e & 0xFFFFu;
+        volatile uint32_t *p = &s_map_zero;
+        if (seg == BB_MAP_SEG_SENSOR && idx < 64u) {
+            p = (volatile uint32_t *)(s_bb_shm + OFF_SENSOR_MAP) + idx;
+        } else if (seg == BB_MAP_SEG_WIRE && idx < 128u) {
+            p = (volatile uint32_t *)(s_bb_shm + OFF_WIRE_MAP) + idx;
+        } else if (seg == BB_MAP_SEG_ACT && idx < 64u) {
+            p = (volatile uint32_t *)(s_bb_shm + OFF_ACTUATOR_STATUS) + idx;
+        }
+        s_map_p[i] = p;
+    }
+}
+
+const uint32_t *bb_map(void) { return s_bb_map_def; }
+
+uint32_t bb_map_sum(const uint32_t *map)
+{
+    /* FNV-1a 32bit —— 固件与 PC 端同一算法, 用来判"表头和固件是不是同一份映射" */
+    uint32_t h = 2166136261u, i;
+    for (i = 0; i < BB_MAP_N; i++) { h ^= map[i]; h *= 16777619u; }
+    return h;
+}
+
 
 void bb_init(uint8_t *shm_base)
 {
     s_bb_shm = shm_base;
 
+    /* ★ 绑定通道映射 (把 60 个槽解析成 SHM 源指针)。必须在 s_bb_shm 之后。 */
+    bb_map_bind(s_bb_map_def);
+
     /* ⓪ 自观测区清零 */
     { uint32_t i; for (i = 0; i < 40u; i++) BB_DIAG[i] = 0u; }
+
+    /* ★ 映射绑定自检 (必须放在 ⓪ 清零之后): 默认表应绑到 48 路 (12 个空槽) */
+    {   uint32_t i, n = 0u;
+        for (i = 0; i < BB_MAP_N; i++) if (s_map_p[i] != &s_map_zero) n++;
+        BB_DIAG[36] = n;                     /* 实际绑到的通道数 (默认表应为 48) */
+        BB_DIAG[37] = bb_map_sum(s_bb_map_def);
+    }
 
     /* ① MDMA 时钟 (AHB3ENR bit0) */
     *(volatile uint32_t *)0x580244D4u |= 1u;
@@ -173,20 +248,15 @@ void bb_kick(uint32_t tick)
     {   uint32_t run = *(volatile uint32_t *)(s_bb_shm + 0x0Du) & 0xFFu;
         uint32_t nr  = *(volatile uint32_t *)(s_bb_shm + 0x0Eu) & 0xFFFFu;
         snap[3] = (run << 24) | (nr & 0xFFFFu); }
-    {   /* SENSOR[0..15] @ SHM+0x40 */
-        volatile uint32_t *src = (volatile uint32_t *)(s_bb_shm + 0x40u);
-        for (uint32_t i = 0; i < 16u; i++) snap[4 + i] = src[i];
-    }
-    {   /* WIRE[0..15] @ SHM+0x240 */
-        volatile uint32_t *src = (volatile uint32_t *)(s_bb_shm + 0x240u);
-        for (uint32_t i = 0; i < 16u; i++) snap[20 + i] = src[i];
-    }
-    {   /* ACTUATOR[0..15] @ SHM+0x140 */
-        volatile uint32_t *src = (volatile uint32_t *)(s_bb_shm + 0x140u);
-        for (uint32_t i = 0; i < 16u; i++) snap[36 + i] = src[i];
+    {   /* ★★ 60 个数据槽全部来自**通道映射表** (已预解析成源指针 ⇒ 拍内不查表、不分枝)。
+         *   默认表 = SENSOR[0..15] / WIRE[0..15] / ACTUATOR[0..15] / 12 空槽
+         *   ⇒ 与旧的"三段硬编码 16 字拷贝"**逐字节相同** (零行为变化)。
+         *   改通道只改 s_bb_map_def 一张表; 记录尺寸/环/块结构/PC 解析全不动。 */
+        uint32_t i;
+        for (i = 0; i < BB_MAP_N; i++) snap[4 + i] = *s_map_p[i];
     }
     /* ══════════ ★★★ 变化才记 (change-triggered logging) ══════════
-     * 与"上一条**已写出**记录"的 48 个值 + 控制字逐项比; 全同 ⇒ 这一拍不写。
+     * 与"上一条**已写出**记录"的 60 个槽 + 控制字逐项比; 全同 ⇒ 这一拍不写。
      *
      * ★ 为什么这样是无损的: 每条记录都是**一个完整的 256B 全量状态**且自带 tick
      *   ⇒ 两条记录之间的所有拍, 其值**必然与前者完全相同** ⇒ PC 端按 tick 就能
@@ -195,9 +265,11 @@ void bb_kick(uint32_t tick)
      *   风险最小, 而收益(缓冲时间)已经拿到。
      * ★ 优雅退化: 若程序真每拍都变, 就退化成"逐拍全量" = 原行为, 不会更差。
      * 实测 (2026-09-12): 变化率 7.49% ⇒ 记录率 ~750/s ⇒ 960 槽缓冲
-     *   从 96ms 提升到约 1.28 秒; 带宽 2.56MB/s -> 192KB/s。 */
+     *   从 96ms 提升到约 1.28 秒; 带宽 2.56MB/s -> 192KB/s。
+     * ★ 比较范围 = 映射表里的 60 个槽 (不是"全部 256 通道"): 映射外的通道
+     *   **根本不记** —— 这是"选择", 不是"近似"。 */
     {   uint32_t i, chg = 0u;
-        for (i = 0; i < 48u; i++) {
+        for (i = 0; i < BB_MAP_N; i++) {
             if (snap[4 + i] != s_prev[i]) { chg = 1u; break; }
         }
         if (chg == 0u && snap[3] == s_prev_ctrl && s_bb_have_prev != 0u) {
@@ -206,7 +278,7 @@ void bb_kick(uint32_t tick)
             BB_DIAG[35] = s_bb_kicks;
             return;                              /* 不写, 也不占环槽 */
         }
-        for (i = 0; i < 48u; i++) s_prev[i] = snap[4 + i];
+        for (i = 0; i < BB_MAP_N; i++) s_prev[i] = snap[4 + i];
         s_prev_ctrl = snap[3];
         s_bb_have_prev = 1u;
     }

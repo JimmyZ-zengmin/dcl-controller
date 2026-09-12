@@ -760,7 +760,17 @@ static int sd_log_flush_header(void)
     h[13] = s_log_batches;
     h[14] = s_log_hdr_flush;
     for (i = 0; i < 15u; i++) sum += h[i];
-    h[15] = sum;                                         /* 简单校验和 */
+    h[15] = sum;                                         /* 简单校验和 (语义不变) */
+    /* ★★ 通道映射随头落卡 ⇒ 数据自带"这一列是哪一路通道"。
+     *   为什么**不升 LOG_VERSION**: h[0..15] 的语义一个没变 (h[15] 仍只校验 h[0..14]),
+     *   旧固件读新头照常续写, 新固件读旧头 (h[76] 不是魔数) 退回默认表。
+     *   一旦升版本 ⇒ sd_log_open 判定"版本不符" ⇒ 当新卡重建 ⇒ s_log_blk 归零,
+     *   **从 LBA1 开始覆写, 把卡上已有的几 GB 记录逐步毁掉**。 */
+    {   const uint32_t *m = bb_map();
+        for (i = 0; i < BB_MAP_N; i++) h[BB_MAP_HDR_OFF + i] = m[i];
+        h[BB_MAP_HDR_OFF + BB_MAP_N] = BB_MAP_HDR_MAGIC;
+        h[BB_MAP_HDR_SUM_OFF]        = bb_map_sum(m);
+    }
     s_log_hdr_flush++;
     return sd_write_block(0u, (const uint8_t *)h);
 }

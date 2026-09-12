@@ -3,6 +3,9 @@ build_min/
 .la/
 tmp_dap/
 
+# 一次性诊断/核对临时目录 (raw 盘读出的大 CSV 等) —— 可复跑, 不入版本控制
+.tmpctl/
+
 # LA 导出临时文件 (h723_la_modbus.py 生成)
 tools/_la_modbus.txt
 

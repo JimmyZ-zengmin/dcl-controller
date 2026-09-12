@@ -16,10 +16,23 @@
  *   [1]      tick   —— ★ 这一排数据是哪一拍的 (引擎拍号, 10kHz)
  *   [2]      seq    —— 全局记录序号 (单调递增, 回卷后可凭它找最新)
  *   [3]      ctrl   run<<24 | n_routes<<16 | seq_step
- *   [4..19]  SENSOR[0..15] (f32 × 16)
- *   [20..35] WIRE[0..15] (f32 × 16)
- *   [36..51] ACTUATOR[0..15] (f32 × 16)
- *   [52..63] 预留 (对齐 256B)
+ *   [4..63]  60 个数据槽 —— ★★ **"哪一槽是哪一路通道"由通道映射表决定**。
+ *
+ * ★★ 通道映射 (2026-09-12): 记录里 4 字头 + 60 数据字 = 正好 64 字 = 256B。
+ *   映射表 = 60 个 u32, 每项 `(seg << 16) | idx`:
+ *       seg 0 = SENSOR (idx 0..63)   1 = WIRE (idx 0..127)
+ *       2 = ACTUATOR (idx 0..63)     3 = 空槽 (恒 0)
+ *   表随**日志头**写到卡上 (LBA0 的 h[16..75] + 魔数 h[76] + 校验 h[77]),
+ *   PC 端按它标列名 —— 数据自带"这一列是哪一路通道"。
+ *
+ *   ★ 为什么不是"把记录放大到全部 256 通道": 缓冲条数 = 环字节 / 记录字节,
+ *     丢包风险 = "一次 SD 卡内写抖动窗口内产出的条数 > 槽数"。记录 256B→1040B
+ *     会让槽数 960→236 (÷4), 同时通道变多活跃度上升、产出也升 —— **双重恶化**:
+ *     实测最坏卡顿 220ms, 变化率 15% 时 236 槽只够 157ms ⇒ 丢包立刻回来。
+ *     **保持小记录才是鲁棒性来源**; 扩通道靠"选得准", 不靠"装得下"。
+ *
+ *   ★ 默认映射 = SENSOR[0..15] / WIRE[0..15] / ACTUATOR[0..15] / 12 空槽,
+ *     与"没有映射表"时的旧布局**逐字节相同** ⇒ 默认零行为变化 (可 A/B 证)。
  */
 #ifndef DCL_BLACKBOX_H
 #define DCL_BLACKBOX_H
@@ -39,6 +52,19 @@
 #define BBLOG_REC_MAGIC 0x4B424C44u   /* "DLBK" 每条记录的魔数 */
 #define BB_SEQ_MAGIC    0x51455344u   /* "DSEQ" 序号魔数 */
 
+/* ── 通道映射 ── */
+#define BB_MAP_N        60u           /* 记录里的数据槽数 (64 字 - 4 字头) */
+#define BB_MAP_SEG_SENSOR 0u
+#define BB_MAP_SEG_WIRE   1u
+#define BB_MAP_SEG_ACT    2u
+#define BB_MAP_SEG_NONE   3u
+#define BB_ME(seg, idx) (((uint32_t)(seg) << 16) | (uint32_t)(idx))
+
+/* 卡上日志头里的映射区位置 (头块 512B = 128 字, h[0..15] 是原有字段) */
+#define BB_MAP_HDR_OFF  16u           /* 映射表在日志头里的字偏移 */
+#define BB_MAP_HDR_MAGIC 0x50414D42u  /* "BMAP" */
+#define BB_MAP_HDR_SUM_OFF (BB_MAP_HDR_OFF + BB_MAP_N + 1u)  /* = 77 */
+
 #define EVT_BOOT         0x01u
 #define EVT_ENGINE_START 0x02u
 #define EVT_ENGINE_STOP  0x03u
@@ -51,4 +77,9 @@ uint32_t bb_write_idx(void);
 uint32_t bb_slots_produced(void);   /* 已产出的快照条数 (单调) */
 uint32_t bb_tick_last(void);           /* 最近一次写入的 tick (诊断) */
 
+/* ★ 当前生效的通道映射 (60 项), 供 sd.c 写进日志头 ⇒ 数据自描述 */
+const uint32_t *bb_map(void);
+uint32_t bb_map_sum(const uint32_t *map);   /* 映射表校验和 (两端同一算法) */
+
 #endif /* DCL_BLACKBOX_H */
+
