@@ -525,6 +525,37 @@ static inline void stats_reset(void)
 }
 
 /* ══════════ 拍中断 ══════════ */
+
+#if IO_IN_ISR
+/* ★★★ P1/P2 (2026-09-12): 拍内 I/O 必须走**间接调用 (BLX)**, 不能直接 BL。
+ *
+ * 事故与证据链 (别把它简化成"加个函数指针就好了"):
+ *   ISR 在 **ITCM (0x0)**, 而 di_poll/adc_poll/hil_out_poll 在 **FLASH (0x0800xxxx)** ——
+ *   两者相距 **128MB**, 远超 Thumb `BL` 的 ±16MB 编码范围。
+ *   · 链接器确实**插了 veneer** (`__di_poll_veneer@0x17F8` 等 4 个, 见 .map),
+ *     且**板上逐字节核对过**: 0x17FC=0x0800534D / 0x1804=0x08004F45 / 0x180C=0x080051B1,
+ *     与 elf 完全一致 ⇒ veneer 本身没被漏拷、没被 gc 掉。
+ *   · 但整机**卡死在 `Default_Handler`** (PC=0x080057C4), 三条独立判据确认
+ *     **TIM2_IRQHandler 从未被执行**: ① 断点 0x0 未命中(核心仍 RUNNING)
+ *     ② `g_stage` 从未被写成 7 (ISR 的第一件事) ③ `g_tick_count` 恒 0。
+ *     (对照构建 `-DDCL_IO_IN_ISR=0` 一切正常 ⇒ 变量就是这三个调用。)
+ *   · veneer 机制**为何失效尚未查明**(已列为待查项), 但**规律是清楚的**:
+ *     本工程的既有代码里, ISR 内的**跨区**调用**一律走函数指针**
+ *     —— 见 `engine_tick(g_shm, tick, sel ? engine_scan_itcm : engine_scan_flash, ...)`,
+ *     那条路生成的是 `BLX` (寄存器间接, **无距离限制**), 所以从来没事;
+ *     而 ISR 里的**同区**(ITCM→ITCM)调用 `mb_tick` / `engine_*` 才用直接 BL。
+ *   ⇒ 本次照**同一条纪律**走: 用函数指针 ⇒ 生成 BLX, 不从 veneer 走。
+ *   ★ 教训 (值得写进 ARCH): **在 ITCM/flash 分离的工程里, "把一个函数从 ITCM 挪到
+ *     flash"不是零风险重构** —— 它会把该函数的所有调用点从"同区 BL"变成"跨区调用",
+ *     而链接器**不会报错**。 */
+/* ★ 注: 这里**不能**用"函数指针数组"来绕开跨区调用 —— 试过了, 会被 `-O2` 的
+ *   **常量传播**打回原形: 数组是 `static const`, GCC 直接把它折成直接 BL。
+ *   现象极具误导性 —— 源码明明改了、编译零警告, 但 `pyocd flash` 报
+ *   `programmed 0 bytes, identical N bytes` (产物一模一样), 板子行为纹丝不动。
+ *   ⇒ 改用**声明上的 `long_call` 属性** (见 di.h / adc.h / hil.h): 它强制生成
+ *     BLX (寄存器间接), 不受常量传播影响。所以 ISR 里仍是普通的直接调用写法。 */
+#endif
+
 ISR_PLACE void TIM2_IRQHandler(void)
 {
     uint32_t t0 = DWT_CYCCNT;
@@ -608,6 +639,21 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   ★ 为什么放这里: 在 `g_tick_count++` 之后、**任何门之前** ——
          *     只要这一拍进来了就翻一次, 与引擎跑不跑无关。 */
         SHM_U32(g_shm, OFF_CTRL_HEARTBEAT)++;
+
+        /* ══════════ ★ P1/P2: 拍内**输入段** (2026-09-12) ══════════
+         * ★ 位置三条理由:
+         *   ① 必须在扫描门**之前** —— 扫描要读 SENSOR, 而 DI/AI 都写那里;
+         *   ② **不受 gate/RUN 门控** —— 停机时现场输入仍必须可读 (HMI 要看现场值),
+         *      与 mb_tick 放门外同类理由: **输入面不门控, 输出面才门控**;
+         *   ③ 在 HEARTBEAT **之后** —— 最便宜的存活信号先落袋: 即使输入段出问题,
+         *      心跳也已经翻过了 (可观测性的排序原则)。
+         * ★ A/B 对照 (IO_IN_ISR=0): 本段整段不编译, 输入回主循环的 ai_tick/di_tick
+         *   (改前行为)。两档共用同一套采样体 ⇒ 对照里唯一的变量是**驱动位置**。 */
+#if IO_IN_ISR
+        /* 这两个函数声明带 `long_call` ⇒ 编译器生成 BLX, 不走 veneer (见上方长注释) */
+        di_poll(g_shm, g_tick_count);    /* DI: 每 100 拍相位锚定采样 + 去抖 → SENSOR[3..6] */
+        adc_poll(g_shm, g_tick_count);   /* AI/HIL反馈: 非阻塞状态机 → SENSOR[8..10] / [2] */
+#endif
 
         g_engine_run_seen = SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN);
         if (g_engine_gate && g_engine_run_seen) {
@@ -705,6 +751,41 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   (本项目铁律: 热路径成本必须可观测, 不能靠"放在计时之外"来装便宜。) */
         mb_tick(g_shm);
         g_mb_ticks++;
+
+#if IO_IN_ISR
+        /* ★★★ TEMP-DIAG-F (2026-09-12): **等长替代** —— 用 `di_poll` 的调用**顶替**
+         *   `hil_out_poll` 的调用。两者在调用点的机器码体积几乎相同 (都是
+         *   `blx Rn` + 一个常量池项), 而 `di_poll` 自带相位门
+         *   (`tick % 100 == 0`) ⇒ 绝大多数拍**立即返回** ⇒ 基本无副作用。
+         *
+         *   这是本轮最能**定方向**的一个实验, 判据二选一、互斥:
+         *     · 这样**也卡**  ⇒ 与 `hil_out_poll` 这个符号/它的目标地址**无关**,
+         *                      根因是"ISR 里多出一处跨区调用"这件事**本身** ——
+         *                      即 ISR 的**体积/布局**, 正好对上项目已知的家族问题
+         *                      (ARCH-H723.md §0.3 "本平台对代码体积敏感";
+         *                       T26 期间也记过"加 200 字节就改变上电行为")。
+         *     · 这样**不卡**  ⇒ 与 `hil_out_poll` 这个符号或它指向的代码有关。 */
+        /* ══════════ ★ P1: 拍内**输出段** (2026-09-12) ══════════
+         * ★ 位置: 扫描与顺序域**之后** —— 输出臂读的是 WIRE[HIL_U_WIRE],
+         *   必须用**本拍刚算出来**的值。放扫描前会输出上一拍的结果, 白白多一拍延迟。
+         * ★ 安全态语义不变: hil_out_poll → hil_out_apply 内部仍受 ENGINE_RUN 门控,
+         *   STOP 后仍归零 (HIL_SAFE=1)。门控放在**域内部**而不是在 ISR 外面再包一层,
+         *   这样"哪些输出受门控"由各域自己声明, ISR 里不必硬编码一张清单 ——
+         *   否则将来每加一个输出面都得回来改 ISR, 正是"改一处忘一处"的老路。
+         *
+         * ★★ 它曾经"一加进 ISR 就整机卡死", 查了十几轮才定位到**真因不在它**:
+         *   卡死的根因是**向量表的落位** —— `_vtor_itcm = 0x1880` (128 对齐但不是
+         *   256 对齐) 时整机卡进 Default_Handler。完整证据链 (全部实测):
+         *     · 把本调用换成**等长**的 `di_poll` 调用        → 仍卡
+         *     · 换成 **4 条 nop** (8 字节, 完全无调用)         → 仍卡
+         *     · 把 ISR 体积一次推过阈值 (+200B nop, 向量表随之落到 0x1900) → **正常**
+         *     · 重现那 8 字节体积, 但把向量表改成 **256 对齐** (落到 0x1900) → **正常**
+         *   ⇒ 与"调用谁 / 函数在哪 / 函数体做什么"全都无关, 只与**表落哪**有关。
+         *   修法: ld/STM32H723ZG_FLASH.ld 的 `.itcm_vectors` 对齐 128 → **256**。
+         *   ★ 这条值得记住: **ARMv7-M 只要求 VTOR 128 对齐**, 所以 256 是**实测**出来的
+         *     经验值, 不是 spec 要求 —— 换板子/换型号要重新验。 */
+        hil_out_poll(g_shm, g_tick_count);
+#endif
 
         uint32_t t1 = DWT_CYCCNT;
         uint32_t di = t1 - t0;
@@ -2075,6 +2156,13 @@ static void obs_anchor(void)
     sink ^= g_cmd_req_cnt;     sink ^= g_cmd_req_last;
     /* 审计发现 H 的观测面 (engine.c 侧, 不读会被回收) */
     sink ^= g_safe_mask_nonzero;
+    /* ★ P1/P2 拍内 I/O 观测面 (不读会被 --gc-sections 回收 —— 本项目已知族:
+     *   第一版 g_selftest_state / g_isr_itcm 都这么从符号表里消失过)。
+     *   g_safe_mask_oob  : GPIO_MASK 越界写次数 (定案② 的违规判据, 应恒 0)
+     *   g_adc_sm_done    : 状态机完成转换数 (正向证据, 必须单调增)
+     *   g_adc_sm_timeout : 状态机超时数 (应恒 0; 与上面那个成对读才分得清"没坏"与"没跑") */
+    sink ^= g_safe_mask_oob;
+    sink ^= g_adc_sm_done;     sink ^= g_adc_sm_timeout;
     /* 审计 #1 的观测面: 物理输出面 登记数 / 上次实际执行数 */
     sink ^= g_out_surfaces;    sink ^= g_safe_surfaces_ran;
     /* W4 通信域 */
@@ -2137,6 +2225,23 @@ int main(void)
             g_boot_status = -100;      /* 记因: 向量表 > ITCM 副本区 */
             g_stage = 0xFFu;
             blink_error(100);           /* 不返回 */
+        }
+        /* ★★★ EXP-E (2026-09-12): 先用**内存全宽写 (64 位)** 把整片向量表区"写实",
+         *   再执行后面的 32 位逐项拷贝。这是 ST 官方给的解法, 也是本轮要验证的机制:
+         *
+         *   机制 (来源: DS13313 + AN5342 + ST 社区, 三条互证):
+         *     · ITCM 是 **64 位宽**接口, 且**每 64 位字带 8 位 ECC** (SEC-DED), ECC **不可关闭**;
+         *     · 当**写宽 < 内存宽度**时, 存储器控制器改走 **RD / MODIFY / WR** ;
+         *     · 那个 **RD 会读到"从未写过"的 ITCM** ⇒ **触发 ECC 错误**;
+         *     · AN5342 的要求原文: "使用 ECC 时**必须初始化代码访问的所有存储器**",
+         *       且初始化应**按内存宽度写** (原文: "WR with the memory width to avoid RD/MODIFY/WR")。
+         *   ⇒ 向量表拷贝是 32 位逐项写 ⇒ 恰好踩中这条。本段先把整片 `.itcm_vectors`
+         *     用 64 位写填 0, 后面的 32 位拷贝就踩在**已初始化**的字上, RD 不再报错。 */
+        {
+            volatile uint64_t *iv = (volatile uint64_t *)LSYM_ADDR(_vtor_itcm);
+            uint32_t n8 = (uint32_t)((LSYM_ADDR(_evtor_itcm) - LSYM_ADDR(_vtor_itcm)) / 8u);
+            for (uint32_t i = 0; i < n8; i++) iv[i] = 0ull;
+            __asm__ volatile("dsb" ::: "memory");
         }
         for (uint32_t i = 0; i < n4; i++) dst[i] = src[i];
         __asm__ volatile("dsb" ::: "memory");
@@ -2249,6 +2354,22 @@ int main(void)
 
     /* ⑤ 100μs 拍 */
     tick_timer_init();
+    /* ★★ 拍活体自检 (2026-09-12): 等 3 个 tick, 不动 ⇒ 取向量失败, 当场点灯。
+     *   这防的不是某一个 bug, 而是**一切"取向量失败"类故障**: 表位置错、表内容坏、
+     *   对齐不足被硬件掩码……它们的症状全是"上电就卡在 Default_Handler, 且卡的
+     *   位置与真因毫无关联"(2026-09-12 的向量表对齐事故花了一个通宵, 而这个自检
+     *   本可以在 10 分钟内报警)。
+     *   ★ 位置: VTOR 已在 main 开头设置, NVIC 使能随 tick_timer_init ⇒ 拍应该
+     *     正在跑, 这里只确认它真的在跳 ISR。 */
+    {
+        uint32_t t0 = g_tick_count;
+        uint32_t guard = 0;
+        while (((g_tick_count - t0) < 3u) && (++guard < 1000000u)) { }
+        if ((g_tick_count - t0) < 3u) {
+            g_boot_status = -101;      /* 记因: 拍中断没有真的进来 */
+            blink_error(101);           /* 不返回 */
+        }
+    }
     g_stage = 8;
 
     /* ⑥ 协议层 (阶段 3.1): USART1 + 帧解析
@@ -2431,10 +2552,26 @@ int main(void)
          *   所以每轮调用只花几条指令。 */
         if (macro_tick(g_shm, g_tick_count)) g_macro_ticks++;
 
-        /* ★ W5: AI / DI / HIL 周期任务 (各自按 10ms 自节流, 主循环驱动, 不进 ISR) */
+        /* ★ W5: AI / DI / HIL 周期任务 —— **交付档下已搬进拍内** (P1/P2, 2026-09-12)。
+         * ★ IO_IN_ISR=1 (交付): 不再在此驱动, 三者由 ISR 的**输入段/输出段**按拍执行
+         *   —— 这就是"把主循环上的、ISR 引擎外的 I/O 搬进引擎内"。
+         * ★ IO_IN_ISR=0 (**A/B 对照档 = 改前行为**): 三者照旧在主循环跑, 供同一套测量
+         *   方法打出"改前"的那一份数据。没有这一档, "搬进拍内更确定"就只能算相关性,
+         *   不能算结论 (本项目"结构性改动必须配可失败对照"的既有纪律)。 */
+#if !IO_IN_ISR
+        /* 对照档 (= 改前行为): AI / DI / HIL 三个周期域全部由主循环按 10ms 驱动 */
         ai_tick(g_shm, g_tick_count);
         di_tick(g_shm, g_tick_count);
         hil_tick(g_shm, g_tick_count);
+#else
+        /* ★ 交付档: 三个域**都已进 ISR 拍内** (输入段 di_poll/adc_poll + 输出段 hil_out_poll),
+         *   所以主循环**不再驱动任何一个** —— 一个输出面只应有一个驱动者。
+         *   ★ 这里之前是不对的: `hil_tick` 曾两档都跑, 于是它和 ISR 里的 `hil_out_poll`
+         *     **重复写 TIM3_CCR1**。两者读的是同一份 WIRE[20]、算出的 duty 相同, 所以
+         *     **恰好无害** —— 但那是"碰巧一致", 不是设计。既然输出臂已经进了拍内,
+         *     就该把主循环这条路径**整个撤掉**, 而不是靠"反正算出来一样"来兜。
+         *     (本项目铁律: 一个量只能有一个权威来源/驱动者。) */
+#endif
 
         /* 栈哨兵周期巡检 (廉价: 32 个字, 主循环有 100μs 一次的机会) */
         g_guard_ok = (uint32_t)shm_guard_ok();

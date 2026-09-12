@@ -46,7 +46,29 @@ int      adc_read(uint32_t ch, uint16_t *out);
 void     adc_analog_pin(uint32_t pin);   /* 把某引脚置 analog 模式 (供 HIL 用) */
 
 void ai_init(uint8_t *base);             /* 配 3 路引脚 analog + SENSOR 初值 */
-void ai_tick(uint8_t *base, uint32_t tick_now);   /* 主循环: 每 10ms 采一轮 → SENSOR */
+void ai_tick(uint8_t *base, uint32_t tick_now);   /* 主循环: 每 10ms 采一轮 → SENSOR (对照档) */
+
+/** @brief ★★ P2 拍内非阻塞 ADC 状态机: 由 ISR **每拍**调用一次。
+ *
+ *  ★ 为什么必须非阻塞 (本文件最重要的一个数字): `adc_read()` 单次转换 ≈ **259µs**
+ *    (`SMP=810.5 周期 @ adc_ker_ck=3.125MHz`), 而拍长只有 100µs ⇒ 一次转换 = **2.6 拍**。
+ *    在 ISR 里自旋等 EOC 会把拍周期直接撑成 ISR 时长。
+ *  ★ 做法: 一拍启动, 若干拍后取结果。通道轮询 AI0→AI1→AI2→HIL_FB,
+ *    一轮 16 拍 ⇒ AI 每 **1.6ms** 更新 (原 10ms);
+ *    HIL 反馈累加 16 次 ⇒ **25.6ms** 出一个平均值 (原 10ms 窗口内阻塞 16 次, 功能等价)。
+ *  ★ 与 adc_read 的关系: **共存**。adc_read 留给自检 (需要"立刻拿到本次结果");
+ *    生产路径走本状态机。
+ *  ★ 观测面 (缺了它们就等于静默失败):
+ *      g_adc_sm_done    完成转换数 —— **正向证据**, 必须随运行单调增;
+ *      g_adc_sm_timeout 超时数 —— **应恒 0**。两者成对读, 才能区分
+ *                       "ADC 没坏" 与 "状态机根本没跑起来"。
+ *  ★★ `long_call` = **正确性要求** (不是优化提示): ITCM 里的 ISR 到本函数 (flash)
+ *     相距 128MB, 超出 Thumb `BL` 的 ±16MB ⇒ 必须走 BLX。实测: 靠链接器 veneer
+ *     会整机卡进 Default_Handler (详见 main.c 里 s_io_in 那段证据链, 或 di.h)。 */
+__attribute__((long_call)) void adc_poll(uint8_t *base, uint32_t tick_now);
+
+extern volatile uint32_t g_adc_sm_done;
+extern volatile uint32_t g_adc_sm_timeout;
 
 /* 自检 (零接线): 用 GPIO 内部上拉/下拉把 AI 引脚拉到已知电平, 逐通道读 ADC。
  *   method 0 = 引脚置 **analog** + 上/下拉;  1 = 置 **input** + 上/下拉。

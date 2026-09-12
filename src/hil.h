@@ -28,7 +28,20 @@
 #define HIL_FB_AVG      16     /* 无 RC 时反馈取 16 次平均 (方波占空比估计) */
 
 void hil_init(uint8_t *base);
-void hil_tick(uint8_t *base, uint32_t tick_now);
+void hil_tick(uint8_t *base, uint32_t tick_now);   /* 主循环版 (A/B 对照档 / 兼容保留) */
+
+/** @brief ★ P1 拍内输出臂: 由 ISR **每拍**调用, 读 WIRE[HIL_U_WIRE] → 写 TIM3_CCR1。
+ *  ★ 与 hil_tick 的输出臂**逻辑完全相同** (共用 hil_out_apply()), 区别只在执行频率:
+ *      hil_tick     : 主循环, 每 10ms 一次
+ *      hil_out_poll : ISR, 每 100µs 一次
+ *  ★ 为什么更快是对的: TIM3_CCR1 已配 OC1PE (预装载) ⇒ 写入在**下一个 PWM 更新事件**
+ *    才生效 (1kHz ⇒ 1ms)。两种频率的生效时刻几乎一样, 但"每拍写"保证预装载寄存器里
+ *    **永远有一个新鲜值**; "每 10ms 写"则会在两次更新之间留下陈旧窗口。
+ *  ★ 安全态语义**不变**: 仍受 ENGINE_RUN 门控 (HIL_SAFE=1), STOP 后仍归零。
+ *  ★ 反馈眼已从本入口**剥离** —— 它由 ADC 拍内状态机负责 (见 adc.h)。对照档仍走 hil_tick。
+ *  ★★ `long_call` = **正确性要求**: ITCM 里的 ISR 到本函数 (flash) 相距 128MB,
+ *     超出 Thumb `BL` 的 ±16MB ⇒ 必须走 BLX (详见 main.c 里 s_io_in 的证据链)。 */
+__attribute__((long_call)) void hil_out_poll(uint8_t *base, uint32_t tick_now);
 
 /** @brief HIL 物理输出的**安全态** —— 由 engine 的物理输出面注册表在 STOP/RESET 时调用。
  *  ★ 语义: 把 PWM 占空比压到 0 (输出归零), 并回写 `OFF_HIL_DUTY` 镜像。

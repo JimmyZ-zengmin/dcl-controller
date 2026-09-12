@@ -40,11 +40,12 @@ void di_init(uint8_t *base)
     __asm__ volatile("dsb" ::: "memory");
 }
 
-void di_tick(uint8_t *base, uint32_t tick_now)
+/* ══════════ 采样体 (两个入口共用) ══════════
+ * ★ 抽出来是为了让"主循环版"与"拍内版"**逐字相同地**跑同一段逻辑 ——
+ *   这样 A/B 对照时唯一的变量才真的是**触发方式**, 而不是"我顺手又改了什么"。
+ *   (本项目纪律: 对照实验里出现的每一处差异都必须是有意为之且写在注释里。) */
+static void di_sample_all(uint8_t *base)
 {
-    static uint32_t last = 0;
-    if ((uint32_t)(tick_now - last) < 100u) return;     /* 100 拍 = 10ms (同 S3 vTaskDelay(1)) */
-    last = tick_now;
     for (int i = 0; i < DI_COUNT; i++) {
         uint8_t lv = (uint8_t)di_pin_read(DI_PINS[i]);
         if (lv == s_last[i]) {
@@ -58,11 +59,27 @@ void di_tick(uint8_t *base, uint32_t tick_now)
          *   cold_start_reset() 整段 memset(SHM), 而 DI 的去抖状态住在 C 静态里
          *   (不受 memset 影响)。若沿用 S3 "只在变化时写", 一次 0x13 RESET 之后
          *   槽被清 0、而电平"没变化"⇒ 永远不再回填, SENSOR[3..6] 停在 0 (实测到)。
-         *   每 10ms 4 次 float 存储代价可忽略, 换来"任何清零路径后都自愈"。 */
+         *   每轮 4 次 float 存储代价可忽略, 换来"任何清零路径后都自愈"。 */
         *(volatile float *)(base + OFF_SENSOR_MAP + (uint32_t)(DI_SENSOR_BASE + i) * 4u) =
             s_stable[i] ? 1.0f : 0.0f;
     }
     __asm__ volatile("dsb" ::: "memory");
+}
+
+/* 主循环版 (A/B 对照档 = 改前行为): **相对节流** ⇒ 实际间隔 100~101 拍 */
+void di_tick(uint8_t *base, uint32_t tick_now)
+{
+    static uint32_t last = 0;
+    if ((uint32_t)(tick_now - last) < (uint32_t)DI_SAMPLE_DIV) return;
+    last = tick_now;
+    di_sample_all(base);
+}
+
+/* ★ P1 拍内版 (交付): **拍相位锚定** ⇒ 严格每 DI_SAMPLE_DIV 拍一次, 见 di.h 的说明 */
+void di_poll(uint8_t *base, uint32_t tick_now)
+{
+    if ((tick_now % (uint32_t)DI_SAMPLE_DIV) != 0u) return;
+    di_sample_all(base);
 }
 
 void di_selftest(uint8_t *out)

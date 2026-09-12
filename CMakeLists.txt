@@ -54,6 +54,17 @@ set(DCL_DEPLOY_SELFTEST "0"     CACHE STRING "上电跑 deploy 自检 (9 例)")
 #     (历史教训: 向量表那次就是靠 0 档量出 8153 拍缺口, 才证明判据没瞎。)
 set(DCL_HIL_SAFE "1" CACHE STRING "停机安全态覆盖 HIL 输出 (1 交付 / 0 改前行为对照)")
 
+# ---- ★ P1/P2 拍内 I/O 搬迁的 A/B 对照开关 (2026-09-12) ----
+#   1 = 交付: DI / AI / HIL 由 **ISR 按拍**驱动 (输入段 + 输出段, 见 main.c 的 ISR 注释)
+#   0 = **改前行为**: 三者仍由主循环按 10ms 自节流驱动 (ai_tick / di_tick / hil_tick)
+#   ★ 为什么必须有 0 档 (与 DCL_HIL_SAFE / DCL_VTOR_ITCM 同一条纪律):
+#     "搬进拍内"改变的是**驱动位置**, 影响的是**确定性** —— 而确定性恰恰是最容易被
+#     "改完跑一下看起来正常"糊过去的性质。必须用**同一套测量方法**在两档上打出两份
+#     数字 (isr_cyc 增量 / DI 采样间隔 / PWM 跟随延迟), 差异才算证据。
+#   ★ 附带价值 (可失败判据): IO_IN_ISR=1 而 ADC 非阻塞化失效时, 拍周期会**当场崩掉**
+#     (ADC 单次转换 259µs > 拍长 100µs) —— 这本身就是"非阻塞化是必需, 不是优化"的实证。
+set(DCL_IO_IN_ISR "1" CACHE STRING "I/O 驱动位置 (1 ISR 拍内 / 0 主循环对照)")
+
 # Cortex-M7 + 双精度 FPU + 硬浮点 (与老项目 build.bat 一致)
 set(MCU_FLAGS -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb)
 
@@ -89,6 +100,7 @@ add_compile_options(
     -DDEPLOY_SELFTEST=${DCL_DEPLOY_SELFTEST}
     -DMIN_TX_STRESS=${DCL_MIN_STRESS}
     -DHIL_SAFE=${DCL_HIL_SAFE}
+    -DIO_IN_ISR=${DCL_IO_IN_ISR}
 )
 
 # syscalls.c 是 newlib 桩: 函数签名由 newlib 规定, 参数天然用不上。

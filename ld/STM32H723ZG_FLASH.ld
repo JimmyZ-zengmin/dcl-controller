@@ -146,16 +146,24 @@ SECTIONS
     _eitcm = .;
   } >ITCM AT>FLASH
 
-  /* ---- ITCM: **向量表副本** (NOLOAD: 内容由 main() 在"使能任何中断之前"从 flash 拷入) ----
-   * VMA 紧跟 .itcm_text 之后 (128B 对齐 —— VTOR 的要求); 占 1KB
-   * (H723 有 16 系统 + ~150 IRQ 个向量 ≈ 664B, 留到 1KB 有余量)。
-   * ★ 为什么用 NOLOAD 而不是 AT>FLASH: 让**拷贝这件事在代码里显式可见**
-   *   (main() 里那几行), 而不是藏在启动文件的自动搬运循环里 —— 这段的顺序性
-   *   ("必须先拷再开中断") 是正确性要求, 值得写在一眼能看到的地方。 */
-  .itcm_vectors (NOLOAD) : ALIGN(128)
+  /* ---- ITCM: **向量表副本** —— 钉在 ITCM 末尾 + 1024 字节对齐 (2026-09-12 根因修复) ----
+   *
+   * ★★ 真因 (ARM 官方规则, developer.arm.com 102283): VTOR 的对齐必须是 2 的幂,
+   *   且 ≥ 4×N (N = 支持的异常总数)。H723: 150 IRQ + 16 系统异常 = **166 项**,
+   *   4×166 = 664 字节 ⇒ 向上取 2 的幂 = **1024 字节**。
+   *
+   *   之前用 128 对齐 ⇒ 硬件把表当 32 项: TIM2(索引 44) 取向量时被掩码到
+   *   **44 mod 32 = 12**, 读到保留项指向的 Default_Handler ⇒ 整机卡死
+   *   ——这就是"表内容全对、VTOR 全对、无 ECC 无 fault, 却跳错地方"的原因。
+   *   256 对齐之所以"看起来能用", 是因为索引 44 < 64 没被掩码 —— **纯运气**:
+   *   任何 IRQ ≥ 48 (索引 ≥ 64) 的中断在 256 对齐下都会被掩到错位, 是埋着的雷。
+   *
+   * ★ 位置: **钉在 ITCM 末尾** (0xFC00), 与代码大小彻底解耦 —— 代码从 0x0 向上长,
+   *   表位置永远不变 ⇒ 一次验证永久有效, 不再"每次改代码都买一张落位彩票"。
+   *   配套 ASSERT: 代码涨到吃掉表区时, **链接期**就报错, 不会静默上板。 */
+  _vtor_itcm = ORIGIN(ITCM) + LENGTH(ITCM) - 0x400;
+  .itcm_vectors _vtor_itcm (NOLOAD) :
   {
-    . = ALIGN(128);
-    _vtor_itcm = .;
     . = . + 1024;
     _evtor_itcm = .;
   } >ITCM
@@ -228,3 +236,7 @@ SECTIONS
 /* 提供 DTCM 段符号给固件做自检 (阶段 2 会加 SHM 布局断言) */
 ASSERT(_shm_end <= ORIGIN(DTCM) + LENGTH(DTCM), "DTCM overflow: 数据表放不下")
 ASSERT(_eitcm <= ORIGIN(ITCM) + LENGTH(ITCM), "ITCM overflow: 热代码放不下")
+/* ★ 向量表钉在 ITCM 末尾: 热代码涨进表区时在**链接期**就报错 (2026-09-12 配套)。
+ *   之前这个边界没有任何人守 —— 代码涨 8 字节表就跳一整格, 落到坏地址就整机卡死,
+ *   而链接器一声不吭。现在把这个依赖显式化。 */
+ASSERT(_eitcm <= _vtor_itcm, "ITCM code overflow: 热代码吃掉了向量表副本区")

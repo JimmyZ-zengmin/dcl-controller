@@ -62,6 +62,7 @@ DEFAULTS=(
     -DDCL_DEPLOY_SELFTEST=0
     -DDCL_MIN_UART=0
     -DDCL_HIL_SAFE=1
+    -DDCL_IO_IN_ISR=1
 )
 
 "$CMAKE" -S "$WIN_HERE" -B "$BUILD" -G Ninja \
@@ -78,7 +79,23 @@ DEFAULTS=(
 #              ② 这里再扫一遍完整日志 (含链接器/汇编的警告)
 set -o pipefail
 LOG="$HERE/build/buildlog.txt"
-"$CMAKE" --build "$BUILD" 2>&1 | tee "$LOG"
+# ★★ 已知间歇性失败 (2026-09-12 一天踩 3 次, 且**不一定重跑一次就收敛**):
+#     cc1.exe: fatal error: can't open '...\build\tmp\ccXXXXXX.s' for writing: Permission denied
+#   随机文件、随机名、且失败的文件里包含**从未改动过**的 .c ⇒ 与代码无关 (已知族)。
+#   ⇒ 这里加**一次自动重试**; 但**显式打印出来, 不静默** ——
+#     静默重试会把"真的编译失败"掩盖成"重试后还是失败", 丢掉第一次的错误信息。
+if ! "$CMAKE" --build "$BUILD" 2>&1 | tee "$LOG"; then
+    echo
+    if grep -q "Permission denied" "$LOG" && grep -q "can't open" "$LOG"; then
+        echo "★★ 命中已知症状 (build/tmp Permission denied, 与代码无关) ⇒ 清 tmp 后自动重试一次。"
+        rm -rf "$BUILD/tmp"
+        mkdir -p "$BUILD/tmp"
+        "$CMAKE" --build "$BUILD" 2>&1 | tee "$LOG"
+    else
+        echo "★★ 构建失败, 且**不是**已知的 build/tmp 症状 ⇒ 按真实构建失败处理 (见上面的日志)。"
+        exit 1
+    fi
+fi
 
 NW=$(grep -c "warning:" "$LOG" || true)
 if [ "$NW" != "0" ]; then

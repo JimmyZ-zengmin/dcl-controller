@@ -6,6 +6,9 @@
 #include "engine.h"
 #include "regs.h"
 #include "clock.h"
+/* ★ P2: 拍内状态机要写 HIL 反馈槽 ⇒ 需要 HIL_FB_SENSOR / HIL_FB_AVG。
+ *   hil.h 不包含 adc.h, 所以无循环包含。 */
+#include "hil.h"
 
 #define ADC1  ADC1_BASE
 
@@ -146,4 +149,115 @@ void ai_selftest(uint8_t *base, uint32_t method, uint16_t *out)
         }
     }
     for (int i = 0; i < AI_NCH; i++) adc_analog_pin(AI_PINS[i]);   /* 恢复 */
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * ★★ P2 (2026-09-12): 拍内非阻塞 ADC 状态机
+ * ══════════════════════════════════════════════════════════════════
+ * 为什么必须是非阻塞的 (本文件最有分量的一个数字):
+ *   `adc_read()` 单次转换 ≈ **259µs** —— `SMP=810.5 周期 @ adc_ker_ck=3.125MHz`
+ *   (见 adc_init 对 /8 与 BOOST=0 的推导)。而拍长只有 **100µs**。
+ *   ⇒ 一次转换 = **2.6 个拍**。在 ISR 里自旋等 EOC 会把拍周期直接撑成 ISR 时长
+ *     (即项目已知的"超载"形态: 拍周期由 ISR 时长决定, 不再是 100µs)。
+ *   ⇒ 唯一的出路是**把等待摊到多个拍上**: 一拍启动, 若干拍后再取结果。
+ *
+ * 通道轮询与更新率 (实测推算, 见 docs/PLAN-io-into-engine.md §2.5):
+ *   序列 AI0 → AI1 → AI2 → HIL_FB → AI0 → …
+ *   每通道占用 ADC_SM_START_WAIT 拍 (启动那拍 + 等待), 4 通道 ⇒ 一轮 16 拍 = 1.6ms
+ *     · AI 3 路: 每 **1.6ms** 更新 (原来是 10ms —— 快了 6 倍)
+ *     · HIL 反馈: 累加 HIL_FB_AVG(=16) 次 ⇒ 16 轮 = **25.6ms** 出一个平均值
+ *       (原来是 10ms 窗口内阻塞 16 次; 功能等价 —— 平均值的正确性不依赖窗口长度,
+ *        方波周期 1ms, 两个窗口都跨多个完整周期。代价只是**反馈跟随变慢**,
+ *        而反馈量本身是慢变量 ⇒ 已知且有意的取舍, 不是副作用。)
+ *
+ * 每拍代价: 无事可做时 = 一次自增 + 一次比较 + return (约 5 cyc);
+ *           取结果那拍多一次 DR 读 + 一次 float 存储 (约 25 cyc)。
+ *           平均 ≈ 9 cyc/拍 ⇒ 占拍预算 0.02%。
+ *
+ * ★ 与 `adc_read` 的关系: 两者**共存**。adc_read 留给"自检/一次性读"用 (ai_selftest
+ *   需要"立刻拿到本次转换结果", 状态机做不到)。生产路径走本状态机。
+ *
+ * ★★ 超时必须有自己的计数 (不能静默):
+ *   正常情况下 259µs 后 EOC 必到 (4 拍远大于 2.6 拍)。若一直不到, 说明 ADC 配置坏了
+ *   或外设挂了 —— 这类"本该发生却没发生"的事件按项目纪律**必须可被外部读走**,
+ *   否则就是下一个"一切正常, 只有 X 是 0"的静默失效。
+ *   ⇒ `g_adc_sm_timeout` 独立计数 (应恒 0), `g_adc_sm_done` 作为**正向证据**
+ *     (它必须随运行时间单调增 —— 与 timeout 成对, 才能区分"没坏"与"根本没跑")。
+ */
+#define ADC_SM_NCH        (AI_NCH + 1)   /* AI 3 路 + HIL 反馈 1 路 */
+#define ADC_SM_START_WAIT 3u             /* 启动后先等 3 拍再查 EOC (259µs ≈ 2.6 拍) */
+#define ADC_SM_TIMEOUT    8u             /* 超过 8 拍仍无 EOC ⇒ 放弃本次 (远大于 2.6 拍, 只在真故障时触发) */
+
+static struct {
+    uint8_t  idx;       /* 下一个要启动的通道索引 (0..ADC_SM_NCH-1) */
+    uint8_t  pend;      /* 1 = 已启动, 等结果 */
+    uint8_t  wait;      /* 已等待的拍数 */
+    uint32_t fb_acc;    /* HIL 反馈累加 (原始码) */
+    uint32_t fb_n;      /* HIL 反馈已累加次数 */
+} s_sm;
+
+volatile uint32_t g_adc_sm_done    = 0;   /* 完成转换次数 (正向证据: 必须单调增) */
+volatile uint32_t g_adc_sm_timeout = 0;   /* 超时次数 (应恒 0) */
+
+/* 取回的原始码按通道落槽。idx < AI_NCH ⇒ AI 通道; 否则 = HIL 反馈 (累加后出平均)。 */
+static void adc_sm_store(uint32_t idx, uint16_t raw, uint8_t *base)
+{
+    if (idx < (uint32_t)AI_NCH) {
+        *(volatile float *)(base + OFF_SENSOR_MAP
+                            + (uint32_t)(AI_SENSOR_BASE + (int)idx) * 4u) = ai_raw_to_volt(raw);
+    } else {
+        s_sm.fb_acc += (uint32_t)raw;
+        if (++s_sm.fb_n >= (uint32_t)HIL_FB_AVG) {
+            float v = (float)(s_sm.fb_acc / (uint32_t)HIL_FB_AVG) * 3.3f / 65535.0f;
+            *(volatile float *)(base + OFF_SENSOR_MAP
+                                + (uint32_t)HIL_FB_SENSOR * 4u) = v;
+            /* 排障镜像: 与 hil.c 同契约 (最近一次的原始码), 便于对照 0x37 扫描读数 */
+            *(volatile uint32_t *)(base + OFF_HIL_FB_RAW) = (uint32_t)raw;
+            s_sm.fb_acc = 0u;
+            s_sm.fb_n   = 0u;
+        }
+    }
+}
+
+static void adc_sm_start(uint32_t ch)
+{
+    /* ★ 启动前先清 EOC/OVR —— 与 adc_read 同款, 同一个实测陷阱:
+     *   连读时上一轮若留下 EOC(或 OVR), 本次 ADSTART 后会**立即**看到 EOC=1
+     *   ⇒ 读到的是**上一次的 DR**(旧值)。状态机同样是"连读", 所以这一步不能省。 */
+    ADC_ISR(ADC1) = (1u << 2) | (1u << 3);
+    ADC_SQR1(ADC1) = (uint32_t)((ch & 0x1Fu) << 6);      /* L[3:0]=0 → 1 次转换; SQ1=ch */
+    ADC_CR(ADC1) |= ADC_CR_ADSTART;
+}
+
+void adc_poll(uint8_t *base, uint32_t tick_now)
+{
+    (void)tick_now;                     /* 状态机自带节律 (按拍推进), 不需要额外相位 */
+    if (!s_adc_ready) return;
+
+    if (s_sm.pend) {
+        if (s_sm.wait < ADC_SM_START_WAIT) { s_sm.wait++; return; }   /* 起跑阶段: 不查 */
+        if (ADC_ISR(ADC1) & ADC_ISR_EOC) {
+            uint16_t raw = (uint16_t)(ADC_DR(ADC1) & 0xFFFFu);        /* 读 DR 同时清 EOC */
+            adc_sm_store(s_sm.idx, raw, base);
+            s_sm.pend = 0;
+            g_adc_sm_done++;
+        } else {
+            s_sm.wait++;
+            if (s_sm.wait >= ADC_SM_TIMEOUT) {
+                g_adc_sm_timeout++;     /* ★ 显式计数, 不静默 (见上方长注释) */
+                s_sm.pend = 0;
+            } else {
+                return;                 /* 还在等, 本拍不做别的 */
+            }
+        }
+    }
+
+    /* 启动下一通道 (与"取结果"同拍进行 —— 省掉一拍空转) */
+    uint32_t next = (uint32_t)s_sm.idx;
+    uint32_t ch   = (next < (uint32_t)AI_NCH) ? AI_CHS[next] : HIL_FB_CH_PA5;
+    adc_sm_start(ch);
+    s_sm.idx++;
+    if (s_sm.idx >= (uint8_t)ADC_SM_NCH) s_sm.idx = 0;
+    s_sm.pend = 1;
+    s_sm.wait = 0;
 }
