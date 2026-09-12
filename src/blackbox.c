@@ -77,13 +77,16 @@
 static volatile uint8_t *s_bb_shm = 0;
 static volatile uint32_t s_bb_widx = 0;    /* 当前写入槽号 */
 static volatile uint8_t s_bb_ready = 0;
-static volatile uint32_t s_bb_kicks = 0;   /* kick 次数 = 已产出条数 (单调) */
+static volatile uint32_t s_bb_kicks = 0;   /* 总拍数 (单调, 诊断用) */
+static volatile uint32_t s_bb_records = 0; /* ★ 真正写进环的记录数 (单调) —— 环游标 */
+static volatile uint32_t s_bb_skipped = 0; /* ★ 因"内容没变"而跳过的拍数 */
 static volatile uint32_t s_bb_seq = 0;     /* 记录序号 (与 kick 同步) */
 /* ★ "变化率"统计 (2026-09-12): 决定黑匣子该"缩记录"还是"变化才记"。
  *   s_chg_ticks = 至少有一个通道变了的拍数; s_chg_vals = 变化通道总数。
  *   ⇒ 变化率 = s_chg_ticks/总拍数; 平均每次变几个 = s_chg_vals/s_chg_ticks。 */
-static volatile uint32_t s_prev[48];
-static volatile uint32_t s_chg_ticks = 0, s_chg_vals = 0;
+static volatile uint32_t s_prev[48];       /* 上一条**已写出**记录的 48 个值 */
+static volatile uint32_t s_prev_ctrl = 0;  /* 上一条已写出记录的控制字 */
+static volatile uint32_t s_bb_have_prev = 0;
 static volatile uint32_t s_last_dst = 0;   /* 上一拍的目的地址 (用于"数据有没有落地") */
 
 void bb_init(uint8_t *shm_base)
@@ -166,7 +169,7 @@ void bb_kick(uint32_t tick)
     /* ★ 每条记录自带"是哪一拍"的标注: magic + tick + seq + ctrl */
     snap[0] = BBLOG_REC_MAGIC;
     snap[1] = tick;
-    snap[2] = s_bb_seq;
+    snap[2] = 0u;                                /* seq 只在真写记录时才分配 */
     {   uint32_t run = *(volatile uint32_t *)(s_bb_shm + 0x0Du) & 0xFFu;
         uint32_t nr  = *(volatile uint32_t *)(s_bb_shm + 0x0Eu) & 0xFFFFu;
         snap[3] = (run << 24) | (nr & 0xFFFFu); }
@@ -182,18 +185,36 @@ void bb_kick(uint32_t tick)
         volatile uint32_t *src = (volatile uint32_t *)(s_bb_shm + 0x140u);
         for (uint32_t i = 0; i < 16u; i++) snap[36 + i] = src[i];
     }
-    s_bb_seq++;
-    {   /* 变化率统计: 与上一拍比 48 个通道值 (≈100 拍, 可忽略) */
-        uint32_t i, n = 0u;
+    /* ══════════ ★★★ 变化才记 (change-triggered logging) ══════════
+     * 与"上一条**已写出**记录"的 48 个值 + 控制字逐项比; 全同 ⇒ 这一拍不写。
+     *
+     * ★ 为什么这样是无损的: 每条记录都是**一个完整的 256B 全量状态**且自带 tick
+     *   ⇒ 两条记录之间的所有拍, 其值**必然与前者完全相同** ⇒ PC 端按 tick 就能
+     *   逐拍精确复原。省掉的只是"重复", 不是"数据"。
+     * ★ 为什么不做变长记录: 保持固定的 256B 槽 ⇒ 环/块结构/PC 解析全不用改,
+     *   风险最小, 而收益(缓冲时间)已经拿到。
+     * ★ 优雅退化: 若程序真每拍都变, 就退化成"逐拍全量" = 原行为, 不会更差。
+     * 实测 (2026-09-12): 变化率 7.49% ⇒ 记录率 ~750/s ⇒ 960 槽缓冲
+     *   从 96ms 提升到约 1.28 秒; 带宽 2.56MB/s -> 192KB/s。 */
+    {   uint32_t i, chg = 0u;
         for (i = 0; i < 48u; i++) {
-            uint32_t v = snap[4 + i];
-            if (v != s_prev[i]) { n++; s_prev[i] = v; }
+            if (snap[4 + i] != s_prev[i]) { chg = 1u; break; }
         }
-        if (n != 0u) { s_chg_ticks++; s_chg_vals += n; }
-        BB_DIAG[33] = s_chg_ticks;
-        BB_DIAG[34] = s_chg_vals;
-        BB_DIAG[35] = s_bb_kicks;
+        if (chg == 0u && snap[3] == s_prev_ctrl && s_bb_have_prev != 0u) {
+            s_bb_skipped++;
+            BB_DIAG[34] = s_bb_skipped;
+            BB_DIAG[35] = s_bb_kicks;
+            return;                              /* 不写, 也不占环槽 */
+        }
+        for (i = 0; i < 48u; i++) s_prev[i] = snap[4 + i];
+        s_prev_ctrl = snap[3];
+        s_bb_have_prev = 1u;
     }
+    snap[2] = s_bb_seq++;
+    s_bb_records++;
+    BB_DIAG[33] = s_bb_records;                  /* 写出的记录数 */
+    BB_DIAG[34] = s_bb_skipped;                  /* 跳过的拍数 */
+    BB_DIAG[35] = s_bb_kicks;                    /* 总拍数 */
 
     /* ② ★★ 快照搬运 = **CPU 字拷贝** (默认)。
      *
@@ -273,7 +294,7 @@ void bb_kick(uint32_t tick)
 }
 
 uint32_t bb_write_idx(void) { return s_bb_widx; }
-uint32_t bb_slots_produced(void) { return s_bb_kicks; }
+uint32_t bb_slots_produced(void) { return s_bb_records; }   /* ★ 环里是真的记录数 */
 
 uint32_t bb_tick_last(void)
 {

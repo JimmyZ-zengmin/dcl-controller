@@ -9,6 +9,13 @@
     [0] magic "DLBK"   [1] tick   [2] seq   [3] ctrl
     [4..19] SENSOR[0..15]  [20..35] WIRE[0..15]  [36..51] ACTUATOR[0..15]
 
+★★ 记法是"**变化才记**"(2026-09-12): 每拍都算, 但**只有内容变了才写一条**。
+   ⇒ 每条记录仍是一个**完整全量状态**且自带 tick;
+     两条记录之间的所有拍, 其值**必然与前者相同**。
+   ⇒ **tick 会出现跳变, 这是设计如此, 不是丢数据**:
+     tick=1000 的下一条可能是 tick=1007 —— 说明 1000~1006 拍值未变。
+   ⇒ 这样数据量降到约 1/13, 落盘缓冲从 96ms 提升到秒级, 丢包归零。
+
 为什么必须按**物理盘**直读: 这是专用裸介质, 没有文件系统。
 本脚本用 ctypes 设备句柄, **不需要管理员权限**。
 
@@ -135,7 +142,13 @@ def main():
     print("  有效记录 %d 条   seq %d..%d   tick %d..%d" %
           (len(recs), recs[0][2], recs[-1][2], recs[0][1], recs[-1][1]))
     gaps = sum(1 for i in range(1, len(recs)) if recs[i][2] != recs[i - 1][2] + 1)
-    print("  seq 不连续处 = %d  (回卷边界或丢包会体现为跳变)" % gaps)
+    print("  seq 不连续处 = %d  (回卷边界或丢包会体现为跳变; 变化才记不造成跳变)" % gaps)
+    inc = sum(1 for i in range(1, len(recs)) if recs[i][1] == recs[i - 1][1] + 1)
+    print("  tick 连号比例 = %d/%d = %.1f%%  (变化才记 ⇒ 低是正常的; 跳变处值保持不变)"
+          % (inc, len(recs) - 1, 100.0 * inc / max(1, len(recs) - 1)))
+    if len(recs) > 1:
+        print("  平均每条记录覆盖 %.2f 拍 (省掉的都是重复)"
+              % ((recs[-1][1] - recs[0][1]) / (len(recs) - 1)))
 
     print("\n=== 最后 3 条 (带 tick 标注) ===")
     for w in recs[-3:]:
