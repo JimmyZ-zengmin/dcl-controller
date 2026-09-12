@@ -174,7 +174,8 @@ volatile uint32_t g_sd_blocks = 0;
  *   好处: 换 CLKDIV / 开关 High Speed 不需要重新编译烧录 (项目"非侵入式交互"纪律)。
  *   [0] 数据期 CLKDIV (0 / 未写 ⇒ 用默认 SD_DATA_CLKDIV)
  *   [1] =1 ⇒ 识别后发 CMD6 把卡切到 High Speed (50MHz 前必须; 25MHz 不需要)
- *   [2] =1 ⇒ 只跑性能测试 (sd_dump_blackbox 里写满 + 回读, 由调用方计时)
+ *   [2] =1 ⇒ **只测写** (跳过回读校验) —— 测吞吐时必须置, 否则 256 次单块读
+ *            会把耗时算进去, 量出来的不是写速度(判据必须只反映被测对象)
  *   读完清零 ⇒ 不会悄悄改变下次上电的行为。 */
 #define SD_CFG      ((volatile uint32_t *)0x24002000u)
 #define SD_DATA_CLKDIV_DEF  2u      /* 100MHz/(2*2) = 25MHz */
@@ -653,6 +654,15 @@ void sd_dump_blackbox(void)
         SD_DIAG[14] = i + SD_BURST_BLKS;
     }
     SD_DIAG[3] = g_sd_blocks;
+
+    /* ★ 性能模式: 只测写 (跳过回读校验)。测吞吐必须走这支 ——
+     *   否则 256 次单块读的耗时会混进来, 量出来的不是写速度。 */
+    if (SD_CFG[2] != 0u) {
+        SD_CFG[2] = 0u;
+        SD_DIAG[26] = 0u;
+        SD_DIAG[20] = (SD_DIAG[14] == 256u) ? 0x600D : 0x600E;
+        return;
+    }
 
     /* ② 回读逐字比对 (对端证据; 低 16 位 = 不符块数, bit16 = 中途读失败) */
     SD_DIAG[26] = sd_verify(src, scratch, base_lba);
