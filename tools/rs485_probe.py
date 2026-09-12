@@ -133,6 +133,40 @@ def pyocd_counters():
         return None
 
 
+def board_tx_burst(proto_port, link_port, seconds):
+    """让板子**连续从 PA2 真发应答**, 同时监听 485 口。
+
+    用途: 数据流起来时才能看 LED —— dongle 的 RX 灯闪 ⇒ 板子的数据真的过总线到了 PC。
+      · 002 直接看灯: 让用户盯着 USB-485 的 TX/RX 灯与 485 模块的灯。
+      · 同时统计 485 口收到的字节数 (若真到了, 会收到 N 条 Modbus 应答)。
+    """
+    proto = serial.Serial(proto_port, 115200, timeout=0.3)
+    link = serial.Serial(link_port, 115200, timeout=0.3)
+    mb = mb_frame(1, [0x03, 0x9C, 0x41, 0x00, 0x01])
+    print("① 切 隧道RX + 物理TX: %s" % xfer(proto, dcl_frame(0x62, bytes([1, 1]))).hex(" "))
+    print("② 连发 %d 秒 —— ★ 现在盯着 USB-485 的 LED 与 485 模块的 LED" % seconds)
+    t0 = time.time()
+    n = 0
+    got = bytearray()
+    while time.time() - t0 < seconds:
+        xfer(proto, dcl_frame(0x60, mb), 0.05)        # 注入 → 板子从 PA2 发应答
+        n += 1
+        nwait = link.in_waiting
+        if nwait:
+            got += link.read(nwait)
+        time.sleep(0.30)
+    print("   注入了 %d 次; 485 口累计收到 %d 字节 %s"
+          % (n, len(got), got[:48].hex(" ") if got else "(无)"))
+    print("③ 恢复物理RX: %s" % xfer(proto, dcl_frame(0x62, bytes([0, 1]))).hex(" "))
+    link.close()
+    proto.close()
+    print("\n判读 (结合你看到的灯):")
+    print("  dongle RX 灯跟着闪 + 上面收到 01 03 02.. ⇒ **板子→模块→总线→PC 全通**")
+    print("  dongle TX 灯闪但 RX 灯不闪            ⇒ 发送出去了, 回不来 (A/B 极性/模块接收)")
+    print("  两个灯都不闪                          ⇒ dongle 侧就没动 (或灯不是数据灯)")
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     if serial is None:
@@ -144,6 +178,14 @@ def main():
     if not port:
         print(__doc__)
         return 2
+
+    if "--board-tx" in argv:
+        i = argv.index("--board-tx") + 1
+        secs = int(argv[i]) if (i < len(argv) and argv[i].isdigit()) else 20
+        if not proto:
+            print("[X] --board-tx 需要同时给 --proto COMxx (协议口, 用它驱动板子)")
+            return 2
+        return board_tx_burst(proto, port, secs)
 
     f_mb = mb_frame(1, [0x03, 0x9C, 0x41, 0x00, 0x01])        # 测 USART2 (PA2/PA3)
     f_dcl = dcl_frame(0x62, bytes([0x00, 0x01]))               # 测 USART1 (PA9/PA10), 幂等
