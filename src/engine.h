@@ -461,7 +461,13 @@ _Static_assert(sizeof(MacroCtrl_t) == 16, "MacroCtrl_t must be 16 bytes");
  * 位置: SHM 尾部空闲区, 与 WIRE/ACTUATOR 物理分离 (覆盖分析见 MEMORY-LAYOUT.md §4)。 */
 #define OFF_DO_SHADOW       0x6E08   /* u32: DO 打包位图 (MDMA 锁存源) */
 #define OFF_DO_SHADOW_SEQ   0x6E0C   /* u32: shadow 写序号 (诊断"电平对应哪一拍") */
-#define OFF_W5_OBS_END      0x6E10
+#define OFF_RTC_SSR         0x6E10   /* u32: RTC 亚秒计数器 (1024Hz, 分辨率 ~1ms) */
+#define OFF_RTC_TR          0x6E14   /* u32: RTC 时间寄存器 (BCD: 时分秒) */
+#define OFF_RTC_DR          0x6E18   /* u32: RTC 日期寄存器 (BCD: 年月日) */
+#define OFF_EVT_HEAD        0x6E1C   /* u32: 事件环形缓冲写指针 (单调递增) */
+#define OFF_EVT_BUF         0x6E20   /* 32 条 × 8B = 256B 事件环形缓冲 ([ssr, code] × 32) */
+#define OFF_EVT_END         0x6F20   /* 事件区结束 */
+#define OFF_W5_OBS_END      0x6F20
 _Static_assert(OFF_MACRO_END <= OFF_HIL_DUTY, "SHM: W5 观测区与 MACRO 区重叠");
 _Static_assert(OFF_HIL_FB_RAW + 4u <= SHM_SIZE, "SHM: W5 观测区越出 SHM 末尾");
 

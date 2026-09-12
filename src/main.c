@@ -58,6 +58,7 @@
 #include "di.h"
 #include "hil.h"
 #include "do.h"
+#include "rtc.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -2434,6 +2435,7 @@ int main(void)
      *   **第一次被真正清零** (之前它只有计数、没有动作 —— 定案②的欠账在此收清)。 */
     g_stage = 26; do_init(g_shm);
     do_latch_init();                    /* ★ P3-B: 影子 + MDMA 定时锁存链 (须在 do_init 后) */
+    rtc_init(g_shm);                     /* ★ RTC: LSE 32.768kHz 时基 + 事件时间戳 */
 #if HIL_SAFE
     eng_register_output_surface(do_outputs_safe);
 #endif
