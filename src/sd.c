@@ -712,9 +712,11 @@ static uint32_t sd_cfg_take_raw(uint32_t idx)
     return v;
 }
 
+/* ★ 用到的下标是 0..8 (含 blackbox.c 的 4/5/7 与 main 的 8), 上限必须留够 ——
+ *   第一版写 `idx > 3 → 0` 把 4/5/7/8 全挡死, 是"加了保护反而废掉功能"的典型。 */
 uint32_t sd_cfg_take(uint32_t idx)
 {
-    if (idx > 3u) return 0u;
+    if (idx > 14u) return 0u;
     return sd_cfg_take_raw(idx);
 }
 
