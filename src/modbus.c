@@ -437,7 +437,15 @@ void mb_config(uint8_t *base, uint8_t slave_addr, int use_uart)
     c->state = MB_ST_IDLE;
     c->crc_acc = 0xFFFF;
     c->src = use_uart ? 0 : 1;      /* RX: 0=USART2 FIFO, 1=隧道 (默认隧道: 零硬件可测) */
-    c->tx_uart = 0;                 /* TX: 默认留缓冲 (0x61 可读); 0x62 可切物理口 */
+    /* ★★ TX 默认改成**物理口** (2026-09-12)。
+     *   原默认 0 = "响应只留缓冲, 等 0x61 读回" —— 那是**零硬件隧道测试**的便利,
+     *   但一个真的 Modbus 从站必须在总线上应答, 出厂默认就该能直接对话。
+     *   ★ 改它**不破坏**原有测试: `mb_push_bytes()` 只决定"要不要**额外**推到 USART2",
+     *     TX 缓冲照样被填满 ⇒ 0x61 依旧读得到响应 (只是不再替 PC 清缓冲)。
+     *   ★ 为什么必须在**编译期**定而不是靠 0x62: 实测本机 CMSIS-DAP 每次 pyocd 会话
+     *     结束都会复位板子 ⇒ 运行期写 SHM 的配置活不到下一次会话 (上电 cold_start_reset
+     *     会 memset SHM)。0x62 仍可随时切回缓冲模式做隧道测试。 */
+    c->tx_uart = 1;
 
     uint8_t *rx = mb_rx(base), *tx = mb_tx(base);
     for (int i = 0; i < MB_MAX_FRAME; i++) { rx[i] = 0; tx[i] = 0; }
