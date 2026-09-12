@@ -245,8 +245,8 @@ def main():
 
     f_mb = mb_frame(1, [0x03, 0x9C, 0x41, 0x00, 0x01])        # 测 USART2 (PA2/PA3)
     f_dcl = dcl_frame(0x62, bytes([0x00, 0x01]))               # 测 USART1 (PA9/PA10), 幂等
-    print("Modbus 帧 = %s   (测 PA2/PA3)" % f_mb.hex(" "))
-    print("DCL 帧    = %s   (测 PA9/PA10, cmd=0x62 幂等)\n" % f_dcl.hex(" "))
+    print("Modbus 帧 = %s   (测 USART2/Modbus 通路; 引脚由 DCL_MB_UART_ALT 决定)" % f_mb.hex(" "))
+    print("DCL 帧    = %s   (测 USART1/协议口, cmd=0x62 幂等)\n" % f_dcl.hex(" "))
 
     # ★★ 必须先取**基线**: 固件里的 frames_rx/err_crc 是**自启动以来累计**的,
     #    直接看绝对值会把"之前隧道注入(0x60)留下的 1"当成"这次物理请求的成功证据"
@@ -311,7 +311,7 @@ def main():
         print("  ? 没有固件侧对账 ⇒ 只能看回显: %s" % ("有回显" if got_dcl else "无回显(疑似不通)"))
         print("     强烈建议加 --proto COMxx(=协议口) 做增量对账, 否则'没响应'说明不了任何事")
     elif got_dcl:
-        print("  C. DCL 帧被当场应答 ⇒ 你接的是 **PA9/PA10 (协议口)**, 要挪到 PA2/PA3")
+        print("  C. DCL 帧被当场应答 ⇒ 线接在 **协议口(USART1)** 上, 要挪到 Modbus 口(USART2)")
     elif d_frx:
         print("  B. 固件收到了 Modbus 帧 (Δframes_rx=%+d) ⇒ **链路正常**, 可直接跑 "
               "tools/mb_master_test.py" % d_frx)
