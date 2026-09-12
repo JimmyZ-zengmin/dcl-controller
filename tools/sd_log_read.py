@@ -24,6 +24,16 @@
     python sd_log_read.py --disk 2         # 指定物理盘
     python sd_log_read.py --blocks 4096    # 读最后 4096 块 (≈8192 条 = 0.8s)
     python sd_log_read.py --csv out.csv    # 导出 CSV (带 tick 列)
+    python sd_log_read.py --csvin old.csv  # 不碰卡, 直接核一个已导出的 CSV (跑判据/做对照)
+    python sd_log_read.py --verify         # 跑"变化才记"判据, 失败退出码 = 1
+
+★★ 判据设计 (为什么不能只看 tick 连号率):
+  "tick 连号率低" 在变化才记下**是设计如此**, 所以它**不可能失败** ——
+  一个不可能失败的判据等于没有判据。真正能失败的是下面这条:
+    [判据A] 相邻两条记录"48 通道值(按位比)"全同的对数必须 == 0
+            若 > 0 ⇒ 固件里"没变就不写"没生效 (或这是逐拍全量的旧数据)
+  对照 (证明判据A 真的能失败): 逐拍全量数据上这个数应 ≈ 92%
+     python sd_log_read.py --csvin <旧数据.csv> --verify   ==> 期望 FAIL (数千对)
 """
 import csv
 import ctypes
@@ -73,11 +83,80 @@ def looks_like_card(d):
         return False
 
 
+def _bits48(vals):
+    """把 48 个通道值打成位串 —— 与固件里 uint32 逐位比较**等价**。
+
+    为什么不用字符串/浮点比: 固件比的是 RAW 位 (snap[4+i] != s_prev[i])。
+    -0.0 与 +0.0 数值相等但位不同; NaN 更不用说。走位串才和固件同一把尺子。"""
+    return struct.pack("<48f", *vals)
+
+
+def load_csv_rows(path):
+    """从 sd_log_read.py --csv 导出的文件里恢复 (tick, seq, vals48)。"""
+    rows = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rd = csv.reader(f)
+        next(rd, None)                              # 表头
+        for r in rd:
+            if len(r) < 53:
+                continue
+            rows.append((int(r[0]), int(r[1]),
+                         tuple(float(x) for x in r[5:53])))
+    rows.sort(key=lambda x: x[1])
+    return rows
+
+
+def verify_rows(rows, label):
+    """跑"变化才记"判据。返回 True=全部通过。"""
+    print("\n=== 判据 ===")
+    if len(rows) < 3:
+        print("  [!] 记录太少 (%d), 无法判" % len(rows))
+        return False
+    bad = []
+
+    # [判据 0] tick 严格递增 (顺序/时间轴自洽)
+    noninc = sum(1 for a, b in zip(rows, rows[1:]) if b[0] <= a[0])
+    print("  [0] tick 严格递增          : 违反 %d 处 %s" % (noninc, "OK" if noninc == 0 else "FAIL"))
+    if noninc:
+        bad.append("tick 不严格递增")
+
+    # [判据 1] seq 连续 (无丢包; 回卷边界会表现为 1 处跳变)
+    gaps = sum(1 for a, b in zip(rows, rows[1:]) if b[1] != a[1] + 1)
+    print("  [1] seq 连续 (丢包/回卷)   : 跳变 %d 处 %s" % (gaps, "OK" if gaps <= 1 else "FAIL"))
+    if gaps > 1:
+        bad.append("seq 跳变 %d 处 (丢包或回卷)" % gaps)
+
+    # ★ [判据 2] 变化才记生效性 —— 这是唯一"能失败"的判据
+    same = sum(1 for a, b in zip(rows, rows[1:]) if _bits48(a[2]) == _bits48(b[2]))
+    ratio = 100.0 * same / (len(rows) - 1)
+    print("  [2] 相邻记录 48 通道全同   : %d/%d = %.2f%% %s"
+          % (same, len(rows) - 1, ratio, "OK" if same == 0 else "FAIL"))
+    if same:
+        bad.append("有 %d 对相邻记录内容完全相同 ⇒ 变化才记没生效" % same)
+
+    cov = (rows[-1][0] - rows[0][0]) / max(1, len(rows) - 1)
+    print("  [i] 平均每条覆盖 %.2f 拍 (压缩比 %.1fx)" % (cov, cov))
+    print("  [i] tick %d..%d  记录 %d 条  源: %s" % (rows[0][0], rows[-1][0], len(rows), label))
+
+    if bad:
+        print("  ==> 判定: FAIL  (%s)" % "; ".join(bad))
+        return False
+    print("  ==> 判定: PASS")
+    return True
+
+
 def main():
     argv = sys.argv[1:]
     disk_no = int(argv[argv.index("--disk") + 1]) if "--disk" in argv else None
     nblk = int(argv[argv.index("--blocks") + 1]) if "--blocks" in argv else 512
     csv_path = argv[argv.index("--csv") + 1] if "--csv" in argv else None
+    csv_in = argv[argv.index("--csvin") + 1] if "--csvin" in argv else None
+    do_verify = "--verify" in argv
+
+    if csv_in:
+        rows = load_csv_rows(csv_in)
+        print("=== 离线核对 CSV: %s  (%d 行) ===" % (csv_in, len(rows)))
+        return 0 if verify_rows(rows, csv_in) else 1
 
     print("=== 扫描物理盘找日志头 (magic DLOG @LBA0) ===")
     d = None
@@ -141,14 +220,9 @@ def main():
         return 1
     print("  有效记录 %d 条   seq %d..%d   tick %d..%d" %
           (len(recs), recs[0][2], recs[-1][2], recs[0][1], recs[-1][1]))
-    gaps = sum(1 for i in range(1, len(recs)) if recs[i][2] != recs[i - 1][2] + 1)
-    print("  seq 不连续处 = %d  (回卷边界或丢包会体现为跳变; 变化才记不造成跳变)" % gaps)
-    inc = sum(1 for i in range(1, len(recs)) if recs[i][1] == recs[i - 1][1] + 1)
-    print("  tick 连号比例 = %d/%d = %.1f%%  (变化才记 ⇒ 低是正常的; 跳变处值保持不变)"
-          % (inc, len(recs) - 1, 100.0 * inc / max(1, len(recs) - 1)))
-    if len(recs) > 1:
-        print("  平均每条记录覆盖 %.2f 拍 (省掉的都是重复)"
-              % ((recs[-1][1] - recs[0][1]) / (len(recs) - 1)))
+    rows = [(w[1], w[2], struct.unpack("<48f", struct.pack("<48I", *w[4:52])))
+            for w in recs]
+    ok = verify_rows(rows, "卡上最近 %d 块" % nblk) if do_verify else True
 
     print("\n=== 最后 3 条 (带 tick 标注) ===")
     for w in recs[-3:]:
@@ -174,7 +248,7 @@ def main():
                             + [f32(x) for x in w[20:36]]
                             + [f32(x) for x in w[36:52]])
         print("\n[+] CSV 已导出: %s (%d 行, 每行带 tick)" % (csv_path, len(recs)))
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
