@@ -249,6 +249,30 @@ OBS uint32_t g_opt_sr = 0;   /* FLASH_OPTSR_CUR (bit4=IWDG1_SW: 1=软件看门�
 #define BOOT_REC_W_DEFH      38u          /* [38] "进过 Default_Handler" 魔数 (由默认处理器锚点写) */
 #define BOOT_REC_W_DEFH_PC   39u          /* [39] 进默认处理器时**出错指令的 PC** ⇒ 直接指到元凶 */
 
+/* ★★ ISR 段检查点 (2026-09-13, 为"ISR 卡在哪一段"而加)
+ *   背景: LA 宽度探针已证明**擦 flash 时 ISR 卡死 210.6ms**, 但静态排查已排除 5 条假设
+ *   (直接调用/故障处理器/尾调用/读 rodata/运行期扫描选择) ⇒ 必须知道**卡在哪一段**。
+ *   ★ 为什么不用调试器现场抓 PC: pyocd 连接要数秒, 而窗口只有 ~210ms ⇒ 抓不到。
+ *   ⇒ 同一套"加可读面"的办法: ISR 每过一个段就把 `(段号<<28 | 拍号)` 写进 **AXI**
+ *     (不被启动清零 ⇒ 跨复位不丢) ⇒ 复位后读它 = **最后走完的段** ⇒ 卡点在它之后。
+ *   ★ 成本: 每段一次 store (APB/AXI 各走各的总线), 7 段/tick ≈ 7 个周期 / 40000 ⇒ 可忽略。 */
+#define BOOT_REC_W_CKPT      40u          /* [40] ISR 段检查点 (每拍覆盖, = 当前这轮) */
+#define BOOT_REC_W_CKPT_P    41u          /* [41] **上一轮**的检查点 (取证段在 ISR 启动前搬过来)
+                                           *   ★ 为什么必须有 prev: 检查点**每拍都写**, 复位后新一轮
+                                           *     会立刻覆盖 [40] ⇒ 直接读 [40] 读到的永远是"当前这轮",
+                                           *     对"上一轮卡在哪"毫无用处 (第一版就是这么被骗的)。 */
+/* ★★ 为什么放 BOOT_REC[40] 而**不是**另开一个 AXI 地址: 协议只允许读 **SHM** 区,
+ *   绝对地址区只有"启动记录"这条既有的读取通道 (BOOT_AXI 就是这么读的)。
+ *   第一版我另开了 0x24000600, 结果工具报"读被拒"—— 判据放错地方等于没有判据。 */
+/* ★ dsb 是必须的 (第一版漏了): 复位**不会冲刷 AXI 写缓冲**, 没有 dsb 时"最后一次 store"
+ *   可能根本没落到内存 ⇒ 读回来的检查点是**上一次能落地的值** ⇒ 仪器自己骗人
+ *   (症状: 明明 ISR 冻在入口, 读出来却是"上一拍走完了"). 诊断档加 dsb 可接受。 */
+#define ISR_CKPT(id)  do { \
+        *(volatile uint32_t *)(BOOT_REC_ADDR + BOOT_REC_W_CKPT * 4u) = \
+            (((uint32_t)(id) << 28) | (g_tick_count & 0x0FFFFFFFu)); \
+        __asm__ volatile("dsb 0xF" ::: "memory"); \
+    } while (0)
+
 /* ★★ 默认处理器锚点 (2026-09-13, 一次实测缺陷的产物) —— 见启动文件里 Default_Handler 的注释。
  *   目的: 把"**是谁跳进了 Default_Handler**"变成**跨复位可读**的证据。
  *   为什么必须有它: 本缺陷躲过两轮排查, 就是因为一次故障只表现为"板子重启了",
@@ -817,6 +841,8 @@ ISR_PLACE void TIM2_IRQHandler(void)
      *     "**最大高电平宽度**"(可量化): 正常 <10µs, 卡死 **≈200ms = DCL_WDT_MS**
      *     ⇒ 两个独立量互证, 一次判死。
      *   ★ 放在**第一句**: 探针要覆盖整个 ISR —— 若入口之后的取指就卡住, 也必须看得到。 */
+    ISR_CKPT(1);      /* ① 入口 —— ★ 放在 hb_set **之前**: 探针置高说明"已进入",
+                       *   但若连这一句都没写成, 就说明冻在**进入后的第一条总线访问**上。 */
     hb_set(HB_ISR_PIN);
 
     uint32_t t0 = DWT_CYCCNT;
@@ -1153,6 +1179,7 @@ ISR_PLACE void TIM2_IRQHandler(void)
          * ★ 确定性影响: STOP 态本就不做计时统计; RUN 态它仍在 t1 之前,
          *   所以 mb_tick 的开销**照常计入 isr_cyc_max** —— 对外可见, 不隐藏。
          *   (本项目铁律: 热路径成本必须可观测, 不能靠"放在计时之外"来装便宜。) */
+        ISR_CKPT(3);  /* ③ 时基检测/喂狗之后 */
         mb_tick(g_shm);
         g_mb_ticks++;
 
@@ -1188,8 +1215,11 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   修法: ld/STM32H723ZG_FLASH.ld 的 `.itcm_vectors` 对齐 128 → **256**。
          *   ★ 这条值得记住: **ARMv7-M 只要求 VTOR 128 对齐**, 所以 256 是**实测**出来的
          *     经验值, 不是 spec 要求 —— 换板子/换型号要重新验。 */
+        ISR_CKPT(4);  /* ④ mb_tick 之后 */
         hil_out_poll(g_shm, g_tick_count);
-        do_poll(g_shm, g_tick_count);        /* ★ P3-A: DO 输出面 ACTUATOR → GPIOE (BSRR 原子写) */
+        ISR_CKPT(5);  /* ⑤ **hil_out_poll 之后** (上一轮实测卡在 ④→⑤ 之间 ⇒ 细分) */
+        do_poll(g_shm, g_tick_count);
+        ISR_CKPT(6);  /* ⑥ do_poll 之后 */        /* ★ P3-A: DO 输出面 ACTUATOR → GPIOE (BSRR 原子写) */
 #endif
 
         uint32_t t1 = DWT_CYCCNT;
@@ -1263,6 +1293,7 @@ ISR_PLACE void TIM2_IRQHandler(void)
      *   本 ISR 无提前 return (已核) ⇒ 这一个出口就够; 若将来加了提前 return,
      *   必须同时补 hb_clr(), 否则探针会**永久拉高**、把判据变成恒真的假报警。
      *   ★ 这也让 `g_hb_isr_tog` 成为"**完成次数**": ISR 卡住时它停止增长。 */
+    ISR_CKPT(7);      /* ⑦ 出口 (走完 ⇒ 说明本拍完整) */
     hb_clr(HB_ISR_PIN);
     g_hb_isr_tog++;
 }
@@ -2779,6 +2810,10 @@ int main(void)
      * ★ AXI(NOLOAD) 上电=随机 ⇒ 用 [1]"RCLK" 首次标记 + [29] 校验和把"上电垃圾"与
      *   "真现场"分开。0x24000500 起 32 字。 */
     {   volatile uint32_t *rc = (volatile uint32_t *)BOOT_REC_ADDR;
+
+        /* ★ 先把上一轮的 ISR 段检查点搬到 [41] —— 必须在**拍 ISR 开始覆盖 [40] 之前**做。
+         *   本段在启动早期执行, 而拍 ISR 从阶段 ⑤ 才开跑, 所以这里来得及。 */
+        rc[BOOT_REC_W_CKPT_P] = rc[BOOT_REC_W_CKPT];
         const FaultLedger_t *lg = fault_ledger_r(g_shm);   /* 此刻 SHM 还没被清 */
         /* ★★ "上一轮卡在哪一步"的正确来源 (2026-09-13 修正 —— 此前它是个**空字段**):
          *   旧写法读 `g_stage` 并论证"DTCM 跨复位不丢" —— 论证**漏了一环**:

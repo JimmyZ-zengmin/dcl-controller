@@ -94,7 +94,7 @@ FIELD_MAPS = {
         ("first", 7), ("last", 11), ("cats[0..15]", 12), ("prev_mark", 28),
         ("checksum", 29), ("live_stage", 30), ("live_tick", 31),
         ("hang_this", 32), ("hang_prev", 33),
-        ("looprst_this", 34), ("gapmax_this", 35),
+        ("looprst_this", 34), ("gapmax_this", 35), ("isr_ckpt", 40), ("isr_ckpt_prev", 41),
         ("looprst_prev", 36), ("gapmax_prev", 37),
     ],
 }
@@ -132,7 +132,7 @@ def layout_check(name, words):
 
 
 # 本工具**期望**的区内字数 (与上面 FIELD_MAPS 配套; 固件增删字段时这里必须同步)
-EXPECT_WORDS = {"FAULTLOG": 35, "WDT_STAT": 48, "BOOT_AXI": 40, "PERSIST_STAT": 8}
+EXPECT_WORDS = {"FAULTLOG": 35, "WDT_STAT": 48, "BOOT_AXI": 44, "PERSIST_STAT": 8}
 
 
 def crc_ccitt(d):
@@ -378,6 +378,20 @@ def verdict(name, e, w):
                 out.append("挂死归因: 上一轮**没有**走到设计的挂死点 (AXI[33]=0)"
                            + ("; 但本轮标记 [32]='HANG' ⇒ 此刻正处在挂死点"
                               if (len(w) > 32 and w[32] == 0x474E4148) else ""))
+        if len(w) > 41 and w[41]:
+            cid = (w[41] >> 28) & 0xF; tk = w[41] & 0x0FFFFFFF
+            mp = {1: "①入口", 3: "③时基/喂狗后", 4: "④mb_tick 后",
+                  5: "⑤hil_out_poll 后", 6: "⑥do_poll 后", 7: "⑦出口(整拍走完)"}
+            out.append("★★ **上一轮** ISR 最后走完 = **%s** (拍号=%d) ⇒ 卡点必在它之后"
+                       % (mp.get(cid, "id=%d ?" % cid), tk))
+        if len(w) > 40 and w[40]:
+            cid = (w[40] >> 28) & 0xF; tk = w[40] & 0x0FFFFFFF
+            mp = {1: "①入口", 3: "③时基/喂狗后", 4: "④mb_tick 后",
+                  5: "⑤hil_out_poll 后", 6: "⑥do_poll 后", 7: "⑦出口(整拍走完)"}
+            out.append("★ ISR 段检查点: 最后走完 = **%s** (拍号=%d) ⇒ 卡点在它之后"
+                       % (mp.get(cid, "id=%d ?" % cid), tk))
+            if cid != 7:
+                out.append("    ★ 即:**上一拍 ISR 没走完**就被卡住 (这不是'偶发超时', 是真卡死)")
         if len(w) > 37:
             # ★ 停滞自愈的归因面 (审计 P1①): 软复位会清 .bss, 没有这两个"上一轮"值就只剩
             #   "又启动了一次"。能回答"为什么复位 / 复位过几次 / 死前卡了多久"。

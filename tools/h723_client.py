@@ -98,11 +98,10 @@ def find_board():
     cands = [p.device for p in list_ports.comports()]
     for dev in cands:
         try:
-            d = Dcl(dev, wait=0.05, timeout=0.3)
-            if engine_status(d) is not None:
-                d.close()
+            # ★ 用 link_alive (它自带重试与合适的等待) —— 第一版用 `Dcl(dev, wait=0.05)`
+            #   自己探, 等待太短 ⇒ **板子明明在也应答, 却判"找不到板子"** ✗
+            if link_alive(dev, tries=2):
                 return dev
-            d.close()
         except Exception:
             pass
     raise RuntimeError("自动找板子失败 (试过 %s)" % cands)

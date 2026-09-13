@@ -70,6 +70,10 @@ set(DCL_WDT_PR "4" CACHE STRING "IWDG 预分频档 0..7")
 #     0 (对照): 只记录 FAULT_LOOP_STALL, 不复位 ⇒ 用来证明"不会自愈"那一半。
 #   ★ 阈值/窗口的定义与实测依据见 main.c 的"主循环活性"段 (阈值不许拍)。
 set(DCL_LOOP_RESET "1" CACHE STRING "主循环失活自愈 (1 交付 / 0 只记录不复位)")
+#   DCL_PERSIST_SAVE: 掉电保持"保存" (2026-09-13 **已降级为默认 0**)。
+#     为什么默认 0: 擦/写内部 flash 与 200ms 看门狗不共存 ⇒ "保存"= 重启机器。
+#     置 1 只用于**诊断/将来修复后的回归** (见 docs/audit/H723-PERSIST-WDT-DEFECT.md)。
+set(DCL_PERSIST_SAVE "0" CACHE STRING "掉电保持保存 (0=已降级不可用 / 1=打开, 需先修 ISR 卡死)")
 
 if(DCL_MIN_UART)
     set(TARGET min_uart)
@@ -162,6 +166,7 @@ add_compile_options(
     -DWDT_START_FIRST=${DCL_WDT_START_FIRST}
     -DWDT_PR_VALUE=${DCL_WDT_PR}u
     -DDCL_LOOP_RESET=${DCL_LOOP_RESET}
+    -DDCL_PERSIST_SAVE=${DCL_PERSIST_SAVE}
     -DBOOT_BANNER=${DCL_BOOT_BANNER}
     -DBANNER_PERIOD_MS=${DCL_BANNER_PERIOD}
     -DUART_SELFTEST=${DCL_UART_SELFTEST}
