@@ -11,6 +11,13 @@
 
 ---
 
+### [**从这里开始 →**](docs/GETTING-STARTED.md)
+
+> 源码与构建产物在哪 · 工具链（gcc / cmake / ninja / pyocd）· **4 条命令烧录** ·
+> 跑通第一个程序 · **每条结论用哪个脚本自己复现** · 硬件原理图与引脚表 · 7 个必读的坑
+
+---
+
 ## 它解决什么问题（以及为什么不是又做一个 PLC）
 
 工业场景里拿到"确定性"，主流有两条路：
@@ -287,6 +294,9 @@ tools/      h723_proto.py（★协议层 PC 侧 6 用例，含异常路径）
             h723_persist_win.py（★ 落盘窗口验收, 协议侧免调试器）
   legacy/   clock_probe.sh / ws_scan.sh（早期 SWD 探测，已被证伪，留档）
 docs/       迁移方案 + 时钟依据 + 频率天花板 + 阶段1/2报告
+            + GETTING-STARTED.md（★ 用户入口：源码/构建/烧录/复现实验）
+            + hw/（★ 板级原理图）+ HARDWARE-PINOUT.md（引脚速查）
+            + PLAN-P2-hardware.md（阶段 2 硬件选型）
             + STAGE3-REPORT.md（档桶分档）+ STAGE3-1-REPORT.md（★协议层）
             + STAGE3-2-REPORT.md（★deploy 路径）+ AUDIT-H723-stage2.md（审计报告）
             + REF-flash-placement.md（落位机制）+ 硬件接线
