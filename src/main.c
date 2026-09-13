@@ -282,13 +282,32 @@ OBS uint32_t g_opt_sr = 0;   /* FLASH_OPTSR_CUR (bit4=IWDG1_SW: 1=软件看门�
  *   ★ 为什么用 GPIO 而不往 UART 插字节: 主循环正在组帧/发帧时 ISR 插字节会**劈开
  *     响应帧** (对端解析器错位) —— 那是拿"可观测"换"通信正确性"。GPIO 完全不碰数据流,
  *     且天然符合铁律 0 (观测不改变被测对象); 想看波形接 LA 即可 (`saleae-la-verify`)。
- *   ★ 脚位: PE0 = ISR 心跳 / PE1 = 主循环心跳 (GPIOE 全空闲, 见 engine.h 定案)。
- *     若你的排针上取不到 PE0/PE1, **只改下面两个宏**即可 (其余代码与脚位无关)。
- *   ★ 分频 500 拍 = 50ms 翻转 ⇒ 10Hz 方波 (LA 低采样率也看得清; 接 LED 是 5Hz 闪)。 */
-#define HB_GPIO_PORT          4u        /* GPIO_BASE(4) = GPIOE */
-#define HB_ISR_PIN            0u        /* PE0 */
-#define HB_LOOP_PIN           1u        /* PE1 */
-#define HB_DIV_TICKS          500u
+ *   ★ 脚位: **PB0 = ISR 心跳 / PB1 = 主循环心跳**。
+ *     ★★ 为什么**不能**用 PE0/PE1 (2026-09-13 纠正, 我第一版就选错了):
+ *       `do.h` 定案 **GPIOE 整个端口 = DO 数字量输出面** (`DO_GPIO_PORT 4`):
+ *       `do_init()` 把 **PE0..15 全部**配成推挽输出, 而 `do_poll()` **在 ISR 里每拍**
+ *       把 `ACTUATOR[0..15]` 写到 GPIOE(BSRR 原子写) ⇒ 心跳要么被每拍覆盖, 要么反过来
+ *       翻转 DO 通道 0/1。而 `docs/CORE-ENGINE.md` 早写了"macro **不许**碰 PE"。
+ *       ★ 更阴的是: **"心跳计数在涨"这条软件侧验证照样通过** —— 又一个"看起来在工作"。
+ *       ⇒ 所以下面加了**编译期防撞断言**, 让"选到已占用端口"这件事**编译不过**。
+ *     ★ 端口占用总表 (选脚前必须对照; 已按源码逐条核过):
+ *       PA(0): AI=PA0/PA1/PA4, HIL 反馈=PA5, HIL PWM=PA6, 协议口=PA9/PA10, PA13/14=SWD
+ *       PB(1): **无组件占用** ← 心跳放这里
+ *       PC(2): DI=PC0..3, SDMMC1=PC8..12
+ *       PD(3): 485 口=PD5/PD6 (line_probe 也在 PD6), SDMMC1=PD2
+ *       PE(4): **DO 输出面 16 路** (见上)
+ *     若你的排针上取不到 PB0/PB1, **只改下面两个宏**即可 (其余代码与脚位无关),
+ *     但**必须先查上面这张表**(防撞断言只挡 DO 那一个已知冲突)。 */
+#define HB_GPIO_PORT          1u        /* GPIO_BASE(1) = GPIOB (软件侧唯一无占用的端口) */
+#define HB_ISR_PIN            0u        /* PB0 */
+#define HB_LOOP_PIN           1u        /* PB1 */
+#define HB_DIV_TICKS          500u       /* 500 拍 = 50ms 翻转 ⇒ 10Hz 方波 (LA 低采样率也看清) */
+
+/* ★★ 编译期防撞: 心跳端口**不得**落在 DO 输出面上。
+ *   这一条是把我自己踩的坑 (选了 PE0/PE1) 变成**机制** —— 选错就编译不过,
+ *   而不是等到"脚上没波形"才发现 (那时软件计数还是好好的)。 */
+_Static_assert(HB_GPIO_PORT != DO_GPIO_PORT,
+               "heartbeat port collides with the DO output plane (GPIOE)");
 
 /* ── 主循环活性 / 阻塞窗口 / 心跳 的状态 ── */
 OBS uint32_t g_block_until    = 0;   /* 已知阻塞窗口的截止 tick (0 或已过期 = 无窗口) */
@@ -344,12 +363,12 @@ static inline __attribute__((always_inline)) void hb_toggle(uint32_t pin)
     else                                      GPIO_BSRR(HB_GPIO_PORT) = (1u << pin);
 }
 
-/** 心跳脚初始化: PE0/PE1 设为推挽输出、高速率不需要 (低速即可, 减少噪声)。
+/** 心跳脚初始化: PB0/PB1 设为推挽输出 (低速足够, 少一点边沿噪声)。
  *  ★ 必须在拍中断开始**之前**调用 —— 否则前几次 hb_toggle() 写的是还没配成输出的寄存器
  *    (结果不是错, 是"没效果", 属静默失败族)。 */
 static void hb_pins_init(void)
 {
-    RCC_AHB4ENR |= RCC_AHB4ENR_GPIOEEN;
+    RCC_AHB4ENR |= RCC_AHB4ENR_GPIOBEN;      /* 权威: stm32h723xx.h GPIOBEN_Pos = 1 */
     __asm__ volatile("dsb" ::: "memory");
     /* MODER: 每脚 2 位, 01 = 通用输出 ⇒ 先清两位再置低位 */
     GPIO_MODER(HB_GPIO_PORT) &= ~((3u << (HB_ISR_PIN * 2u)) | (3u << (HB_LOOP_PIN * 2u)));
@@ -3323,6 +3342,14 @@ int main(void)
         /* ★ [39] 主循环是否**已进入** —— 让外部能区分"还停在启动段"与"主循环死了"
          *   (这两件事的处置完全不同: 前者是正常的 ~33s 启动, 后者要自愈)。 */
         SHM_U32(g_shm, OFF_WDT_STAT + 156u) = g_loop_entered;           /* [39] */
+        /* ★ 心跳的"自证"面 (2026-09-13, 纠正 PE0/PE1 那次的直接产物):
+         *   [40] 当前 ODR 快照 —— 两次读值不同就说明**寄存器真的在翻** (LA 之外的第一道证据);
+         *   [41..43] **固件自报**端口/两脚编号 —— 工具不许写死脚位 (否则换脚即假报, 同
+         *            PR=4/RLR=99 那类教训); 人也能据此直接把 LA 夹到对的两脚上。 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 160u) = GPIO_ODR(HB_GPIO_PORT);   /* [40] */
+        SHM_U32(g_shm, OFF_WDT_STAT + 164u) = HB_GPIO_PORT;             /* [41] */
+        SHM_U32(g_shm, OFF_WDT_STAT + 168u) = HB_ISR_PIN;               /* [42] */
+        SHM_U32(g_shm, OFF_WDT_STAT + 172u) = HB_LOOP_PIN;              /* [43] */
 
         /* ★★ AXI 活体镜像 (2026-09-13) —— 把当前 stage / 拍号写进复位取证记录 [30]/[31]。
          *   为什么必须"活着写": `g_stage`/`g_tick_count` 住在 .bss, 而**启动代码的清零

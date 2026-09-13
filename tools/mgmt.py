@@ -81,6 +81,7 @@ FIELD_MAPS = {
         ("loop_reset_cnt", 31), ("loop_reset_en", 32), ("stall_ticks", 33),
         ("block_active", 34), ("hb_isr_tog", 35), ("hb_loop_tog", 36),
         ("gap_max_undecl", 37), ("gap_decl", 38), ("loop_entered", 39),
+        ("hb_odr", 40), ("hb_port", 41), ("hb_isr_pin", 42), ("hb_loop_pin", 43),
     ],
     "BOOT_AXI": [
         ("boot_count", 0), ("rclk", 1), ("rsr", 2), ("bdcr", 3),
@@ -126,7 +127,7 @@ def layout_check(name, words):
 
 
 # 本工具**期望**的区内字数 (与上面 FIELD_MAPS 配套; 固件增删字段时这里必须同步)
-EXPECT_WORDS = {"FAULTLOG": 35, "WDT_STAT": 40, "BOOT_AXI": 40}
+EXPECT_WORDS = {"FAULTLOG": 35, "WDT_STAT": 44, "BOOT_AXI": 40}
 
 
 def crc_ccitt(d):
@@ -494,6 +495,15 @@ def verdict(name, e, w):
             if len(w) > 39:
                 out.append("  主循环已进入=%d %s" % (w[39],
                            "(0 ⇒ **还停在启动段**(~33s), 此时不判停滞)" if not w[39] else ""))
+            if len(w) > 43:
+                # ★ 心跳自证: 固件自报脚位 (工具不写死) + 当前 ODR 快照。
+                #   两次读 ODR 值不同 ⇒ 寄存器真的在翻 (LA 之外的第一道证据);
+                #   若两脚被别的组件占用 (我第一版把心跳放到 DO 的 PE0/PE1)，这里会**纹丝不动**。
+                pc = "ABCDEFGHIJK"
+                out.append("  心跳脚: P%s%d(ISR) / P%s%d(主循环) / 当前 ODR=0x%X "
+                           "(两次读应不同 ⇒ 寄存器在翻)"
+                           % (pc[w[41]] if w[41] < 11 else "?", w[42],
+                              pc[w[41]] if w[41] < 11 else "?", w[43], w[40]))
             # ★★ 阈值余量判据必须用 **[37] 未声明段的最大间隔** —— 用 [29] 会把"合法声明过的
             #   长阻塞 (persist ~1.55s)"算进来, 于是在**每次正常刷盘时误报**。
             #   (两个语义不同的量必须分开: 声明过的阻塞是已知合法的, 未声明才可疑。)

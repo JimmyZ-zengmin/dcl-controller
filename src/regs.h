@@ -29,10 +29,12 @@
 #define RCC_PLL1DIVR    REG32(RCC_BASE + 0x030)   /* DIVN1[8:0] DIVP1[15:9] DIVQ1[22:16] DIVR1[29:23] */
 #define RCC_AHB4ENR     REG32(RCC_BASE + 0x0E0)
 /* ★ AHB4 上的 GPIO 时钟使能位 (权威: ST stm32h723xx.h `RCC_AHB4ENR_GPIOxEN_Pos` ——
- *   实测抄得: GPIODEN=3, **GPIOEEN=4**, GPIOFEN=5)。基址侧也核对过:
- *   `GPIOE_BASE = D3_AHB1PERIPH_BASE + 0x1000` = 0x58021000, 与本文件 `GPIO_BASE(4)` 一致。
- *   ★ 为什么新增 GPIOE: 它**全空闲** (engine.h 已定案), 拿来做"ISR 活 / 主循环活"
- *     双心跳 —— PLC 级要求"主循环死了"这件事得能从外部**实时**看见。 */
+ *   实测抄得: GPIOBEN=1, GPIOCEN=2, GPIODEN=3, GPIOEEN=4, GPIOFEN=5)。基址侧也核对过:
+ *   `GPIOE_BASE = D3_AHB1PERIPH_BASE + 0x1000` = 0x58021000 ↔ 本文件 `GPIO_BASE(4)`
+ *   (GPIOB 同理: +0x0400 = 0x58020400 ↔ GPIO_BASE(1))。 */
+#define RCC_AHB4ENR_GPIOBEN (1u << 1)
+/* ★ 注意 GPIOE 属 **DO 输出面** (do.h 定案: PE0..15 全归 do_init/do_poll) ——
+ *   任何诊断用的脚都**不许**放这个端口 (见 main.c 的编译期防撞断言)。 */
 #define RCC_AHB4ENR_GPIOEEN (1u << 4)
 #define RCC_APB1LENR    REG32(RCC_BASE + 0x0E8)
 #define RCC_APB4ENR     REG32(RCC_BASE + 0x0F4)
