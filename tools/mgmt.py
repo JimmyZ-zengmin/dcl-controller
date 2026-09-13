@@ -54,6 +54,80 @@ FAULT_NAMES = {
 FAULT_EXTERNAL = {14: "DWT 时基被外部停掉 (调试器会话) ⇒ DWT 计时统计不可用; 复位即恢复"}
 MB_ST = {0: "IDLE", 1: "RX", 2: "EXEC", 3: "BUILD", 4: "TX"}
 
+# ═══════════════ ★★ 字段布局对账 (2026-09-13, 回应审计 P2③) ═══════════════
+#  问题: 一个区的**字段语义**有两份副本 —— manifest.h 的注释 + 本文件的按偏移解析。
+#    今天真的踩到了一次: FAULTLOG 加 `f_first_valid` 之后, **其后所有字偏移 +1**,
+#    而工具一句也不会响 (它会安静地读错位)。这类错误没有任何判据能抓。
+#  做法 (三层, 由廉价到贵, 现在做了前两层):
+#    ① **列在这里的声明式字段表** —— 偏移必须递增、必须在区内、条数必须与区内字数相符;
+#      这条自洽校验能抓住"我改了 parser 却忘了改表"(反之亦然), 且**不需要固件配合**。
+#    ② 目录自报的 `words` 与本表的**最高偏移+1 必须一致** ⇒ 固件增删字段时这里会响。
+#    ③ (待做) 固件自报"字段数 + 字段表 FNV", 工具独立重算比对 —— 那样连**改名/原位换义**
+#      也能抓到; 现在 ①② 覆盖的是"增删/挪位"这一类 (也正是实际会高频发生的那类)。
+FIELD_MAPS = {
+    "FAULTLOG": [
+        ("magic", 0), ("total", 1), ("first_valid", 2),
+        ("cats[0..23]", 3), ("first", 27), ("last", 31),
+    ],
+    "WDT_STAT": [
+        ("armed", 0), ("wdt_ms", 1), ("loop_hb", 2), ("hang_isr", 3),
+        ("stall_cnt", 4), ("feed_cnt", 5), ("stall_thr", 6), ("stage", 7),
+        ("rc", 8), ("csr", 9), ("pr", 10), ("rlr", 11), ("sr", 12), ("opt_sr", 13),
+        ("sr0", 14), ("pr0", 15), ("rlr0", 16), ("sr1", 17), ("sr2", 18),
+        ("sr_start", 19), ("wait_cyc", 20), ("kr_busy_snap", 21), ("kr_blocked", 22),
+        ("sync_ok", 23), ("want_pr", 24), ("want_rlr", 25),
+        ("timebase_dead", 26), ("timebase_dead_ticks", 27),
+        ("block_win_max", 28), ("loop_gap_max", 29), ("loop_gap_at", 30),
+        ("loop_reset_cnt", 31), ("loop_reset_en", 32), ("stall_ticks", 33),
+        ("block_active", 34), ("hb_isr_tog", 35), ("hb_loop_tog", 36),
+        ("gap_max_undecl", 37), ("gap_decl", 38), ("loop_entered", 39),
+    ],
+    "BOOT_AXI": [
+        ("boot_count", 0), ("rclk", 1), ("rsr", 2), ("bdcr", 3),
+        ("prev_stage", 4), ("prev_tick", 5), ("prev_flt_total", 6),
+        ("first", 7), ("last", 11), ("cats[0..15]", 12), ("prev_mark", 28),
+        ("checksum", 29), ("live_stage", 30), ("live_tick", 31),
+        ("hang_this", 32), ("hang_prev", 33),
+        ("looprst_this", 34), ("gapmax_this", 35),
+        ("looprst_prev", 36), ("gapmax_prev", 37),
+    ],
+}
+
+
+def layout_check(name, words):
+    """字段布局对账 (返回 (是否一致, 说明列表))。
+    ★ 三层各管一件事:
+      ① 本表**自洽** (偏移递增) —— 挡"改了 parser 忘了改表"。
+      ② 下表 `EXPECT_WORDS` = 本工具**期望**的区内字数 —— 挡"固件增删字段"(最常发生的一类;
+         今天 FAULTLOG 加 `f_first_valid` 就是它, 当时工具会安静读错位)。
+      ③ 最高偏移必须落在区内 —— 挡"表比区还大"。
+    ★ 为什么这三层都不需要固件配合: 它们只问"工具自己自不自洽 + 与目录自报能不能对上"。
+      固件那一侧的对应保险是 `_Static_assert(sizeof(struct) == N)`。"""
+    m = FIELD_MAPS.get(name)
+    if not m:
+        return True, []
+    out, bad = [], False
+    prev = -1
+    for fn, off in m:
+        if off <= prev:
+            out.append("  ★ 布局表非递增: %s@%d 在 %d 之后" % (fn, off, prev)); bad = True
+        prev = off
+    top = max(o for _, o in m)
+    if words is not None:
+        want = EXPECT_WORDS.get(name)
+        if want is not None and words != want:
+            out.append("  ★★ 布局漂移: 目录自报 %d 字, 本工具按 %d 字解析 ⇒ "
+                       "固件增删过字段而工具没跟上 (拒绝解析, 请同步两侧)"
+                       % (words, want))
+            bad = True
+        if top > words - 1:
+            out.append("  ★ 布局表越界: 最高字段偏移 %d ≥ 区内字数 %d" % (top, words)); bad = True
+    return (not bad), out
+
+
+# 本工具**期望**的区内字数 (与上面 FIELD_MAPS 配套; 固件增删字段时这里必须同步)
+EXPECT_WORDS = {"FAULTLOG": 35, "WDT_STAT": 40, "BOOT_AXI": 40}
+
 
 def crc_ccitt(d):
     c = 0xFFFF
@@ -183,8 +257,11 @@ def verdict(name, e, w):
             out.append("★ enabled=0 ⇒ 通信域没开, 什么都不收")
             bad = True
     elif name == "FAULTLOG":
-        magic, total, cats = w[0], w[1], w[2:2 + 24]
-        first, last = w[26:30], w[30:34]
+        # ★ 偏移以 FIELD_MAPS["FAULTLOG"] 为准 —— 2026-09-13 加了 f_first_valid ⇒ 其后全部 +1。
+        #   这正是"字段语义两份副本"的具体伤害, 所以偏移这件事现在有对账 (layout_check)。
+        magic, total, cats = w[0], w[1], w[3:3 + 24]
+        first_valid = w[2]
+        first, last = w[27:31], w[31:35]
         if magic != 0x464C4F47:
             out.append("★ magic=0x%08X 不是 FLOG ⇒ 台账没登记" % magic)
             return True, out
@@ -199,8 +276,16 @@ def verdict(name, e, w):
                 if i not in FAULT_EXTERNAL:
                     ext += cats[i]
                 out.append("  %-16s = %-8d%s" % (FAULT_NAMES.get(i, "cat%d" % i), cats[i], tag))
-        out.append("  首例: code=%d(%s) tick=%d c0=0x%08X c1=%d"
-                   % (first[0], FAULT_NAMES.get(first[0], "-"), first[1], first[2], first[3]))
+        if first_valid:
+            out.append("  首例: code=%d(%s) tick=%d c0=0x%08X c1=%d"
+                       % (first[0], FAULT_NAMES.get(first[0], "-"), first[1], first[2], first[3]))
+        else:
+            # ★ 独立的 valid 位让"没有首例"和"首例是 code 0"彻底分开 (审计 P2)。
+            out.append("  首例: (**未登记**) —— f_first_valid=0 ⇒ 本轮还没有任何异常"
+                       " (不是'首例的 code 是 0')")
+            if total:
+                # ★ 能失败的判据: 有记录却无首例 ⇒ 台账自相矛盾
+                out.append("    ★ total=%d 却无首例 ⇒ 自相矛盾, 台账坏了" % total); bad = True
         out.append("  末例: code=%d(%s) tick=%d c0=0x%08X c1=%d"
                    % (last[0], FAULT_NAMES.get(last[0], "-"), last[1], last[2], last[3]))
         if ext:
@@ -259,6 +344,32 @@ def verdict(name, e, w):
         if len(w) > 31:
             out.append("活体镜像: 此刻 stage=%d / 拍号=%d (AXI 跨复位不丢 ⇒ 复位后它即"
                        "上一轮的最后现场)" % (w[30], w[31]))
+        if len(w) > 33:
+            # ★★ 挂死归因 (回应审计 P1②): RSR=IWDG1RSTF 无法区分"设计中的挂死"与
+            #   "注入引发别的异常(HardFault→Default_Handler)也导致没人喂狗" —— 两者同形。
+            #   锚点把这件事变成可读回的证据。
+            if w[33] == 0x474E4148:
+                out.append("挂死归因: **上一轮走到了设计的挂死点** (AXI[33]='HANG') ⇒ 注入生效;"
+                           " 若复位原因是 IWDG1, 则**是看门狗救的场**, 不是别处异常")
+            elif w[33]:
+                out.append("挂死归因: AXI[33]=0x%08X ≠ 'HANG' ⇒ 需要核实这是什么 (异常来源存疑)"
+                           % w[33])
+            else:
+                out.append("挂死归因: 上一轮**没有**走到设计的挂死点 (AXI[33]=0)"
+                           + ("; 但本轮标记 [32]='HANG' ⇒ 此刻正处在挂死点"
+                              if (len(w) > 32 and w[32] == 0x474E4148) else ""))
+        if len(w) > 37:
+            # ★ 停滞自愈的归因面 (审计 P1①): 软复位会清 .bss, 没有这两个"上一轮"值就只剩
+            #   "又启动了一次"。能回答"为什么复位 / 复位过几次 / 死前卡了多久"。
+            out.append("主循环活性: 本轮 停滞复位=%d 次 / 最大间隔=%d 拍(%.1fs)   "
+                       "上一轮 复位=%d 次 / 最大间隔=%d 拍(%.1fs)"
+                       % (w[34], w[35], w[35] * 100e-6, w[36], w[37], w[37] * 100e-6))
+            if w[36]:
+                out.append("    ⇒ **上一轮是因为主循环停滞而主动复位的** (不是看门狗, 也不是掉电)"
+                           " —— 这是 PLC 级自愈动作的证据")
+            elif w[37]:
+                out.append("    (上一轮的实测最大阻塞 %d 拍 = %.1fs —— 用于校验停滞阈值余量)"
+                           % (w[37], w[37] * 100e-6))
         cats = w[12:28]
         nz = [(i, c) for i, c in enumerate(cats) if c]
         if nz:
@@ -307,17 +418,32 @@ def verdict(name, e, w):
                           w[12] if len(w) > 12 else 0))
             out.append("  ⇒ 缺少顺序/关闸/意图字段; 返回码 -2 就是 wdt.h 记的那个缺陷")
             return (len(w) > 8 and s32(w[8]) != 0), out
-        rc = s32(w[8])
+        armed, rc = s32(w[0]), s32(w[8])
+        # ★★ "武装了"必须三样同看 (2026-09-13 实测抓到一次**会撒谎的判据**):
+        #   只看 rc==0 会把 **`-DDCL_WDT=0` 档**报成"✓ 已武装" —— 那一档根本没编译看门狗
+        #   代码, g_wdt_diag 全 0 ⇒ 返回码读出来就是 0。而同一条读数里 armed(=初值 0xFF=255)
+        #   /超时档(0)/喂狗计数(0) 三个数同时露出破绽。
+        #   而方向最危险: **没有保护却报"有保护"** —— 审计时足以让人放过一个真问题。
+        no_wdt_code = (armed == 0xFF and w[1] == 0 and w[5] == 0)
+        if no_wdt_code:
+            out.append("启动返回码=%d / armed=%d(初值) / 超时档=%d ms / 喂狗计数=%d"
+                       % (rc, armed, w[1], w[5]))
+            out.append("  ⇒ **本档没有编译看门狗代码**(`-DDCL_WDT=0`) ⇒ PR/RLR/SR/关闸取证"
+                       "在本档全部无意义, 故不逐条判读 (免得给出 4 条误导性的 ★)")
+            out.append("  ★★ 注意: 返回码 [8]=0 **不代表已武装** —— 那是全 0 内存读作 0。"
+                       "只判 rc 的写法在这一档会撒谎, 方向是最危险的那种 (无保护报成有保护)")
+            return True, out
+        ok_armed = (armed == 0 and rc == 0 and w[1] > 0)
         out.append("启动返回码=%d %s / armed=%d / 超时档=%d ms / 喂狗计数=%d (必须单调涨)"
-                   % (rc, "✓ 已武装" if rc == 0 else "★ 启动失败", s32(w[0]), w[1], w[5]))
+                   % (rc, "✓ 已武装" if ok_armed else "★未武装", armed, w[1], w[5]))
+        if not ok_armed:
+            out.append("  ★ 看门狗**没有武装** ⇒ 本板当前无看门狗保护 (卡死不会被复位)")
+            bad = True
         want_pr, want_rlr = w[24], w[25]        # ★ 固件自报的目标值 (不是工具硬编码)
         out.append("板内读回: RCC_CSR=0x%X(bit0=LSION bit1=LSIRDY) PR=%d RLR=%d SR=0x%X"
                    % (w[9], w[10], w[11], w[12]))
         out.append("  固件自报目标: PR=%d RLR=%d (SR 应为 0 ⇒ 更新已落)"
                    % (want_pr, want_rlr))
-        if rc != 0:
-            out.append("  ★ 看门狗**没有武装** ⇒ 本板当前无看门狗保护 (卡死不会被复位)")
-            bad = True
         if w[8] == 0xFFFFFFFD or w[8] == 0xFFFFFFFE:   # -3 / -2
             out.append("  ★ 静态失败码 ⇒ 见 wdt.h: -2 = PR/RLR 更新未落 (先启动后配置), "
                        "-3 = 读回不符 (解锁序列被打断)")
@@ -350,8 +476,66 @@ def verdict(name, e, w):
         if w[3]:
             out.append("  ★ 注入挂起标志=1 ⇒ 拍 ISR 已被人为卡死; 看门狗应在 ≤%d ms 内复位"
                        % w[1])
+        # ★★ 主循环活性 (2026-09-13 整改, 回应审计 P1① "唯一不能自愈的失效模式")。
+        #   阈值 [33] 与"本档是否启用自愈" [32] **都由固件自报** —— 工具写死阈值就会在
+        #   调阈值后变成假报警 (PR=4/RLR=99 那类教训)。
+        if len(w) > 36:
+            out.append("主循环活性: 阈值=%d 拍(%.1fs) / 自愈=%s / 停滞事件=%d 次 / 停滞复位=%d 次"
+                       % (w[33], w[33] * 100e-6,
+                          "启用" if w[32] else "★未启用(=DCL_LOOP_RESET 对照档)",
+                          w[4], w[31]))
+            out.append("  实测最大间隔=%d 拍(%.1fs) @tick=%d / 已声明最大窗口=%d 拍 / 此刻在窗口内=%d"
+                       % (w[29], w[29] * 100e-6, w[30], w[28], w[34]))
+            if len(w) > 38:
+                out.append("  未声明段最大间隔=%d 拍(%.1fs) / 最大间隔那段已声明过=%d"
+                           % (w[37], w[37] * 100e-6, w[38]))
+            out.append("  双心跳计数: ISR=%d / 主循环=%d (两者都该涨; 只有 ISR 涨 ⇒ 主循环死)"
+                       % (w[35], w[36]))
+            if len(w) > 39:
+                out.append("  主循环已进入=%d %s" % (w[39],
+                           "(0 ⇒ **还停在启动段**(~33s), 此时不判停滞)" if not w[39] else ""))
+            # ★★ 阈值余量判据必须用 **[37] 未声明段的最大间隔** —— 用 [29] 会把"合法声明过的
+            #   长阻塞 (persist ~1.55s)"算进来, 于是在**每次正常刷盘时误报**。
+            #   (两个语义不同的量必须分开: 声明过的阻塞是已知合法的, 未声明才可疑。)
+            gap_judge = w[37] if len(w) > 38 else w[29]
+            if w[33] and gap_judge >= w[33]:
+                # ★ 判据 (能失败): 未声明的合法阻塞若顶到阈值 ⇒ 阈值没有余量, 迟早误复位
+                out.append("    ★ 未声明段最大间隔 ≥ 阈值 ⇒ **阈值无余量** (会误复位), 必须重新定阈值")
+                bad = True
+            elif w[33] and gap_judge * 3 >= w[33] * 2:
+                # ★ 预警 (还没到, 但已在同一量级): 把"阈值迟早不够用"从**事后事故**
+                #   变成**事前提醒**。
+                out.append("    △ 未声明段最大间隔已达阈值的 %d%%, 正在逼近 —— 建议重定阈值"
+                           % (gap_judge * 100 // w[33]))
+            if w[31] and not w[32]:
+                out.append("    ★ 已发生 %d 次停滞而本档未启用自愈 —— 对照档的预期状态"
+                           % w[31])
+            if w[26]:
+                out.append("    △ 此刻 DWT 计时无效 (外部条件/调试器, **非固件缺陷**); 累计 %d 拍"
+                           % w[27])
+            if w[35] and w[36] == 0:
+                out.append("    ★ ISR 心跳在涨而主循环心跳恒 0 ⇒ **主循环从未跑起来** (或已死)")
+                bad = True
+    elif name == "SD_CFG":
+        # ★ 魔数判读 (2026-09-13, 回应审计 P3②): 这个区**只在魔数有效时才被固件采纳** ——
+        #   不报魔数, 读的人会把 AXI 上电随机值当成"配置"。我今天就被这条坑过一次:
+        #   注入时只写了魔数没清块, 于是 [0..14] 的随机垃圾**全部被放行**成活配置。
+        mag = w[15] if len(w) > 15 else 0
+        okm = (mag == 0xF00DBEEF)
+        out.append("魔数 [15]=0x%08X ⇒ %s"
+                   % (mag, "有效 (固件会采纳 [0..14] 的配置字)" if okm else
+                      "**无效** ⇒ [0..14] 全部按 0 处理 (随机值不会被采纳)"))
+        if okm:
+            live = ", ".join("[%d]=%d" % (i, w[i]) for i in range(min(15, len(w))) if w[i])
+            out.append("  生效的配置字: %s" % (live if live else "(全 0)"))
+        else:
+            nz = [i for i in range(min(15, len(w))) if w[i]]
+            if nz:
+                out.append("  △ [0..14] 有 %d 个非零字而魔数无效 ⇒ 它们是**上电随机值**, 不是配置"
+                           % len(nz))
+                out.append("  ★ 调试器预写务必**先整块清零、魔数最后写** (否则随机值被放行成活配置)")
     else:
-        out.append("(无专用解析器, 原始 %d 字)" % len(w))
+        out.append("(无专用解析器, 原始 %d 字; 需要完整 dump 加 --raw)" % len(w))
         for i in range(0, min(len(w), 16), 4):
             out.append("  +%02X: %s" % (i * 4, " ".join("%08X" % x for x in w[i:i + 4])))
     return bad, out
@@ -372,17 +556,30 @@ def cmd_manifest(b):
     return 0
 
 
-def cmd_read(b, name):
+def cmd_read(b, name, raw=False):
     e, w = b.read(name)
     print("== %s @ 0x%08X (%d 字, kind=%s) ==" % (name, e["addr"], e["words"],
                                                   ["u32", "bits", "bytes", "struct"][e["kind"]]))
-    if e["kind"] == MF_K_BYTES:
-        raw = b"".join(struct.pack("<I", x) for x in w)
-        for i in range(0, min(len(raw), 64), 16):
-            print("  +%03X  %s" % (i, " ".join("%02X" % c for c in raw[i:i + 16])))
-    else:
-        for i in range(0, len(w), 4):
-            print("  [%2d] %s" % (i, " ".join("%08X" % x for x in w[i:i + 4])))
+    # ★★ 布局对账必须在**判读之前** (2026-09-13, 回应审计 P2③): 对不上就**拒绝解析** ——
+    #   否则解析出来的是"错位的数", 比不解析更坏 (它会安静地给出错误结论)。
+    lok, llines = layout_check(name, len(w))
+    if not lok:
+        print("  ★★ 布局对账失败 ⇒ **拒绝解析** (只给原始字, 供你同步两侧字段表):")
+        for l in llines:
+            print("  " + l)
+        for i in range(0, len(w), 8):
+            print("  [%2d] %s" % (i, " ".join("%08X" % x for x in w[i:i + 8])))
+        return 1
+    # ★ `--raw`: 原始 dump 默认不打 —— 34 字的十六进制对判读是噪声 (审计 P3①);
+    #   需要时显式要 (例如怀疑解析器本身)。
+    if raw or e["kind"] == MF_K_BYTES:
+        if e["kind"] == MF_K_BYTES:
+            braw = b"".join(struct.pack("<I", x) for x in w)
+            for i in range(0, min(len(braw), 64), 16):
+                print("  +%03X  %s" % (i, " ".join("%02X" % c for c in braw[i:i + 16])))
+        else:
+            for i in range(0, len(w), 4):
+                print("  [%2d] %s" % (i, " ".join("%08X" % x for x in w[i:i + 4])))
     bad, lines = verdict(name, e, w)
     print("  判读:")
     for l in lines:
@@ -468,6 +665,8 @@ def main():
     ap.add_argument("--port", default="COM14")
     ap.add_argument("--manifest", action="store_true")
     ap.add_argument("--read", default=None, metavar="NAME")
+    # ★ `--raw`: 原始 dump 默认不打 (34 字十六进制对判读是噪声, 审计 P3①)
+    ap.add_argument("--raw", action="store_true", help="--read 时同时打原始字")
     ap.add_argument("--health", action="store_true")
     ap.add_argument("--boot", action="store_true")
     ap.add_argument("--symptom", default=None)
@@ -482,7 +681,7 @@ def main():
     if a.manifest:
         return cmd_manifest(b)
     if a.read:
-        return cmd_read(b, a.read)
+        return cmd_read(b, a.read, a.raw)
     if a.boot:
         return cmd_boot(b)
     if a.symptom:

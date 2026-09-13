@@ -542,7 +542,7 @@ _Static_assert(OFF_HIL_FB_RAW + 4u <= SHM_SIZE, "SHM: W5 观测区越出 SHM 末
  * 登记: `fault_init()` 由 cold_start_reset 调用 —— 本域在 SHM 内, 整段 memset 天然
  *       覆盖它, 但按冻结平台纪律**仍显式登记**("天然覆盖"不等于"已登记")。 */
 #define OFF_FAULT_LOG        0x7020
-#define OFF_FAULT_LOG_SZ     144u    /* 实际结构 136B, 留 8B 余量 */
+#define OFF_FAULT_LOG_SZ     152u    /* 实际结构 140B (2026-09-13 加 f_first_valid 后 +4), 留 12B 余量 */
 _Static_assert(OFF_FAULT_LOG >= OFF_BB_SNAP + 256u,
                "SHM: fault ledger overlaps BB_SNAP (256B)");
 _Static_assert(OFF_FAULT_LOG + OFF_FAULT_LOG_SZ <= SHM_SIZE,
@@ -551,9 +551,11 @@ _Static_assert(OFF_FAULT_LOG + OFF_FAULT_LOG_SZ <= SHM_SIZE,
 /* ---- ★ 看门狗/主循环状态 (2026-09-13, 见 src/wdt.h) ----
  * 为什么要有它: 看门狗的配置与**喂狗计数**必须能被外部读走 ——
  *   "武装了就完事"属"写过了就算"的静默失败族; 而**喂狗计数不涨**是"230ms 内必复位"
- *   的唯一外部可见征兆。位置: 0x70B0 (接在故障台账 0x7020+144=0x70B0 之后)。 */
-#define OFF_WDT_STAT         0x70B0
-#define OFF_WDT_STAT_SZ      112u    /* 28 字: 见 manifest.h 的字段说明 */
+ *   的唯一外部可见征兆。位置: 0x70B8 (接在故障台账 0x7020+152=0x70B8 之后)。
+ * ★ 该地址 2026-09-13 挪过一次 (台账加 f_first_valid 后增大) —— **PC 端零改动**:
+ *   工具按 0x64 自报目录取地址, 这正是自描述目录的价值 (见 manifest.h)。 */
+#define OFF_WDT_STAT         0x70B8
+#define OFF_WDT_STAT_SZ      160u    /* 40 字: 见 manifest.h 的字段说明 */
 _Static_assert(OFF_FAULT_LOG + OFF_FAULT_LOG_SZ <= OFF_WDT_STAT,
                "SHM: WDT 状态区与故障台账重叠");
 _Static_assert(OFF_WDT_STAT + OFF_WDT_STAT_SZ <= SHM_SIZE,

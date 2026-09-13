@@ -28,6 +28,12 @@
 #define RCC_PLLCFGR     REG32(RCC_BASE + 0x02C)   /* PLL1RGE / PLL1VCOSEL / PLL1FRACEN ... */
 #define RCC_PLL1DIVR    REG32(RCC_BASE + 0x030)   /* DIVN1[8:0] DIVP1[15:9] DIVQ1[22:16] DIVR1[29:23] */
 #define RCC_AHB4ENR     REG32(RCC_BASE + 0x0E0)
+/* ★ AHB4 上的 GPIO 时钟使能位 (权威: ST stm32h723xx.h `RCC_AHB4ENR_GPIOxEN_Pos` ——
+ *   实测抄得: GPIODEN=3, **GPIOEEN=4**, GPIOFEN=5)。基址侧也核对过:
+ *   `GPIOE_BASE = D3_AHB1PERIPH_BASE + 0x1000` = 0x58021000, 与本文件 `GPIO_BASE(4)` 一致。
+ *   ★ 为什么新增 GPIOE: 它**全空闲** (engine.h 已定案), 拿来做"ISR 活 / 主循环活"
+ *     双心跳 —— PLC 级要求"主循环死了"这件事得能从外部**实时**看见。 */
+#define RCC_AHB4ENR_GPIOEEN (1u << 4)
 #define RCC_APB1LENR    REG32(RCC_BASE + 0x0E8)
 #define RCC_APB4ENR     REG32(RCC_BASE + 0x0F4)
 
@@ -209,7 +215,13 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
                                                * (改主频请同步这句; 权威频率见 clock.h) */
 #define DWT_LAR         REG32(0xE0001FB0UL)   /* 解锁寄存器 (需写 0xC5ACCE55) */
 #define SCB_CPACR       REG32(0xE000ED88UL)   /* FPU 使能: CP10/CP11 全访问 */
-#define SCB_AIRCR       REG32(0xE000ED0CUL)   /* 中断优先级分组 */
+#define SCB_AIRCR       REG32(0xE000ED0CUL)   /* 中断优先级分组 / 软复位 */
+/* ★ 软复位序列 (PLC 级自愈用, 见 main.c 的"主循环失活"段):
+ *   必须先写 VECTKEY = 0x5FA, 否则整次写被忽略 (Cortex-M 的"写钥匙"惯例;
+ *   忘了它 = 典型的"写过了就算"静默失败)。
+ *   SYSRESETREQ 是**异步**的 ⇒ 写完 dsb + 短暂自旋等它生效, 不能假设下一行就不执行了。 */
+#define SCB_AIRCR_VECTKEY      (0x5FAu << 16)
+#define SCB_AIRCR_SYSRESETREQ  (1u << 2)
 #define SCB_CCR         REG32(0xE000ED14UL)   /* bit16 = D-cache, bit17 = I-cache */
 #define SCB_CCR_IC      (1u << 17)
 #define SCB_CCR_DC      (1u << 16)

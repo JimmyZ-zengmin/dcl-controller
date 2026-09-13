@@ -64,6 +64,12 @@ set(DCL_WDT_START_FIRST "1" CACHE STRING "先启动后配置 (1 交付 / 0 改�
 #   DCL_WDT_PR: 预分频档 0..7。存在的理由 = 验证"更新耗时 ≈ 5 个预分频步长"这条推断:
 #     PR=4 ⇒ 2ms/步 ⇒ ~10ms (已实测); PR=6 ⇒ 8ms/步 ⇒ 应变成 ~40ms。
 set(DCL_WDT_PR "4" CACHE STRING "IWDG 预分频档 0..7")
+#   DCL_LOOP_RESET: 主循环失活自愈 (2026-09-13, 回应审计 P1①)。
+#     1 (交付): 拍 ISR 判停滞 → 记录 → eng_outputs_safe() → 软复位。
+#       依据: 主循环死时协议口全断 ⇒ "失联但保持输出"比"复位(停止驱动)"更危险。
+#     0 (对照): 只记录 FAULT_LOOP_STALL, 不复位 ⇒ 用来证明"不会自愈"那一半。
+#   ★ 阈值/窗口的定义与实测依据见 main.c 的"主循环活性"段 (阈值不许拍)。
+set(DCL_LOOP_RESET "1" CACHE STRING "主循环失活自愈 (1 交付 / 0 只记录不复位)")
 
 if(DCL_MIN_UART)
     set(TARGET min_uart)
@@ -155,6 +161,7 @@ add_compile_options(
     -DWDT_SYNC_BUDGET_CYC=${DCL_WDT_SYNC_CYC}u
     -DWDT_START_FIRST=${DCL_WDT_START_FIRST}
     -DWDT_PR_VALUE=${DCL_WDT_PR}u
+    -DDCL_LOOP_RESET=${DCL_LOOP_RESET}
     -DBOOT_BANNER=${DCL_BOOT_BANNER}
     -DBANNER_PERIOD_MS=${DCL_BANNER_PERIOD}
     -DUART_SELFTEST=${DCL_UART_SELFTEST}

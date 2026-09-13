@@ -90,6 +90,7 @@ typedef struct __attribute__((packed, aligned(4))) {
     uint32_t total;      /* 总记录次数 (必须 == Σcats, 见 fault_sane) */
     uint32_t cats[FAULT_N_CATS];   /* [0]=次数(FAULT_NONE 槽不用, 恒 0) */
     /* ---- 首例 (freeze-frame): 最早一次异常的现场 ---- */
+    uint32_t f_first_valid;  /* ★★ 独立的"首例已登记"位 —— 见下方 fault_record 的说明 */
     uint32_t f_code;     /* 分类码 */
     uint32_t f_tick;     /* 发生时的拍序号 (调用者提供的时基) */
     uint32_t f_c0;       /* 上下文 0 (调用者定义, 如 ISR / rx_len / NAK 码) */
@@ -101,9 +102,9 @@ typedef struct __attribute__((packed, aligned(4))) {
 /* ★★ 断言消息**必须 ASCII** —— GCC 7.3.1 会把非 ASCII 打成八进制转义
  *   (实测: 失败时打出 "FaultLedger_t \37777777745\37777777677..." 完全不可读),
  *   这条规矩本项目早前就记过 (见 cross-project 铁律), 这次仍踩了一次。
- *   尺寸 = 4(magic) + 4(total) + 24*4(cats) + 4*4(首例) + 4*4(末例) = 136 */
-_Static_assert(sizeof(FaultLedger_t) == 136u,
-               "FaultLedger_t must be exactly 136 bytes (PC parses by offset)");
+ *   尺寸 = 4(magic) + 4(total) + 24*4(cats) + 4(f_first_valid) + 4*4(首例) + 4*4(末例) = 140 */
+_Static_assert(sizeof(FaultLedger_t) == 140u,
+               "FaultLedger_t must be exactly 140 bytes (PC parses by offset)");
 
 /** 台账指针 (base = SHM 基址) */
 static inline FaultLedger_t *fault_ledger(uint8_t *base)
@@ -134,10 +135,15 @@ static inline void fault_record(uint8_t *base, uint32_t code,
     if (lg->magic != FAULT_MAGIC) lg->magic = FAULT_MAGIC;   /* 兜底 (未登记也能记账) */
     if (code < FAULT_N_CATS) lg->cats[code]++;
     lg->total++;
-    /* 首例: 只在"还没有首例"时写 (FAULT_NONE 哨兵) ——
-     * ★ 注意判据是 f_code == FAULT_NONE 而不是 total == 1:
-     *   total 可能因为 code 越界而不涨, 用 total 判会让首例被**覆盖**掉。 */
-    if (lg->f_code == FAULT_NONE) {
+    /* 首例: 只在"**还没有**首例"时写。
+     * ★★ 判据必须是**独立的 valid 位**, 不能拿 f_code 当哨兵 (2026-09-13 修, 回应审计 P2):
+     *   旧写法判 `lg->f_code == FAULT_NONE`(= 0), 而 **0 落在合法码域内**
+     *   (`if (code < FAULT_N_CATS) cats[code]++` ⇒ 传 code=0 只让 cats[0]++,
+     *   于是 `total == Σcats` 自洽式**照样成立**) ⇒ 一旦有人传 code=0 (bug),
+     *   首例会被**反复覆盖**, 而且**现有唯一能失败的判据也抓不到它**。
+     *   这与项目铁律"错误哨兵绝不能落在合法值域内"是同一条 (ADC 用 0xFFFF 当超时哨兵那次)。 */
+    if (!lg->f_first_valid) {
+        lg->f_first_valid = 1u;
         lg->f_code = code; lg->f_tick = tick; lg->f_c0 = c0; lg->f_c1 = c1;
     }
     lg->l_code = code; lg->l_tick = tick; lg->l_c0 = c0; lg->l_c1 = c1;

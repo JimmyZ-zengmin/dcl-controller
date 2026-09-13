@@ -175,7 +175,10 @@ typedef struct __attribute__((packed, aligned(4))) {
     uint32_t wait_cyc;         /* 等 PVU/RVU/WVU 落花了多少 **CPU 周期** (400MHz ⇒ 2.5ns/周期) */
     uint32_t kr_blocked;       /* 关闸期间 ISR **想喂狗被拦下**的次数 (>0 ⇒ 闸门确实在工作) */
     uint32_t kr_busy_snap;     /* 开闸前那一刻的 g_wdt_kr_busy (应为 1, 之后被清 0) */
-    uint32_t sync_expired;     /* 1 = 同步轮询**跑满了预算**(= 其实什么也没等到) / 0 = 标志真落 */
+    uint32_t sync_ok;          /* ★ 1 = 同步**成功**(PVU/RVU/WVU 真落了) / 0 = 跑满预算啥也没等到
+                                *   ★ 极性说明 (2026-09-13, 回应审计 P3): 原字段名 `sync_expired`
+                                *     且 1 = "跑满预算", 读的人容易把 1 当成"成功" —— 反了。
+                                *     这类"1 到底代表好还是坏"必须由**字段名说清**, 不靠注释。 */
 } WdtDiag_t;
 _Static_assert(sizeof(WdtDiag_t) == 60u,
                "WdtDiag_t must be 15 words (PC reads it as raw u32 from WDT_STAT)");
@@ -235,10 +238,11 @@ static inline int wdt_start(void)
         }
         g_wdt_diag.wait_cyc     = DWT_CYCCNT - c0;
         /* ★★ "跑满预算"与"标志真落"必须分开记 —— 否则"等标志落"可能是个**空动作**:
-         *   两种情况下 wait_cyc 都会是一个大数, 而只有前者说明我们其实什么都没等到。
+         *   两种情况下 wait_cyc 都会是一个大数, 而只有"跑满"说明我们其实什么都没等到。
          *   (项目"空判据"教训: 一个永远成立/永远不成立的动作看起来像在做事。)
-         *   实测有效: 旧顺序的对照 = 跑满(1); 交付档 = 真落(0)。 */
-        g_wdt_diag.sync_expired = exp;
+         *   ★ 极性 = **1 表示成功** (sync_ok): 原写法 1 = 跑满, 读的人容易当成功 (审计 P3)。
+         *   实测有效: 旧顺序的对照 = 0(跑满); 交付档 = 1(真落)。 */
+        g_wdt_diag.sync_ok = (exp == 0u) ? 1u : 0u;
     }
     g_wdt_diag.csr = RCC_CSR;
     g_wdt_diag.pr  = IWDG_PR;
