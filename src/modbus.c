@@ -62,6 +62,11 @@ static inline uint16_t *mb_set(uint8_t *base)  { return (uint16_t *)MB_PTR(base,
 #define MB_DIAG_CFGAFR  9u   /* GPIOD AFRL 实际读回 */
 #define MB_DIAG_CFGPUP 10u   /* GPIOD PUPDR 实际读回 */
 #define MB_DIAG_CFGMK  11u   /* 配置读回标记 */
+/* ★ 15 是**清错误标志的次数** (2026-09-13 补, 审计建议 §4.3)。
+ *   原来只有 ERRACC = "见过哪些错误位" (OR 累加, 只增不减), 于是
+ *   "ORE 被反复清掉、接收反复复活" 与 "ORE 从未出现过" 在读数上**完全一样** ——
+ *   而这正是本次故障的核心机制。⇒ 一个"该变而没变"的量必须能被单独读走。 */
+#define MB_DIAG_ERRCLR 15u
 static inline volatile uint32_t *mb_diag(uint8_t *base)
 {
     return (volatile uint32_t *)(base + OFF_MB_DIAG);
@@ -97,10 +102,21 @@ static inline uint16_t mb_reg(uint8_t *base, uint16_t idx)
 /* ---- 传输层: 拉字节 (隧道注入 或 USART2 FIFO 轮询) ----
  * ★ 与 S3 的差异: ESP32 能读 `hw->status.rxfifo_cnt` 直接拿到 FIFO 深度;
  *   H7 的 USART 没有"当前 FIFO 字节数"寄存器 (只有 RXFNE 标志)。
- *   ⇒ 改为"最多尝试 max_n 次, 每次收 1 字节, 直到 RXNE 落" —— 语义等价。
- *   ★ 顺带: 不使能 H7 的 FIFO (CR1.FIFOEN=0, 单字节缓冲) 也完全够 ——
- *     115200 @ 100μs/拍 → 每拍最多到达 1.15 字节, 单字节缓冲不会溢出。
- *     不开 FIFO 少一处配置, 确定性更好。 */
+ *   ⇒ 改为"最多尝试 max_n 次, 每次收 1 字节, 直到 RXFNE 落" —— 语义等价。
+ *
+ * ★★★ 这里原来有一段**拿平均值当上界**的推理错误 (2026-09-13 实测推翻):
+ *     原文主张 "不使能 FIFO 也完全够 —— 115200 @ 100µs/拍 → 每拍最多到达 1.15 字节"。
+ *     "1.15" 是**均值, 不是上界**: 字节间隔 = 10bit/115200 = **86.8µs**,
+ *     而拍周期 = **100µs** —— **拍比字节慢**, 相位每字节漂 13.2µs,
+ *     于是**周期性出现"一拍内到 2 字节"** ⇒ 单字节 RDR 必然溢出 ⇒ ORE。
+ *   实测对照 (tools/h723_485_ore_verify.py):
+ *     慢发 (逐字节 2000µs) → **8/8 全收**      ← 链路/引脚/PD6 信号全是好的
+ *     快发 (整帧连续)      → **3/8, 必然 ORE** ← 问题纯在接收节奏
+ *     开 FIFOEN 后快发     → **32/32 全收 + 整帧 maxrx=8 + 总线上应答正常**
+ *   ⇒ 修法: mb_uart_enable() 打开 CR1.FIFOEN (深度 8 吸收拍间积压)。
+ *   完整证据链与对照: docs/audit/H723-485-RX-AUDIT.md
+ *
+ * ★★ 配套: 见 mb_rx_clear_errs() —— ORE 不清会**自锁死**接收。 */
 static int ATTR_ITCM mb_pull_rx(uint8_t *base, uint8_t *dst, int max_n)
 {
     MbCtrl_t *c = mb_ctrl(base);
@@ -114,11 +130,31 @@ static int ATTR_ITCM mb_pull_rx(uint8_t *base, uint8_t *dst, int max_n)
         c->rx_pos = (uint8_t)(c->rx_pos + n);
         return n;
     }
-    /* 物理口: 轮询 (不开中断 —— 见 modbus.h 的说明) */
+    /* 物理口: 轮询 (不开中断 —— 见 modbus.h 的说明)
+     * ★ 开 FIFO 之后 bit5 的语义是 RXFNE (FIFO 非空), 而读 RDR 会把 FIFO 逐字节弹出
+     *   ⇒ 下面这个"读一次 ISR、只要 RXFNE 还在就继续读 RDR"的循环天然多字节搬运,
+     *     一个拍内最多搬 MB_TICK_BUDGET(4) 个 —— '一次只读 1 字节' 的旧顾虑不复存在。 */
     int n = 0;
     volatile uint32_t *d = mb_diag(base);
     while (n < max_n) {
         uint32_t isr = USART_ISR(USART2_BASE);
+        /* ★★ 必须先清错误标志, 再判 RXFNE —— 2026-09-13 实测修复:
+         *   若只剩 `if (!(isr & RXNE)) break;` —— 一旦 **ORE=1 且 RXNE=0**,
+         *   就永远 break、**永不读 RDR** ⇒ ORE 永不清; 而 H7 在 ORE 置位期间
+         *   **丢弃所有新收到的字符** ⇒ RXNE 再也不置位 ⇒ **接收自锁死**。
+         *   实测: 该状态下灌 12 帧收 0 字节; 写 ICR 清错误后**立刻复活**
+         *         (0 → 4 字节)。这就是"偶尔收到一点点、然后就没有了"的真因。
+         *   ★ 注意这里**既不 break 也不 continue**: 错误标志与"FIFO 里还有数据"
+         *     是两件事, 清完错误要继续往下判 RXNE/读 RDR。 */
+        if (isr & (USART_ISR_PE | USART_ISR_FE | USART_ISR_NE | USART_ISR_ORE)) {
+            USART_ICR(USART2_BASE) = 0x1FFu;      /* 写 1 清 (实测有效) */
+            d[MB_DIAG_ERRACC] |= (isr & (USART_ISR_PE | USART_ISR_FE
+                                         | USART_ISR_NE | USART_ISR_ORE));
+            /* ★ 审计建议: 原来只记"见过什么错", 不记"清过几次" ——
+             *   于是"ORE 被反复清掉"与"ORE 从未出现"在读数上完全一样。
+             *   要能分开, 就必须有一个独立计数 (同族: "该变而没变"必须可读)。 */
+            d[MB_DIAG_ERRCLR] += 1u;
+        }
         if (!(isr & USART_ISR_RXNE)) break;
         dst[n++] = (uint8_t)(USART_RDR(USART2_BASE) & 0xFFu);
         /* ★★ 每拉到一个字节就记一笔 (见 engine.h 的 OFF_MB_DIAG 说明):
@@ -126,8 +162,6 @@ static int ATTR_ITCM mb_pull_rx(uint8_t *base, uint8_t *dst, int max_n)
          *   ⇒ 外部读不到"曾经有字节到过"任何证据。 */
         d[MB_DIAG_BYTES]  += 1u;
         d[MB_DIAG_LASTISH] = isr;
-        d[MB_DIAG_ERRACC] |= (isr & (USART_ISR_PE | USART_ISR_FE
-                                     | USART_ISR_NE | USART_ISR_ORE));
         d[MB_DIAG_LASTBYT] = (uint32_t)dst[n - 1];
         /* ★ 读 RDR 同时清 RXNE/ORE; S3 那边由 uart_ll_read_rxfifo 完成同样的事 */
     }
@@ -304,6 +338,27 @@ void ATTR_ITCM mb_tick(uint8_t *base)
             d[21] = USART_PRESC(USART2_BASE);
             d[22] = 0x05E20001u;
             d[MB_DIAG_CFGMK]  = 0xCF600001u;
+        }
+    }
+
+    /* ══════════ ★★ 每拍无条件清接收错误标志 (2026-09-13 实测修复) ══════════
+     * ★ 为什么必须在**这里**(而不是只在 mb_pull_rx 里):
+     *   mb_pull_rx 只在 MB_ST_IDLE / MB_ST_RX 两个状态被调用; 状态机走到
+     *   EXEC → BUILD → TX 期间**完全不读 RDR**。那段时间一旦来字节就必然 ORE,
+     *   而 ORE 未清 ⇒ H7 丢弃后续所有字符 ⇒ 这一拍处理完回到 IDLE 时**接收已经死了**。
+     *   (实测症状: 一帧被收下 → 进 BUILD/TX → 之后再也收不到, 只能等复位。)
+     * ★ 位置: 在"首拍配置读回"**之后** —— 保留上电瞬间 ISR 的原值当证据, 不去盖掉它。
+     * ★ 顺序: 先读 ISR 再写 ICR(写 1 清); 只清**错误位**那一组, 不动 RXNE。
+     * ★ 这是"同一族缺陷只修了一半"的收口: USART1 在 uart.c 里已有 FE/NE/ORE 逐个清除,
+     *   USART2 漏了 —— 而本次故障恰好就落在没修的那个口上。 */
+    {
+        uint32_t isr = USART_ISR(USART2_BASE);
+        if (isr & (USART_ISR_PE | USART_ISR_FE | USART_ISR_NE | USART_ISR_ORE)) {
+            USART_ICR(USART2_BASE) = 0x1FFu;
+            volatile uint32_t *d = mb_diag(base);
+            d[MB_DIAG_ERRACC] |= (isr & (USART_ISR_PE | USART_ISR_FE
+                                         | USART_ISR_NE | USART_ISR_ORE));
+            d[MB_DIAG_ERRCLR] += 1u;
         }
     }
 
@@ -580,9 +635,19 @@ void mb_uart_enable(void)
     USART_BRR(USART2_BASE) = USART2_BRR_115200;
     USART_PRESC(USART2_BASE) = 0;                       /* 不分频 (BRR 已按 PCLK1 算) */
 
-    /* ④ 使能: UE | TE | RE —— **不开 RXNEIE** (轮询, 见 modbus.h 说明) */
-    USART_CR1(USART2_BASE) = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+    /* ④ 使能: UE | TE | RE | ★ FIFOEN —— **不开 RXNEIE** (轮询, 见 modbus.h 说明)
+     * ★★★ FIFOEN 是 2026-09-13 实测修复 (docs/audit/H723-485-RX-AUDIT.md):
+     *   RDR 只有 1 字节深, 而拍周期(100µs) > 字节间隔(86.8µs) ⇒ 相位漂移 ⇒
+     *   **周期性"一拍内到 2 字节"** ⇒ 单字节 RDR 必然 ORE。原注释"每拍最多 1.15 字节"
+     *   是**平均值不是上界**, 正是它把这条缺陷藏了一整轮排查。
+     *   实测: 不开 FIFO 快发 8 字节只收 3; 开 FIFO 后 **32/32 全收、maxrx=8(整帧)、
+     *         总线上应答 CRC 正确**。FIFO 深度 8 吸收拍间积压。
+     * ★ H7 要求 FIFOEN 在 **UE=0** 时配置: 本函数是"先整写 CR1"的写法, 天然满足;
+     *   若将来改成增量改位, 必须先清 UE。 */
+    USART_CR1(USART2_BASE) = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE
+                           | USART_CR1_FIFOEN;
     (void)USART_ISR(USART2_BASE);                       /* 读一次清初值 */
+    USART_ICR(USART2_BASE) = 0x1FFu;                    /* ★ 顺手清掉上电残留的错误位 */
     __asm__ volatile("dsb" ::: "memory");
 }
 

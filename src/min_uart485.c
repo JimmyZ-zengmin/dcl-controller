@@ -211,7 +211,13 @@ static void phase_rx(void)
             if (isr & USART_ISR_FE) g_err_fe++;
             if (isr & USART_ISR_NE) g_err_ne++;
             if (isr & USART_ISR_ORE) g_err_ore++;
-            continue;
+            /* ★★ 这里原来有一句 `continue;` —— 它**跳过了下面的 RDR 读取**。
+             *   后果: FE/NE/PE 时数据**仍在 RDR 里**, 不读就等于**主动丢字节**;
+             *   而 ORE 的唯一可靠清除方式正是"读 ISR 再读 RDR"。
+             *   (它至少写了 ICR 所以不像主固件那样彻底锁死, 但会静默丢字节 ——
+             *    对一个"诊断固件"来说, 丢字节比不工作更糟: 会把假象喂给判据。)
+             *   ⇒ 不 continue: 清完错误继续往下判 RXNE 并读 RDR。
+             *   同族记录见 docs/audit/H723-485-RX-AUDIT.md §2.3 */
         }
         if (isr & USART_ISR_RXNE) {
             uint8_t b = (uint8_t)(USART_RDR(USART2_BASE) & 0xFFu);

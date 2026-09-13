@@ -166,10 +166,14 @@ def main():
         print("  ==> A FAIL")
 
     # ---- B 写 40065 再回读 ----
-    req, raw, rsp = m.xfer([0x06, 0x9C, 0x80, 0x12, 0x34])
+    # ★★ 地址修 (2026-09-13): 原来是 `0x9C80` = **40064** —— 而 40064 落在**只读区**
+    #    (固件 MB_NREG=64 ⇒ 读区 40001..40064 / 写区 40065..40128), 于是固件回异常 02,
+    #    被本工具误判成"写不进去"。字面 40001 制下 **线上地址就等于十进制寄存器号**:
+    #    40065 = 0x9C81。这一处少加了个 1, 让一条**完全正确**的固件行为背了 FAIL。
+    req, raw, rsp = m.xfer([0x06, 0x9C, 0x81, 0x12, 0x34])
     show("B1 写 40065=0x1234", req, raw, rsp)
-    ok_w = rsp and rsp[1] == 0x06 and rsp[2:6] == bytes([0x9C, 0x80, 0x12, 0x34])
-    req, raw, rsp = m.xfer([0x03, 0x9C, 0x80, 0x00, 0x01])
+    ok_w = rsp and rsp[1] == 0x06 and rsp[2:6] == bytes([0x9C, 0x81, 0x12, 0x34])
+    req, raw, rsp = m.xfer([0x03, 0x9C, 0x81, 0x00, 0x01])
     show("B2 回读 40065", req, raw, rsp)
     got = int.from_bytes(rsp[3:5], "big") if (rsp and rsp[1] == 0x03 and len(rsp) >= 7) else None
     if ok_w and got == 0x1234:
@@ -181,7 +185,12 @@ def main():
     # ---- C 写只读区必须异常 02 ----
     req, raw, rsp = m.xfer([0x06, 0x9C, 0x41, 0x00, 0x01])
     show("C 写只读 40001", req, raw, rsp)
-    if rsp and rsp[1] == 0x83 and rsp[2] == 0x02:
+    # ★★ 判据修 (2026-09-13): 原来写死 `rsp[1] == 0x83` —— 但 0x83 是 **0x03 请求**的
+    #    异常功能码, 而本项发的是 **0x06** 请求 ⇒ 异常码必为 `0x06|0x80 = 0x86`。
+    #    ⇒ 原判据**永远失败**, 把"固件正确地拒绝了写只读区"读成了缺陷。
+    #    (同族铁律: 判据里写死的常量必须与"这一项实际发什么"对上 ——
+    #     D/E 两项发 0x03 所以 0x83 是对的, C 发 0x06 就必须是 0x86。)
+    if rsp and rsp[1] == 0x86 and rsp[2] == 0x02:
         print("  ==> C OK  异常 02 (唯一写者语义在)")
     else:
         fails.append("C")

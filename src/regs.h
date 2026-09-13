@@ -373,6 +373,11 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
 #define USART_CR1_TE      (1u << 3)    /* 发送使能 */
 #define USART_CR1_RXNEIE  (1u << 5)    /* RXNE/RXFNE 中断使能 */
 #define USART_CR1_OVER8   (1u << 15)   /* 8 倍过采样 (本项目用 16 倍 → 必须 0) */
+/* ★★ CR1.FIFOEN (bit29) —— 使能 RX/TX FIFO (深度 8/16)。
+ *   2026-09-13 实测必需: RDR 只 1 字节深, 而 100µs 拍周期 > 86.8µs 字节间隔
+ *   ⇒ 相位漂移 ⇒ 周期性"一拍到 2 字节" ⇒ 必然 ORE ⇒ 见 docs/audit/H723-485-RX-AUDIT.md。
+ *   ★ H7 要求本位置在 **UE=0** 时写入 ⇒ 必须先关 UE 再整写 CR1 (现有写法天然满足)。 */
+#define USART_CR1_FIFOEN  (1u << 29)
 
 /* ISR (L21188 起) */
 #define USART_ISR_PE      (1u << 0)    /* 校验错误 (ISR.bit0) */
