@@ -83,6 +83,10 @@ FIELD_MAPS = {
         ("gap_max_undecl", 37), ("gap_decl", 38), ("loop_entered", 39),
         ("hb_odr", 40), ("hb_port", 41), ("hb_isr_pin", 42), ("hb_loop_pin", 43),
     ],
+    "PERSIST_STAT": [
+        ("cmds", 0), ("saves", 1), ("skip_run", 2), ("nak", 3),
+        ("writes", 4), ("erase_ok", 5), ("erase_fail", 6), ("dirty_target", 7),
+    ],
     "BOOT_AXI": [
         ("boot_count", 0), ("rclk", 1), ("rsr", 2), ("bdcr", 3),
         ("prev_stage", 4), ("prev_tick", 5), ("prev_flt_total", 6),
@@ -127,7 +131,7 @@ def layout_check(name, words):
 
 
 # 本工具**期望**的区内字数 (与上面 FIELD_MAPS 配套; 固件增删字段时这里必须同步)
-EXPECT_WORDS = {"FAULTLOG": 35, "WDT_STAT": 44, "BOOT_AXI": 40}
+EXPECT_WORDS = {"FAULTLOG": 35, "WDT_STAT": 44, "BOOT_AXI": 40, "PERSIST_STAT": 8}
 
 
 def crc_ccitt(d):
@@ -526,6 +530,28 @@ def verdict(name, e, w):
             if w[35] and w[36] == 0:
                 out.append("    ★ ISR 心跳在涨而主循环心跳恒 0 ⇒ **主循环从未跑起来** (或已死)")
                 bad = True
+    elif name == "PERSIST_STAT":
+        # ★★ 这个区是一次**真实误判**的直接产物: 原先 erase_ok/fail 外部读不到, 于是
+        #    一次被**跳过**的落盘(引擎 RUN ⇒ persist_save 第一道门 return 1, 21ms)
+        #    被读成"落盘很快" ⇒ 得出相反结论。**判据不存在时, 人只能猜, 而猜错没有提示。**
+        w0, saves, skip, nak, writes, eok, efail = w[0], w[1], w[2], w[3], w[4], w[5], w[6]
+        dirty, tgt = (w[7] & 1), (w[7] >> 8)
+        out.append("0x43 调用=%d / 受理 save=%d (其中因**引擎RUN跳过**=%d) / 拒绝=%d"
+                   % (w0, saves, skip, nak))
+        out.append("★ 真正写完=%d 次 / **擦除成功=%d** / 擦失败=%d / dirty=%d / 目标扇区=%d"
+                   % (writes, eok, efail, dirty, tgt))
+        # 判据 1 (能失败): 代码每次都先擦后写 ⇒ erase_ok 应恒等于 writes
+        if writes and eok != writes:
+            out.append("  ★ 写完 %d 次而只擦 %d 次 ⇒ 有路径**绕过擦除** (缺陷)" % (writes, eok))
+            bad = True
+        # 判据 2: 数据为空时别把"没数据"读成"很快"
+        if writes == 0:
+            out.append("  △ **还没真正落过盘** ⇒ 本档的'擦除阻塞'数据为空 "
+                       "(别把'没数据'读成'落盘很快')")
+        # 判据 3 (直接防我犯过的错): 有跳过 ⇒ 那些请求没擦盘, 测阻塞前必须先 STOP
+        if skip:
+            out.append("  ★ 有 %d 次 save 因**引擎 RUN 被跳过** ⇒ 这些请求**根本没擦盘**;"
+                       " 要测落盘阻塞必须先确认引擎已 STOP (0x38 run==0)" % skip)
     elif name == "SD_CFG":
         # ★ 魔数判读 (2026-09-13, 回应审计 P3②): 这个区**只在魔数有效时才被固件采纳** ——
         #   不报魔数, 读的人会把 AXI 上电随机值当成"配置"。我今天就被这条坑过一次:

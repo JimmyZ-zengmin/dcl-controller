@@ -272,7 +272,13 @@ OBS uint32_t g_opt_sr = 0;   /* FLASH_OPTSR_CUR (bit4=IWDG1_SW: 1=软件看门�
 #define DCL_LOOP_RESET  1               /* 1 = 交付 (停滞⇒安全态+复位) / 0 = 能失败的对照构建 */
 #endif
 #define LOOP_STALL_TICKS      12000u    /* 停滞阈值 (拍) = 1.2s, 依据见 ① */
-#define PERSIST_BLOCK_TICKS   25000u    /* persist 落盘(端到端实测 ~1.55s) 的声明窗口 = 2.5s (1.6×余量) */
+#define PERSIST_BLOCK_TICKS   80000u    /* persist 落盘窗口 = **8s, 必须 ≥ flash.c 的擦除超时预算**
+                                         *   (FL_ERASE_TIMEOUT_CYC = 8s) —— 两者是同一件事的两种单位,
+                                         *   改一个必须改另一个, 否则 3s 的擦除会在 2.5s 处被停滞自愈复位。
+                                         *   ★ 实测依据 (2026-09-13): 真实擦除会**触发看门狗复位**
+                                         *     (擦除期间喂狗停摆), 已在 flash.c 的 fl_wait_qw 里用
+                                         *     "有界喂狗"修掉; 这里的窗口是**第二道**保险:
+                                         *     即使喂狗失效, 停滞判据也不该在合法擦除期间动手。 */
 #define SD_POLL_BLOCK_TICKS    8000u    /* sd_log_poll 例行刷盘: 实测单次间隔最大 0.48s ⇒ 0.8s 窗口 */
 #define SD_INIT_BLOCK_TICKS   30000u    /* sd_reopen_log (整卡重初始化, 含识别重试) 的声明窗口 */
 
@@ -3360,6 +3366,22 @@ int main(void)
         SHM_U32(g_shm, OFF_WDT_STAT + 164u) = HB_GPIO_PORT;             /* [41] */
         SHM_U32(g_shm, OFF_WDT_STAT + 168u) = HB_ISR_PIN;               /* [42] */
         SHM_U32(g_shm, OFF_WDT_STAT + 172u) = HB_LOOP_PIN;              /* [43] */
+
+        /* ★★ 掉电保持诊断 (2026-09-13, 起因是一次真实的误判):
+         *   关键是 [5] `erase_ok` —— **"这次擦了没"必须可读回**。原先这两个计数器只被
+         *   obs_anchor 锚定, 外部完全看不见 ⇒ 我把一次被**跳过**的落盘(21ms)读成了
+         *   "落盘很快", 得出相反结论。没有判据就会得出相反结论 (本项目铁律)。
+         *   ★ 能失败的判据: 代码**每次都先擦后写** ⇒ `erase_ok` 应恒等于 `writes`;
+         *     若 writes 涨而 erase_ok 不涨 ⇒ 有路径绕过了擦除 (那就是缺陷)。 */
+        SHM_U32(g_shm, OFF_PERSIST_STAT +  0u) = g_persist_cmds;      /* [0] 0x43 调用次数 */
+        SHM_U32(g_shm, OFF_PERSIST_STAT +  4u) = g_persist_saves;     /* [1] 受理的 save 请求 */
+        SHM_U32(g_shm, OFF_PERSIST_STAT +  8u) = g_persist_skip_run;  /* [2] 因引擎 RUN 跳过 */
+        SHM_U32(g_shm, OFF_PERSIST_STAT + 12u) = g_persist_nak;       /* [3] 拒绝次数 */
+        SHM_U32(g_shm, OFF_PERSIST_STAT + 16u) = g_persist_writes;    /* [4] 真正写完的次数 */
+        SHM_U32(g_shm, OFF_PERSIST_STAT + 20u) = g_persist_erase_ok;  /* [5] ★ 擦成功次数 */
+        SHM_U32(g_shm, OFF_PERSIST_STAT + 24u) = g_persist_erase_fail;/* [6] 擦失败次数 */
+        SHM_U32(g_shm, OFF_PERSIST_STAT + 28u) = (g_persist_dirty ? 1u : 0u)
+                                               | ((uint32_t)g_persist_target << 8); /* [7] */
 
         /* ★★ AXI 活体镜像 (2026-09-13) —— 把当前 stage / 拍号写进复位取证记录 [30]/[31]。
          *   为什么必须"活着写": `g_stage`/`g_tick_count` 住在 .bss, 而**启动代码的清零

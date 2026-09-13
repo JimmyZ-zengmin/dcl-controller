@@ -9,6 +9,8 @@
  */
 #include "flash.h"
 #include "regs.h"
+/* ★★ 有界喂狗需要 wdt_feed() (2026-09-13, 实测缺陷修复 —— 见 fl_wait_qw 内注释) */
+#include "wdt.h"
 
 /* 超时阈值 (DWT 周期数; 400MHz 下 1 秒 = 4e8)。
  * 擦除上限给 8 秒, 编程一个字给 1 秒 —— 都不可能在正常硬件上触发,
@@ -16,7 +18,13 @@
 #define FL_ERASE_TIMEOUT_CYC   (8u * 400000000u)
 #define FL_WRITE_TIMEOUT_CYC   (1u * 400000000u)
 
-static inline uint32_t fl_cyccnt(void)
+/* ★★ 必须进 ITCM 的属性 (2026-09-13, 一次实测缺陷的直接产物) —— 见 fl_wait_qw 的注释。
+ *   本项目对"向量表 + ISR 进 ITCM"早有定案, 这里是同一条纪律的**遗漏面**:
+ *   擦扇区期间 **flash 取指被 stall**, 所以**连等待循环本身**也必须在 ITCM 里,
+ *   否则 CPU 连一条"喂狗"指令都取不到 (它也在 flash 里) ⇒ 看门狗必复位。 */
+#define FL_ITCM  __attribute__((section(".itcm_text"), noinline, used))
+
+FL_ITCM static uint32_t fl_cyccnt(void)
 {
     return DWT_CYCCNT;
 }
@@ -31,7 +39,18 @@ volatile uint32_t g_fl_err_sr1   = 0;
 volatile uint32_t g_fl_err_cr1   = 0;
 volatile uint32_t g_fl_err_cnt   = 0;
 
-/** @brief 等待操作队列排空。★ 判据是 QW, 不是 BSY (见 flash.h 前言第 ③ 条) */
+/** @brief 等待操作队列排空。★ 判据是 QW, 不是 BSY (见 flash.h 前言第 ③ 条)
+ *  ★★ 本函数**必须放在 ITCM** (`FL_ITCM`), 理由是一次实测缺陷:
+ *    擦一个 128KB 扇区要几百 ms, 而擦除期间 **flash 取指被 stall** ——
+ *    若本等待循环还在 flash 里, CPU 连循环体的一条指令都取不到, 更谈不上"在循环里喂狗"
+ *    ⇒ 拍 ISR 也停摆 (它的调用同样踩 flash) ⇒ **看门狗 200ms 到点, 把板子复位**。
+ *    实测症状: 每次真实落盘 → 启动次数 +1 / RSR=IWDG1 / PERSIST_STAT 全 0
+ *    (即**配置永远存不下去, 而"保存配置"变成了"重启机器"**)。
+ *    ★ 项目对"向量表 + ISR 进 ITCM"早有定案 —— 这是同一条纪律的**遗漏面**:
+ *      **只要一段代码要在 flash 忙时运行, 它自己就不能在 flash 里。**
+ *    ★ 修法验证前它已经骗过我一次: 我先在循环里加了"每 N 轮喂一次", 无效 ——
+ *      因为那段代码压根执行不到 (取指就没了)。"加了喂狗" ≠ "喂狗能执行"。 */
+FL_ITCM
 static int fl_wait_qw(uint32_t timeout_cyc)
 {
     uint32_t t0 = fl_cyccnt();
@@ -54,6 +73,27 @@ static int fl_wait_qw(uint32_t timeout_cyc)
             return FL_OK;
         }
         if ((fl_cyccnt() - t0) > timeout_cyc) return FL_ERR_TIMEOUT;
+
+        /* ★★ 有界喂狗 (2026-09-13, 一次**实测缺陷**的修复) ★★
+         * 缺陷: 落盘要**擦 128KB 扇区**, 而看门狗超时只有 200ms, 喂狗点在**拍 ISR** ——
+         *   擦除期间 ISR 的取指/调用会踩 flash 总线 ⇒ 喂狗停摆 ⇒ **每次真实落盘
+         *   都被看门狗复位板子**: 现场后果是"操作员按保存 → 机器重启", 而配置**永远存不下去**
+         *   (实测: 落盘瞬间 启动次数+1、RSR=IWDG1、PERSIST_STAT 的 writes/erase_ok 恒 0,
+         *    且"上一轮最后拍"就停在落盘那一刻 ⇒ 主循环再没回来)。
+         *   ★ 这是典型的**集成回归**: "擦除 816ms"(09-11) 与 "看门狗 200ms"(09-13) 两个决定
+         *     各自都验证过, 但**组合从没测过** —— 单看任何一份记录都发现不了。
+         * 为什么喂: 看门狗的职责是"抓 CPU 卡死", **不是"给合法长操作设上界"**;
+         *   合法长操作应当能把活干完。
+         * 为什么"有界": 无条件喂会把"擦除卡死"也变成永远不复位 ⇒ 保护退化成空判据。
+         *   ⇒ **只在超时预算内喂**(本行位于超时判据之后); 一旦超预算立即 return 并停止喂狗,
+         *     真卡死时看门狗照常动手 (失败安全)。
+         *   ★ 形状与主循环停滞判据的"带截止时间的窗口"完全一致 —— 本项目的一贯做法。
+         * ★★ 为什么是**每轮都喂**而不是"N 轮喂一次": 第一版写的是 `++div >= 20000` 才喂,
+         *   结果**仍然复位** —— 因为擦除期间每次读 `FLASH_SR1` 都要等 flash 总线
+         *   (单次迭代可能到 µs 级), 20000 次 ≈ **200ms = 看门狗超时** ⇒ 第一次喂狗来得太晚。
+         *   ⇒ 教训: **"隔 N 次做一次"这类写法在"单次耗时未知"的循环里是不可靠的**;
+         *     KR 写只有几周期, 每轮都喂没有代价。 */
+        wdt_feed();
     }
 }
 

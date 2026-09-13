@@ -561,6 +561,21 @@ _Static_assert(OFF_FAULT_LOG + OFF_FAULT_LOG_SZ <= OFF_WDT_STAT,
 _Static_assert(OFF_WDT_STAT + OFF_WDT_STAT_SZ <= SHM_SIZE,
                "SHM: WDT 状态区越出 SHM 末尾");
 
+/* ---- ★★ 掉电保持诊断面 (2026-09-13) ----
+ * 为什么必须有它 (一次真实的误判): `g_persist_erase_ok/fail` 原来**只被 obs_anchor 锚定**
+ *   (防 gc-sections 回收), **没有任何外部可读面** ⇒ PC 侧判不出"这次落盘到底擦了没"。
+ *   于是我把一次 **21ms** 的落盘读成"落盘很快", 而真因是**引擎 RUN 时跳过了整条路径**
+ *   (`persist_save` 在第一道语义门就 return 1)。**没有判据, 就会得出相反结论** ——
+ *   这是本项目"写一次就算"铁律的又一例 (同族: PR/RLR 写死、喂狗计数不可读)。
+ * 为什么单独一个区: 擦除是**唯一能合法阻塞主循环 ~1.5s** 的路径, 而停滞判据的窗口
+ *   正是为它留的 ⇒ "擦了没 / 擦了几次 / 跳过了几次"必须可读回, 否则**窗口大小无从验证**。 */
+#define OFF_PERSIST_STAT        0x7180
+#define OFF_PERSIST_STAT_SZ     32u      /* 8 字: 见 manifest.h 的字段说明 */
+_Static_assert(OFF_WDT_STAT + OFF_WDT_STAT_SZ <= OFF_PERSIST_STAT,
+               "SHM: PERSIST_STAT 与 WDT 状态区重叠");
+_Static_assert(OFF_PERSIST_STAT + OFF_PERSIST_STAT_SZ <= SHM_SIZE,
+               "SHM: PERSIST_STAT 越出 SHM 末尾");
+
 
 /* ══════════ 路由条目 (16B packed) —— 与 S3 逐字节相同 ══════════ */
 typedef struct __attribute__((packed, aligned(4))) {
