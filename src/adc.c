@@ -3,6 +3,7 @@
  * 见 adc.h 的移植说明。本文件的关键纪律: **所有位域/偏移抄官方头文件**, 不手推。
  */
 #include "adc.h"
+#include "itcm.h"   /* ★ ISR 调用树必须住 ITCM —— 见该头文件 */
 #include "engine.h"
 #include "regs.h"
 #include "clock.h"
@@ -246,7 +247,7 @@ static void adc_sm_start(uint32_t ch)
  *   (原 16 拍 = 1.6ms, 快一倍; HIL 反馈均值跨度 25.6ms → 12.8ms)。
  * ★ 握手: pend=1 表示"有转换在跑"; kick 只在 pend==0 时启动 (否则 ADC busy)。
  *   对照档 (IO_IN_ISR=0) 走 adc_poll() 整体 (reclaim+kick 顺序调), 语义不变。 */
-void adc_poll_reclaim(uint8_t *base)
+DCL_ITCM void adc_poll_reclaim(uint8_t *base)
 {
     if (!s_adc_ready) return;
     if (!s_sm.pend) return;    /* 无转换在跑 (上拍尾没 kick) ⇒ 无事 */
@@ -266,7 +267,7 @@ void adc_poll_reclaim(uint8_t *base)
     }
 }
 
-void adc_poll_kick(void)
+DCL_ITCM void adc_poll_kick(void)
 {
     if (!s_adc_ready) return;
     if (s_sm.pend) return;     /* 还有转换在跑 ⇒ 不启动 (等回收), ADC 单次模式 busy */

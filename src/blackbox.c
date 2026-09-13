@@ -12,6 +12,7 @@
  *   ⇒ 新固件启动时读 BB_BASE 处的 magic 判断是否有未读数据。
  *   BB_MAGIC 位置 = BB_AXI_BASE (每槽 [0] 的 tick 位置 = 槽起始)。 */
 #include "blackbox.h"
+#include "itcm.h"   /* ★ ISR 调用树必须住 ITCM —— 见该头文件 */
 #include "sd.h"   /* sd_cfg_take: 带魔数门的一次性配置字 */
 #include "engine.h"
 #include "regs.h"
@@ -299,7 +300,7 @@ void bb_init(uint8_t *shm_base)
     bb_kick(0);
 }
 
-void bb_kick(uint32_t tick)
+DCL_ITCM void bb_kick(uint32_t tick)
 {
     int samp;
     if (!s_bb_ready || !s_bb_shm) return;

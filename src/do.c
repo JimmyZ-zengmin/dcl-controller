@@ -11,6 +11,7 @@
  *   (高 16 位非 0 ⇒ g_safe_mask_oob) 在 engine.c 的 eng_outputs_safe 里, 不在本处重复。
  */
 #include "do.h"
+#include "itcm.h"   /* ★ ISR 调用树必须住 ITCM —— 见该头文件 */
 #include "engine.h"
 #include "regs.h"
 
@@ -176,7 +177,7 @@ void do_latch_init(void)
     __asm__ volatile("dsb" ::: "memory");
 }
 
-void do_poll(uint8_t *base, uint32_t tick_now)
+DCL_ITCM void do_poll(uint8_t *base, uint32_t tick_now)
 {
     (void)tick_now;          /* 输出面每拍都做, 不需要相位 */
     if (!s_do_ready) return;

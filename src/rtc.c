@@ -13,6 +13,7 @@
  * ★ 观测面: SSR/TR/DR 三个寄存器的**值**拷进 SHM (pyocd 直接读)。
  *   SSR 是 16 位向下计数器 (1024Hz), 差值 = 事件间精确时间。 */
 #include "rtc.h"
+#include "itcm.h"   /* ★ ISR 调用树必须住 ITCM —— 见该头文件 */
 #include "engine.h"
 #include "regs.h"
 
@@ -138,7 +139,7 @@ void rtc_init(uint8_t *base)
 
 static uint32_t s_latch_div = 0;
 
-void rtc_latch(void)
+DCL_ITCM void rtc_latch(void)
 {
     if (!s_rtc_ready) return;
     if ((s_latch_div++ & (RTC_LATCH_DIV - 1u)) != 0u) return;   /* 降频 (绝大多数拍只花几拍) */

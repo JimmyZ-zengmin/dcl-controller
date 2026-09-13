@@ -2,6 +2,7 @@
  * di.c — DI 数字量输入 (W5 外设域)。见 di.h 说明 (语义逐字保留 S3)。
  */
 #include "di.h"
+#include "itcm.h"   /* ★ ISR 调用树必须住 ITCM —— 见该头文件 */
 #include "engine.h"
 #include "regs.h"
 
@@ -76,7 +77,7 @@ void di_tick(uint8_t *base, uint32_t tick_now)
 }
 
 /* ★ P1 拍内版 (交付): **拍相位锚定** ⇒ 严格每 DI_SAMPLE_DIV 拍一次, 见 di.h 的说明 */
-void di_poll(uint8_t *base, uint32_t tick_now)
+DCL_ITCM void di_poll(uint8_t *base, uint32_t tick_now)
 {
     if ((tick_now % (uint32_t)DI_SAMPLE_DIV) != 0u) return;
     di_sample_all(base);

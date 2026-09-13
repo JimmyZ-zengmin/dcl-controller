@@ -2,6 +2,7 @@
  * hil.c — HIL 硬件在环 (W5 外设域)。见 hil.h 说明 (语义保留 S3)。
  */
 #include "hil.h"
+#include "itcm.h"   /* ★ ISR 调用树必须住 ITCM —— 见该头文件 */
 #include "adc.h"
 #include "engine.h"
 #include "regs.h"
@@ -168,7 +169,7 @@ void hil_outputs_safe(void)
  *   修法是 ld/STM32H723ZG_FLASH.ld 的 `.itcm_vectors` 对齐 128 → **256**。
  *   ★ 保留 `long_call` (见 hil.h): 本函数在 flash 而 ISR 在 ITCM, 相距 128MB ⇒
  *     必须走 BLX。这**不是**本次卡死的原因, 但确实是真实的跨区调用要求。 */
-void hil_out_poll(uint8_t *base, uint32_t tick_now)
+DCL_ITCM void hil_out_poll(uint8_t *base, uint32_t tick_now)
 {
     (void)tick_now;          /* 输出臂每拍都做, 不需要相位 */
     g_hil_out_n++;           /* 活性计数 (每拍+1; 防空判据) */

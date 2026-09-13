@@ -246,6 +246,32 @@ OBS uint32_t g_opt_sr = 0;   /* FLASH_OPTSR_CUR (bit4=IWDG1_SW: 1=软件看门�
 #define BOOT_REC_W_GAPMAX    35u          /* [35] 本轮主循环两轮最大间隔 (拍) —— 实测证据 */
 #define BOOT_REC_W_LOOPRST_P 36u          /* [36] 上一轮的 [34] (取证段搬过来) */
 #define BOOT_REC_W_GAPMAX_P  37u          /* [37] 上一轮的 [35] (取证段搬过来) */
+#define BOOT_REC_W_DEFH      38u          /* [38] "进过 Default_Handler" 魔数 (由默认处理器锚点写) */
+#define BOOT_REC_W_DEFH_PC   39u          /* [39] 进默认处理器时**出错指令的 PC** ⇒ 直接指到元凶 */
+
+/* ★★ 默认处理器锚点 (2026-09-13, 一次实测缺陷的产物) —— 见启动文件里 Default_Handler 的注释。
+ *   目的: 把"**是谁跳进了 Default_Handler**"变成**跨复位可读**的证据。
+ *   为什么必须有它: 本缺陷躲过两轮排查, 就是因为一次故障只表现为"板子重启了",
+ *   什么都没留下 (故障台账在 SHM, 复位就清零; 而 vg_stage 之类的 .bss 更是启动即清)。
+ *   ⇒ 证据必须写进 **AXI(不被启动清零)** 才活得下来。
+ *   ★ 必须 ISR_PLACE(ITCM): 它要在**flash 忙时**也能跑 —— 否则连这几行记录都执行不到,
+ *     那就又回到"什么都没留下"的局面 (这正是本次缺陷的形态)。
+ *   ★ 不许碰 flash: 只用栈上取数 + AXI 写 (AXI 是 RAM, 与 flash 控制器无关)。
+ *   ★ 不喂狗: 保留既有语义 —— 卡在默认处理器 ⇒ 看门狗复位;
+ *     负向对照 (`-DDCL_WDT=0`) 仍应表现为"永久卡死"。 */
+ISR_PLACE void dcl_default_handler_anchor(uint32_t exc_return)
+{
+    uint32_t sp;
+    /* EXC_RETURN bit2: 0 = 用的是 MSP, 1 = PSP */
+    if (exc_return & 0x4u) __asm__ volatile("mrs %0, psp" : "=r"(sp));
+    else                   __asm__ volatile("mrs %0, msp" : "=r"(sp));
+    /* Cortex-M 标准异常帧: 偏移 0x18 处是出错时的 PC */
+    uint32_t pc = *(volatile uint32_t *)(uintptr_t)(sp + 0x18u);
+    volatile uint32_t *r = (volatile uint32_t *)BOOT_REC_ADDR;
+    r[BOOT_REC_W_DEFH_PC] = pc;                          /* 先写 PC, 再写魔数 (顺序: 魔数=有效标记) */
+    r[BOOT_REC_W_DEFH]    = 0x44454648u;                 /* "DEFH" */
+    __asm__ volatile("dsb" ::: "memory");
+}
 
 /* ══════════ 主循环活性: 阈值 / 已知阻塞窗口 / 自愈 (2026-09-13, 回应审计 P1①) ══════════
  * 审计指出: 喂狗点在拍 ISR ⇒ **主循环死了既不复位、也读不到** (协议口全在主循环里) ——
@@ -367,6 +393,18 @@ static inline __attribute__((always_inline)) void hb_toggle(uint32_t pin)
 {
     if (GPIO_ODR(HB_GPIO_PORT) & (1u << pin)) GPIO_BSRR(HB_GPIO_PORT) = (1u << (pin + 16u));
     else                                      GPIO_BSRR(HB_GPIO_PORT) = (1u << pin);
+}
+
+/** 直接置高 (BSRR 低 16 位) —— 用于 ISR 入口/出口探针。 */
+static inline __attribute__((always_inline)) void hb_set(uint32_t pin)
+{
+    GPIO_BSRR(HB_GPIO_PORT) = (1u << pin);
+}
+
+/** 直接拉低 (BSRR 高 16 位)。 */
+static inline __attribute__((always_inline)) void hb_clr(uint32_t pin)
+{
+    GPIO_BSRR(HB_GPIO_PORT) = (1u << (pin + 16u));
 }
 
 /** 心跳脚初始化: PB0/PB1 设为推挽输出 (低速足够, 少一点边沿噪声)。
@@ -771,6 +809,16 @@ static inline void stats_reset(void)
 
 ISR_PLACE void TIM2_IRQHandler(void)
 {
+    /* ★★ ISR 宽度探针 (2026-09-13, 回应审计的强判据建议) —— 出口在函数末尾。
+     *   **入口置高 / 出口拉低** ⇒ 正常是 ~µs 级窄脉冲 (每拍一个);
+     *   而"ISR 卡在 flash 取指"时会**拉成一条长高电平, 直到看门狗复位**。
+     *   ⇒ 判据从"心跳在不在跳"(**存在性**判据 —— 10Hz 停 200ms 只丢 2 个沿,
+     *     长采集里看起来"仍在跳", 会得出**反向结论**)变成
+     *     "**最大高电平宽度**"(可量化): 正常 <10µs, 卡死 **≈200ms = DCL_WDT_MS**
+     *     ⇒ 两个独立量互证, 一次判死。
+     *   ★ 放在**第一句**: 探针要覆盖整个 ISR —— 若入口之后的取指就卡住, 也必须看得到。 */
+    hb_set(HB_ISR_PIN);
+
     uint32_t t0 = DWT_CYCCNT;
 
     /* ★★ 时基活性 —— **检测必须与"使用"同源** (2026-09-13 修, 回应审计的口径不一致):
@@ -854,13 +902,13 @@ ISR_PLACE void TIM2_IRQHandler(void)
                 for (;;) { __asm__ volatile("nop"); }
             }
 
-            /* ★ 双心跳之 **ISR 侧** (PLC 级实时可观测: 主循环死时协议口全断, 只能靠脚看)。
-             *   每 500 拍翻转 ⇒ 10Hz 方波。用静态计数器而不是 `% HB_DIV_TICKS`
-             *   (取模在拍里要除法, 5000 次/秒的除法纯属浪费)。 */
-            {
-                static uint32_t s_hb_div = 0u;
-                if (++s_hb_div >= HB_DIV_TICKS) { s_hb_div = 0u; hb_toggle(HB_ISR_PIN); g_hb_isr_tog++; }
-            }
+            /* ★ 双心跳之 **ISR 侧** —— 已从"每 500 拍翻转(10Hz 方波)"改成
+             *   **"入口置高 / 出口拉低"的宽度探针** (2026-09-13, 回应审计):
+             *   10Hz 那种形状只能回答"心跳还在不在"(存在性判据), 而本缺陷恰恰是
+             *   "ISR 卡 200ms 后复位再恢复" —— 长采集里只丢 2 个沿, 看不出来。
+             *   ⇒ 探针脉冲的**宽度**可量化, 且卡死时 ≈200ms 正好等于看门狗超时。
+             *   ★ `g_hb_isr_tog` 语义随之变准: 现在数的是**走完的 ISR 次数**
+             *     (卡住时不增长) ⇒ 协议侧也能判"ISR 是否还在完成"。 */
 
             /* ★★ 主循环停滞检测 (2026-09-13) —— **判据必须放在这里**:
              *   主循环自己无法报告自己停了 (第一版写在主循环里 ⇒ 恒不成立的空判据)。
@@ -1210,6 +1258,13 @@ ISR_PLACE void TIM2_IRQHandler(void)
         }
         g_per_prev = t0;
     }
+
+    /* ★★ ISR 出口: 拉低探针 + 记"走完一次" —— **必须放在单出口处**。
+     *   本 ISR 无提前 return (已核) ⇒ 这一个出口就够; 若将来加了提前 return,
+     *   必须同时补 hb_clr(), 否则探针会**永久拉高**、把判据变成恒真的假报警。
+     *   ★ 这也让 `g_hb_isr_tog` 成为"**完成次数**": ISR 卡住时它停止增长。 */
+    hb_clr(HB_ISR_PIN);
+    g_hb_isr_tog++;
 }
 
 /* ══════════════════════════════════════════════════════════════════

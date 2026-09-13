@@ -131,8 +131,23 @@ LoopForever:
  * @param  None
  * @retval : None
 */
-  .section .text.Default_Handler,"ax",%progbits
+  /* ★★ Default_Handler 必须住在 ITCM (2026-09-13, 一次实测缺陷的产物) ★★
+   *   它是**所有未实现向量 + 默认故障**的共同落点 (115 个弱别名都指这儿)。
+   *   而"擦/写内部 flash 期间 **flash 取指会被 stall**" ⇒ 若它留在 .text(flash),
+   *   一旦跳进来**连循环体的 `b` 都取不到** ⇒ 彻底卡死 ⇒ 喂狗停 ⇒ 200ms 看门狗复位。
+   *   现场语义: "保存配置 → 机器重启", 且查不出是谁跳进来的。
+   *   ★ 它此前已经咬过本项目两次 (main.c 注释记着 "整机卡死在 Default_Handler,
+   *     PC=0x080057C4"), 但每次都只被当成"那个功能的 bug", 没人问"它自己为什么在 flash"。
+   *   ⇒ 两条改动:
+   *     ① 放 `.itcm_text` —— 让它在 flash 忙时**能跑** (与拍 ISR 同一条纪律, 见 src/itcm.h);
+   *     ② 进它之前调 C 侧锚点, 把"**谁跳进来的**"(EXC_RETURN + 压栈 PC + VECTACTIVE)
+   *        记进 **AXI(跨复位不丢)** ⇒ "进过默认处理器"这件事**永远不静默**。
+   *   ★ 锚点**不喂狗** —— 保留既有语义: 卡在这里 ⇒ 看门狗复位 (负向对照 `DCL_WDT=0`
+   *     仍应表现为"永久卡死")。 */
+  .section .itcm_text,"ax",%progbits
 Default_Handler:
+  mov r0, lr                       /* EXC_RETURN: bit2 = 用的是 MSP(0) 还是 PSP(1) */
+  bl  dcl_default_handler_anchor   /* 记 AXI (不返回也是安全的: 下面就是死循环) */
 Infinite_Loop:
   b Infinite_Loop
   .size Default_Handler, .-Default_Handler
