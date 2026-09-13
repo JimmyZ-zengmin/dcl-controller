@@ -26,6 +26,15 @@ set(DCL_MIN_UART "0" CACHE STRING "1 = 只编最小 UART 固件 (src/min_uart.c)
 set(DCL_MIN_UART2 "0" CACHE STRING "1 = 只编最小 485/USART2 接收固件 (src/min_uart485.c)")
 set(DCL_MIN_STRESS "0" CACHE STRING "最小固件: 1 = TX 不停发 (压力模式, 便于判 TX 通路)")
 
+# ---- ★ 响应延迟优化 (2026-09-13): 两个 A/B 开关, 见 src/engine.h 的推导 ----
+#   MB_BUILD_BUDGET: 组装每拍字节预算 (纯 CPU 部分)。4 = **改前行为** (与 RX 预算同用 4),
+#     32 = 交付; 133B 响应的组装从 33 拍压到 5 拍 (3.3ms → 0.5ms), WCET 代价 ≈4µs/拍。
+#   MB_FAST_FRAME: 1 = 按长度早判帧 (长度到 + CRC 通过即判帧), 0 = **改前行为** (只等静默)。
+#   ★ 为什么要留 0 档 (本项目铁律): "改完只跑交付版看到变快"不构成证据 ——
+#     必须用**同一套判据**在 0 档上量出"慢"(能失败的对照), 改进才算被证明。
+set(DCL_MB_BUILD_BUDGET "32" CACHE STRING "组装每拍字节预算 (4 = 改前行为对照)")
+set(DCL_MB_FAST_FRAME "1" CACHE STRING "按长度早判帧 (0 = 改前行为对照)")
+
 if(DCL_MIN_UART)
     set(TARGET min_uart)
 elseif(DCL_MIN_UART2)
@@ -108,6 +117,8 @@ add_compile_options(
     -DVTOR_ITCM=${DCL_VTOR_ITCM}
     -DPA9_MODE=${DCL_PA9_MODE}
     -DMB_UART_ALT=${DCL_MB_UART_ALT}
+    -DMB_BUILD_BUDGET=${DCL_MB_BUILD_BUDGET}
+    -DMB_FAST_FRAME=${DCL_MB_FAST_FRAME}
     -DBOOT_BANNER=${DCL_BOOT_BANNER}
     -DBANNER_PERIOD_MS=${DCL_BANNER_PERIOD}
     -DUART_SELFTEST=${DCL_UART_SELFTEST}

@@ -67,6 +67,31 @@ static inline uint16_t *mb_set(uint8_t *base)  { return (uint16_t *)MB_PTR(base,
  *   "ORE 被反复清掉、接收反复复活" 与 "ORE 从未出现过" 在读数上**完全一样** ——
  *   而这正是本次故障的核心机制。⇒ 一个"该变而没变"的量必须能被单独读走。 */
 #define MB_DIAG_ERRCLR 15u
+/* ══════════ 响应延迟观测面 (2026-09-13 新增) ══════════
+ * ★ 为什么必须补这个: 此前所有"响应时间"的数字都来自 **PC 侧**(经 USB) ——
+ *   而 USB/CH340 的开销 (实测 2.2ms) 比被测的改进量还大, 等于用一把能量 1 米的尺
+ *   去量 1 毫米的改动。⇒ 把"请求最后一字节到达 → 响应第一字节发出"的**板内**
+ *   周期数记下来: 不含 USB、不含线缆, 直接反映固件自身的处理延迟。
+ * ★ 量化误差: 请求侧的时刻取自"拉到该字节的那一拍", 故有 ≤1 拍 (100µs) 的量化;
+ *   响应侧的时刻是精确的 (写 TDR 那一下)。比较**改前/改后**时量化误差是共模的。
+ * ★★ 单位是 **100µs 拍**而不是 CPU 周期 —— 这是**故意的** (2026-09-13 踩到):
+ *   第一版用 `DWT_CYCCNT`, 实测 `LAT_N=227` 却 `LAT_LAST=0` —— 因为
+ *   **调试器(pyocd)会话会静默停掉 DWT_CYCCNT**(本项目"铁律 0"的既知血证:
+ *     "一切正常, 只有时间量是 0")。⇒ 用 DWT 当时间源, 就会把"调试器来过"读成
+ *   "延迟为 0"。改成**自己的拍计数**后, 该观测量不再依赖任何可被外部关掉的东西。
+ *   (这本身就是铁律 0 的又一次应用: 观测量不能依赖"可能被观测动作改变"的状态。)
+ *   ⇒ 读数换算: 1 拍 = 100µs。 */
+#define MB_DIAG_LAT_LAST 23u  /* 最近一次: 响应延迟 (CPU 周期) */
+#define MB_DIAG_LAT_MIN  24u
+#define MB_DIAG_LAT_MAX  25u
+#define MB_DIAG_LAT_N    26u  /* 样本数 */
+#define MB_DIAG_T_RX     27u  /* 内部: 最近一次拉到字节的 DWT 时刻 */
+#define MB_DIAG_FASTOK   28u  /* 内部: 早判帧 (CRC 门) 成功次数 */
+
+/* 通信域自己的拍计数 (每次 mb_tick +1, 单位 100μs)。
+ * ★ 为什么不用 DWT_CYCCNT: 见上面 MB_DIAG_LAT_* 的注释 —— 调试器会话会静默把它停掉,
+ *   于是"延迟"会被读成 0。自己的计数器不依赖任何可被外部关掉的状态 (铁律 0)。 */
+static uint32_t s_mb_tick;
 static inline volatile uint32_t *mb_diag(uint8_t *base)
 {
     return (volatile uint32_t *)(base + OFF_MB_DIAG);
@@ -176,6 +201,16 @@ static int ATTR_ITCM mb_push_tx(uint8_t *base, const uint8_t *src, int n)
     while (sent < n) {
         if (!(USART_ISR(USART2_BASE) & USART_ISR_TXE)) break;
         USART_TDR(USART2_BASE) = src[sent++];
+    }
+    /* ★ 响应延迟观测: 本次是这条响应的**第一个**字节 (c->tx_sent 是调用前的偏移)
+     *   ⇒ 此刻 − 请求最后一字节到达时刻 = 板内处理延迟 (含静默等待 + 解析 + 组装)。 */
+    if (sent > 0 && c->tx_sent == 0u) {
+        volatile uint32_t *d = mb_diag(base);
+        uint32_t lat = s_mb_tick - d[MB_DIAG_T_RX];      /* 单位: 100µs 拍 */
+        d[MB_DIAG_LAT_LAST] = lat;
+        if (d[MB_DIAG_LAT_N] == 0u || lat < d[MB_DIAG_LAT_MIN]) d[MB_DIAG_LAT_MIN] = lat;
+        if (lat > d[MB_DIAG_LAT_MAX]) d[MB_DIAG_LAT_MAX] = lat;
+        d[MB_DIAG_LAT_N] += 1u;
     }
     return sent;
 }
@@ -311,12 +346,41 @@ static void ATTR_ITCM mb_parse_frame(uint8_t *base)
     c->state = respond ? MB_ST_BUILD : MB_ST_IDLE;
 }
 
+/* ---- 请求帧的**确定长度** (2026-09-13 早判帧用) ----
+ * Modbus RTU 靠 3.5 字符静默划帧, 但**多数请求的长度是可以算出来的**:
+ *   0x01..0x08 (读写单个/位操作)  → [addr][func][X2][Y2][crc2] = **8 字节**
+ *   0x0F / 0x10 (写多个)          → [addr][func][start2][qty2][bc][data…][crc2]
+ *                                   = **9 + bc**, bc = rx[6]
+ *   其它功能码                    → 0 (未知 ⇒ 交给静默判帧兜底)
+ * ⇒ "长度已到 + **CRC 通过**" 是比"等静默"更强的完整帧判据 (CRC-16 误判 1/65536)。
+ *   ★ 返回 0 表示"此刻还判不出来", 调用者必须保持沉默、不要误判。
+ * ★ 整个函数被 `#if MB_FAST_FRAME` 包住: 对照档 (FAST_FRAME=0) 下没有任何调用点,
+ *   而本工程的 `-Werror` 会把 "defined but not used" 变成编译失败 ——
+ *   刚踩过: 对照构建因此**编译失败**, 而**失败的构建会让 pyocd flash 跳过烧录并返回 0**,
+ *   于是"对照档"其实还在跑交付档 (症状: 对照读数与交付读数一模一样)。
+ *   ⇒ 见下面 verify 步骤: 烧完必须**读回一个只有新固件才有的量**才算数。 */
+#if MB_FAST_FRAME
+static uint16_t ATTR_ITCM mb_expected_len(const uint8_t *rx, uint16_t len)
+{
+    switch (rx[1]) {
+    case 0x01u: case 0x02u: case 0x03u: case 0x04u:
+    case 0x05u: case 0x06u: case 0x07u: case 0x08u:
+        return 8u;
+    case 0x0Fu: case 0x10u:
+        return (len >= 7u) ? (uint16_t)(9u + (uint16_t)rx[6]) : 0u;
+    default:
+        return 0u;
+    }
+}
+#endif
+
 /* ---- ISR 每拍推进 (核心: 分摊 + 限速) ---- */
 void ATTR_ITCM mb_tick(uint8_t *base)
 {
     MbCtrl_t *c = mb_ctrl(base);
     if (!c->enabled) return;
 
+    s_mb_tick++;                                /* 本域自己的拍计数 (响应延迟测量用) */
     uint8_t budget = c->tick_budget ? c->tick_budget : MB_TICK_BUDGET;
     uint8_t *rx = mb_rx(base);
     /* ★★ 首个 tick 把 GPIOD 的**实际配置**读回来发布 (一次性)。
@@ -375,7 +439,30 @@ void ATTR_ITCM mb_tick(uint8_t *base)
             {   /* ★ 记下"到过多少字节" —— 这是"字节到了但框不成帧"的唯一指纹 */
                 volatile uint32_t *d = mb_diag(base);
                 if (c->rx_len > d[MB_DIAG_MAXRX]) d[MB_DIAG_MAXRX] = c->rx_len;
+                /* ★ 响应延迟测量的**起点**: 本拍拉到过字节的时刻 (单位: 拍) */
+                d[MB_DIAG_T_RX] = s_mb_tick;
             }
+#if MB_FAST_FRAME
+            /* ══════ ★★ 按长度早判帧 (2026-09-13 优化, A/B 开关 MB_FAST_FRAME) ══════
+             * 老实现: 收到字节后必须再等 MB_SILENT_TICKS×100µs (400µs) 静默才敢判帧
+             *         ⇒ 每条事务白付 400µs (8B 事务总长才 2.5ms, 占 16%!)。
+             * 这里: 长度由功能码算出, 一到就用 **CRC 做闸门**当场判帧, 不等静默。
+             * ★ 只在 `rx_len == 期望长度` 的那一拍试一次 —— 失败就退回静默路径,
+             *   所以不会每拍重算 CRC (WCET 有界: 每帧最多一次 ≤253B 的 CRC)。
+             * ★ 静默路径**原样保留**作兜底 (未知功能码/坏帧/被截断的帧都还得靠它)。 */
+            if (c->rx_len >= 4u) {
+                uint16_t want = mb_expected_len(rx, c->rx_len);
+                if (want != 0u && c->rx_len == want) {
+                    uint16_t crc_recv = (uint16_t)(rx[want - 2u]
+                                        | ((uint16_t)rx[want - 1u] << 8));
+                    if (mb_crc16(rx, (uint16_t)(want - 2u)) == crc_recv) {
+                        mb_diag(base)[MB_DIAG_FASTOK] += 1u;
+                        c->state = MB_ST_EXEC;      /* 帧完整 ⇒ 立刻解析, 省掉 400µs */
+                        break;
+                    }
+                }
+            }
+#endif
         } else if (c->state == MB_ST_RX) {
             /* 隧道注入的帧: rx_pos 已达 rx_len (视为收满) → pull 返回 0 → 累计静默 */
             if (++c->silent >= MB_SILENT_TICKS) {
@@ -403,7 +490,7 @@ void ATTR_ITCM mb_tick(uint8_t *base)
          *   ⇒ mb_inject 的 `state != IDLE` 守卫恒真 ⇒ 之后所有注入 NAK busy,
          *   一条**完全合法**的读请求即可让通信域永久不可用 (只能 RESET/断电)。
          *   total ≤ 2×125+5 = 255 < 256, 天然安全。 */
-        while (n < budget && c->b_pos < total && c->b_pos < MB_TX_SIZE) {
+        while (n < MB_BUILD_BUDGET && c->b_pos < total && c->b_pos < MB_TX_SIZE) {
             uint8_t b;
             if (c->b_pos < c->b_len) {
                 b = mb_resp_byte(base, c->b_pos);

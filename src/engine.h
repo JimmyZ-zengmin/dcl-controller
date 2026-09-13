@@ -383,8 +383,39 @@ _Static_assert(OFF_MB_DIAG + OFF_MB_DIAG_SZ <= 0x4AA0u, "SHM: MB 诊断区越出
  *   ★ 物理大小 = OFF_MB_TX 区 256B (见下方布局断言); 0x61 读取端缓冲
  *     (main.c h_mb_resp) 也必须按本值开, 否则 tx_len>128 会写穿栈。 */
 #define MB_TX_SIZE     256
-#define MB_TICK_BUDGET 4      /* 每拍最多处理字节数 (限速, WCET 上界) */
+#define MB_TICK_BUDGET 4      /* RX 每拍最多拉几字节 (限速, WCET 上界) */
 #define MB_SILENT_TICKS 4     /* 静默拍数 ≥ 3.5 字符 (见上方推导) */
+
+/* ══════════ 响应延迟优化 (2026-09-13) —— 两个**可 A/B 的开关** ══════════
+ * 动机 (实测, tools/mb_rate_test.py + mb_duplex_test.py):
+ *   · 一条 8B↔8B 事务, 线上只需 1.69ms; 而**板内**的额外开销是
+ *     400µs 静默判帧 + 组装按 4 字节/拍分摊 (8B 要 7 拍 ≈ 700µs)。
+ *     ⇒ 8B 帧的协议开销占整条事务的 **44%**; 133B 响应的组装要 **33 拍 ≈ 3.3ms**。
+ *   · 主流 PLC 一次把整帧推出去, 没有这种分摊 —— 这是我们唯一真正落后主流的地方。
+ *
+ * MB_BUILD_BUDGET: 组装(CPU-only)每拍的字节预算。与 MB_TICK_BUDGET **故意分开**:
+ *   那个管"从 FIFO 拉字节"(受波特率与 FIFO 深度约束), 这个管"纯 CPU 组装"。
+ *   ★ WCET 代价是**可算且有界**的: 每个响应字节 ≈ `mb_resp_byte`+`crc16_step` ≈ 30 周期,
+ *     预算 32 ⇒ 单拍最多 ≈960 周期 (240MHz 下 4µs, 占 100µs 拍的 4%)。
+ *   ★ 不能直接给 256: 那会让单拍最多 ≈7700 周期 (32µs), 侵占拍预算。
+ *     32 已把 133B 响应从 **33 拍压到 5 拍** (3.3ms → 0.5ms)。
+ *   ★ A/B 对照: 4 = **改前行为**。必须用同一套判据在两档上各打一份,
+ *     "改完只跑交付版看到变快"不构成证据 (本项目铁律)。
+ * 传法: bash build.sh -DDCL_MB_BUILD_BUDGET=4 */
+#ifndef MB_BUILD_BUDGET
+#define MB_BUILD_BUDGET 32
+#endif
+
+/* MB_FAST_FRAME: 1 = **按长度早判帧**。
+ *   老实现只能等满 3.5 字符静默 (MB_SILENT_TICKS×100µs) 才敢判"帧收完了"。
+ *   但多数请求的长度由功能码就确定 (0x01..0x08 → 8B; 0x0F/0x10 → 9+bytecount),
+ *   于是"长度到 + **CRC 通过**"本身就是更强的完整帧判据 ⇒ 不必再等那 400µs。
+ *   ★ 为什么安全: CRC-16 闸门 (误判 1/65536) + 静默路径**原样保留**兜底;
+ *     且只在 `rx_len == 期望长度` 那一拍试一次, 不会每拍重算 CRC。
+ *   ★ A/B 对照: 0 = **改前行为** (只走静默判帧)。 */
+#ifndef MB_FAST_FRAME
+#define MB_FAST_FRAME 1
+#endif
 
 /* ---- 通信域控制块 (40B, OFF_MB_CTRL) ----
  * ISR 每拍推进状态机; PC 侧可用 0x22 读本块观察通信域状态与统计。

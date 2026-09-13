@@ -99,6 +99,7 @@ NAMES = {
     12: "PD6 low samples",
     13: "PD6 total samples",
     14: "probe marker",
+    15: "ERRCLR(清错误次数)",
     16: "USART2 CR1",
     17: "USART2 CR2",
     18: "USART2 CR3",
@@ -106,9 +107,17 @@ NAMES = {
     20: "USART2 ISR",
     21: "USART2 PRESC",
     22: "reg marker",
+    23: "LAT_LAST(板内响应延迟,拍=100us)",
+    24: "LAT_MIN(拍)",
+    25: "LAT_MAX(拍)",
+    26: "LAT_N(样本数)",
+    27: "T_RX(内部,拍)",
+    28: "FASTOK(早判帧成功次数)",
+    29: "free",
 }
 
-KEY = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22]
+KEY = [0, 1, 2, 3, 4, 5, 15, 16, 17, 18, 19, 20, 21, 22,
+       23, 24, 25, 26, 28, 6, 8, 9, 10, 11]
 
 
 def read_diag(ser, timeout=0.6):
