@@ -45,7 +45,10 @@ void di_init(uint8_t *base)
  * ★ 抽出来是为了让"主循环版"与"拍内版"**逐字相同地**跑同一段逻辑 ——
  *   这样 A/B 对照时唯一的变量才真的是**触发方式**, 而不是"我顺手又改了什么"。
  *   (本项目纪律: 对照实验里出现的每一处差异都必须是有意为之且写在注释里。) */
-static void di_sample_all(uint8_t *base)
+/* ★★ 2026-09-13: 加 DCL_ITCM —— 闸门证明它"从 ISR 可达却落在 FLASH"(0x08005A28)。
+ *   原先只把入口 `di_poll` 搬了 ITCM, 而它调的**采样体**留在 flash ⇒ 同 hil_out_apply
+ *   那类"只搬一层"的漏网 (见 itcm.h: 判据是**传递闭包**, 不是直接被调者)。 */
+DCL_ITCM static void di_sample_all(uint8_t *base)
 {
     for (int i = 0; i < DI_COUNT; i++) {
         uint8_t lv = (uint8_t)di_pin_read(DI_PINS[i]);

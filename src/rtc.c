@@ -146,7 +146,10 @@ DCL_ITCM void rtc_latch(void)
     rtc_snapshot();
 }
 
-void rtc_snapshot(void)
+/* ★★ 2026-09-13: 加 DCL_ITCM —— 闸门证明它"从 ISR 可达却落在 FLASH"(0x08005DCC)。
+ *   `rtc_latch()` 是 DCL_ITCM 的, 但它按降频门调的**快照体**留在 flash ⇒
+ *   擦 flash 期间撞上一次就 stall (同 hil_out_apply / di_sample_all 一族)。 */
+DCL_ITCM void rtc_snapshot(void)
 {
     uint32_t tr1, tr2, dr, i;
     if (!s_rtc_ready) return;

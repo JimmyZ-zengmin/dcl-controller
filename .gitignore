@@ -21,3 +21,7 @@ build_min485/
 # RM0468 抽出的 6MB 全文文本, 读手册查规格用)。抽出来的文本随时能重生成,
 # 且体积大 ⇒ 与 .tmpctl 同理, 不入版本控制。工具本体在 tools/pdf_grep.py (受控)。
 .workbuddy/scratch/
+
+# 第三方资料 (ST 手册 / 板商例程 / 驱动包) —— 体积大(382MB)且非自研, 不入版本控制.
+# 需要时从原始资料包取; 引用其内容请在 docs/ 里写路径与结论, 而不是把 PDF 提交进来.
+Hardware Official Documentation/

@@ -79,8 +79,22 @@ void hil_init(uint8_t *base)
 /* ══════════ 输出臂 (两个入口共用) ══════════
  * ★ 抽出来是为了让"主循环版"与"拍内版"**逐字相同地**跑同一段逻辑 ——
  *   这样 A/B 对照时唯一的变量才真的是**执行频率**, 而不是"我顺手又改了什么"。 */
-/* ★ 2026-09-12: 暂时留在 flash —— 曾试过放 ITCM, 见 hil_out_poll 的未决项说明。 */
-static void hil_out_apply(uint8_t *base)
+/* ★★★ 2026-09-13: **必须**住 ITCM —— 它是"擦 flash 期间 ISR 卡死"的真凶。
+ *   症状链: 落盘(擦 flash) ⇒ 拍 ISR 每拍都要执行本函数 ⇒ 而它的机器码在 **FLASH**,
+ *     取指被 stall ⇒ ISR 不返回 ⇒ 喂狗停 ⇒ 200ms 后 IWDG 复位
+ *     ⇒ 现场语义"操作员按保存 = 机器重启", 且配置**从未落盘**。
+ *   ★ 为什么此前"看不出它是元凶" —— 两层假象, 都是仪器在骗人:
+ *     ① 本函数被 GCC **部分内联(IPA)** 拆成 `hil_out_apply.part.0`, 主体落在
+ *        FLASH `0x08007a14`; 而 `hil_out_poll` 在 ITCM ⇒ 靠链接器 veneer
+ *        (`ldr.w pc,[pc]` → flash) 跳过去。`nm | grep hil_out_apply` 只看得到
+ *        `.part.0` 这类名字, 很容易被当成"已经在 ITCM 的那个函数"。
+ *     ② 闸门 `gate_isr_itcm.py` 当时有 6 个自身 bug, 输出的是**"无违规"**
+ *        (逐条见该脚本注释; 其中"读字面量没做字节序反转"让第②③项判据整体失效)。
+ *   ★ 2026-09-12 那句注释"暂时留在 flash —— 曾试过放 ITCM"的由来: 当时确实一放
+ *     ITCM 就卡死, 但真因是**向量表落位** (`_vtor_itcm` 只做了 128 对齐, 见下方
+ *     hil_out_poll 的完整证据链), 与"本函数放哪"无关 ⇒ 本函数的落位就这么被漏掉了。
+ *   ★ 纪律(见 itcm.h): **凡 ISR 可达的函数必须 DCL_ITCM**, 与"它调谁/谁调它"无关。 */
+DCL_ITCM static void hil_out_apply(uint8_t *base)
 {
     /* ★ 硬件未就绪直接返回 —— 见 s_hil_ready 的说明 (少了这一句会整机卡死) */
     if (!s_hil_ready) return;

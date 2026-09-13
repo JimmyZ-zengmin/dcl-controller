@@ -1123,7 +1123,10 @@ uint32_t eng_output_surface_count(void) { return s_out_safe_n; }
 /* 输出安全态: 停机 ≠ 输出保持最后一拍 —— 工业语义"停机 = 进安全态"。
  * ★ H723 没有 GPIO_OUT_W1TC (S3 的"只清不置"), 等价物 = BSRR 高 16 位。
  *   掩码外的引脚完全不受影响 (这正是 S3 用 W1TC 的用意: 别碰没被引擎管的脚)。 */
-void eng_outputs_safe(void)
+/* ★★ 2026-09-13: 加 ATTR_ITCM —— 闸门证明它"从 ISR 可达却落在 FLASH"(0x08004930)。
+ *   它经**函数指针注册表**被调用 (eng_register_output_surface), 而函数指针调用
+ *   **静态解析不出目标** ⇒ 正是 itcm.h 说的"必须显式保证的那一类"。 */
+ATTR_ITCM void eng_outputs_safe(void)
 {
     uint32_t mask = SHM_U32(g_shm, OFF_CTRL_GPIO_MASK);
     /* ★★ 审计发现 H (2026-09-11) 的处置 —— 这里原本是:

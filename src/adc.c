@@ -109,7 +109,16 @@ int adc_read(uint32_t ch, uint16_t *out)
 
 /* ══════════ AI: 3 路模拟量 → SENSOR[8..10] (V) ══════════ */
 static const uint32_t AI_PINS[AI_NCH] = { AI_PIN_PA0, AI_PIN_PA1, AI_PIN_PA4 };
-static const uint32_t AI_CHS[AI_NCH]  = { AI_CH_PA0,  AI_CH_PA1,  AI_CH_PA4  };
+/* ★★★ 2026-09-13: **必须住 ITCM** —— `adc_poll_kick()` (DCL_ITCM, 拍 ISR 每拍调用)
+ *   通过 `ldr Rd,[pc,#imm]` 读本表。表原先落在 **.rodata(FLASH)** ⇒ 擦 flash 期间
+ *   这次"读常量"同样被 stall ⇒ ISR 卡死 ⇒ 看门狗复位。
+ *   这正是 itcm.h 第②条纪律说的: **"代码进 ITCM" ≠ "ISR 不碰 flash"**。
+ *   ★ 为什么用 `.itcm_rodata` 而**不是** `.itcm_text`: 本对象是**只读数据**(const),
+ *     而 `.itcm_text` 的属性是 `ax`(可执行) ⇒ 混用会报 `section type conflict`
+ *     (实测: gcc 7.3.1 直接拒绝编译)。`.itcm_rodata` 在链接脚本里与热代码同区,
+ *     由启动文件 `LoopCopyITCMInit` 一并拷进 ITCM (见 ld 目录下的 .ld)。 */
+static const uint32_t AI_CHS[AI_NCH] __attribute__((section(".itcm_rodata")))
+    = { AI_CH_PA0,  AI_CH_PA1,  AI_CH_PA4  };
 
 static inline float ai_raw_to_volt(uint16_t raw)
 {

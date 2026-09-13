@@ -19,7 +19,7 @@
 
 ---
 
-## 当前状态（2026-09-10）
+## 当前状态（2026-09-13；本节自 09-10 起持续追加，最新在末尾）
 
 - ✅ **工具链**：GCC 7.3.1（STM32CubeIDE 自带）+ cmake 4.0.3 + ninja 1.12.1 + pyocd 0.44.1
 - ✅ **时钟**（HSE 25MHz → VOS0 → PLL1，M=5 / N=80 / P=1 / 整数模式）：
@@ -129,6 +129,20 @@
 - ⚠️ **本板实测频率天花板 ≈465MHz**（450/460 可跑，470 起不运行）
   → 数据手册标称 550MHz，差距原因指向 **VCORE 实际电压或板级供电/VCAP**
   → 详见 `docs/REF-frequency-ceiling.md`（含完整排除清单）
+- ★★ **ISR 落位不变量已闭合 + 加了构建期闸门**（2026-09-13 夜，
+  证据见 `docs/audit/H723-PERSIST-WDT-DEFECT.md` §10）
+  - 缺陷形态：**8 处**"ISR 可达却落在 FLASH"（含 GCC 部分内联产生的 `.part.0` 分身）。
+    拍 ISR 每拍经链接器 veneer（`ldr.w pc,[pc]`）跳进 flash 取指 ⇒
+    **擦 flash 期间取指被 stall** ⇒ ISR 不返回 ⇒ 喂狗停 ⇒ 看门狗复位
+    （现场语义：**"操作员按保存 = 机器重启"**，且配置从未落盘）。
+  - 修复：8 处全部落 ITCM（只读常量表用新增的 `.itcm_rodata` 段 ——
+    只读数据不能与 `ax` 代码段共用输入段名）。
+  - ★ 根因之外的另一半：**闸门 `tools/gate_isr_itcm.py` 从未接入构建**
+    （`itcm.h` 却宣称"构建期会拦下"），且它自己还有 **6 个 bug** ——
+    最坏的一个是"读字面量没做字节序反转"，让"目标在不在 flash"的判据**恒为假**，
+    却照样打印"检查了 220 个字面量"。⇒ 修掉后同一个 ELF 立刻从 **0 违规** 报出 **8 处**。
+  - 现状：闸门已接入 `build.sh`（不过就构建失败）；验收 **违规 0 / 白名单 1（显式）**；
+    ISR 检查点实测跑到 **⑦（出口）**。
 
 ---
 
@@ -156,11 +170,14 @@ tools/      h723_proto.py（★协议层 PC 侧 6 用例，含异常路径）
             h723_stage1_read.py（阶段 1：读回 DWT 空拍测量）
             h723_stage2_read.py（阶段 2：单会话 A/B 测量 + 落位/前提验证 + 守卫）
             h723_pad_sweep.py（落位扫描）· h723_ports.py（串口自检）
+            gate_isr_itcm.py（★★ ISR 调用树落位闸门 —— 已接入 build.sh, 不过就构建失败）
+            h723_persist_win.py（★ 落盘窗口验收, 协议侧免调试器）
   legacy/   clock_probe.sh / ws_scan.sh（早期 SWD 探测，已被证伪，留档）
 docs/       迁移方案 + 时钟依据 + 频率天花板 + 阶段1/2报告
             + STAGE3-REPORT.md（档桶分档）+ STAGE3-1-REPORT.md（★协议层）
             + STAGE3-2-REPORT.md（★deploy 路径）+ AUDIT-H723-stage2.md（审计报告）
             + REF-flash-placement.md（落位机制）+ 硬件接线
+            + audit/（外部审计与缺陷报告；H723-PERSIST-WDT-DEFECT.md ★ 掉电保持全链证据 §10~§13）
 ```
 
 ---
@@ -209,7 +226,8 @@ python tools/h723_proto.py          # 协议层 (需 CH340 接线)        12/12
 python tools/h723_w1.py             # 运行控制 + SHM 读写          28/28
 python tools/h723_w2_probe.py       # W2 Force (pyocd, 免串口)      14/14
 python tools/h723_seq.py            # W3 顺序域                    27/27
-python tools/h723_persist.py        # ★ 已降级: 保存不可用 (历史 26/26, 见下方★)
+python tools/h723_persist.py        # W2.4 掉电保持 (pyocd 直驱; ★ 见"平台级风险")
+python tools/h723_persist_win.py    # ★ 落盘窗口验收 (协议侧, 免调试器; -DDCL_WDT_PERSIST_WINDOW=0 可打对照)
 python tools/h723_modbus.py         # W4 Modbus RTU                15/15
 python tools/h723_macro.py          # W5.1 macro VM                18/18
 python tools/h723_w5.py             # W5 外设域 (DI/AI/HIL)        18/18
@@ -320,6 +338,18 @@ bash build.sh                  && pyocd flash ... && python tools/h723_w5.py --p
     想判断"编辑是否真的生效"，别信工具回执，`grep` 一次文件。
 16. ★ **`connect_mode=under-reset` 不带 `-c reset` 会读回垃圾**（不只是"陈旧 SRAM"）：
     本轮读 GPIO 寄存器时全部返回同一个 `0xABFFFFFF`。加 `-c reset -c "sleep 300"` 后正常。
+17. ★★ **ISR 可达的代码与常量必须住 ITCM —— 这条现在有构建期闸门兜底**（2026-09-13）
+    - "ISR 可达"是**传递闭包**，不是"直接被调者"。漏一个就够让**擦 flash 时的 ISR 卡死**
+      —— 实例：`hil_out_apply` 被 GCC 部分内联成 `.part.0` 落在 FLASH，
+      而 `hil_out_poll`(ITCM) 靠链接器 veneer(`ldr.w pc,[pc]`) 跳过去 ⇒
+      擦 flash 期间取指 stall ⇒ ISR 不返回 ⇒ 喂狗停 ⇒ 看门狗复位（现场表现："保存"= "重启机器"）。
+    - 纪律：凡"ISR 里调用的函数"必须加 `DCL_ITCM`；**只读常量表**用 `.itcm_rodata` 段
+      （不能用 `.itcm_text` —— 只读数据与 `ax` 代码段共用输入段名会被 gcc 拒绝）。
+    - ★ 闸门 `tools/gate_isr_itcm.py` 已**接入 `build.sh`**（不过就构建失败）。
+      它此前从未被构建调用（`itcm.h` 却宣称"构建期会拦下"）—— **这才是缺陷活过 4 轮审计的原因**。
+    - ★★ 它自己曾有 **6 个 bug**，最坏的一个是"读字面量没做字节序反转" ⇒
+      "目标在不在 flash"的判据**恒为假**，却照样打印"检查了 220 个字面量"。
+      ⇒ **仪器也必须"判据能失败"**；修掉后同一个 ELF 立刻从 0 违规报出 8 处。
 
 ---
 
@@ -342,13 +372,30 @@ bash build.sh                  && pyocd flash ... && python tools/h723_w5.py --p
 
 1. ✅ UART + 协议帧 —— 真实串口 12/12（BRR 错 16 倍已修, 见 `docs/FIX-REPORT-usart1-brr.md`）
 2. ✅ deploy 路径 —— 成本表本平台实测 / STAGING 归组 / ISR 原子热重载 ≤1 拍 / "已生效"可观测
-3. ⚠️ **persist —— 已显式降级: 本平台不提供"保存配置"**（2026-09-13）
-   - 原因: **擦/写内部 flash 与 200ms 看门狗不共存** —— 擦除期间拍 ISR 卡死 ~210.6ms
-     (LA 实测), 喂狗停 ⇒ 看门狗复位。即"保存"实际表现为"**重启机器**", 且配置**从未落盘**
-     (PERSIST_STAT 的 writes/erase_ok 恒 0)。完整证据: `docs/audit/H723-PERSIST-WDT-DEFECT.md`。
-   - 现在: `0x43` **查询**仍可用; `0x43` **落盘** ⇒ **明确 NAK**（板子不再重启）;
-     **上电只读加载保留**（不写 ⇒ 无 stall 风险, 且保留"恢复到 STOP 态"的安全语义）。
-   - 恢复方式: `-DDCL_PERSIST_SAVE=1`（**但必须先解决 ISR 卡死**, 否则每次保存都重启）。
+3. 🟡 **persist —— 落盘路径已打通并实测可用, 但默认仍关闭**（2026-09-13 夜, 上板实测）
+   - ★★ **真因已定位**（两次独立复现）: 擦 flash 期间拍 ISR 的 **`wdt_feed()`（写 `IWDG_KR`）
+     无法完成** ⇒ ISR 卡住不返回 ⇒ 喂狗停 ⇒ 200ms 后 IWDG 复位 ⇒ "保存"= "重启机器",
+     且配置从未落盘。
+     ★ 两条旧归因已被**实测排除**: ① 不是"APB 挂住"（TIM2 就在 APB1, 读写都过）;
+     ② 不是"代码落位"（ISR 可达的代码与常量已全在 ITCM, 见下）。
+   - ✅ **已修**: 落盘时把 IWDG 超时**临时放大到 8s**（`wdt_set_timeout_ms()`，
+     在 `persist_save()` 的**单一出口**恢复），开关 `DCL_WDT_PERSIST_WINDOW`（`=0` 即改前对照）。
+     **L3 实测全绿**: 落盘 1.01s · `writes=1 ab=3(双副本有效) nr=128` · 未复位 ·
+     ISR 检查点=⑦(出口) · 12s 后 tick 仍推进（窗口确实关回去）。
+     验收: `python tools/h723_persist_win.py COMxx`（**协议侧, 不用调试器**）。
+   - ⚠️ **为什么仍默认关闭 —— 平台级风险（不是软件缺陷）**:
+     H7 的**擦除过程被打断**（掉电 / 复位 / 看门狗）⇒ **FLASH 控制器进入异常态**,
+     此后**任何** flash 读都不返回 ⇒ 上电卡在 `Reset_Handler` 第一条指令
+     （现场 `pc=0x08007af8`, 而 `CFSR/HFSR=0` ⇒ **是总线读不返回, 不是 fault**）
+     ⇒ **固件无法自救**（代码本身就在读不了的 flash 里），
+     **必须用调试器/编程器恢复**（实测 `python tools/h723_persist.py --wipe` 一次成功擦除即可恢复）。
+     ⇒ 现场若发生掉电, 需**人工介入**。
+   - ⇒ **工程结论**: 内部 flash 做掉电保持**在本平台不可靠**;
+     现场要用应换**外部介质**（FRAM/EEPROM，无擦除窗口）。项目当初降级它的判断是对的。
+     完整证据链: `docs/audit/H723-PERSIST-WDT-DEFECT.md` §10~§13。
+   - 现在: `0x43` **查询**仍可用; `0x43` **落盘** ⇒ 明确 **NAK**（默认档, 板子不再被自己重启）;
+     **上电只读加载保留**（不写 ⇒ 无风险, 且保留"恢复到 STOP 态"的安全语义）。
+   - 开启方式: `-DDCL_PERSIST_SAVE=1`（**已实测可用**; 但须接受上面的掉电风险）。
    - ★ 原先那两行 `26/26`、`T26 11/11` 是**看门狗武装之前**的记录 —— 现已失效, 保留供对照。
 4. 🟢 **S3 回归平移（20 套, 脚本零改动）—— 22/30 通过**（2026-09-11 16:xx）
    - 分布: **22 PASS / 7 项 S3 平台专属 N/A / 1 项半可修**
@@ -454,9 +501,15 @@ bash build.sh                  && pyocd flash ... && python tools/h723_w5.py --p
 
 **仍欠（不粉饰）**
 
+- ★★ **内部 flash 掉电保持（平台级阻塞, 非软件缺陷）**：落盘路径已修好并实测可用
+  （见"阶段 3"第 3 条），但 **H7 擦除过程一旦被打断（掉电/复位）⇒ FLASH 控制器异常
+  ⇒ 上电卡在 `Reset_Handler`, 只能靠调试器/编程器恢复**。⇒ 现场要用掉电保持需改
+  **外部介质（FRAM/EEPROM）**；`DCL_PERSIST_SAVE` 因此保持默认 0。
 - 真 RS485（DE/RE 方向控制 + 对端收发）· Modbus **RX** 物理验证 —— 等硬件
 - **LA 外部抖动复验**（阻塞：Saleae 无物理分析仪）· **拍周期抖动直方图仪器**（待做）
 - HIL 50% 占空精度（串 1kΩ+1µF 可提）· H723 频率天花板 ~465MHz（VCAP 供电嫌疑）
+- 协议层 L2（"擦除中打断后能否回退到另一份副本"）**未验** —— 被上面那条平台级风险挡住：
+  一旦打断就进不了固件, 谈不上"回退加载"。
 
 
 > 注意：`g_scan_mode` 现在是**全局开关**；deploy 落地后分档应变成**表自带的属性**

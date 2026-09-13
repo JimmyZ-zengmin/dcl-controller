@@ -768,7 +768,10 @@ static void scb_enable_icache(void)
 }
 
 /* ══════════ 清统计 ══════════ */
-static inline void stats_reset(void)
+/* ★★ 2026-09-13: 加 ISR_PLACE(ITCM) 并**去掉 inline** —— 闸门证明它"从 ISR 可达却在
+ *   FLASH"(0x080002E0)。ISR_PLACE 含 noinline, 与 inline 互斥 (见 modbus.c 的既有教训),
+ *   故必须先去掉 inline。放 ITCM 后它比在 flash 更快, 不存在性能回退。 */
+static ISR_PLACE void stats_reset(void)
 {
     g_eng_cyc_last  = 0;
     g_eng_cyc_first = 0;      /* ★ 0 = "还没有样本", 与"样本恰好为 0"区分开 */
@@ -844,6 +847,10 @@ ISR_PLACE void TIM2_IRQHandler(void)
     ISR_CKPT(1);      /* ① 入口 —— ★ 放在 hb_set **之前**: 探针置高说明"已进入",
                        *   但若连这一句都没写成, 就说明冻在**进入后的第一条总线访问**上。 */
     hb_set(HB_ISR_PIN);
+    /* ★ 诊断细分 (2026-09-13, 为"擦 flash 时 ISR 卡在哪"):
+     *   ⑨ 证明 **GPIOB(AHB4)** 写成功 —— 与下面的 **TIM2(APB1)** 访问做对照,
+     *   用来区分"所有总线都停"与"只有 APB 停下来"。读法: 复位后看 BOOT_REC[41] 的段号。 */
+    ISR_CKPT(9);
 
     uint32_t t0 = DWT_CYCCNT;
 
@@ -879,9 +886,16 @@ ISR_PLACE void TIM2_IRQHandler(void)
         s_tb_prev = t0;
     }
 
+        /* ★ 诊断细分: ⑩ 到了 TIM2 访问之前。
+         *   TIM2 是 **APB1** 外设 —— 若卡在 ⑩→⑪ 之间, 卡点就是"**擦 flash 期间
+         *   APB 外设访问无法完成**"(原始报告 §9.4 的归因), 而不是"代码取指 stall"
+         *   (那个已在本次修复中解决: 见 hil_out_apply 等 → ITCM)。 */
+        ISR_CKPT(10);
         if (TIM_SR(TIM2_BASE) & TIM_SR_UIF) {
             TIM_SR(TIM2_BASE) = ~TIM_SR_UIF;
             g_stage = 7;
+            /* ★ 诊断细分: ⑪ = **TIM2 的读+写都过了** ⇒ 卡点在喂狗或其后。 */
+            ISR_CKPT(11);
 
 #if DCL_WDT
             /* ★★ 喂狗 (2026-09-13) —— 位置**有意放在中断入口最早处**:
@@ -907,7 +921,14 @@ ISR_PLACE void TIM2_IRQHandler(void)
             } else
 #endif
             {
+                /* ★ 诊断细分 (2026-09-13): 把**喂狗**夹住。
+                 *   ⑫→⑬ 之间只有一条 `wdt_feed()` (写 `IWDG_KR=0xAAAA`),
+                 *   ⇒ 若上一轮停在 ⑫, 卡点就是 **IWDG 寄存器访问本身**。
+                 *   注意 IWDG 与 TIM2 **不在同一个域**: TIM2 在 D2/APB1(实测能访问),
+                 *   IWDG 在 D3/SRD —— 这条区分是本次定位的关键。 */
+                ISR_CKPT(12);
                 wdt_feed();
+                ISR_CKPT(13);
                 SHM_U32(g_shm, OFF_WDT_STAT + 20u)++;   /* ★ 喂狗计数 (单调) —— 外部可见的"在喂"证据 */
             }
 #endif  /* DCL_WDT */

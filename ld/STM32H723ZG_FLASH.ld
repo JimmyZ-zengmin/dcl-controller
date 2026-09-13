@@ -142,6 +142,13 @@ SECTIONS
     _sitcm = .;
     *(.itcm_text)
     *(.itcm_text*)
+    /* ★ 2026-09-13: 拍 ISR 读的**只读常量表**也必须住 ITCM —— 否则擦 flash 期间
+     *   读它同样会被 stall (实例: `adc_poll_kick` 每拍读 `AI_CHS`, 见表原先在 .rodata)。
+     *   ★ 为什么单独一个段名: 只读数据(`a`)与可执行代码(`ax`)不能共用**输入**段名,
+     *   gcc 7.3.1 会直接报 `section type conflict`(实测)。合进同一个**输出**段即可,
+     *   ⇒ 启动拷贝范围 `_sitcm.._eitcm` 自动覆盖, 无需改启动文件。 */
+    *(.itcm_rodata)
+    *(.itcm_rodata*)
     . = ALIGN(4);
     _eitcm = .;
   } >ITCM AT>FLASH

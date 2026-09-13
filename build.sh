@@ -64,6 +64,7 @@ DEFAULTS=(
     -DDCL_WDT_SYNC_CYC=40000000
     -DDCL_WDT_START_FIRST=1
     -DDCL_WDT_PR=4
+    -DDCL_WDT_PERSIST_WINDOW=8000
     -DDCL_LOOP_RESET=1
     -DDCL_PERSIST_SAVE=0
     -DDCL_BOOT_BANNER=1
@@ -120,6 +121,33 @@ if [ "$NW" != "0" ]; then
     exit 1
 fi
 echo "✓ 零警告 (本工程源文件 + 链接器 + 汇编)"
+
+# ── ★★ ISR 调用树闸门 (2026-09-13 正式接入) ──────────────────────────────
+# ★ 为什么必须有这一步: `src/itcm.h` 早就**宣称**过"构建期的 ISR 调用树闸门会把
+#   '忘了加 DCL_ITCM'变成'构建不过'" —— 但脚本写好后**从未接进构建**。
+#   宣称落空的代价就是本次事故: `hil_out_apply` 漏在 flash ⇒ 擦 flash 时拍 ISR
+#   取指被 stall ⇒ ISR 不返回 ⇒ 喂狗停 ⇒ 看门狗复位 ⇒ "保存配置"变成"重启机器",
+#   而且**配置从未落盘**。这条路径活过了 4 轮外部审计。
+#   ★ 不变量本身见 src/itcm.h; 判据与 6 个已修仪器 bug 见 tools/gate_isr_itcm.py。
+# ★ 找不到 python 时**显式警告并跳过**, 不静默 (静默跳过 = 闸门有洞, 本项目最恨的形态)。
+PY_BIN="${DCL_PYTHON:-$(command -v python || command -v python3 || true)}"
+if [ -z "$PY_BIN" ]; then
+    echo
+    echo "⚠️ 未找到 python ⇒ **跳过** ISR 调用树闸门 —— src/itcm.h 的不变量本次未被校验。"
+    echo "   恢复方式: 装 python, 或设 DCL_PYTHON=<解释器绝对路径>。"
+else
+    echo
+    echo "── ISR 调用树闸门 (src/itcm.h 的不变量: ISR 可达 ⇒ 必须住 ITCM) ──"
+    # ★ 必须用 WIN_HERE (Windows 风格): python.exe 是 Windows 程序, 传 MSYS 风格
+    #   的 `/d/STM/...` 会被它当成"相对当前盘符"⇒ 报 `D:\d\STM\...` 找不到文件。
+    if ! "$PY_BIN" "$WIN_HERE/tools/gate_isr_itcm.py" "$WIN_HERE/build/dcl_h723"; then
+        echo
+        echo "★★ ISR 调用树闸门失败 ⇒ 拒绝通过。"
+        echo "   上表列出的函数**擦 flash 时会让拍 ISR 卡死**(取指/读常量被 stall)。"
+        echo "   修法: 给它们加 DCL_ITCM (见 src/itcm.h); 只读常量表用 .itcm_rodata 段。"
+        exit 1
+    fi
+fi
 
 # ── 打印**实际生效**的开关 (不是"我以为传了什么") ──
 echo

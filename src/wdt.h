@@ -278,6 +278,60 @@ static inline void wdt_feed(void)
     IWDG_KR = IWDG_KEY_FEED;
 }
 
+/* ══════════ ★★★ 运行期改超时 —— 为"落盘窗口"而加 (2026-09-13) ══════════
+ * 为什么需要它 (实测依据, 不要再从零查一遍):
+ *   擦 flash 期间, 拍 ISR 里的 `wdt_feed()`(写 IWDG_KR) **无法完成** ⇒ ISR 卡住不返回
+ *   ⇒ 喂狗停 ⇒ 200ms 后 IWDG 复位 ⇒ "保存配置"变成"重启机器", 且配置从未落盘。
+ *   见 docs/audit/H723-PERSIST-WDT-DEFECT.md §11/§12.2b (L1 实测: 去掉 DCL_WDT 后
+ *   同一份固件落盘**完全成功** — writes=1 / nr=128 / 0.97s / 未复位)。
+ *   ⇒ 形状确定为: **擦除前把窗口放大到 > 最长擦除, 擦完立刻恢复**。
+ *
+ * ★ 窗口取 8000ms 的**唯一理由**: 必须 ≥ `FL_ERASE_TIMEOUT_CYC`(flash.c 的擦除超时预算 8s)
+ *   —— 项目已有同款教训("清空窗口必须 ≥ 该操作**自己的**超时预算, 否则 3s 的擦除会在
+ *   2.5s 处被停滞自愈复位")。正常擦除端到端仅 0.97s, 8s 是给**失败路径**留的。
+ *   ⇒ 这三个量是**同一件事的三种单位**, 改一个必须改另外两个:
+ *      PERSIST_BLOCK_TICKS(main.c, 8s) · FL_ERASE_TIMEOUT_CYC(flash.c, 8s) · 本窗口
+ *
+ * ★ 实现严格照抄 `wdt_start()` 的解锁序列 (RM0468 §50.3.6: 写 PR/RLR 前必须先写 0x5555),
+ *   并**必须关闸** `g_wdt_kr_busy` —— 否则 ISR 每 100µs 的喂狗会撞进"解锁→写 RLR"之间,
+ *   把 RLR 的写**重新保护而静默丢弃**(只在读回时暴露), 这个 ~10ms 的窗口见 wdt.h 文件头。
+ *
+ * @param ms  目标超时(ms), 内部向上取整到 RLR 步长; 0 视为 1。
+ * @return    之前的超时(ms) —— **调用者拿它恢复**; 0 = 失败(配置未改, 调用者不要恢复)。
+ */
+static inline uint32_t wdt_set_timeout_ms(uint32_t ms)
+{
+    if (wdt_lsi_on() != 0) return 0u;          /* 与 wdt_start 同一前提: LSI 得在跑 */
+
+    uint32_t old_rlr = IWDG_RLR & 0xFFFu;      /* 旧值 (供恢复) */
+    uint32_t old_ms  = (old_rlr + 1u) * WDT_STEP_MS;
+
+    if (ms == 0u) ms = 1u;
+    uint32_t rlr = (ms + WDT_STEP_MS - 1u) / WDT_STEP_MS;   /* 向上取整 */
+    if (rlr == 0u)    rlr = 1u;
+    if (rlr > 0x1000u) rlr = 0x1000u;          /* RLR 是 12 位: 值域 0..0xFFF, 步数 1..0x1000 */
+    rlr -= 1u;
+
+    g_wdt_kr_busy = 1u;                        /* ★ 关闸: 编程期间 ISR 不得写 KR */
+    IWDG_KR  = IWDG_KEY_UNLOCK;
+    IWDG_PR  = WDT_PR_VALUE;                   /* PR 不动 (2ms/步) ⇒ 只改 RLR 就够 */
+    IWDG_RLR = rlr;
+
+    /* 等 RVU/PVU 落下 —— "写过了" ≠ "写进去了" (照抄 wdt_start ③ 的口径) */
+    {
+        uint32_t c0 = DWT_CYCCNT;
+        uint32_t dl = c0 + WDT_SYNC_BUDGET_CYC;
+        while (IWDG_SR & IWDG_SR_UPDATE_Msk) {
+            if ((int32_t)(DWT_CYCCNT - dl) >= 0) break;   /* 有符号比较 ⇒ 天然处理回绕 */
+        }
+    }
+    g_wdt_kr_busy = 0u;                        /* ★ 无论成败都开闸 —— 否则永久停喂 */
+
+    /* 读回核对: 写被丢弃时**如实返回失败**, 不让调用者按"改成功"去恢复 */
+    if ((IWDG_RLR & 0xFFFu) != rlr) return 0u;
+    return old_ms;
+}
+
 /** 读回实际生效的配置 (供外部核对"到底写进去了什么") */
 static inline void wdt_readback(uint32_t *pr, uint32_t *rlr, uint32_t *sr)
 {

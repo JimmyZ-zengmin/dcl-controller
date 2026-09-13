@@ -42,7 +42,19 @@ NM = os.path.join(TOOLCHAIN, "arm-none-eabi-nm.exe")
 OD = os.path.join(TOOLCHAIN, "arm-none-eabi-objdump.exe")
 
 ITCM_LO, ITCM_HI = 0x00000000, 0x00010000          # 64KB ITCM
-FLASH_LO = 0x08000000
+FLASH_LO, FLASH_HI = 0x08000000, 0x08200000        # ★ 上界必须有: 否则 DTCM(0x2000…)/AXI(0x2400…)
+                                                   #   这些**数据符号**也会满足 `>= FLASH_LO` 而被报成
+                                                   #   "函数在 flash" (实测 `g_shm` 就被误报过一次 ——
+                                                   #   namelist 里混着数据符号, 判据必须按地址段收口)。
+
+# ★★ 显式白名单: 允许"落在 flash"的 ISR 可达函数。**必须写理由**, 不许静默豁免
+#   (静默豁免 = 闸门有洞 = 本文件已经踩过 6 次的同一个坑)。
+ALLOW_FLASH = {
+    "engine_scan_flash":
+        "对照档, 非缺陷 —— 它存在的唯一目的就是提供'同一份机器码在 flash 里跑'的 A/B 对照 "
+        "(README 的 B1/C1/F1 组, 用来证明 hot code 必须进 ITCM)。"
+        "默认运行期走 engine_scan_itcm; 只有显式选 flash 档时它才会被执行。",
+}
 
 # ★ 静态解析不到的"函数指针"调用, 必须显式列出 (否则闸门有洞)。
 #   `engine_tick(g_shm, tick, sel ? engine_scan_itcm : engine_scan_flash, ...)`
@@ -129,7 +141,14 @@ def read_word(elf, addr, sec=".itcm_text"):
         words = m.group(2).split()
         off = (addr - base) // 4
         if 0 <= off < len(words):
-            return int(words[off], 16)
+            # ★★★ objdump -s 打印的是**机器字节序** (小端: 低字节在前), 不是 32 位数值。
+            #   直接 int() 得到的是字节反转的垃圾 —— 实测把 `0x08007a15` 读成 `0x157a0008`,
+            #   而这个垃圾**几乎不可能**落在 [FLASH_LO, 0x08200000) ⇒ "指向 flash"的判据
+            #   恒为假 ⇒ 第②(函数指针)与第③(读 .rodata)两项判据**整体失效**, 却在报告里
+            #   打印"检查了 220 个字面量"—— 一个**看起来在工作**的仪器。
+            #   ★ 这是本闸门第 6 个自身 bug, 也是"仪器自己也会骗人"的第 6 例;
+            #     前 5 个见 disasm_func 里的注释。根因: 判据的**量纲/编码**没先自证。
+            return int.from_bytes(int(words[off], 16).to_bytes(4, "big"), "little")
     return None
 
 
@@ -159,6 +178,27 @@ def disasm_func(elf, addr, size):
         m = re.match(r"\s*([0-9a-f]+):\s+bl\s+([0-9a-f]+)\s+<", ln)
         if m:
             calls.add(int(m.group(2), 16))
+            continue
+        # ★★★ **veneer 尾跳** (闸门第 5 个盲区, 2026-09-13 实测缺陷的根因所在):
+        #   形式是 `ldr.w pc, [pc]` + 紧跟一个字面量 = 链接器为**跨区调用**生成的跳板。
+        #   ITCM(0x0) 与 FLASH(0x0800…) 相距 128MB, 远超 `bl` 的 ±16MB ⇒ 必然经过它。
+        #   ★ 为什么这个盲区最致命 (前四个盲区只是"漏检", 这个会让结论**反向**):
+        #     它让"函数在 ITCM"这个假象成立 —— 实例: `hil_out_poll` 在 ITCM ✓,
+        #     但它调的 `hil_out_apply.part.0` 在 **FLASH 0x08007a14**, 靠 veneer 跳过去。
+        #     旧闸门 ①豁免 `_veneer` ②不解析 veneer 内的跳转 ⇒ **输出"无违规"**,
+        #     而真相是"拍 ISR 每拍都要去 flash 取指"。
+        #     ⇒ 实测后果: 擦 flash 期间 ISR 卡死 210ms ⇒ 看门狗复位 ⇒ "保存"变"重启"。
+        #   ★ 判据只取 `>= FLASH_LO` 的目标: veneer 存在的唯一理由就是"目标很远且不在本区",
+        #     区内跳转不需要 veneer。取不到字面量时**计入 unresolved 而不是静默跳过**
+        #     (静默跳过 = 又一个"报无违规"的洞)。
+        m = re.match(r"\s*([0-9a-f]+):\s+ldr(?:\.w|\.n)?\s+pc,\s*\[pc(?:,\s*#(\d+))?\]\s*;\s*\(?([0-9a-f]+)", ln)
+        if m:
+            lit = int(m.group(3), 16)
+            tgt = read_word(elf, lit, sec_in)
+            if tgt and tgt >= FLASH_LO:
+                calls.add(tgt)
+            elif tgt is None:
+                unresolved.add(int(m.group(1), 16))
             continue
         # objdump 形如: `154: f8df 815c  ldr.w r8, [pc, #348] ; 2b4 <sym>`
         #   ⇒ 注释里给了**字面量的绝对地址** (2b4), 优先用它 (比手算 pc 相对更稳)。
@@ -230,6 +270,7 @@ def main():
         return 1
 
     seen, viol, unresolved, checked, ro_viol = set(), [], [], 0, []
+    allowed = []                                # 命中白名单的 (必须打印出来, 不许静默)
     dref_n, dref_flash, dref_none = 0, 0, 0    # ★ 自证: 这三条计数必须非零, 否则"无违规"是空的
     q = deque(roots)
     while q:
@@ -239,8 +280,11 @@ def main():
         seen.add(name)
         addr, size = by_name[name]
         checked += 1
-        if FLASH_LO <= addr and not (name.endswith("_veneer")):
-            viol.append((name, addr))
+        if (FLASH_LO <= addr < FLASH_HI) and not name.endswith("_veneer"):
+            if name in ALLOW_FLASH:
+                allowed.append(name)
+            else:
+                viol.append((name, addr))
         calls, ind, drefs = disasm_func(elf, addr, size)
         for (ia, lit) in drefs:
             val = read_word(elf, lit, sec_in_of(addr))
@@ -274,6 +318,11 @@ def main():
         for n, a in sorted(viol, key=lambda x: x[1]):
             print("    %-24s 0x%08X" % (n, a))
         print("\n  ⇒ 加 `DCL_ITCM` (见 src/itcm.h)。**注意传递闭包**: 只补直接被调者不够。")
+    if allowed:
+        print("\nℹ️ 白名单豁免 (%d 个, 理由见脚本内 ALLOW_FLASH —— 显式豁免, 不是静默跳过):"
+              % len(set(allowed)))
+        for n in sorted(set(allowed)):
+            print("    %-24s %s" % (n, ALLOW_FLASH[n][:52] + "..."))
     if unresolved:
         print("\n△ 警告: %d 处**间接调用**静态解析不到 (函数指针) —— 闸门有洞, 必须人工接种子:"
               % len(unresolved))
@@ -293,7 +342,12 @@ def main():
     if not viol and not unresolved and not ro_viol:
         print("\n✅ 通过: 从 ISR 可达的代码**全部**在 ITCM, 且无未解析间接调用。")
     elif not viol and not ro_viol:
-        print("\n△ 没有『可达且在 FLASH』的直接违规, 但存在未解析间接调用 ⇒ 不算通过。")
+        print("\n△ 判据①(代码取指)与③(读数据表)通过, 但有 %d 处**未解析间接调用**(函数指针)。"
+              % len(unresolved))
+        print("   ⇒ 本闸门**按设计返回 0**(允许警告), 所以 build.sh 不会失败 ——")
+        print("     但**不要把它读成'已验证'**: 那几个目标的落位本次**没有任何证据**。")
+        print("     判断是否需要收口的方法见上面'间接调用'那一段; 已知会被调到的目标")
+        print("     (如 `engine_tick` 的 `impl` 形参 → engine_scan_itcm/flash) 应加进 EXTRA_ROOTS。")
     elif ro_viol and not viol:
         print("\n★ 有第③项违规(读 flash 数据表), 但无第①项违规(代码取指) ⇒ 按上面的表去修。")
     return 1 if (viol or ro_viol) else 0

@@ -43,6 +43,7 @@
  *   ⑫ 时钟/GPIO/复位顺序照 `SD_MspInit`: CLK_ENABLE → GPIO → FORCE_RESET/RELEASE_RESET。
  */
 #include "sd.h"
+#include "itcm.h"       /* ★ ISR 调用树必须住 ITCM —— 见该头文件 (sd_cfg_take) */
 #include "regs.h"
 #include "blackbox.h"   /* 记录格式 BB_SLOT_SZ / bb_slots_produced() */
 
@@ -731,7 +732,8 @@ void sd_log_diag_gap(uint32_t gap_ticks, uint32_t inpoll_ticks, uint32_t slow_cn
     SD_DIAG[61] = slow_cnt;
 }
 
-uint32_t sd_cfg_take(uint32_t idx)
+/* ★★ 2026-09-13: 加 DCL_ITCM —— 闸门证明它"从 ISR 可达却落在 FLASH"(0x080070FC)。 */
+DCL_ITCM uint32_t sd_cfg_take(uint32_t idx)
 {
     if (idx > 14u) return 0u;
     return sd_cfg_take_raw(idx);

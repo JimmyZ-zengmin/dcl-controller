@@ -64,6 +64,15 @@ set(DCL_WDT_START_FIRST "1" CACHE STRING "先启动后配置 (1 交付 / 0 改�
 #   DCL_WDT_PR: 预分频档 0..7。存在的理由 = 验证"更新耗时 ≈ 5 个预分频步长"这条推断:
 #     PR=4 ⇒ 2ms/步 ⇒ ~10ms (已实测); PR=6 ⇒ 8ms/步 ⇒ 应变成 ~40ms。
 set(DCL_WDT_PR "4" CACHE STRING "IWDG 预分频档 0..7")
+#   ★★★ DCL_WDT_PERSIST_WINDOW (2026-09-13, 解锁"掉电保持"的那一项):
+#     擦 flash 期间拍 ISR 的喂狗(写 IWDG_KR)**无法完成** ⇒ ISR 卡住 ⇒ 喂狗停
+#     ⇒ 200ms 后 IWDG 复位 ⇒ "保存"变"重启", 配置从未落盘(见 docs/audit/H723-PERSIST-WDT-DEFECT.md)。
+#     ⇒ 落盘时**临时**把超时放大到本值, 擦完在 persist_save 的单一出口恢复。
+#     取值必须 ≥ 擦除超时预算 (flash.c 的 FL_ERASE_TIMEOUT_CYC = 8s): 正常擦除实测仅 0.97s,
+#     多余的部分是给**失败路径**留的。★ 这三个量是同一件事的三种单位, 改一个要改另外两个:
+#       PERSIST_BLOCK_TICKS(main.c) · FL_ERASE_TIMEOUT_CYC(flash.c) · 本值。
+#   =0: **改前行为**对照 (不开窗) ⇒ 落盘应当**复位**, 用同一套判据打出坏的那一半。
+set(DCL_WDT_PERSIST_WINDOW "8000" CACHE STRING "落盘窗口 ms (0 = 改前行为对照: 不开窗, 会复位)")
 #   DCL_LOOP_RESET: 主循环失活自愈 (2026-09-13, 回应审计 P1①)。
 #     1 (交付): 拍 ISR 判停滞 → 记录 → eng_outputs_safe() → 软复位。
 #       依据: 主循环死时协议口全断 ⇒ "失联但保持输出"比"复位(停止驱动)"更危险。
@@ -165,6 +174,7 @@ add_compile_options(
     -DWDT_SYNC_BUDGET_CYC=${DCL_WDT_SYNC_CYC}u
     -DWDT_START_FIRST=${DCL_WDT_START_FIRST}
     -DWDT_PR_VALUE=${DCL_WDT_PR}u
+    -DWDT_PERSIST_WINDOW_MS=${DCL_WDT_PERSIST_WINDOW}u
     -DDCL_LOOP_RESET=${DCL_LOOP_RESET}
     -DDCL_PERSIST_SAVE=${DCL_PERSIST_SAVE}
     -DBOOT_BANNER=${DCL_BOOT_BANNER}

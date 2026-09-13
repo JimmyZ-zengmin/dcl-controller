@@ -19,6 +19,7 @@
 #include "flash.h"
 #include "engine.h"
 #include "transport.h"   /* crc32? 没有 —— 用本地实现, 见下 */
+#include "wdt.h"         /* ★ wdt_set_timeout_ms —— 落盘窗口 (见下方 wdt_window_*) */
 
 /* ══════════════════ CRC32 (IEEE 802.3, poly 0xEDB88320 反射式) ══════════════════
  * ★ 为什么用 CRC32 而不是 S3 的 CRC16-CCITT: persist 载荷是 6KB 级 (S3 是 6KB 也用了
@@ -254,6 +255,49 @@ int persist_load(uint8_t *base)
 
 /* ══════════════════ 落盘 ══════════════════ */
 
+/* ══════════ ★★★ 落盘窗口: 临时放大看门狗超时 (2026-09-13) ══════════
+ * 为什么必须这么做 (实测, 别再从头查一遍):
+ *   擦 flash 期间拍 ISR 的 `wdt_feed()`(写 IWDG_KR) **无法完成** ⇒ ISR 卡住不返回
+ *   ⇒ 喂狗停 ⇒ 200ms 后 IWDG 复位 ⇒ "保存"变成"重启", 且配置从未落盘。
+ *   ★ L1 实测: 同一份固件去掉 DCL_WDT 后落盘**完全成功**
+ *     (writes=1 / nr=128 / 0.97s / 未复位) ⇒ **喂狗是唯一障碍, persist 本身没问题**。
+ *   见 docs/audit/H723-PERSIST-WDT-DEFECT.md §11 / §12.2b。
+ *
+ * ★ 窗口值必须 ≥ `FL_ERASE_TIMEOUT_CYC`(flash.c 的擦除超时预算, 8s) —— 项目已有同款教训:
+ *   "清空窗口必须 ≥ 该操作**自己的**超时预算, 否则 3s 的擦除会在 2.5s 处被停滞自愈复位"。
+ *   这三个量是**同一件事的三种单位**, 改一个必须改另外两个:
+ *     PERSIST_BLOCK_TICKS(main.c) · FL_ERASE_TIMEOUT_CYC(flash.c) · WDT_PERSIST_WINDOW_MS(此处)
+ * ★ 正常擦除端到端仅 **0.97s**(实测); 8s 是给**失败路径**(擦除卡到超时)留的。
+ * ★ 代价必须说清(不许粉饰): 窗口内是"看门狗保护真空", 最坏 8s。
+ *   所以它**只覆盖 persist_save 的擦写段**, 且**无论成败都在单一出口恢复** —— 见 out:。 */
+#ifndef WDT_PERSIST_WINDOW_MS
+#define WDT_PERSIST_WINDOW_MS  8000u
+#endif
+
+/** 开窗: 返回旧超时(供恢复); 0 = 未改成功(调用方**不要**恢复, 保持原样)。 */
+static inline uint32_t wdt_window_open(void)
+{
+#if defined(DCL_WDT) && DCL_WDT
+    /* ★★ 0 档 = **改前行为** (不开窗) —— 项目纪律: 每个特性都要有能打出旧行为的对照,
+     *   否则"新档 PASS"不构成证据 (我们无法排除"判据根本量不出差别")。
+     *   对照档的预期结果就是**复位**, 见 docs/audit/H723-PERSIST-WDT-DEFECT.md §12.4。 */
+    if (WDT_PERSIST_WINDOW_MS == 0u) return 0u;
+    return wdt_set_timeout_ms(WDT_PERSIST_WINDOW_MS);
+#else
+    return 0u;                       /* 该档没有看门狗 ⇒ 无事可做 */
+#endif
+}
+
+/** 关窗: prev == 0 表示当初没改成功 ⇒ 保持原样。 */
+static inline void wdt_window_close(uint32_t prev)
+{
+#if defined(DCL_WDT) && DCL_WDT
+    if (prev != 0u) (void)wdt_set_timeout_ms(prev);
+#else
+    (void)prev;
+#endif
+}
+
 int persist_save(uint8_t *base)
 {
     (void)base;
@@ -330,6 +374,11 @@ int persist_save(uint8_t *base)
      *     单一出口把"无论成败都必须落锁"变成**结构性事实**: 新增任何失败分支
      *     都自动经过 `out:`, 漏不掉。这正是本项目"把纪律变成结构"的一贯做法
      *     (同族: build.sh 每次显式传全默认值、DCL_CAP_H723_NOTYET 的断言)。 */
+    /* ★★★ 落盘窗口: 擦写期间临时放大看门狗超时。
+     *   ★ 位置: 必须在**第一次碰 flash 之前**, 因为灾难点就是"擦除期间的喂狗"。
+     *   ★ 只在擦写段生效 (上面的 RUN 门/参数检查都还没开窗) ⇒ 保护真空最小化。 */
+    uint32_t wdt_prev = wdt_window_open();
+
     int r = flash_erase_sector(tgt_sector);
     if (r != FL_OK) {
         g_persist_erase_fail++;
@@ -363,5 +412,10 @@ int persist_save(uint8_t *base)
 
 out:
     flash_lock();          /* ★ 单一出口: 成功/擦除失败/写失败/回读失败**都**落锁 */
+    /* ★★★ 关窗也在单一出口: 无论成功、擦除失败、写失败还是回读失败, 看门狗**一定**恢复
+     *   到原超时。与 flash_lock 同一个理由 —— 新增任何失败分支都自动经过这里, 漏不掉。
+     *   ★ 若不在这里恢复: 一次失败就让板子**永久**停在 8s 窗口 = 保护被静默削弱
+     *     (正是本项目最忌的"宣称≠实现")。 */
+    wdt_window_close(wdt_prev);
     return r;
 }
