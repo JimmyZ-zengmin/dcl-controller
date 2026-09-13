@@ -193,12 +193,13 @@ def main():
     if shaky:
         print("\n  (其中 %d 段判为【转动中】, 已从噪声统计中剔除 —— 见上面【判定】列)" % shaky)
 
-    if len(stable) >= 2:
+    if len(stable) >= 1:
         sds = sorted(r[1] for r in stable)
         avg_sd = sum(sds) / len(sds)
         med_sd = sds[len(sds) // 2]
         mn_sd = sds[0]
-        print("\n=== 汇总（只用【停住】的 %d 段）===" % len(stable))
+        note = "" if len(stable) >= 3 else "  ⚠ 段数偏少, σ 代表性有限(采样慢时分段粒度粗)"
+        print("\n=== 汇总（只用【停住】的 %d 段）%s ===" % (len(stable), note))
         print("  σ 最小 = %.2f LSB (%.3f mV)" % (mn_sd, mn_sd * VREF / FULL * 1000))
         print("  σ 中位 = %.2f LSB (%.3f mV)" % (med_sd, med_sd * VREF / FULL * 1000))
         print("  σ 平均 = %.2f LSB (%.3f mV)" % (avg_sd, avg_sd * VREF / FULL * 1000))
