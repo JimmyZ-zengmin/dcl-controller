@@ -51,15 +51,18 @@ MAP_OFF = 16
 MAP_SUM_OFF = MAP_OFF + MAP_N + 1        # 77
 SEG_NAME = {0: "SENSOR", 1: "WIRE", 2: "ACT", 3: ""}
 # ★ 与固件 bb_map_bind() 的上限**逐条对应** (见 src/blackbox.c)。
-SEG_LIM = {0: 64, 1: 128, 2: 64, 4: 2, 5: 5, 6: 1, 7: 4}
+SEG_LIM = {0: 64, 1: 128, 2: 64, 4: 2, 5: 5, 6: 1, 7: 4, 8: 2}
 # 非 I/O 槽的名字 (这些槽**不是浮点**, 是整数位图/BCD/计数器 ⇒ 导出按整数格式化)
 SEG_NAMED = {
     (4, 0): "RTC_TR", (4, 1): "RTC_DR",
     (5, 0): "MB_RX_FRAMES", (5, 1): "MB_TX_FRAMES", (5, 2): "MB_ERR_CRC",
     (5, 3): "MB_ERR_EXC", (5, 4): "MB_HEAD",
     (6, 0): "DO_SHADOW",
+    # ★ 8 = 故障台账 (2026-09-13): 记录流里的两列 —— 故障总数 / 末例分类码。
+    #   落盘是"变化才记" ⇒ 计数一变就落一条 ⇒ **故障在时间轴上自带 tick 时间戳**。
+    (8, 0): "FAULT_TOTAL", (8, 1): "FAULT_LAST",
 }
-INT_SEGS = (3, 4, 5, 6, 7)          # 这些段的槽按十进制整数导出/比较, 不按浮点
+INT_SEGS = (3, 4, 5, 6, 7, 8)       # 这些段的槽按十进制整数导出/比较, 不按浮点
 DEF_LABELS = (["SENSOR%d" % i for i in range(16)]
               + ["WIRE%d" % i for i in range(16)]
               + ["ACT%d" % i for i in range(16)]
@@ -158,6 +161,55 @@ def make_labels(h):
     if nbad:
         print("  [!] 映射表里有 %d 个越界槽 (固件按空槽处理, 恒 0) —— 见 BAD* 列" % nbad)
     return out, mapv
+
+
+# ---- ★ 故障台账全景快照 (日志头 h[78..111], 见 src/blackbox.h) ----
+FLT_OFF = 78
+FLT_MAGIC = 0x464C5431          # "FLT1"
+FLT_WORDS = 34
+FLT_N_CATS = 24
+FAULT_NAMES = {
+    1: "MB_ORE", 2: "MB_CRC", 3: "MB_SHORT", 4: "MB_RX_FULL", 5: "MB_EXC",
+    6: "MB_BUILD_OVF", 7: "ISR_OVER", 8: "SCAN_DIV0", 9: "SHM_GUARD",
+    10: "DEPLOY_REJ", 11: "PROTO_NAK", 12: "MACRO_ERR", 13: "CTRL_WHILE_STOP",
+    14: "TIMEBASE",
+}
+# 已知外部条件 (不算功能故障, 但要显示出来)
+FAULT_EXTERNAL = {14: "DWT 时基被外部停掉 (调试器会话) ⇒ DWT 计时统计不可用; 复位即恢复"}
+
+
+def describe_faults(h):
+    """打印日志头里的故障台账全景。
+
+    ★ 与记录流里的 FAULT_TOTAL/FAULT_LAST 两列互补:
+      头快照 = 全景(24 类计数 + 首例现场); 记录流 = 时间轴(何时出的错)。
+    """
+    w = list(h[FLT_OFF:FLT_OFF + FLT_WORDS])
+    if w[0] != FLT_MAGIC:
+        print("  故障台账快照: 无 (h[%d]=0x%08X 不是 FLT1 魔数 —— 老固件写的头, 或从未刷过)"
+              % (FLT_OFF, w[0]))
+        return
+    total, cats = w[1], w[2:2 + FLT_N_CATS]
+    first = w[2 + FLT_N_CATS:2 + FLT_N_CATS + 4]
+    last = w[2 + FLT_N_CATS + 4:2 + FLT_N_CATS + 8]
+    s = sum(cats)
+    print("  故障台账快照: total=%d  sane=%s" % (total, "OK" if total == s else
+                                                 "★BAD(total!=Σ=%d)" % s))
+    if total == 0:
+        print("     ⇒ 除外部条件外, 零故障")
+        return
+    ext = 0
+    for i in range(1, FLT_N_CATS):
+        if cats[i]:
+            tag = ("  [外部条件] " + FAULT_EXTERNAL[i]) if i in FAULT_EXTERNAL else ""
+            if i not in FAULT_EXTERNAL:
+                ext += cats[i]
+            print("     %-16s = %-10d%s" % (FAULT_NAMES.get(i, "cat%d" % i), cats[i], tag))
+    print("     首例: code=%d(%s) tick=%d c0=0x%08X c1=%d"
+          % (first[0], FAULT_NAMES.get(first[0], "-"), first[1], first[2], first[3]))
+    print("     末例: code=%d(%s) tick=%d c0=0x%08X c1=%d"
+          % (last[0], FAULT_NAMES.get(last[0], "-"), last[1], last[2], last[3]))
+    print("     ⇒ 非外部条件故障 %d 笔%s" % (ext, "" if ext else " (只剩外部条件)"))
 
 
 def describe_map(labels, mapv):
@@ -296,8 +348,58 @@ def verify_rows(rows, label, max_boots=8):
     return True
 
 
+def selftest():
+    """合成一个 512B 日志头, 验证本解析器与固件布局**逐字段一致** —— 不需要卡。
+
+    ★ 为什么值得有: "读卡时才发现偏移错了"要等到卡插回 PC; 而布局一致性是**纯本地**的事。
+      这条判据能失败 (任一侧偏移/字段顺序写错, 这里立刻红), 所以它是证据而不是仪式。
+    """
+    ME = lambda s, i: ((s << 16) | i)
+    m = ([ME(0, i) for i in range(14)] + [ME(8, 0), ME(8, 1)]
+         + [ME(1, i) for i in range(16)] + [ME(2, i) for i in range(16)]
+         + [ME(4, 0), ME(4, 1)]
+         + [ME(5, i) for i in range(5)] + [ME(6, 0)]
+         + [ME(7, i) for i in range(4)])
+    assert len(m) == MAP_N, "映射表槽数 %d != %d" % (len(m), MAP_N)
+
+    h = [0] * 128
+    h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7] = (
+        HDR_MAGIC, 5, REC, 2, BLK, 1, 999, 1)
+    h[8], h[9], h[10], h[11], h[12], h[13], h[14] = 1234, 5678, 99, 0, 0, 7, 3
+    h[15] = sum(h[0:15])
+    h[MAP_OFF:MAP_OFF + MAP_N] = m
+    h[MAP_OFF + MAP_N] = MAP_MAGIC
+    h[MAP_SUM_OFF] = map_sum(m)
+
+    cats = [0] * FLT_N_CATS
+    cats[2], cats[8], cats[14] = 3, 1, 7          # CRC=3, SCAN_DIV0=1, TIMEBASE=7
+    total = 3 + 1 + 7
+    snap = [FLT_MAGIC, total] + cats + [8, 1028, 0x00000000, 1028] \
+        + [14, 9999, 0xDEADBEEF, 1]
+    h[FLT_OFF:FLT_OFF + FLT_WORDS] = snap
+
+    labels, mapv = make_labels(h)
+    assert mapv is not None, "合成头的映射表没被接受 (magic/sum 判据有问题)"
+    assert labels[14] == "FAULT_TOTAL", "槽14 标签错: %s" % labels[14]
+    assert labels[15] == "FAULT_LAST", "槽15 标签错: %s" % labels[15]
+    assert slot_segs(mapv)[14] == 8, "槽14 段号不是 8(FAULT)"
+    print("[selftest] 映射表: 60 槽, 槽14/15 = FAULT_TOTAL/FAULT_LAST, sum=0x%08X OK"
+          % map_sum(m))
+    print("[selftest] 台账快照解析:")
+    describe_faults(h)
+    w = h[FLT_OFF:FLT_OFF + FLT_WORDS]
+    assert w[1] == total, "total 读错"
+    assert w[2 + 14] == 7, "cats[14] 读错"
+    assert w[2 + FLT_N_CATS] == 8, "首例 code 读错"
+    assert w[2 + FLT_N_CATS + 4] == 14, "末例 code 读错"
+    print("[selftest] PASS —— 解析器与固件布局一致 (偏移/字段顺序/段号)")
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
+    if "--selftest" in argv:
+        return selftest()          # 布局自检: 不需要卡 (见 selftest 的说明)
     disk_no = int(argv[argv.index("--disk") + 1]) if "--disk" in argv else None
     nblk = int(argv[argv.index("--blocks") + 1]) if "--blocks" in argv else 512
     csv_path = argv[argv.index("--csv") + 1] if "--csv" in argv else None
@@ -349,6 +451,7 @@ def main():
     print("  丢包(跨上电累计) = %d 条   已回卷 = %s   批次数 = %d"
           % (h[11], "是" if h[12] else "否", h[13]))
     describe_map(labels, mapv)
+    describe_faults(h)                            # ★ 故障台账全景 (h[78..111])
 
     data_lba0, data_n = h[5], h[6]
     wp = h[7] - data_lba0                       # 数据区内的写指针 (0 起的块)

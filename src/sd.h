@@ -27,6 +27,7 @@ void sd_set_perf(uint32_t write_ticks, uint32_t verify_ticks, uint32_t verify_re
 
 /* ── 每拍连续落盘日志 (专用裸介质, 环形回卷) ── */
 int  sd_log_open(void);              /* 读/建头部块, 0 = 成功 */
+int  sd_flt_snapshot(void);          /* 把故障台账全景刷进日志头 (上位机 SD_CFG[12] 触发) */
 void sd_log_poll(void);              /* 主循环调: 成批冻结 + 追加(回卷)落盘 */
 int  sd_reopen_log(void);            /* 上位机触发: 重新初始化 SD + 开日志 (卡插晚了) */
 void sd_log_diag_gap(uint32_t gap_ticks, uint32_t inpoll_ticks, uint32_t slow_cnt);

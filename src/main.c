@@ -2578,6 +2578,9 @@ int main(void)
         if (sd_cfg_take(10u) != 0u) mb_line_test(g_shm);
         /* 排障: 在 PD6 上量波形 (SD_CFG[11]=1 + 魔数) */
         if (sd_cfg_take(11u) != 0u) mb_line_probe(g_shm);
+        /* ★ 把故障台账全景刷进 SD 日志头 (SD_CFG[12]=1 + 魔数)。
+         *   显式触发而非固件定时刷 —— 刷一次要写一次 LBA0, 什么时候值得只有上位机知道。 */
+        if (sd_cfg_take(12u) != 0u) { (void)sd_flt_snapshot(); }
         /* ★★★ 空闲窗口自动落盘 (S3 persist_task 语义) —— T15/T26 修复
          *   ── 完整的三次失败记录在 g_persist_req_cnt 上方, 别原样重试第四次 ──
          *   实测结论: 功能正确 (dirty 会清), 但每次落盘有一段失聪窗口

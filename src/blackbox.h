@@ -74,12 +74,32 @@
 #define BB_MAP_SEG_COMM   5u          /* idx 0=帧数 1=响应数 2=CRC错 3=异常 4=状态机首字 */
 #define BB_MAP_SEG_DO     6u          /* idx 0 = DO 打包位图 (真正锁存到引脚的电平) */
 #define BB_MAP_SEG_FORCE  7u          /* idx 0..3 = 强制位图 128bit 的 4 个字 */
+/* ★ 8 = 故障台账 (faultlog.h, 2026-09-13)。idx 0 = 累计故障数, 1 = 末例分类码。
+ *   为什么把它放进**记录流**: 落盘是"变化才记"⇒ 故障计数一变就落一条,
+ *   于是"什么时候出的错"被**天然打了 tick 时间戳** —— 这是事后取证最想要的东西。
+ *   完整的 24 类计数与首例现场在**日志头快照** (h[78..]) 里, 两者互补:
+ *     记录流 = 时间轴(何时), 头快照 = 全景(哪些类、首例现场)。 */
+#define BB_MAP_SEG_FAULT  8u
 #define BB_ME(seg, idx) (((uint32_t)(seg) << 16) | (uint32_t)(idx))
 
 /* 卡上日志头里的映射区位置 (头块 512B = 128 字, h[0..15] 是原有字段) */
 #define BB_MAP_HDR_OFF  16u           /* 映射表在日志头里的字偏移 */
 #define BB_MAP_HDR_MAGIC 0x50414D42u  /* "BMAP" */
 #define BB_MAP_HDR_SUM_OFF (BB_MAP_HDR_OFF + BB_MAP_N + 1u)  /* = 77 */
+
+/* ---- ★ 故障台账全景快照在**日志头**里的位置 (2026-09-13) ----
+ * 放 h[78..111] (34 字): 这是日志头 512B 里**唯一既没被初始化、也不参与任何校验和**
+ * 的一段 (头只用 h[0..15] 自身校验 + h[16..77] 映射表) ⇒
+ *   ① 加它**不改变任何既有语义** ⇒ **不必升 LOG_VERSION**
+ *      (升版本会让 sd_log_open 当新卡重建 ⇒ 从 LBA1 覆写, 毁掉卡上已有记录);
+ *   ② 旧读端看不到它 (无害), 新读端按下方偏移解析。
+ * 布局: [0]=magic [1]=total [2..25]=24 类计数 [26..29]=首例 [30..33]=末例
+ * 刷新: sd_flt_snapshot() —— 由上位机显式触发 (SD_CFG[12]), 符合"别让固件自己猜窗口"。 */
+#define BB_FLT_HDR_OFF   78u
+#define BB_FLT_HDR_MAGIC 0x464C5431u   /* "FLT1" (按字节序读出来就是 FLT1) */
+#define BB_FLT_HDR_WORDS 34u
+_Static_assert(BB_FLT_HDR_OFF + BB_FLT_HDR_WORDS <= 128u,
+               "BB: fault snapshot must fit in the 512B header block (128 words)");
 
 #define EVT_BOOT         0x01u
 #define EVT_ENGINE_START 0x02u
@@ -96,6 +116,10 @@ uint32_t bb_tick_last(void);           /* 最近一次写入的 tick (诊断) */
 /* ★ 当前生效的通道映射 (60 项), 供 sd.c 写进日志头 ⇒ 数据自描述 */
 const uint32_t *bb_map(void);
 uint32_t bb_map_sum(const uint32_t *map);   /* 映射表校验和 (两端同一算法) */
+
+/* 把故障台账全景写进日志头的 h[BB_FLT_HDR_OFF..] (34 字)。
+ * 调用点: sd_log_flush_header() (开日志时) + sd_flt_snapshot() (上位机触发刷新)。 */
+void bb_flt_into_hdr(uint32_t *h);
 
 #endif /* DCL_BLACKBOX_H */
 

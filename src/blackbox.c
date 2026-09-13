@@ -15,6 +15,7 @@
 #include "sd.h"   /* sd_cfg_take: 带魔数门的一次性配置字 */
 #include "engine.h"
 #include "regs.h"
+#include "faultlog.h"   /* 台账: 既作为记录流的两列(BB_MAP_SEG_FAULT), 也进日志头快照 */
 
 /* ── MDMA ch1 寄存器 (ch_n 基址 = MDMA_BASE + 0x40×(n+1); ch1 = +0x80) ── */
 #define BB_M        0x52000080u   /* MDMA ch1 寄存器组基址 (ch0=+0x40, 间距 0x40) */
@@ -105,7 +106,12 @@ static const uint32_t s_bb_map_def[BB_MAP_N] = {
     BB_ME(0,  0), BB_ME(0,  1), BB_ME(0,  2), BB_ME(0,  3),
     BB_ME(0,  4), BB_ME(0,  5), BB_ME(0,  6), BB_ME(0,  7),
     BB_ME(0,  8), BB_ME(0,  9), BB_ME(0, 10), BB_ME(0, 11),
-    BB_ME(0, 12), BB_ME(0, 13), BB_ME(0, 14), BB_ME(0, 15),
+    BB_ME(0, 12), BB_ME(0, 13),
+    /* [14..15] ★ 故障台账 (2026-09-13) —— 占用原 SENSOR[14..15] 两个槽。
+     *   为什么从这里让位: 默认表把 SENSOR/WIRE/ACT 各映射 16 路, 而三个段本身
+     *   支持 64/128/64 路 —— 16 只是**采样**, 且实际用量 (DI 4 + AI 3 → SENSOR[0..10])
+     *   离 14 还远。映射表随头落卡 ⇒ 读端自动按新表打标签, 不用改记录尺寸/环/解析。 */
+    BB_ME(8,  0), BB_ME(8,  1),
     /* [16..31] WIRE[0..15]    —— 旧 [20..35] */
     BB_ME(1,  0), BB_ME(1,  1), BB_ME(1,  2), BB_ME(1,  3),
     BB_ME(1,  4), BB_ME(1,  5), BB_ME(1,  6), BB_ME(1,  7),
@@ -171,6 +177,13 @@ static void bb_map_bind(const uint32_t *map)
             p = (volatile uint32_t *)(s_bb_shm + OFF_DO_SHADOW);
         } else if (seg == BB_MAP_SEG_FORCE && idx < 4u) {
             p = (volatile uint32_t *)(s_bb_shm + OFF_FORCE_MASK + idx * 4u);
+        } else if (seg == BB_MAP_SEG_FAULT && idx < 2u) {
+            /* 故障台账 (faultlog.h): idx 0 = 累计故障数, 1 = 末例分类码。
+             * ★ 偏移用 __builtin_offsetof 从结构体取, 不手写数字 (同 COMM 的做法)。 */
+            const uint8_t *b = (const uint8_t *)s_bb_shm + OFF_FAULT_LOG;
+            p = (volatile uint32_t *)(b + (idx == 0u
+                ? (uint32_t)__builtin_offsetof(FaultLedger_t, total)
+                : (uint32_t)__builtin_offsetof(FaultLedger_t, l_code)));
         }
         s_map_p[i] = p;
     }
@@ -184,6 +197,29 @@ uint32_t bb_map_sum(const uint32_t *map)
     uint32_t h = 2166136261u, i;
     for (i = 0; i < BB_MAP_N; i++) { h ^= map[i]; h *= 16777619u; }
     return h;
+}
+
+/* 故障台账全景 → 日志头 (布局见 blackbox.h: BB_FLT_HDR_OFF)。
+ * ★ 与"记录流里的两列"的分工: 这条给**全景**(24 类计数 + 首例现场),
+ *   记录流给**时间轴**(故障计数的每一次变化都带 tick 落一条)。
+ * ★ 只在"头刷新"时写 ⇒ 需要**上位机显式触发** (SD_CFG[12]) 才是新鲜快照,
+ *   否则就是开日志那一刻的 (通常是全 0)。这与本项目"别让固件自己按时间猜窗口"
+ *   是同一条纪律: 什么时候该落一个全景, 只有上位机知道。 */
+void bb_flt_into_hdr(uint32_t *h)
+{
+    const FaultLedger_t *lg = fault_ledger_r((const uint8_t *)s_bb_shm);
+    uint32_t i;
+    h[BB_FLT_HDR_OFF + 0u] = BB_FLT_HDR_MAGIC;
+    h[BB_FLT_HDR_OFF + 1u] = lg->total;
+    for (i = 0u; i < FAULT_N_CATS; i++) h[BB_FLT_HDR_OFF + 2u + i] = lg->cats[i];
+    h[BB_FLT_HDR_OFF + 2u + FAULT_N_CATS + 0u] = lg->f_code;
+    h[BB_FLT_HDR_OFF + 2u + FAULT_N_CATS + 1u] = lg->f_tick;
+    h[BB_FLT_HDR_OFF + 2u + FAULT_N_CATS + 2u] = lg->f_c0;
+    h[BB_FLT_HDR_OFF + 2u + FAULT_N_CATS + 3u] = lg->f_c1;
+    h[BB_FLT_HDR_OFF + 2u + FAULT_N_CATS + 4u] = lg->l_code;
+    h[BB_FLT_HDR_OFF + 2u + FAULT_N_CATS + 5u] = lg->l_tick;
+    h[BB_FLT_HDR_OFF + 2u + FAULT_N_CATS + 6u] = lg->l_c0;
+    h[BB_FLT_HDR_OFF + 2u + FAULT_N_CATS + 7u] = lg->l_c1;
 }
 
 

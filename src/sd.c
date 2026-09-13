@@ -771,8 +771,23 @@ static int sd_log_flush_header(void)
         h[BB_MAP_HDR_OFF + BB_MAP_N] = BB_MAP_HDR_MAGIC;
         h[BB_MAP_HDR_SUM_OFF]        = bb_map_sum(m);
     }
+    /* ★ 故障台账全景 (h[78..111]): 让"读一次 LBA0"就能拿到故障全景。
+     *   ★ 放在**头校验和之后**是必须的 —— h[15] 只校验 h[0..14], 本段不参与校验,
+     *     所以加它不会破坏任何既有判据, **不必升 LOG_VERSION** (升版本会毁卡上数据)。 */
+    bb_flt_into_hdr(h);
     s_log_hdr_flush++;
     return sd_write_block(0u, (const uint8_t *)h);
+}
+
+/* ★ 上位机显式触发: 把当前故障台账全景刷进日志头 (SD_CFG[12])。
+ *   为什么是"显式触发"而不是固件定时刷: 刷新要**写一次 LBA0**, 而写 SD 有停顿代价;
+ *   什么时候"现在值得落一个全景"只有上位机知道 (同本项目既有纪律:
+ *   "别让固件自己按时间猜窗口")。 */
+int sd_flt_snapshot(void)
+{
+    if (!s_log_ready) return -1;
+    SD_DIAG[17]++;                       /* 刷新次数 (可被外部读走, 证明真的刷过; 17 是空槽) */
+    return sd_log_flush_header();
 }
 
 /* 打开日志: 读头部, 能对上就续写, 否则新建 */
