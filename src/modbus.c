@@ -33,6 +33,7 @@
 #include "modbus.h"
 #include "engine.h"
 #include "regs.h"
+#include "faultlog.h"   /* 统一故障台账: 通信域每一类异常都留案底 (见 faultlog.h) */
 
 #define ATTR_ITCM __attribute__((section(".itcm_text"), noinline))
 
@@ -87,6 +88,7 @@ static inline uint16_t *mb_set(uint8_t *base)  { return (uint16_t *)MB_PTR(base,
 #define MB_DIAG_LAT_N    26u  /* 样本数 */
 #define MB_DIAG_T_RX     27u  /* 内部: 最近一次拉到字节的 DWT 时刻 */
 #define MB_DIAG_FASTOK   28u  /* 内部: 早判帧 (CRC 门) 成功次数 */
+#define MB_DIAG_RX_FULL  29u  /* 内部: RX 缓冲被填满的次数 (帧过长/无帧间隔) */
 
 /* 通信域自己的拍计数 (每次 mb_tick +1, 单位 100μs)。
  * ★ 为什么不用 DWT_CYCCNT: 见上面 MB_DIAG_LAT_* 的注释 —— 调试器会话会静默把它停掉,
@@ -179,6 +181,9 @@ static int ATTR_ITCM mb_pull_rx(uint8_t *base, uint8_t *dst, int max_n)
              *   于是"ORE 被反复清掉"与"ORE 从未出现"在读数上完全一样。
              *   要能分开, 就必须有一个独立计数 (同族: "该变而没变"必须可读)。 */
             d[MB_DIAG_ERRCLR] += 1u;
+            /* ★ 台账: 上下文带 isr 原值与当时的 rx_len —— 这正是 485 那次事故里
+             *   最想问的两个量 (ORE=1 且 RXNE=0 那一刻的状态)。 */
+            fault_record(base, FAULT_MB_ORE, s_mb_tick, isr, (uint32_t)c->rx_len);
         }
         if (!(isr & USART_ISR_RXNE)) break;
         dst[n++] = (uint8_t)(USART_RDR(USART2_BASE) & 0xFFu);
@@ -226,6 +231,8 @@ static void ATTR_ITCM mb_set_exc(uint8_t *base, uint8_t func, uint8_t exc)
     c->b_pos = 0;
     c->crc_acc = 0xFFFF;
     c->err_exc++;
+    /* ★ 台账: 上下文 = (功能码, 异常码) —— 排障要知道"哪类请求被哪种原因拒了" */
+    fault_record(base, FAULT_MB_EXC, s_mb_tick, func, exc);
 }
 
 /* ---- 响应字节生成器 (pos: 0..b_len-1) ---- */
@@ -281,6 +288,8 @@ static void ATTR_ITCM mb_parse_frame(uint8_t *base)
         uint16_t crc_recv = (uint16_t)(rx[len - 2] | ((uint16_t)rx[len - 1] << 8));
         if (mb_crc16(rx, (uint16_t)(len - 2)) != crc_recv) {
             c->err_crc++;
+            /* ★ 台账: 上下文 = (收到长度, 收到CRC) —— "哪个长度上开始错"一眼可见 */
+            fault_record(base, FAULT_MB_CRC, s_mb_tick, (uint32_t)len, (uint32_t)crc_recv);
             respond = 0;                              /* 坏帧: 丢弃不响应 */
         } else {
             uint8_t func = rx[1];
@@ -423,6 +432,7 @@ void ATTR_ITCM mb_tick(uint8_t *base)
             d[MB_DIAG_ERRACC] |= (isr & (USART_ISR_PE | USART_ISR_FE
                                          | USART_ISR_NE | USART_ISR_ORE));
             d[MB_DIAG_ERRCLR] += 1u;
+            fault_record(base, FAULT_MB_ORE, s_mb_tick, isr, 0xE0u);   /* 0xE0=每拍清这一路 */
         }
     }
 
@@ -432,8 +442,19 @@ void ATTR_ITCM mb_tick(uint8_t *base)
         uint8_t tmp[MB_TICK_BUDGET];
         int n = mb_pull_rx(base, tmp, budget);
         if (n > 0) {
-            for (int i = 0; i < n && c->rx_len < MB_MAX_FRAME; i++)
+            int put = 0;
+            for (int i = 0; i < n && c->rx_len < MB_MAX_FRAME; i++) {
                 rx[c->rx_len++] = tmp[i];
+                put++;
+            }
+            /* ★ 台账: 缓冲被填满而还有字节没放下 ⇒ 帧过长 / 无帧间隔。
+             *   这条以前**没有任何量反映** —— 485 那次"帧间零间隔"实验里,
+             *   板子收到 34739 字节却只结算出 1 帧, 当时没人知道是"缓冲满了"。 */
+            if (put < n) {
+                mb_diag(base)[MB_DIAG_RX_FULL] += 1u;
+                fault_record(base, FAULT_MB_RX_FULL, s_mb_tick,
+                             (uint32_t)c->rx_len, (uint32_t)(n - put));
+            }
             c->silent = 0;
             c->state = MB_ST_RX;
             {   /* ★ 记下"到过多少字节" —— 这是"字节到了但框不成帧"的唯一指纹 */
@@ -469,7 +490,11 @@ void ATTR_ITCM mb_tick(uint8_t *base)
                 if (c->rx_len >= 4) { c->state = MB_ST_EXEC; }
                 else {
                     /* ★ 这条"太短就丢"的路径原来**不计数** ⇒ 判据里是个盲区 */
-                    if (c->rx_len > 0u) mb_diag(base)[MB_DIAG_SHORT] += 1u;
+                    if (c->rx_len > 0u) {
+                        mb_diag(base)[MB_DIAG_SHORT] += 1u;
+                        fault_record(base, FAULT_MB_SHORT, s_mb_tick,
+                                     (uint32_t)c->rx_len, 0u);
+                    }
                     c->rx_len = 0; c->rx_pos = 0; c->silent = 0; c->state = MB_ST_IDLE;
                 }
             }
@@ -514,6 +539,9 @@ void ATTR_ITCM mb_tick(uint8_t *base)
              *   算法出了新错 —— 静默丢弃该帧并计一次异常, 保持通信域可用,
              *   而不是把状态机永久钉死在 BUILD (那正是 M1 的故障形态)。 */
             c->err_exc++;
+            /* ★ 台账: "组装越界保护被触发" = 界限/长度算法出了新错, 必须留案底 */
+            fault_record(base, FAULT_MB_BUILD_OVF, s_mb_tick,
+                         (uint32_t)c->b_pos, (uint32_t)total);
             c->tx_len = 0; c->tx_sent = 0;
             c->rx_len = 0; c->rx_pos = 0;
             c->state = MB_ST_IDLE;

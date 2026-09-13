@@ -28,6 +28,7 @@
 #include "macro.h"
 #include "lsym.h"
 #include "primitives.h"
+#include "faultlog.h"   /* 统一故障台账: cold_start_reset 是本域的登记入口 */
 
 /* ITCM 段属性 (阶段 3 的分档调度也住在热路径上) */
 #define ATTR_ITCM __attribute__((section(".itcm_text"), noinline))
@@ -104,6 +105,12 @@ void cold_start_reset(void)
      *     (上电 / 0x13 RESET / deploy 装载) 都会清掉已上传的程序** —— 这是
      *     macro.h 声明的 v0 边界 (RAM-only, 掉电/RESET 丢失), 不是缺陷。 */
     macro_reset(g_shm);
+    /* ★ 统一故障台账登记 (2026-09-13)。
+     *   memset 已把台账清 0, 这里显式写 magic —— 目的是让"漏登记"从
+     *   "读出来是 0 分不清'干净'还是'没登记'" 变成 `fault_sane()==1` 的**可判**状态。
+     *   ★ 台账必须活在**任何清零路径**之后仍然已登记: 上电 / 0x13 RESET /
+     *     deploy 装载 / engine_fill_tables 都经过本函数 ⇒ 放在这里是唯一正确位置。 */
+    fault_init(g_shm);
 }
 
 /* ══════════ 栈边界哨兵 (设防) ══════════

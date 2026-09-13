@@ -53,6 +53,7 @@
 #include "persist.h"
 #include "modbus.h"
 #include "macro.h"
+#include "faultlog.h"   /* 统一故障台账: 主循环/ISR/协议层的异常都留案底 */
 #include "lsym.h"
 #include "adc.h"
 #include "di.h"
@@ -177,6 +178,10 @@ OBS uint32_t g_table_ck       = 0;   /* ★整表校验和 (工具在 Python 里
 OBS uint32_t g_bucket_ck      = 0;   /* ★桶表校验和 (同上, 覆盖 220×u16) */
 OBS uint32_t g_active_routes  = 0;   /* 表内 ACTIVE 条数 (期望 = n_routes) */
 OBS uint32_t g_guard_ok       = 0;   /* 栈哨兵: 1 = SHM 顶上的魔术字完好 */
+/* ★ 时基活性 (2026-09-13): 1 = 主循环检测到 DWT_CYCCNT 不推进 (多半是调试器停的)。
+ *   用途: ① 让"时间量全是 0"这类静默污染**自己浮出来** (见 FAULT_TIMEBASE);
+ *         ② 当 ISR 的"零成本"防御闸门 —— 时基死时 d==0 无意义, 不该计数/记账。 */
+OBS uint32_t g_timebase_dead  = 0;
 OBS uint32_t g_guard_bad_off  = 0xFFFFFFFFu;  /* 被踩的第几个字 (诊断用) */
 
 /* ── 阶段 3: 档桶调度 ── */
@@ -702,7 +707,17 @@ ISR_PLACE void TIM2_IRQHandler(void)
             if (d > g_eng_cyc_max) g_eng_cyc_max = d;
             g_eng_cyc_sum += d;
             g_eng_n++;
-            if (d == 0u) g_eng_div0++;      /* 防御: "零成本"一定是测量坏了 */
+            if (d == 0u) {
+                /* ★ 闸门: 时基已死时 d==0 **不携带任何信息** (DWT 停 → t0==t1)
+                 *   ⇒ 既不计数也不记台账。否则会出现实测到的"185034 拍里 184043 拍
+                 *     都在报 0 周期"—— 既是噪声淹没真信号, 又是**每拍在 ISR 里写台账**
+                 *     的性能隐患。时基故障本身由 FAULT_TIMEBASE 单独报 (主循环检测)。 */
+                if (!g_timebase_dead) {
+                    g_eng_div0++;      /* 防御: "零成本"一定是测量坏了 */
+                    /* ★ 台账 (ISR 内, 只在异常时付代价): 上下文 = (测得周期, 样本序号) */
+                    fault_record(g_shm, FAULT_SCAN_DIV0, g_tick_count, d, g_eng_n);
+                }
+            }
         }
 
         /* ══════════ W3: 顺序域扫描段 (Sequencer) ══════════
@@ -816,7 +831,11 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *     它与 EXEC_DEPLOY_BUDGET(26000, 下载期静态门) 是**两个语义不同的量**,
          *     刻意分开命名 —— 见 engine.h 里那段"一常量两用"的说明。
          *   ★ 成本: 一次比较 + 极少发生的自增 ⇒ 热路径可忽略。 */
-        if (di > EXEC_BUDGET_CYCLES) g_isr_overrun++;
+        if (di > EXEC_BUDGET_CYCLES) {
+            g_isr_overrun++;
+            /* ★ 台账: 上下文 = (实测周期, 预算上限) —— 超了多少一眼可见 */
+            fault_record(g_shm, FAULT_ISR_OVER, g_tick_count, di, EXEC_BUDGET_CYCLES);
+        }
         /* ★★ #2 修复: samples (g_isr_n) = **仅 RUN 拍** (范本语义)。
          *   范本 `core0_isr.c:358` 的 `SAMPLES += 1` 写在 `if (!run) return` **之后**
          *   —— 即 OA13 "统计只反映本次 RUN 段"; 而且 0x38 的 samples 正是取自它
@@ -965,11 +984,33 @@ static void send_response(uint8_t sts, const uint8_t *p, uint32_t n)
 
 static void ack(const uint8_t *p, uint32_t n) { send_response(STS_ACK, p, n); }
 
+/* 拒绝原因码 —— 让"为什么被拒"可被外部读走, 而不是只有一串 NAK 文本。
+ * 文本对人类友好, 码对**脚本判据**友好 (脚本比对字符串太脆, 改一个字就失效)。
+ * ★ 2026-09-13 从 W1 段上移到 nak() 之前: nak() 现在要把拒因码记进故障台账,
+ *   而台账登记点在 nak() 内 —— 宏必须先可见 (原位置在 nak() 之后, 会编译不过)。 */
+#define NAKRH_ADDR     1u   /* 地址非法 / 不对齐 */
+#define NAKRH_RANGE    2u   /* burst 区间非法 / 越界 / 跨禁区 */
+#define NAKRH_COUNT    3u   /* count 为 0 或 > 256 */
+#define NAKRH_SHORT    4u   /* 载荷长度不足 */
+#define NAKRH_NONFIN   5u   /* 写 float 区但值非有限 (NaN/Inf) */
+#define NAKRH_BUDGET   6u   /* START 时发现程序超预算 (F11 毒药表兜底) */
+#define NAKRH_FIDX     7u   /* force: wire 号越界 */
+#define NAKRH_FMODE    8u   /* force: mode 不是 0/1 */
+#define NAKRH_FFIN     9u   /* force: 强制值为 NaN/Inf */
+#define NAKRH_PMODE   10u   /* persist: mode 不是 0/1 */
+
 static void nak(const char *m)
 {
     uint32_t n = 0;
     while (m && m[n]) n++;
     g_nak_count++;
+    /* ★ 台账: 协议层"被拒"必须留案底 (否则只有 g_nak_count 一个总数, 不知道**为什么**被拒)。
+     *   上下文带 g_nak_last = 具体拒因码 (NAKRH_*), 排障时一眼可辨。
+     *   ★ 为什么挂在 nak() 里而不是各拒绝点: 本函数是**唯一的拒绝出口** ——
+     *     一处登记覆盖全部 (若将来新增拒绝点忘了登记, 是"少记"不是"记错",
+     *     且 PC 侧有"NAK 数 == 台账 NAK 数"这条交叉判据兜底)。 */
+    fault_record(g_shm, (g_nak_last == NAKRH_BUDGET) ? FAULT_DEPLOY_REJ : FAULT_PROTO_NAK,
+                 g_tick_count, (uint32_t)g_nak_last, n);
     send_response(STS_NAK, (const uint8_t *)m, n);
 }
 
@@ -1523,19 +1564,6 @@ static void h_engine_status(void)
  * ★ 四个安全守卫必须搬全 (S3 main.c:83-140), 少一个就是一个可利用的洞:
  *     valid_addr / valid_range / write_allowed(NaN 防护) / outputs_safe
  */
-
-/* 拒绝原因码 —— 让"为什么被拒"可被外部读走, 而不是只有一串 NAK 文本。
- * 文本对人类友好, 码对**脚本判据**友好 (脚本比对字符串太脆, 改一个字就失效)。 */
-#define NAKRH_ADDR     1u   /* 地址非法 / 不对齐 */
-#define NAKRH_RANGE    2u   /* burst 区间非法 / 越界 / 跨禁区 */
-#define NAKRH_COUNT    3u   /* count 为 0 或 > 256 */
-#define NAKRH_SHORT    4u   /* 载荷长度不足 */
-#define NAKRH_NONFIN   5u   /* 写 float 区但值非有限 (NaN/Inf) */
-#define NAKRH_BUDGET   6u   /* START 时发现程序超预算 (F11 毒药表兜底) */
-#define NAKRH_FIDX     7u   /* force: wire 号越界 */
-#define NAKRH_FMODE    8u   /* force: mode 不是 0/1 */
-#define NAKRH_FFIN     9u   /* force: 强制值为 NaN/Inf */
-#define NAKRH_PMODE   10u   /* persist: mode 不是 0/1 */
 
 /* 0x20 READ [addr:u32] → ACK [val:u32] */
 static void h_read_w1(const uint8_t *p, uint32_t n)
@@ -2098,6 +2126,7 @@ static void obs_anchor(void)
     sink ^= g_vtor;                       sink ^= g_vtor_want;
     sink ^= g_table_ck;                   sink ^= g_active_routes;
     sink ^= g_guard_ok;                   sink ^= g_guard_bad_off;
+    sink ^= g_timebase_dead;              /* ★ 时基活性标志 (防 --gc-sections 回收) */
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
     sink ^= g_engine_gate;                sink ^= g_engine_sel;
     sink ^= g_n_routes;                   sink ^= g_table_profile;
@@ -2665,8 +2694,49 @@ int main(void)
          *     (本项目铁律: 一个量只能有一个权威来源/驱动者。) */
 #endif
 
+        /* ★★ 时基活性自检 (2026-09-13) —— 让"时间基座被停掉"自己浮出来。
+         *   背景: 台账上线第一次运行就抓到 `SCAN_DIV0` 以 184043/185034 的频率在报,
+         *   上下文 c0 恒 0 ⇒ 引擎扫描测得**恰好 0 周期** ⇒ `DWT_CYCCNT` 根本没在走
+         *   (调试器会话会静默停它 —— 项目"铁律 0"记录过的既知事故)。
+         *   后果极隐蔽: `eng_cyc_*` / `isr_cyc_*` / `pmin/pmax` **全部静默变垃圾**,
+         *   而现象只是"数字是 0", 不会报任何错。
+         *   ⇒ 判据: 主循环每轮 WFI 睡 ~100µs, 活着的 CYCCNT 必然推进数千周期;
+         *     连续多轮 delta==0 ⇒ 只能是被停了。
+         *   ★ 只判"完全不推进" (delta==0): 擦 flash 造成的几十 ms 跨度是**已知合理**窗口,
+         *     判它只会制造噪声 (噪声淹没真警告 = 本项目最恨的失效模式)。
+         *   ★ 连续 100 轮才报 (≈10ms), 避免刚复位/DWT 刚使能时的边界误报;
+         *     之后每 100 轮记一笔当"仍在坏"的心跳 —— 台账 total 会随之增长,
+         *     既能看出"坏了"也能看出"坏了多久"。 */
+        {
+            static uint32_t s_cyccnt_prev = 0u, s_cyccnt_stuck = 0u;
+            uint32_t cnow = DWT_CYCCNT;
+            if ((cnow - s_cyccnt_prev) == 0u) {
+                if (++s_cyccnt_stuck >= 100u) {
+                    s_cyccnt_stuck = 0u;
+                    /* ★ 同时置标志: 让 ISR 知道"此刻的 DWT 计时无效" (见 ISR 里的闸门) */
+                    g_timebase_dead = 1u;
+                    fault_record(g_shm, FAULT_TIMEBASE, g_tick_count, cnow, 0u);
+                }
+            } else {
+                s_cyccnt_stuck = 0u;
+                g_timebase_dead = 0u;      /* 时基活了 ⇒ 撤下闸门 */
+            }
+            s_cyccnt_prev = cnow;
+        }
+
         /* 栈哨兵周期巡检 (廉价: 32 个字, 主循环有 100μs 一次的机会) */
         g_guard_ok = (uint32_t)shm_guard_ok();
+        if (g_guard_ok != 1u) {
+            /* ★ 台账: 护栏被踩 = SHM 与栈边界失守, 属"结构性"异常。
+             *   ★ 去重: 一旦坏了会**每次巡检都判坏** (100µs 一次) ⇒ 不设闸门会
+             *     把台账瞬间刷爆。这里只在"由好变坏"的那一拍记一次 (沿触发, 不是电平触发)。 */
+            static uint32_t s_guard_seen_bad = 0u;
+            if (!s_guard_seen_bad) {
+                s_guard_seen_bad = 1u;
+                fault_record(g_shm, FAULT_SHM_GUARD, g_tick_count, g_guard_ok,
+                             g_guard_bad_off);
+            }
+        }
         g_stage = 9;
         __asm__ volatile("wfi");
     }

@@ -535,6 +535,19 @@ _Static_assert(sizeof(MacroCtrl_t) == 16, "MacroCtrl_t must be 16 bytes");
 _Static_assert(OFF_MACRO_END <= OFF_HIL_DUTY, "SHM: W5 观测区与 MACRO 区重叠");
 _Static_assert(OFF_HIL_FB_RAW + 4u <= SHM_SIZE, "SHM: W5 观测区越出 SHM 末尾");
 
+/* ---- ★ 统一故障台账 (2026-09-13, 见 faultlog.h 的长注释) ----
+ * 位置: 0x7020 —— 紧接 BB_SNAP(0x6F20 + 256 = 0x7020) 之后的**空闲尾区**
+ *       (0x7020..0x8000 共 4064B, 此前未分配)。
+ * 暴露方式: **不新增协议命令**, PC 用已有 `0x22 READ_BURST` 直接读本区 (30 字 = 120B)。
+ * 登记: `fault_init()` 由 cold_start_reset 调用 —— 本域在 SHM 内, 整段 memset 天然
+ *       覆盖它, 但按冻结平台纪律**仍显式登记**("天然覆盖"不等于"已登记")。 */
+#define OFF_FAULT_LOG        0x7020
+#define OFF_FAULT_LOG_SZ     144u    /* 实际结构 136B, 留 8B 余量 */
+_Static_assert(OFF_FAULT_LOG >= OFF_BB_SNAP + 256u,
+               "SHM: fault ledger overlaps BB_SNAP (256B)");
+_Static_assert(OFF_FAULT_LOG + OFF_FAULT_LOG_SZ <= SHM_SIZE,
+               "SHM: fault ledger exceeds SHM_SIZE");
+
 
 /* ══════════ 路由条目 (16B packed) —— 与 S3 逐字节相同 ══════════ */
 typedef struct __attribute__((packed, aligned(4))) {
