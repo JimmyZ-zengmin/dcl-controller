@@ -49,7 +49,7 @@ FAULT_NAMES = {
     1: "MB_ORE", 2: "MB_CRC", 3: "MB_SHORT", 4: "MB_RX_FULL", 5: "MB_EXC",
     6: "MB_BUILD_OVF", 7: "ISR_OVER", 8: "SCAN_DIV0", 9: "SHM_GUARD",
     10: "DEPLOY_REJ", 11: "PROTO_NAK", 12: "MACRO_ERR", 13: "CTRL_WHILE_STOP",
-    14: "TIMEBASE",
+    14: "TIMEBASE", 15: "LOOP_STALL", 16: "WDT_RESET", 17: "WDT_INIT_FAIL",
 }
 FAULT_EXTERNAL = {14: "DWT 时基被外部停掉 (调试器会话) ⇒ DWT 计时统计不可用; 复位即恢复"}
 MB_ST = {0: "IDLE", 1: "RX", 2: "EXEC", 3: "BUILD", 4: "TX"}
@@ -217,27 +217,139 @@ def verdict(name, e, w):
             out.append("★ 绑到的槽数不是 60 ⇒ 表里有越界项")
             bad = True
     elif name == "BOOT_AXI":
+        # ★ 位定义权威: ST stm32h723xx.h。RMVF(16) **不是**复位原因, 它是清除位 —— 不列入。
+        #   完整位表: 17=CPURSTF 19=D1RSTF 20=D2RSTF 21=BORRSTF 22=PINRSTF 23=PORRSTF
+        #             24=SFTRSTF 26=IWDG1RSTF 28=WWDG1RSTF 30=LPWRRSTF
+        CAUSE = ((17, "CPURSTF CPU复位"), (19, "D1RSTF D1域"), (20, "D2RSTF D2域"),
+                 (21, "BORRSTF 欠压"), (22, "PINRSTF 复位脚"), (23, "PORRSTF 上电"),
+                 (24, "SFTRSTF 软件复位"), (26, "★IWDG1RSTF 独立看门狗"),
+                 (28, "WWDG1RSTF 窗口看门狗"), (30, "LPWRRSTF 低功耗"))
+        # ★★ 合法签名表 —— **逐字抄 RM0468 Table 52 "Reset source identification"**。
+        #   列序: LPWR|WWDG1|IWDG1|SFT|POR|PIN|BOR|D2|D1|CPU (手册表格的行)。
+        SIG = ((0x00FA0000, "上电复位 (POR 伴 PIN/BOR/D2/D1/CPU)"),
+               (0x00420000, "引脚复位 (NRST)"),
+               (0x00620000, "欠压复位 (BOR)"),
+               (0x01420000, "软件复位 (SFTRESET / SYSRESETREQ)"),
+               (0x00020000, "CPU 复位 (CPURST)"),
+               (0x10420000, "★ 窗口看门狗 WWDG1 复位"),
+               (0x04420000, "★ 独立看门狗 IWDG1 复位"),
+               (0x00080000, "D1 退出 DStandby"),
+               (0x00100000, "D2 退出 DStandby"),
+               (0x40420000, "★ 低功耗非法复位 (D1 DStandby / CPU CStop)"))
         rsr, bdcr = w[2], w[3]
-        names = []
-        for bit, nm in ((16, "PORR 上电"), (17, "SFTRSTF 软件复位"), (18, "IWDG1 独立看门狗"),
-                        (19, "WWDG1 窗口看门狗"), (20, "LPWR 低功耗"), (21, "BORR 欠压"),
-                        (22, "PINR 复位脚")):
-            if rsr & (1 << bit):
-                names.append(nm)
-        known = 0x7F << 16
-        stray = rsr & ~known
-        out.append("启动次数=%d RSR=0x%08X BDCR=0x%08X" % (w[0], rsr, bdcr))
-        out.append("复位原因位: %s" % (", ".join(names) if names else "无 (首次上电或未置位)"))
-        # ★ 不许照抄"多因同时成立"这种物理上不可能的结论:
-        #   一次复位只可能有一个主因 ⇒ 同时置多位 = 标志没被清 / 位定义不符, 要么就是复位源真在反复抖。
-        if len(names) > 1:
-            out.append("  ★ 同时置 %d 位 ⇒ **不是单一复位原因**。可能: ①RSR 未被清(RMVF) "
-                       "②位定义与实际不符 ③复位源在反复抖动。需要单独查, 别照抄成'多个原因'。"
-                       % len(names))
+        names = [nm for bit, nm in CAUSE if rsr & (1 << bit)]
+        known = 0
+        for bit, _ in CAUSE:
+            known |= 1 << bit
+        stray = rsr & ~known & ~(1 << 16)          # 排除 RMVF(可读回 1)
+        r = rsr & known                             # 只看原因位域
+        hit = [(v, nm) for v, nm in SIG if v == r]
+        out.append("启动次数=%d" % w[0])
+        out.append("复位状态 RSR=0x%08X BDCR=0x%08X" % (rsr, bdcr))
+        if hit:
+            out.append("复位原因: %s   (RSR 0x%08X == RM0468 Table52 的合法签名)"
+                       % (hit[0][1], hit[0][0]))
+        else:
+            out.append("复位原因: **未命中 Table52 任何签名** (原因位域=0x%08X)" % r)
+            out.append("  已置起的位: %s" % (", ".join(names) if names else "(无)"))
+        out.append("上一轮: 停在 g_stage=%s / 最后拍=%d   故障摘要: total=%d 首例=%s@tick%d 末例=%s@tick%d"
+                   % (w[4], w[5], w[6],
+                      FAULT_NAMES.get(w[7], "-"), w[8],
+                      FAULT_NAMES.get(w[10], "-"), w[11]))
+        if len(w) > 31:
+            out.append("活体镜像: 此刻 stage=%d / 拍号=%d (AXI 跨复位不丢 ⇒ 复位后它即"
+                       "上一轮的最后现场)" % (w[30], w[31]))
+        cats = w[12:28]
+        nz = [(i, c) for i, c in enumerate(cats) if c]
+        if nz:
+            out.append("上一轮故障分类: %s"
+                       % ", ".join("%s=%d" % (FAULT_NAMES.get(i, "cat%d" % i), c)
+                                   for i, c in nz))
+        # ★★ 判据 (2026-09-13 **修正**): 不再是"原因位恰好 1 个" —— 那条是**假判据**。
+        #   RM0468 Table 52 授权: **单次复位事件常置起多个位** ——
+        #     引脚复位 = CPURSTF+PINRSTF (0x00420000);
+        #     IWDG 超时 = IWDG1RSTF+PINRSTF+CPURSTF (0x04420000)。手册原话:
+        #     "when an IWDG1 timeout occurs (line #8), both PINRSTF and IWDG1RSTF bits
+        #      are set, indicating that the IWDG1 also generated a pin reset"。
+        #   实测一次正常复位脚复位 0x00420000 被老判据判为异常 ⇒ 它会**永远报警**,
+        #   等于不存在 (与项目"空判据"教训同族; 看门狗复位也会被它误判)。
+        #   ⇒ 现在只问一件事: **这组位是不是某一次复位事件能产生的**。
+        if not hit:
+            out.append("  ★ 单次复位事件产生不出这组位 ⇒ 疑似 RMVF 没清 (标志跨复位累积)"
+                       "或位定义不符 —— 见 regs.h 的位说明")
             bad = True
         if stray:
-            out.append("  ★ RSR 里有本项目未定义的位: 0x%08X ⇒ 位定义需重核" % stray)
+            out.append("  ★ RSR 有未定义位 0x%08X ⇒ 位定义需重核" % stray)
             bad = True
+        # ★ 判据二 (能失败): "上一轮停在主循环 (stage=9) 却出现 IWDG1RSTF" ⇒ 看门狗真救过场。
+        #   对照: `-DDCL_WDT=0` 构建下同样的注入会永久卡死 —— 那个方向判据证明得出"坏"。
+        if (rsr & (1 << 26)) and w[4] == 9:
+            out.append("  ⇒ **上一轮跑到主循环后没能再喂狗, 被独立看门狗复位** —— "
+                       "这正是看门狗该做的事 (对照: WDT=0 构建下同样的注入会永久卡死)")
+    elif name == "WDT_STAT":
+        # ★★ 判据全部做成"能失败"的。**只看 armed==0 不算证明** —— 必须三样同看:
+        #   ① 读回的 PR/RLR **等于固件自报的目标值** (配置真的落地了, 不是"我写过")
+        #   ② IWDG_SR 的 PVU/RVU/WVU 全清零 (更新真的完成了)
+        #   ③ [23]=0: 同步是"等到了标志"而不是"跑满预算"(后者=什么都没等到)
+        #   2026-09-13 的 -2 事件就是"① 没做"的直接后果: 当时手里只有"我写过 0x5555"。
+        # ★★ "期望值"必须来自**固件**([24][25]), 不能写死在工具里 —— 换 PR 档时
+        #    写死的那版立刻变成假报警 (实测: PR=6 档被它报成"配置没落地")。
+        def s32(x):
+            return x - (1 << 32) if x >= 0x80000000 else x
+        if len(w) < 26:
+            # ★ 版本闸: 板上固件若是**改前版本**(16 字 / 24 字), 后面的字段不存在。
+            #   第一版解析器在这里直接 IndexError 崩掉 —— 工具必须能对旧固件说话,
+            #   否则"读不到就崩"会把"固件旧"伪装成"工具坏了"。
+            out.append("★ WDT_STAT 只有 %d 字 (本解析器要 26) ⇒ 板上固件比本工具旧" % len(w))
+            out.append("  可读: 返回码=%d / 超时=%d ms / 喂狗计数=%d / PR=%d RLR=%d SR=0x%X"
+                       % (s32(w[8]) if len(w) > 12 else 0, w[1], w[5],
+                          w[10] if len(w) > 12 else 0, w[11] if len(w) > 12 else 0,
+                          w[12] if len(w) > 12 else 0))
+            out.append("  ⇒ 缺少顺序/关闸/意图字段; 返回码 -2 就是 wdt.h 记的那个缺陷")
+            return (len(w) > 8 and s32(w[8]) != 0), out
+        rc = s32(w[8])
+        out.append("启动返回码=%d %s / armed=%d / 超时档=%d ms / 喂狗计数=%d (必须单调涨)"
+                   % (rc, "✓ 已武装" if rc == 0 else "★ 启动失败", s32(w[0]), w[1], w[5]))
+        want_pr, want_rlr = w[24], w[25]        # ★ 固件自报的目标值 (不是工具硬编码)
+        out.append("板内读回: RCC_CSR=0x%X(bit0=LSION bit1=LSIRDY) PR=%d RLR=%d SR=0x%X"
+                   % (w[9], w[10], w[11], w[12]))
+        out.append("  固件自报目标: PR=%d RLR=%d (SR 应为 0 ⇒ 更新已落)"
+                   % (want_pr, want_rlr))
+        if rc != 0:
+            out.append("  ★ 看门狗**没有武装** ⇒ 本板当前无看门狗保护 (卡死不会被复位)")
+            bad = True
+        if w[8] == 0xFFFFFFFD or w[8] == 0xFFFFFFFE:   # -3 / -2
+            out.append("  ★ 静态失败码 ⇒ 见 wdt.h: -2 = PR/RLR 更新未落 (先启动后配置), "
+                       "-3 = 读回不符 (解锁序列被打断)")
+        if w[10] != want_pr:
+            out.append("  ★ 读回 PR=%d ≠ 固件目标 %d ⇒ 配置没落地" % (w[10], want_pr)); bad = True
+        if w[11] != want_rlr:
+            out.append("  ★ 读回 RLR=%d ≠ 固件目标 %d ⇒ 配置没落地" % (w[11], want_rlr)); bad = True
+        if w[12] & 0x7:
+            out.append("  ★ IWDG_SR=0x%X 仍有更新中标志(PVU|RVU|WVU) ⇒ 值未落地" % w[12])
+            bad = True
+        out.append("顺序取证: 动手前SR=0x%X(PR=%d RLR=%d) → 启动后=0x%X → 解锁后=0x%X "
+                   "→ 写完PR/RLR=0x%X → 等更新落=%.1fµs%s"
+                   % (w[14], w[15], w[16], w[19], w[17], w[18], w[20] * 2.5 / 1000.0,
+                      "  ★跑满预算(=什么都没等到)" if (len(w) > 23 and w[23]) else ""))
+        out.append("关闸取证: 开闸前闸门=%d (应=1) / 关闸期间拦下的喂狗=%d 次 (应>0)"
+                   % (w[21], w[22]))
+        if w[21] != 1:
+            out.append("  ★ 开闸前闸门=%d ⇒ 关闸没生效/没被走到" % w[21]); bad = True
+        if w[22] == 0:
+            # ★★ 窗口实测 ≈10ms (PR=4) / ≈40ms (PR=6), 远长于 100µs 拍 ⇒ 正常情况下
+            #   ISR 一定会撞进来几次: kr_blocked 应 ≈ 等待时间 / 100µs
+            #   (实测 101 ↔ 10095µs, 400 ↔ 40011µs, 两个数互相印证)。
+            #   为 0 只可能是: 闸门没编译进去 (`-DDCL_WDT_FEED_GATE=0` 的对照档), 或 ISR 没在跑。
+            #   **它仍是旁证不是判据** —— 判据是 [8]=0 + [10]/[11]==[24]/[25] + [12]=0。
+            out.append("  △ 关闸期间拦下 0 次 —— 在这个窗口长度下不该为 0。"
+                       "若本档是 `-DDCL_WDT_FEED_GATE=0` 对照构建则属预期; 否则查 ISR 是否在跑")
+        if w[4]:
+            out.append("  主循环停滞事件=%d 次 (阈值 %d 拍 ≈ %.1fs)"
+                       % (w[4], w[6], w[6] * 100e-6))
+        if w[3]:
+            out.append("  ★ 注入挂起标志=1 ⇒ 拍 ISR 已被人为卡死; 看门狗应在 ≤%d ms 内复位"
+                       % w[1])
     else:
         out.append("(无专用解析器, 原始 %d 字)" % len(w))
         for i in range(0, min(len(w), 16), 4):
@@ -294,7 +406,7 @@ def cmd_health(b):
     if not alive:
         bad += 1
     print("   引擎: ENGINE_RUN 字节=0x%02X (bit0=%d)" % (w2[3] & 0xFF, w2[3] & 1))
-    for nm in ("FAULTLOG", "MB_DIAG", "MB_CTRL", "BB_DIAG", "RTC_DIAG", "BOOT_AXI"):
+    for nm in ("FAULTLOG", "WDT_STAT", "MB_DIAG", "MB_CTRL", "BB_DIAG", "RTC_DIAG", "BOOT_AXI"):
         try:
             e, w = b.read(nm)
         except SystemExit as ex:
@@ -328,6 +440,7 @@ def cmd_symptom(b, s):
                  ("MB_RX", "收到的原始字节 (最硬证据: 内容对不对)"),
                  ("MB_TX", "待发/已发的响应字节")],
         "reset": [("BOOT_AXI", "复位次数 + 复位原因 (看门狗/掉电/复位脚/软件)"),
+                  ("WDT_STAT", "看门狗到底武装了没: 返回码 + PR/RLR/SR 读回 + 关闸取证"),
                   ("SHM_CTRL", "复位后 HEARTBEAT 是否在推进 (ISR 活着)")],
         "faults": [("FAULTLOG", "首例(冻结现场) + 24 类计数 + 自洽式"),
                    ("MB_DIAG", "通信类故障的上下文")],

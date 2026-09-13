@@ -35,6 +35,36 @@ set(DCL_MIN_STRESS "0" CACHE STRING "最小固件: 1 = TX 不停发 (压力模�
 set(DCL_MB_BUILD_BUDGET "32" CACHE STRING "组装每拍字节预算 (4 = 改前行为对照)")
 set(DCL_MB_FAST_FRAME "1" CACHE STRING "按长度早判帧 (0 = 改前行为对照)")
 
+# ---- ★ 独立看门狗 (2026-09-13): 喂狗契约与理由见 src/wdt.h 文件头 ----
+#   DCL_WDT=1 (交付): IWDG1 超时 200ms, **喂狗点 = 拍 ISR** (不把主循环拉进门)。
+#   DCL_WDT=0: **改前行为**, 不看门狗。
+#   ★ 为什么必须有 0 档 (本项目铁律: 结构性改动必配"能失败的对照"):
+#     配合运行时注入钩子 `SD_CFG[13]` (让拍 ISR 死循环) 打两份:
+#       WDT=0 ⇒ 板子**永久卡死** (串口全无应答)      ← 判据证明得出"坏"
+#       WDT=1 ⇒ **200ms 内复位** 且 `mgmt.py --boot` 说得出原因 ← 修复才算被证明
+#     只跑 1 档看到"能复位"不构成证据 —— 你无法排除"根本没注入进去"。
+#   DCL_WDT_MS: 超时档。200ms 的依据 = 已知最长合法阻塞 ~816ms 只压主循环、
+#     而**擦除期间拍中断不丢** (T26 的 A/B: 对照 8153 拍缺口 / 交付 0 拍) ⇒ 拍能喂狗。
+set(DCL_WDT     "1"   CACHE STRING "独立看门狗 (1 交付 / 0 改前行为对照)")
+set(DCL_WDT_MS  "200" CACHE STRING "看门狗超时 ms (LSI 32kHz, PR=4 ⇒ 2ms/计数)")
+#   DCL_WDT_FEED_GATE=1 (交付): 拍 ISR 喂狗前先过"关闸"—— wdt_start() 编程 PR/RLR 期间
+#     不许写 IWDG_KR。依据 RM0468 §50.3.6: 写 KR 的其它值(点名重载键 0xAAAA)**会打断
+#     PR/RLR 的解锁序列**。而喂狗就是写 0xAAAA、且每 100µs 一次 ⇒ 不关闸就会用自己的
+#     喂狗把初始化打断, 现象是 `wdt_start()` 返回 -2 (PVU/RVU 永不清零)。
+#   =0: **改前行为**对照 —— 用同一套测量方法打一份"坏"的读数出来。
+set(DCL_WDT_FEED_GATE "1" CACHE STRING "喂狗门 (1 交付 / 0 改前行为: 不关闸)")
+#   等 PR/RLR 更新落的轮询预算 (次数)。400MHz 下次循环 ≈10 周期 ⇒ 4e6 ≈ 100ms。
+#   实测 4e5(≈10ms) 两次开机都"刚好用完" ⇒ 换成 4e6 做 A/B, 区分"真耗时"与"跑满预算"。
+#   关闸期间 IWDG 按默认档在数 (~512ms) ⇒ 100ms 仍在安全区。
+set(DCL_WDT_SYNC_CYC "40000000" CACHE STRING "等更新落的周期死线 (4e7 = 100ms @400MHz)")
+#   DCL_WDT_START_FIRST=1 (交付): **先写 0xCCCC 启动, 再配 PR/RLR**。
+#     ★ 这一条是 `wdt_start()` 返回 -2 的**已证实根因** (单变量对照: 只改这一处 ⇒ -2→0)。
+#   =0: 改前行为对照 (先配后启动) —— 必须有, 否则"修好了"只是一句话。
+set(DCL_WDT_START_FIRST "1" CACHE STRING "先启动后配置 (1 交付 / 0 改前行为对照)")
+#   DCL_WDT_PR: 预分频档 0..7。存在的理由 = 验证"更新耗时 ≈ 5 个预分频步长"这条推断:
+#     PR=4 ⇒ 2ms/步 ⇒ ~10ms (已实测); PR=6 ⇒ 8ms/步 ⇒ 应变成 ~40ms。
+set(DCL_WDT_PR "4" CACHE STRING "IWDG 预分频档 0..7")
+
 if(DCL_MIN_UART)
     set(TARGET min_uart)
 elseif(DCL_MIN_UART2)
@@ -119,6 +149,12 @@ add_compile_options(
     -DMB_UART_ALT=${DCL_MB_UART_ALT}
     -DMB_BUILD_BUDGET=${DCL_MB_BUILD_BUDGET}
     -DMB_FAST_FRAME=${DCL_MB_FAST_FRAME}
+    -DDCL_WDT=${DCL_WDT}
+    -DWDT_TIMEOUT_MS=${DCL_WDT_MS}u
+    -DWDT_FEED_GATE=${DCL_WDT_FEED_GATE}
+    -DWDT_SYNC_BUDGET_CYC=${DCL_WDT_SYNC_CYC}u
+    -DWDT_START_FIRST=${DCL_WDT_START_FIRST}
+    -DWDT_PR_VALUE=${DCL_WDT_PR}u
     -DBOOT_BANNER=${DCL_BOOT_BANNER}
     -DBANNER_PERIOD_MS=${DCL_BANNER_PERIOD}
     -DUART_SELFTEST=${DCL_UART_SELFTEST}

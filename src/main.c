@@ -55,6 +55,7 @@
 #include "macro.h"
 #include "faultlog.h"   /* 统一故障台账: 主循环/ISR/协议层的异常都留案底 */
 #include "manifest.h"   /* 诊断资源目录: 0x64 让板子自报"哪里出问题读什么" */
+#include "wdt.h"        /* 独立看门狗: 喂狗点=拍 ISR (契约见 wdt.h 文件头) */
 #include "lsym.h"
 #include "adc.h"
 #include "di.h"
@@ -183,6 +184,36 @@ OBS uint32_t g_guard_ok       = 0;   /* 栈哨兵: 1 = SHM 顶上的魔术字完
  *   用途: ① 让"时间量全是 0"这类静默污染**自己浮出来** (见 FAULT_TIMEBASE);
  *         ② 当 ISR 的"零成本"防御闸门 —— 时基死时 d==0 无意义, 不该计数/记账。 */
 OBS uint32_t g_timebase_dead  = 0;
+/* ★ 看门狗与"主循环是否在推进" (2026-09-13)
+ *   g_loop_hb    : 主循环心跳 (每轮 +1)。★ 它**不**参与喂狗 ——
+ *                  看门狗只保证"CPU+定时器+拍ISR 活着"(理由见 wdt.h 的喂狗契约):
+ *                  实测 sector erase 会让主循环阻塞 ~816ms, 把主循环拉进门 ⇒ 每次刷盘都误复位。
+ *                  ⇒ 主循环的死活改由**记录 + 上位机判** (FAULT_LOOP_STALL + mgmt.py --health)。
+ *   g_wdt_ms     : 实际生效的看门狗超时 (由 wdt.h 算出), 供外部核对"配置到底是多少"。
+ *   g_wdt_armed  : wdt_start() 的返回值 (0=已启动)。 */
+OBS uint32_t g_loop_hb        = 0;
+OBS uint32_t g_wdt_ms         = 0;
+OBS uint32_t g_wdt_armed      = 0xFFu;
+/* ★ 故障注入钩子 (SD_CFG[13]=1 触发): 在拍 ISR 里**故意死循环**。
+ *   用途: 证明"看门狗真的会复位" —— 这是**能失败判据**的对照组来源:
+ *     · `-DDCL_WDT=0` 构建 + 注入 ⇒ 板子永久卡死 (串口全无应答)
+ *     · `-DDCL_WDT=1` 构建 + 注入 ⇒ 200ms 内复位, 且 `mgmt.py --boot` 说得出原因
+ *   没有前一半, "看门狗有效"就只是一句话。 */
+OBS uint32_t g_hang_isr       = 0;
+/* ★ 看门狗启动的"每一步读回" (见 wdt.h 的 WdtDiag_t): 返回码 + RCC_CSR + IWDG PR/RLR/SR。
+ *   为什么要它: 实测第一次 `wdt_start()` 返回 -2 (PR/RLR 没写进去), 而当时手里只有
+ *   "我写过 0x5555" —— 查不出为什么。**"写过了就算"必须配读回核对**(项目铁律)。 */
+WdtDiag_t g_wdt_diag;
+/* ★★ 关闸 (喂狗门) —— 定义与理由见 wdt.h 文件头 ② / RM0468 §50.3.6。
+ *   `g_wdt_kr_busy`: 1 = wdt_start() 正在编程 PR/RLR, 此刻**任何**对 IWDG_KR 的写
+ *   (含喂狗用的 0xAAAA) 都会"breaks the sequence"、把 PR/RLR 重新保护起来。
+ *   为什么用 OBS(=volatile+used) 而不是普通全局: 它在 **ISR 与主线程间共享**,
+ *   volatile 保证"置 1"对 ISR 可见地**早于**解锁写 (不被优化掉/不重排)。
+ *   `g_wdt_kr_blocked`: 被闸门拦下的喂狗次数 —— 让"闸门有没有真拦住东西"可读回,
+ *   而不是一句"我加了闸"。 */
+OBS uint32_t g_wdt_kr_busy    = 0;
+OBS uint32_t g_wdt_kr_blocked = 0;
+OBS uint32_t g_opt_sr = 0;   /* FLASH_OPTSR_CUR (bit4=IWDG1_SW: 1=软件看门狗/0=硬件看门狗) */
 OBS uint32_t g_guard_bad_off  = 0xFFFFFFFFu;  /* 被踩的第几个字 (诊断用) */
 
 /* ── 阶段 3: 档桶调度 ── */
@@ -570,9 +601,64 @@ ISR_PLACE void TIM2_IRQHandler(void)
 {
     uint32_t t0 = DWT_CYCCNT;
 
-    if (TIM_SR(TIM2_BASE) & TIM_SR_UIF) {
-        TIM_SR(TIM2_BASE) = ~TIM_SR_UIF;
-        g_stage = 7;
+        if (TIM_SR(TIM2_BASE) & TIM_SR_UIF) {
+            TIM_SR(TIM2_BASE) = ~TIM_SR_UIF;
+            g_stage = 7;
+
+#if DCL_WDT
+            /* ★★ 喂狗 (2026-09-13) —— 位置**有意放在中断入口最早处**:
+             *   这一行执行得到 ⇒ **CPU + TIM2 + 拍中断三者都活着**。
+             *   契约与理由(为什么不把主循环拉进门)见 src/wdt.h 的文件头。
+             *   ★ 必须早于任何可能 return 的分支 —— 否则那条路径会跳过喂狗。
+             *
+             * ★★★ 必须过"关闸"这一道 (2026-09-13 第二次修正, 依据 RM0468 §50.3.6):
+             *   喂狗 = 写 `IWDG_KR = 0xAAAA`, 而手册逐字写明 **写 KR 的其它值 (点名
+             *   0xAAAA 这个重载操作) 会打断 PR/RLR 的解锁序列、把寄存器重新保护起来**。
+             *   本 ISR **每 100µs 跑一次**, 而 `wdt_start()` 的"解锁 → 写 PR/RLR →
+             *   等更新落"窗口也就 ~125µs ⇒ **不加闸, 我们就是在用自己的喂狗反复打断
+             *   看门狗的初始化**。现象: 写被接受(标志置起)、PVU/RVU 永不清零、
+             *   `wdt_start()` 返回 -2 —— 而"我写过 0x5555 了"这句话解释不了它。
+             *   ⇒ 这道闸是"**配置期间不得被异步写者干扰**"这条一般纪律的实例:
+             *     凡带解锁序列/写保护的寄存器, 其编程期都必须有明确的互斥。
+             *   ★ 用 `DCL_WDT_FEED_GATE=0` 可回到**改前行为**(不关闸) —— 对照构建。 */
+#if WDT_FEED_GATE
+            if (g_wdt_kr_busy) {
+                g_wdt_kr_blocked++;              /* ★ 证据: ISR 确实想写, 被闸门拦下 */
+            } else
+#endif
+            {
+                wdt_feed();
+                SHM_U32(g_shm, OFF_WDT_STAT + 20u)++;   /* ★ 喂狗计数 (单调) —— 外部可见的"在喂"证据 */
+            }
+            /* ★ 故障注入 (对照组用): 注入后本拍不再返回 ⇒ 之后没有喂狗 ⇒ 看门狗到期复位。
+             *   `-DDCL_WDT=0` 构建下它会永久卡死 —— 那正是"判据能失败"的对照。 */
+            if (g_hang_isr) { for (;;) { __asm__ volatile("nop"); } }
+#endif
+
+            /* ★★ 主循环停滞检测 (2026-09-13) —— **判据必须放在这里**:
+             *   主循环自己无法报告自己停了 (第一版写在主循环里 ⇒ 恒不成立的空判据)。
+             *   本 ISR 每拍看一次 g_loop_hb: 若连续 ≥1.2s 没推进 ⇒ 记一笔。
+             *   ★ 阈值 1.2s 的依据: 已知最长合法阻塞是 sector erase ~816ms (T26 实测)
+             *     ⇒ 比它大一档, 刷盘不会刷出假故障; 又远小于"人察觉不到"的量级。
+             *   ★ 这样"瞬时阻塞(恢复后留痕)"与"永久卡死(复位前留痕, 台账会被清但 AXI 摘要里
+             *     的 flt_total/first 会带上它)"两条路径都能被看见。 */
+            {
+                static uint32_t s_hb_seen = 0u, s_hb_stall = 0u;
+                if (g_loop_hb != s_hb_seen) {
+                    s_hb_seen = g_loop_hb; s_hb_stall = 0u;
+                } else if (s_hb_seen == 0u) {
+                    /* ★★ 闸门: 主循环**还没进入**时不许判停滞。
+                     *   实测(2026-09-13): 上电时 g_loop_hb 一直是 0, 而 SD 卡不在位会让
+                     *   `sd_init → sd_identify → sd_cmd` 阻塞很久 ⇒ 我在 SD 卡拔掉采集时
+                     *   拿到"stall_cnt=15"——**全是启动期的误报**, 差点据此判定"主循环死了"。
+                     *   ⇒ 判据必须先确认"它曾经在跑", 否则"还没开始"会被读成"已经死了"。 */
+                    s_hb_stall = 0u;
+                } else if (++s_hb_stall >= 12000u) {
+                    s_hb_stall = 0u;
+                    fault_record(g_shm, FAULT_LOOP_STALL, g_tick_count, g_loop_hb, g_stage);
+                    SHM_U32(g_shm, OFF_WDT_STAT + 16u)++;   /* 停滞事件计数 (外部可见) */
+                }
+            }
 
         if (g_stat_reset) {            /* 切配置用 (不清拍周期统计, 保连续性) */
             g_stat_reset = 0;
@@ -2166,7 +2252,7 @@ static void obs_anchor(void)
     sink ^= g_vtor;                       sink ^= g_vtor_want;
     sink ^= g_table_ck;                   sink ^= g_active_routes;
     sink ^= g_guard_ok;                   sink ^= g_guard_bad_off;
-    sink ^= g_timebase_dead;              /* ★ 时基活性标志 (防 --gc-sections 回收) */
+    sink ^= g_timebase_dead;              sink ^= g_opt_sr;              /* ★ 时基活性标志 (防 --gc-sections 回收) */
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
     sink ^= g_engine_gate;                sink ^= g_engine_sel;
     sink ^= g_n_routes;                   sink ^= g_table_profile;
@@ -2355,23 +2441,56 @@ int main(void)
     pin_out_init(UARTT_PORT, UARTT_BIT);
 #endif
     g_isr_itcm = ISR_ITCM;      /* ★ 在代码里写一次, 否则会被 --gc-sections 回收 */
-    g_stage = 1;
 
-    /* ★★ 复位取证 (2026-09-13) —— 485 联机排障里反复出现"计数器倒退", 必须先分清
-     *   是"我的调试动作复位了它"还是"它自己复位": **一块会在观测时被复位的板子,
-     *   做不了可靠通信, 别的问题都会被它掩盖。**
-     *   做法: 把"启动次数 + 复位原因"写进 **AXI (NOLOAD, 跨复位保留)** ——
-     *   即使 pyocd 会复位它, 也能从 AXI 里数出它到底启动了几次、每次为什么。
-     *   布局: [0]=启动次数 [1]="RCLK" 首次标记 [2]=RCC_RSR [3]=RCC_BDCR
-     *   RCC_RSR(0xD0) 的位: 0=LPWRRSTF 1=WWDG1RSTF 2=IWDG1RSTF 3=SFTRSTF(BOR?)
-     *     16=PORR 17=SFTRSTF 18=IWDG1RSTF 19=WWDG1RSTF 20=LPWRRSTF 21=BORR 22=PINR
-     *   ⇒ 读出来就能判"是外部复位脚 / 看门狗 / 掉电 / 软件"哪一种。 */
+    /* ══════════ ★★★ 复位取证 (2026-09-13 重写) ══════════
+     * 目的: 回答"**上一轮为什么停 / 停在哪 / 之前有多少故障**" —— 看门狗的价值全在这。
+     *
+     * ★★ 顺序是硬要求: 本段必须在 `g_stage = 1` **之前**。
+     *    g_stage 住在 DTCM, 而 **DTCM 跨复位不丢**(系统复位不清 SRAM) ⇒
+     *    此刻读到的还是**上一轮最后写的值** = "它卡在哪一步"。一旦先执行 g_stage=1,
+     *    这个现场就被自己覆盖了。同理, 故障台账在 SHM(DTCM)里也还活着 ——
+     *    但它马上会被 cold_start_reset() 的整段 memset 清掉, 所以**必须在这里抄走摘要**。
+     *
+     * ★★ 位定义抄权威 (ST stm32h723xx.h), **不是注释里那套**:
+     *      16=RMVF(清除位) 17=CPURSTF 19=D1RSTF 20=D2RSTF 21=BORRSTF
+     *      22=PINRSTF 23=PORRSTF 24=SFTRSTF
+     *    ⚠️ 旧代码写的是 `|= (1u << 24)` —— 那清的是 **SFTRSTF**, 而 RMVF 在 **bit 16**
+     *      ⇒ **复位标志从首次上电起从未被清过**, 实测读出 0x01FA0000 且 7 个域复位位同置。
+     *    ⇒ 修法: **纯写 RMVF 位, 不做读改写**(避免把只读标志位写回的隐患)。
+     *
+     * ★ AXI(NOLOAD) 上电=随机 ⇒ 用 [1]"RCLK" 首次标记 + [29] 校验和把"上电垃圾"与
+     *   "真现场"分开。0x24000500 起 32 字。 */
     {   volatile uint32_t *rc = (volatile uint32_t *)0x24000500u;
-        if (rc[1] != 0x52434C4Bu) { rc[1] = 0x52434C4Bu; rc[0] = 0u; }
+        const FaultLedger_t *lg = fault_ledger_r(g_shm);   /* 此刻 SHM 还没被清 */
+        /* ★★ "上一轮卡在哪一步"的正确来源 (2026-09-13 修正 —— 此前它是个**空字段**):
+         *   旧写法读 `g_stage` 并论证"DTCM 跨复位不丢" —— 论证**漏了一环**:
+         *   g_stage 住在 `.bss`, 而**标准启动代码在 main() 之前就把 .bss 清零了**
+         *   ⇒ 本段读到的永远是 0。实测: 拍 ISR 被注入挂死 (上一轮明明已跑到 stage=9),
+         *     `--boot` 仍报 "停在 g_stage=0"。**一个恒为 0 的现场等于没有现场。**
+         *   ⇒ 改从 AXI 的**活体镜像** [30]/[31] 取 —— 主循环每轮写当前值, 而 AXI 是
+         *     (NOLOAD)、启动不清、跨复位不丢 ⇒ 复位后读到的就是上一轮的最后现场。
+         *     顺带它还能当"**没复位时**此刻跑到哪"的活体视图 (见 BOOT_AXI 的 [30]/[31])。 */
+        uint32_t rec_valid  = (rc[1] == 0x52434C4Bu) ? 1u : 0u;
+        uint32_t prev_stage = rec_valid ? rc[30] : 0u;
+        uint32_t prev_tick  = rec_valid ? rc[31] : 0u;
+        uint32_t rsr = RCC_RSR;
+        if (!rec_valid) { rc[1] = 0x52434C4Bu; rc[0] = 0u; }
         rc[0]++;
-        rc[2] = REG32(0x580244D0u);                  /* RCC_RSR 复位状态 */
-        rc[3] = REG32(0x58024470u);                  /* RCC_BDCR */
-        REG32(0x580244D0u) |= (1u << 24);            /* RMVF: 清标志, 下次只见下次的 */
+        rc[2] = rsr;                       /* 本轮启动的复位原因 */
+        rc[3] = RCC_BDCR;
+        rc[4] = prev_stage;                /* ★ 上一轮卡在哪一步 */
+        rc[5] = prev_tick;
+        rc[6] = lg->total;                 /* ★ 上一轮的故障摘要 (台账马上要被 memset) */
+        rc[7] = lg->f_code;  rc[8] = lg->f_tick; rc[9] = lg->f_c0;
+        rc[10] = lg->l_code; rc[11] = lg->l_tick;
+        for (uint32_t i = 0u; i < 16u; i++) rc[12u + i] = lg->cats[i];
+        rc[28] = 0x50524556u;              /* "PREV" 段有效标记 */
+        {   uint32_t s = 0u;
+            for (uint32_t i = 4u; i <= 28u; i++) s += rc[i];
+            rc[29] = s;                    /* 校验和 ⇒ 上电随机值必然对不上 */
+        }
+        RCC_RSR = RCC_RSR_RMVF;            /* ★ 纯写 bit16: 清标志, 下次只见下次的 */
+        g_stage = 1;
     }
 
     /* ① 时钟 */
@@ -2382,6 +2501,23 @@ int main(void)
 
     g_clock_hclk = clock_get_hclk_hz();
     g_stage = 3;
+
+    /* ★★ 复位后"尽早进安全电平" (2026-09-13, 看门狗配套) ——
+     *   事实: 输出脚(DO=GPIOE)的引脚配置在 **do_init (阶段 26)** 才做;
+     *   在那之前引脚是**复位默认 = 输入/高阻**。⇒ 若此刻看门狗/掉电把板子复位,
+     *   从"停止驱动"到"do_init 把它配成输出"之间有一个几十毫秒的高阻窗口,
+     *   执行器侧没有外部下拉时会随漏电/干扰漂移。
+     *   修法(纯软件): 一拿到时钟就把 DO 口**显式配成推挽输出并输出低** ——
+     *   把高阻窗口从"到阶段 26"缩到"到阶段 3"。
+     *   ★ 边界(必须写清, 否则又是"宣称>实现"): 这给出的是**软件定义的安全电平**,
+     *     它**不能**覆盖"复位瞬间到本段代码执行"那一小段(μs~ms 级)以及**掉电**场景 ——
+     *     那两种只有**硬件外部下拉**(或失效安全驱动器)能保证。 */
+    RCC_AHB4ENR |= (1u << DO_GPIO_PORT);        /* 先开该口时钟 (否则写入被丢弃) */
+    for (uint32_t p = 0u; p < 16u; p++) {
+        GPIO_BSRR(DO_GPIO_PORT) = (1u << (16u + p));   /* 先置低电平 (写 BR) */
+    }
+    GPIO_MODER(DO_GPIO_PORT) = 0x55555555u;     /* 全部推挽输出 (低) */
+    __asm__ volatile("dsb" ::: "memory");
 
     /* ② 落位自检 (宣称=实现: "表在 DTCM" 必须可验证) */
     g_shm_addr         = (uint32_t)(uintptr_t)g_shm;
@@ -2467,6 +2603,31 @@ int main(void)
 
     /* ⑤ 100μs 拍 */
     tick_timer_init();
+#if DCL_WDT
+    /* ★★ 启动独立看门狗 (2026-09-13) —— 位置: **紧接拍定时器之后**。
+     *   理由: 喂狗点在拍 ISR 里, 所以"武装"必须**晚于**拍中断开始跑 ——
+     *   否则从武装到第一次喂狗之间没人喂, 200ms 后自己复位一次。
+     *   从本行到第一拍喂狗只差 ≤100µs ✓。
+     *   ★ 若拍中断因"取向量失败"根本没起来 (项目真实踩过的整机卡死族):
+     *     看门狗会在 200ms 后复位 ⇒ AXI 记录里会看到**启动次数单调涨 + 上一轮 stage 停在 6**
+     *     ⇒ "上电就卡住"这件事从"通宵排查"变成**一眼可读**。这也是它值得武装在此的原因。 */
+    g_wdt_ms    = wdt_timeout_ms();
+    g_wdt_armed = (uint32_t)wdt_start();
+    /* ★ 启动失败必须留案底 (否则表现只是"看门狗没救场", 查不出为什么)。
+     *   context 带 (返回码, RCC_CSR) —— 本平台已知的坑: 若 LSI 没起, PR/RLR 同步永远
+     *   完不成 ⇒ 写被拒 ⇒ 返回 -2, 而"我写过寄存器了"这句话毫无用处。 */
+    if (g_wdt_armed != 0u) {
+        fault_record(g_shm, FAULT_WDT_INIT_FAIL, g_tick_count,
+                     g_wdt_armed, g_wdt_diag.csr);
+    }
+    /* ★★ IWDG 配不进去的**头号嫌疑**: H7 的 option byte `FLASH_OPTSR.IWDG1_SW` (bit4)
+     *   决定 IWDG1 是"硬件看门狗"(上电自动启动、配置由 option byte 定、**软件写不动**)
+     *   还是"软件看门狗"。若为硬件模式, 我们的 -2 就是它 —— 且这**不是缺陷而是特性**
+     *   (硬件模式的看门狗软件关不掉, 对 PLC 反而更好)。
+     *   ⇒ 读一次 FLASH_OPTSR_CUR 定案 (权威偏移: ST 头 FLASH_TypeDef offset 0x1C) ——
+     *     本平台 pyocd 读不了 flash 寄存器区, 所以必须由固件自读。 */
+    g_opt_sr = REG32(0x5200201Cu);
+#endif
     /* ★★ 拍活体自检 (2026-09-12): 等 3 个 tick, 不动 ⇒ 取向量失败, 当场点灯。
      *   这防的不是某一个 bug, 而是**一切"取向量失败"类故障**: 表位置错、表内容坏、
      *   对齐不足被硬件掩码……它们的症状全是"上电就卡在 Default_Handler, 且卡的
@@ -2621,6 +2782,9 @@ int main(void)
         /* ★ 把故障台账全景刷进 SD 日志头 (SD_CFG[12]=1 + 魔数)。
          *   显式触发而非固件定时刷 —— 刷一次要写一次 LBA0, 什么时候值得只有上位机知道。 */
         if (sd_cfg_take(12u) != 0u) { (void)sd_flt_snapshot(); }
+        /* ★ 故障注入: 让拍 ISR 死循环 (SD_CFG[13]=1 + 魔数)。
+         *   用来给看门狗做**能失败的对照** —— 注入后正常工作必需复位 (见 wdt.h)。 */
+        if (sd_cfg_take(13u) != 0u) { g_hang_isr = 1u; }
         /* ★★★ 空闲窗口自动落盘 (S3 persist_task 语义) —— T15/T26 修复
          *   ── 完整的三次失败记录在 g_persist_req_cnt 上方, 别原样重试第四次 ──
          *   实测结论: 功能正确 (dirty 会清), 但每次落盘有一段失聪窗口
@@ -2766,6 +2930,58 @@ int main(void)
             }
             s_cyccnt_prev = cnow;
         }
+
+        /* ★ 主循环心跳 (2026-09-13) —— 只有 +1 这一个动作。
+         *   ★ 检测**不在这里**: 主循环自己跟自己比是**恒成立的空判据**
+         *     (第一版就这么写过)。停滞后主循环根本不执行 ⇒ 它没法报告自己停了。
+         *   ⇒ 判据放在**拍 ISR** 里观察本计数器 (见 ISR 那段), 这样"瞬时阻塞"与
+         *     "永久卡死"两种都能记下来。喂狗**不**依赖它 (理由见 wdt.h)。 */
+        g_loop_hb++;
+
+        /* ★ 发布看门狗/主循环状态到 SHM (供 0x22 按名字读; 见 manifest.h 的 WDT_STAT)。
+         *   为什么每轮都发: "武装了就完事"属静默失败族 —— 喂狗计数与超时档必须**可读回**。 */
+        SHM_U32(g_shm, OFF_WDT_STAT +  0u) = g_wdt_armed;
+        SHM_U32(g_shm, OFF_WDT_STAT +  4u) = g_wdt_ms;
+        SHM_U32(g_shm, OFF_WDT_STAT +  8u) = g_loop_hb;
+        SHM_U32(g_shm, OFF_WDT_STAT + 12u) = g_hang_isr;
+        SHM_U32(g_shm, OFF_WDT_STAT + 24u) = 12000u;      /* 停滞阈值 (拍) */
+        SHM_U32(g_shm, OFF_WDT_STAT + 28u) = g_stage;     /* 当前阶段 (实时) */
+        /* ★ 启动的读回 (rc/RCC_CSR/IWDG PR/RLR/SR) —— 让"到底写进去了没"可被外部核对,
+         *   不必再靠 pyocd 读外设区 (本平台 pyocd 读外设不可靠, 实测读数自相矛盾)。 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 32u) = g_wdt_diag.rc;
+        SHM_U32(g_shm, OFF_WDT_STAT + 36u) = g_wdt_diag.csr;
+        SHM_U32(g_shm, OFF_WDT_STAT + 40u) = g_wdt_diag.pr;
+        SHM_U32(g_shm, OFF_WDT_STAT + 44u) = g_wdt_diag.rlr;
+        SHM_U32(g_shm, OFF_WDT_STAT + 48u) = g_wdt_diag.sr;
+        SHM_U32(g_shm, OFF_WDT_STAT + 52u) = g_opt_sr;      /* FLASH_OPTSR_CUR */
+        SHM_U32(g_shm, OFF_WDT_STAT + 56u) = g_wdt_diag.sr0;
+        SHM_U32(g_shm, OFF_WDT_STAT + 60u) = g_wdt_diag.pr0;
+        /* ★ 分步快照的第二截 (2026-09-13 第二次修正后新增) —— 顺序/关闸这两项改动
+         *   必须留下"这次真的不一样"的可读证据, 否则就是"改完看到 rc=0 就说修好了"。 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 64u) = g_wdt_diag.rlr0;
+        SHM_U32(g_shm, OFF_WDT_STAT + 68u) = g_wdt_diag.sr1;      /* 解锁后 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 72u) = g_wdt_diag.sr2;      /* 写完 PR/RLR 后 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 76u) = g_wdt_diag.sr_start; /* 启动(KR=0xCCCC)后 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 80u) = g_wdt_diag.wait_cyc; /* 等标志落的 CPU 周期 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 84u) = g_wdt_diag.kr_busy_snap;  /* 开闸前闸门状态(应=1) */
+        SHM_U32(g_shm, OFF_WDT_STAT + 88u) = g_wdt_diag.kr_blocked;    /* ISR 被拦下的喂狗次数 */
+        /* ★ [23] 区分"等到了标志"与"跑满预算" —— 少了它, "等标志落"可能是空动作。 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 92u) = g_wdt_diag.sync_expired;
+        /* ★ [24][25] **固件自己声明的目标值** (WDT_PR_VALUE / WDT_RLR_VALUE)。
+         *   为什么要报出来: 工具原先把"期望 PR=4 / RLR=99"**硬编码**在自己身上 ——
+         *   换成 PR=6 档时立刻变成假报警 ("PR=6 ≠ 我写的 4")。
+         *   判据必须是"**意图 vs 读回**", 而意图只能由固件给 (它就是编译产物的一部分)。 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 96u) = WDT_PR_VALUE;
+        SHM_U32(g_shm, OFF_WDT_STAT + 100u) = WDT_RLR_VALUE;
+
+        /* ★★ AXI 活体镜像 (2026-09-13) —— 把当前 stage / 拍号写进复位取证记录 [30]/[31]。
+         *   为什么必须"活着写": `g_stage`/`g_tick_count` 住在 .bss, 而**启动代码的清零
+         *   先于取证段执行** ⇒ 复位后从它们读不到"上一轮停在哪"(旧实现就是这么读到恒 0 的)。
+         *   而 AXI 是 (NOLOAD)、启动不清、跨复位不丢 ⇒ 这里的写入就是留给下一轮取证的现场。
+         *   顺带得到"没复位时此刻跑到哪"的活体视图 —— 同一个字段两个用途。
+         *   代价: 每轮 2 次 AXI 写 (HCLK=CPU/2, 每次约 2 周期), 相对 4 万周期/拍可忽略。 */
+        {   volatile uint32_t *bk = (volatile uint32_t *)0x24000500u;
+            bk[30] = g_stage; bk[31] = g_tick_count; }
 
         /* 栈哨兵周期巡检 (廉价: 32 个字, 主循环有 100μs 一次的机会) */
         g_guard_ok = (uint32_t)shm_guard_ok();

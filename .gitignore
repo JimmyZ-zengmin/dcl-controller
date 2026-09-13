@@ -16,3 +16,8 @@ __pycache__/
 
 # 最小固件的独立构建目录 (DCL_MIN_UART2 档) —— 与 build/ 同理, 可复跑
 build_min485/
+
+# 本工程的临时工作区 —— 里面是**可复跑**的中间产物 (例: tools/pdf_grep.py 从
+# RM0468 抽出的 6MB 全文文本, 读手册查规格用)。抽出来的文本随时能重生成,
+# 且体积大 ⇒ 与 .tmpctl 同理, 不入版本控制。工具本体在 tools/pdf_grep.py (受控)。
+.workbuddy/scratch/

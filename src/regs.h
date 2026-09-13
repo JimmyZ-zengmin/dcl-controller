@@ -446,4 +446,65 @@ _Static_assert(IRQ_USART1 < 64u, "IRQ_USART1 outside NVIC macro range 0..63");
  *   (原 NVIC_IPR(n) 是个 32 位访问器, 有上述误伤风险且无人使用, 已删除) */
 #define NVIC_IPB(n)     (*(volatile uint8_t *)(0xE000E400UL + (n)))
 
+/* ══════════ RCC: 复位状态 (RSR) 与 LSI (2026-09-13) ══════════
+ * ★★ 位定义**抄自 ST 官方设备头** (权威: 本机
+ *   D:/STM/tools/lxb_ref/.../CMSIS/Device/ST/STM32H7xx/Include/stm32h723xx.h)。
+ *   ⚠️ 本项目 main.c 原来那套注释位表**是错的** (把 bit16 当 PORR —— 真身是 **RMVF**;
+ *      把 bit24 当"不存在" —— 真身是 SFTRSTF; 18/19 位根本不存在),
+ *      而按错注释写出的清除代码 `|= (1u<<24)` **清的是别的位** ⇒ 复位标志从未被清、
+ *      从首次上电起一直累积 (实测读出 0x01FA0000, 7 个域复位位同置)。
+ *   ⇒ 教训 (同族第 N 次): **位定义必须抄权威头, 注释里自洽的推导不算证据。** */
+#define RCC_CSR         REG32(RCC_BASE + 0x074)   /* LSION/LSIRDY 等 */
+#define RCC_BDCR        REG32(RCC_BASE + 0x070)   /* 备份域: RTCSEL/RTCEN/LSEON
+                                                   * (RTC 相关宏见下方 RTC 小节) */
+#define RCC_CSR_LSION   (1u << 0)
+#define RCC_CSR_LSIRDY  (1u << 1)
+#define RCC_RSR         REG32(RCC_BASE + 0x0D0)   /* 复位状态 (R/W, 见下) */
+#define RCC_RSR_RMVF    (1u << 16)   /* ★ 写 1 清除全部复位标志 (不是 bit24!) */
+#define RCC_RSR_CPURSTF (1u << 17)
+#define RCC_RSR_D1RSTF  (1u << 19)
+#define RCC_RSR_D2RSTF  (1u << 20)
+#define RCC_RSR_BORRSTF (1u << 21)
+#define RCC_RSR_PINRSTF (1u << 22)
+#define RCC_RSR_PORRSTF (1u << 23)
+#define RCC_RSR_SFTRSTF (1u << 24)
+/* ★★ 下面这三位是**看门狗识别**的关键 —— 我第一遍只取了前 8 个位就下结论说
+ *   "RSR 没有看门狗位", 那是**我自己 grep 截断**造成的误判 (head -24 切掉了后半)。
+ *   完整位表: 16/17/19/20/21/22/23/24/26/28/30。教训同族: **读权威源要读全**,
+ *   数输出行数不叫核实。 */
+#define RCC_RSR_IWDG1RSTF (1u << 26)   /* ★ 独立看门狗复位 (我们用的这个) */
+#define RCC_RSR_WWDG1RSTF (1u << 28)   /* 窗口看门狗复位 (未用) */
+#define RCC_RSR_LPWRRSTF  (1u << 30)   /* 低功耗模式复位 */
+/* 全部"复位原因"位的掩码 (RMVF 不算原因) —— 供"只置了一位"这类判据用 */
+#define RCC_RSR_CAUSE_Msk (RCC_RSR_CPURSTF | RCC_RSR_D1RSTF | RCC_RSR_D2RSTF \
+    | RCC_RSR_BORRSTF | RCC_RSR_PINRSTF | RCC_RSR_PORRSTF | RCC_RSR_SFTRSTF \
+    | RCC_RSR_IWDG1RSTF | RCC_RSR_WWDG1RSTF | RCC_RSR_LPWRRSTF)
+
+/* ══════════ IWDG1 —— 独立看门狗 (2026-09-13) ══════════
+ * 基址 = D3_APB1PERIPH_BASE(0x58000000) + 0x4800。
+ * ★ 选 IWDG 不选 WWDG: ① IWDG 走 **LSI**, 不依赖 APB/主时钟 ⇒ 时钟树错了它还在数;
+ *   ② 一旦启动**无法停止** (只能复位) ⇒ 不会被软件误关;
+ *   ③ WWDG 的窗口语义与"忙等"冲突, 且超时上限只有几十 ms (PCLK 100MHz 下),
+ *      做不出 200ms 这一档。 */
+#define IWDG1_BASE      (0x58004800UL)
+#define IWDG_KR         REG32(IWDG1_BASE + 0x00)   /* 键寄存器 */
+#define IWDG_PR         REG32(IWDG1_BASE + 0x04)   /* 预分频 */
+#define IWDG_RLR        REG32(IWDG1_BASE + 0x08)   /* 重载值 */
+#define IWDG_SR         REG32(IWDG1_BASE + 0x0C)   /* 状态 (PVU/RVU 更新中) */
+#define IWDG_WINR       REG32(IWDG1_BASE + 0x10)   /* 窗口 (不用, 保持默认) */
+/* 键值 —— ★ **不在 ST 设备头里** (RM0468 定义), 故须实机验证一次:
+ *   解锁 PR/RLR 可写 → 0x5555;  启动计数 → 0xCCCC;  喂狗(重载) → 0xAAAA */
+#define IWDG_KEY_UNLOCK  0x5555u
+#define IWDG_KEY_START   0xCCCCu
+#define IWDG_KEY_FEED    0xAAAAu
+#define IWDG_SR_PVU      (1u << 0)   /* 预分频寄存器正在更新 */
+#define IWDG_SR_RVU      (1u << 1)   /* 重载寄存器正在更新 */
+#define IWDG_SR_WVU      (1u << 2)   /* 窗口寄存器正在更新 (我们不用窗口, 但**必须一起等**) */
+/* ★ 三个标志的语义 (RM0468 §50.4.4): set = 该寄存器的更新正在 VDD 域进行中;
+ *   **reset by hardware when the update operation is completed in the VDD voltage
+ *   domain (takes up to five RC 40 kHz cycles)** ⇒ 正常约 125µs 内自己落。
+ *   ST 的 HAL_IWDG_Init() 等的就是这三个 (`IWDG_KERNEL_UPDATE_FLAGS`)。
+ *   ★ 我们第一版只等了 PVU|RVU —— 这本身不是失败原因, 但口径必须与 HAL 一致。 */
+#define IWDG_SR_UPDATE_Msk (IWDG_SR_PVU | IWDG_SR_RVU | IWDG_SR_WVU)
+
 #endif /* DCL_REGS_H */

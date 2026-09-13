@@ -548,6 +548,17 @@ _Static_assert(OFF_FAULT_LOG >= OFF_BB_SNAP + 256u,
 _Static_assert(OFF_FAULT_LOG + OFF_FAULT_LOG_SZ <= SHM_SIZE,
                "SHM: fault ledger exceeds SHM_SIZE");
 
+/* ---- ★ 看门狗/主循环状态 (2026-09-13, 见 src/wdt.h) ----
+ * 为什么要有它: 看门狗的配置与**喂狗计数**必须能被外部读走 ——
+ *   "武装了就完事"属"写过了就算"的静默失败族; 而**喂狗计数不涨**是"230ms 内必复位"
+ *   的唯一外部可见征兆。位置: 0x70B0 (接在故障台账 0x7020+144=0x70B0 之后)。 */
+#define OFF_WDT_STAT         0x70B0
+#define OFF_WDT_STAT_SZ      112u    /* 28 字: 见 manifest.h 的字段说明 */
+_Static_assert(OFF_FAULT_LOG + OFF_FAULT_LOG_SZ <= OFF_WDT_STAT,
+               "SHM: WDT 状态区与故障台账重叠");
+_Static_assert(OFF_WDT_STAT + OFF_WDT_STAT_SZ <= SHM_SIZE,
+               "SHM: WDT 状态区越出 SHM 末尾");
+
 
 /* ══════════ 路由条目 (16B packed) —— 与 S3 逐字节相同 ══════════ */
 typedef struct __attribute__((packed, aligned(4))) {
