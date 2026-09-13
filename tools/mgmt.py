@@ -82,6 +82,7 @@ FIELD_MAPS = {
         ("block_active", 34), ("hb_isr_tog", 35), ("hb_loop_tog", 36),
         ("gap_max_undecl", 37), ("gap_decl", 38), ("loop_entered", 39),
         ("hb_odr", 40), ("hb_port", 41), ("hb_isr_pin", 42), ("hb_loop_pin", 43),
+        ("engine_sel", 44), ("scan_used", 45), ("scan_flash", 46), ("scan_itcm", 47),
     ],
     "PERSIST_STAT": [
         ("cmds", 0), ("saves", 1), ("skip_run", 2), ("nak", 3),
@@ -131,7 +132,7 @@ def layout_check(name, words):
 
 
 # 本工具**期望**的区内字数 (与上面 FIELD_MAPS 配套; 固件增删字段时这里必须同步)
-EXPECT_WORDS = {"FAULTLOG": 35, "WDT_STAT": 44, "BOOT_AXI": 40, "PERSIST_STAT": 8}
+EXPECT_WORDS = {"FAULTLOG": 35, "WDT_STAT": 48, "BOOT_AXI": 40, "PERSIST_STAT": 8}
 
 
 def crc_ccitt(d):
@@ -520,6 +521,15 @@ def verdict(name, e, w):
             if len(w) > 39:
                 out.append("  主循环已进入=%d %s" % (w[39],
                            "(0 ⇒ **还停在启动段**(~33s), 此时不判停滞)" if not w[39] else ""))
+            if len(w) > 47:
+                # ★★ 扫描选择面: 它决定拍 ISR 是否调 flash 代码 (擦除期间 = 会卡死)
+                out.append("  扫描选择: g_engine_sel=%d ⇒ 运行期用 **0x%08X** (%s) / flash版=0x%08X itcm版=0x%08X"
+                           % (w[44], w[45],
+                              "**FLASH 版 ⇒ 擦除期间 ISR 必卡死!**" if w[45] == w[46] else "ITCM 版 ✓ (安全)",
+                              w[46], w[47]))
+                if w[44] == 0:
+                    out.append("    ★ g_engine_sel=0 ⇒ 扫描走 FLASH 版 ⇒ **拍 ISR 会读 flash 代码**"
+                               " ⇒ 擦除/写 flash 期间必然 stall ⇒ 看门狗复位")
             if len(w) > 43:
                 # ★ 心跳自证: 固件自报脚位 (工具不写死) + 当前 ODR 快照。
                 #   两次读 ODR 值不同 ⇒ 寄存器真的在翻 (LA 之外的第一道证据);

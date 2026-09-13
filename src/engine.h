@@ -555,7 +555,11 @@ _Static_assert(OFF_FAULT_LOG + OFF_FAULT_LOG_SZ <= SHM_SIZE,
  * ★ 该地址 2026-09-13 挪过一次 (台账加 f_first_valid 后增大) —— **PC 端零改动**:
  *   工具按 0x64 自报目录取地址, 这正是自描述目录的价值 (见 manifest.h)。 */
 #define OFF_WDT_STAT         0x70B8
-#define OFF_WDT_STAT_SZ      176u    /* 44 字: 见 manifest.h 的字段说明 */
+#define OFF_WDT_STAT_SZ      192u    /* 48 字: 见 manifest.h 的字段说明
+                                      * ★ [44..46] 2026-09-13 加: 扫描选择面 ——
+                                      *   `g_engine_sel` 决定**拍 ISR 会调哪一份扫描**
+                                      *   (ITCM 版 / **FLASH 版**)。它决定"ISR 会不会碰 flash 代码"
+                                      *   ⇒ 按项目铁律必须**可被外部读走**, 不许只放在 OBS 里。 */
 _Static_assert(OFF_FAULT_LOG + OFF_FAULT_LOG_SZ <= OFF_WDT_STAT,
                "SHM: WDT 状态区与故障台账重叠");
 _Static_assert(OFF_WDT_STAT + OFF_WDT_STAT_SZ <= SHM_SIZE,

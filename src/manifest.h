@@ -162,7 +162,7 @@ static const ManifestEnt_t g_manifest[] = {
      *   ★★ 复位原因判据权威: RM0468 **Table52 (Reset source identification)** ——
      *     单次事件会置起**多个**位 (引脚复位=CPURSTF+PINRSTF; IWDG 超时=+IWDG1RSTF),
      *     所以"原因位恰好 1 个"是**假判据** (见 tools/mgmt.py 的 SIG 表)。 */
-    MF_ENTRY("WDT_STAT",  OFF_WDT_STAT, 44u, MF_K_U32, MF_F_SHM),
+    MF_ENTRY("WDT_STAT",  OFF_WDT_STAT, 48u, MF_K_U32, MF_F_SHM),
     /*   [0]g_wdt_armed (0=已启动; 负数=失败码) [1]实际超时 ms [2]主循环心跳(单调)
      *   [3]注入挂起标志 [4]主循环停滞事件计数 [5]**喂狗计数(单调)** ← 它不涨 ⇒ ISR 没在喂
      *   [6]主循环停滞阈值(拍) [7]当前 g_stage (实时)

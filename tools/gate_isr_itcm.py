@@ -55,6 +55,27 @@ def run(cmd):
                           errors="replace").stdout
 
 
+def load_sections(elf):
+    """→ [(name, addr, size)]。用于判断"某个字面量指向的地址属于哪个段" ——
+    这是第 ③ 项判据(数据访问 flash)的依据: 指向 `.rodata*`/`.data*` ⇒ **读 flash 常量**, 必 stall。"""
+    out = run([OD, "-h", elf])
+    secs = []
+    for ln in out.splitlines():
+        m = re.match(r"\s*\d+\s+(\S+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)", ln)
+        if m:
+            name, size, vma = m.group(1), int(m.group(2), 16), int(m.group(3), 16)
+            if size:
+                secs.append((name, vma, size))
+    return secs
+
+
+def seg_of(addr, secs):
+    for n, a, sz in secs:
+        if a <= addr < a + sz:
+            return n
+    return None
+
+
 def load_symbols(elf):
     """→ {name: (addr, size)}, [(addr, size, name)] 按地址排序 (用于定位)"""
     out = run([NM, "-S", "--defined-only", elf])
@@ -90,6 +111,10 @@ def func_at(addr, spans):
     return None, None, None
 
 
+def sec_in_of(addr):
+    return ".itcm_text" if (ITCM_LO <= addr < ITCM_HI) else ".text"
+
+
 def read_word(elf, addr, sec=".itcm_text"):
     """从 ELF 的**指定段**里读 4 字节 (用于解析 `ldr Rn,[pc,#i]` 字面量)。
     ★ 必须指定段: 同一个数值地址在 `.debug_frame`/`.text` 里都可能存在 —— 第一版没带 `-j`,
@@ -112,13 +137,14 @@ def disasm_func(elf, addr, size):
     """反汇编一个函数 → (直接/可解调用目标集合, 真正无法解析的间接调用指令地址集合)
     ★ 第二版: 把 `ldr Rn,[pc,#i]` + `blx Rn` 解析出来 (项目 `long_call` 的形态)。"""
     if size <= 0:
-        return set(), set()
+        return set(), set(), []
     # 字面量池与函数**同段** ⇒ 按函数地址推断该从哪个段读字面量 (见 read_word 的注释)
-    sec_in = ".itcm_text" if (ITCM_LO <= addr < ITCM_HI) else ".text"
+    sec_in = sec_in_of(addr)
     out = run([OD, "-d", "--no-show-raw-insn",
                "--start-address=0x%x" % addr, "--stop-address=0x%x" % (addr + size), elf])
     calls, unresolved = set(), set()
     ldr_lit = {}          # 寄存器 → 字面量地址
+    data_refs = []        # [(指令地址, 字面量地址)] —— 第 ③ 项判据的输入
     fn_lo, fn_hi = addr, addr + size
     for ln in out.splitlines():
         # ★★ **尾调用** (闸门第 4 个盲区): `b.w <目标>` 若目标落在**本函数之外**, 那是
@@ -142,6 +168,7 @@ def disasm_func(elf, addr, size):
         m = re.match(r"\s*([0-9a-f]+):\s+(\S+)\s+(r\d+),\s*\[pc,\s*#(\d+)\]\s*;\s*\(?([0-9a-f]+)", ln)
         if m and m.group(2).startswith("ldr"):
             ldr_lit[m.group(3)] = int(m.group(5), 16)
+            data_refs.append((int(m.group(1), 16), int(m.group(5), 16)))
             continue
         m = re.match(r"\s*([0-9a-f]+):\s+blx\s+(r\d+)", ln)
         if m:
@@ -160,7 +187,7 @@ def disasm_func(elf, addr, size):
         m = re.match(r"\s*([0-9a-f]+):\s+blx\s+r", ln)
         if m:
             unresolved.add(int(m.group(1), 16))
-    return calls, unresolved
+    return calls, unresolved, data_refs
 
 
 def main():
@@ -174,6 +201,7 @@ def main():
         return 1
 
     by_name, spans = load_symbols(elf)
+    secs = load_sections(elf)
     # ★★ 根集合必须**去噪** (第一版没做, 报出 115 条全是假的):
     #   启动文件把一大堆未实现的向量声明成 `弱别名 → Default_Handler`, 它们的**地址全一样**
     #   ⇒ 若照单全收, 闸门会被"Default_Handler 在 flash"刷屏, 真违规被淹没。
@@ -201,7 +229,8 @@ def main():
         print("★ 闸门无法运行: 一个真实实现的 ISR 根都没找到")
         return 1
 
-    seen, viol, unresolved, checked = set(), [], [], 0
+    seen, viol, unresolved, checked, ro_viol = set(), [], [], 0, []
+    dref_n, dref_flash, dref_none = 0, 0, 0    # ★ 自证: 这三条计数必须非零, 否则"无违规"是空的
     q = deque(roots)
     while q:
         name = q.popleft()
@@ -212,7 +241,18 @@ def main():
         checked += 1
         if FLASH_LO <= addr and not (name.endswith("_veneer")):
             viol.append((name, addr))
-        calls, ind = disasm_func(elf, addr, size)
+        calls, ind, drefs = disasm_func(elf, addr, size)
+        for (ia, lit) in drefs:
+            val = read_word(elf, lit, sec_in_of(addr))
+            dref_n += 1
+            if val is None:
+                dref_none += 1
+                continue
+            if FLASH_LO <= val < 0x08200000:
+                dref_flash += 1
+                sec = seg_of(val, secs)
+                if sec and (sec.startswith(".rodata") or sec.startswith(".data")):
+                    ro_viol.append((name, ia, val, sec))
         for c in calls:
             n, _, _ = func_at(c, spans)
             if n and n not in seen:
@@ -225,6 +265,8 @@ def main():
     print("=" * 78)
     print("ISR 调用树闸门 — 真实 ISR 根 %d 个 (剔除 %d 个 Default_Handler 别名), 遍历函数 %d 个"
           % (len(roots), dropped, checked))
+    print("  ★ 自证: 检查了 %d 个字面量 (读不到 %d, 指向 flash 的 %d) —— 若全 0 则本判据是空的"
+          % (dref_n, dref_none, dref_flash))
     print("  根: %s" % ", ".join(sorted(roots)[:8]) + (" ..." if len(roots) > 8 else ""))
     print("=" * 78)
     if viol:
@@ -241,11 +283,20 @@ def main():
         for n, ips in sorted(agg.items()):
             print("    %-24s %d 处  (例: 0x%08X)" % (n, len(ips), ips[0]))
         print("    ⇒ 把确实会被调到的目标加进本脚本的 EXTRA_ROOTS (现在: %s)" % EXTRA_ROOTS)
-    if not viol and not unresolved:
+    if ro_viol:
+        print("\n★ 违规(第③项): 以下函数**从 flash 读数据表** (%d 处) —— 取指在 ITCM 也没用," % len(ro_viol))
+        print("  '代码进 ITCM' ≠ '不碰 flash': 读 .rodata/LUT 同样 stall。")
+        for n, ia, val, sec in sorted(ro_viol, key=lambda x: x[1])[:20]:
+            print("    %-22s 指令@0x%X → 表@0x%08X (%s)" % (n, ia, val, sec))
+        if len(ro_viol) > 20:
+            print("    ... 共 %d 处" % len(ro_viol))
+    if not viol and not unresolved and not ro_viol:
         print("\n✅ 通过: 从 ISR 可达的代码**全部**在 ITCM, 且无未解析间接调用。")
-    elif not viol:
+    elif not viol and not ro_viol:
         print("\n△ 没有『可达且在 FLASH』的直接违规, 但存在未解析间接调用 ⇒ 不算通过。")
-    return 1 if viol else 0
+    elif ro_viol and not viol:
+        print("\n★ 有第③项违规(读 flash 数据表), 但无第①项违规(代码取指) ⇒ 按上面的表去修。")
+    return 1 if (viol or ro_viol) else 0
 
 
 if __name__ == "__main__":

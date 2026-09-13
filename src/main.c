@@ -3421,6 +3421,16 @@ int main(void)
         SHM_U32(g_shm, OFF_WDT_STAT + 164u) = HB_GPIO_PORT;             /* [41] */
         SHM_U32(g_shm, OFF_WDT_STAT + 168u) = HB_ISR_PIN;               /* [42] */
         SHM_U32(g_shm, OFF_WDT_STAT + 172u) = HB_LOOP_PIN;              /* [43] */
+        /* ★★ [44..45] 扫描选择面 (2026-09-13): 它决定**拍 ISR 调哪一份扫描** ——
+         *   `sel ? engine_scan_itcm : engine_scan_flash`, 而 **flash 版落在 FLASH**:
+         *   擦除期间走到它就 stall ⇒ ISR 卡死 ⇒ 看门狗复位 (本缺陷的机制链)。
+         *   ⇒ "运行期到底用哪一份"必须能回读, 否则又是一处只能猜的状态。
+         *   [45] 直接报**将被调用的那个函数的地址** ⇒ 拿它和 nm 的符号地址一比即知。 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 176u) = g_engine_sel;             /* [44] 0=FLASH版 1=ITCM版 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 180u) =
+            (uint32_t)(uintptr_t)(g_engine_sel ? engine_scan_itcm : engine_scan_flash); /* [45] */
+        SHM_U32(g_shm, OFF_WDT_STAT + 184u) = (uint32_t)(uintptr_t)engine_scan_flash;   /* [46] 对照: flash 版地址 */
+        SHM_U32(g_shm, OFF_WDT_STAT + 188u) = (uint32_t)(uintptr_t)engine_scan_itcm;    /* [47] 对照: itcm 版地址 */
 
         /* ★★ 掉电保持诊断 (2026-09-13, 起因是一次真实的误判):
          *   关键是 [5] `erase_ok` —— **"这次擦了没"必须可读回**。原先这两个计数器只被
