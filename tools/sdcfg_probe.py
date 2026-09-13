@@ -64,25 +64,63 @@ def parse_reads(out):
 
 
 class Sender(threading.Thread):
-    def __init__(self, port, ms):
+    """在另一个口上持续发东西, 给固件侧同时进行的测量制造"被测激励"。
+
+    ★ mode:
+      'mb'    → 发合法 Modbus 帧 (给 485 总线灌数据)
+      'inject'→ 发 0x60 隧道注入帧 (DCL 协议口)。**这是让"板子自己在 PD5 上发"的唯一手段**:
+                固件收到 0x60 后走完 Modbus 状态机, 从 USART2 把应答推到真总线。
+                于是"板上 TX 有活动"这件事可以与"PD6 上量到的波形"**同时发生**,
+                用来判 PD6 到底接在模块的 TXD 还是别的地方 (485 收发器驱动总线时会
+                **本地回显** ⇒ 接对的话 PD6 必然跟着动)。
+    """
+
+    def __init__(self, port, ms, mode="mb", ser=None):
         super().__init__(daemon=True)
         self.port, self.ms, self.n = port, ms, 0
+        self.mode, self.ser, self.own = mode, ser, (ser is None)
 
     def run(self):
-        import serial
-        try:
-            s = serial.Serial(self.port, 115200, timeout=0.05)
-        except Exception as ex:
-            print("  !! 发送口打开失败: %s" % ex)
-            return
-        f = bytes([1, 3, 0x9C, 0x41, 0x00, 0x0A, 0xC5, 0xCD])  # 合法 Modbus 读请求
+        s = self.ser
+        if s is None:
+            try:
+                import serial
+                s = serial.Serial(self.port, 115200, timeout=0.05)
+            except Exception as ex:
+                print("  !! 发送口打开失败: %s" % ex)
+                return
+        if self.mode == "inject":
+            def crc_mb(d):
+                c = 0xFFFF
+                for b in d:
+                    c ^= b
+                    for _ in range(8):
+                        c = (c >> 1) ^ 0xA001 if (c & 1) else (c >> 1)
+                return c
+            r = bytes([1, 3, 0x9C, 0x41, 0x00, 0x0A])
+            x = crc_mb(r)
+            mbreq = r + bytes([x & 0xFF, x >> 8])
+            body = bytes([0x60, len(mbreq) & 0xFF, (len(mbreq) >> 8) & 0xFF]) + mbreq
+            c = 0xFFFF
+            for b in body:
+                c ^= (b << 8)
+                for _ in range(8):
+                    c = ((c << 1) ^ 0x1021) & 0xFFFF if (c & 0x8000) else (c << 1) & 0xFFFF
+            f = bytes([0xC0]) + body + bytes([c & 0xFF, c >> 8])
+        else:
+            f = bytes([1, 3, 0x9C, 0x41, 0x00, 0x0A, 0xC5, 0xCD])  # 合法 Modbus 读请求
         t0 = time.time()
         while (time.time() - t0) * 1000 < self.ms:
-            s.write(f)
-            s.flush()
-            self.n += 1
-            time.sleep(0.01)
-        s.close()
+            try:
+                s.write(f)
+                s.flush()
+                self.n += 1
+            except Exception:
+                break
+            if self.mode != "inject":
+                time.sleep(0.01)
+        if self.own:
+            s.close()
 
 
 def main():
@@ -93,6 +131,9 @@ def main():
     ap.add_argument("--run-ms", type=int, default=600)
     ap.add_argument("--cycles", type=int, default=1, help="同一会话内重复触发 N 次 (取多张位图)")
     ap.add_argument("--send-port", default=None, help="触发期间在另一个口持续发 Modbus 帧")
+    ap.add_argument("--inject", action="store_true",
+                    help="★ --send-port 改发 0x60 隧道注入帧: 让**板子自己在 PD5 上发**"
+                         "(与 --idx 11 合用 ⇒ 判 PD6 是否接到模块 TXD: 驱动总线时本地回显)")
     ap.add_argument("--send-ms", type=int, default=4000)
     ap.add_argument("--show-raw", action="store_true")
     a = ap.parse_args()
@@ -125,10 +166,12 @@ def main():
 
     snd = None
     if a.send_port:
-        snd = Sender(a.send_port, a.send_ms)
+        snd = Sender(a.send_port, a.send_ms, mode=("inject" if a.inject else "mb"))
         snd.start()
         time.sleep(0.4)
-        print("  并发在 %s 上持续发 Modbus 帧 (%d ms)…" % (a.send_port, a.send_ms))
+        print("  并发在 %s 上持续发%s (%d ms)…"
+              % (a.send_port, "0x60 注入帧(板子会在 PD5 上发)" if a.inject else " Modbus 帧",
+                 a.send_ms))
 
     print("  触发 SD_CFG[%d] × %d 次…" % (a.idx, a.cycles))
     out = run_pyocd(cmds)
