@@ -995,6 +995,21 @@ void engine_reload_active(uint8_t *base)
 #define ENG_GPIOF (0x58020000u)   /* GPIOA 起始 */
 #define ENG_GPIOFE (0x58022000u)  /* GPIOK 结束 (0x58020000 + 0x400*11) */
 
+/* ══════════ ★★ AXI 诊断窗 —— **只读**扩展 (2026-09-13) ══════════
+ * 起因 (实测): `SD_DIAG(0x24000200)` / `BB_DIAG(0x24000300)` / `SD_CFG(0x24000400)` /
+ *   `BOOT_AXI(0x24000500)` 全在 **AXI**, 而协议的读路径只放行 SHM / APB 外设 / GPIO
+ *   ⇒ **这些诊断区只能用调试器(halt + pyocd)看** —— 这本身就违反"非侵入式交互"(铁律 0):
+ *     观测不得改变被测对象, 而调试器会停引擎。
+ *   ★ 而且"看门狗复位原因"正好在 AXI (BOOT_AXI[2]=RCC_RSR / [3]=RCC_BDCR) ——
+ *     ⇒ **这条只读窗是看门狗功能的前置**: 没有它, 复位之后只能靠调试器读原因。
+ * ★★ 为什么必须做成"只读"而不是直接放宽 eng_valid_range:
+ *   写路径 (0x21 WRITE / 0x23 WRITE_BURST) 复用的是 range 守卫 —— 一并放宽就等于
+ *   **一条协议帧能改 SD_CFG(调试钩子) 或踩坏黑匣子 AXI 环**。读只读, 写不碰。
+ *   窗口上界 0x24000600 = BOOT_AXI(0x24000500)+24B 之后留余量;
+ *   ★ 此窗内含 SD_CFG —— 允许读(看得到钩子现值), 但写仍被 eng_valid_addr 拒。 */
+#define ENG_AXIDIAGF  0x24000000u
+#define ENG_AXIDIAGFE 0x24000600u
+
 /* RCC / PWR / FLASH 各自 1KB 的禁区, valid_addr 里逐个排除 */
 #define ENG_IS_FORBIDDEN(a) \
     (((a) >= RCC_BASE   && (a) < RCC_BASE   + 0x400u) || \
@@ -1034,6 +1049,22 @@ int eng_valid_range(uint32_t a, uint32_t bytes)
     if (a >= ENG_GPIOF && e <= ENG_GPIOFE) return 1;
     return 0;
 }
+
+/* ---- ★ 只读版守卫: 在 range 之上再放行 AXI 诊断窗 (见上面 ENG_AXIDIAGF 的注释) ----
+ * 只给 **0x20/0x22 (读)** 用; 0x21/0x23 (写) 仍走 eng_valid_addr/eng_valid_range。 */
+int eng_valid_rrange(uint32_t a, uint32_t bytes)
+{
+    if (eng_valid_range(a, bytes)) return 1;
+    if (bytes == 0u) return 0;
+    if (a & 3u) return 0;
+    {   uint32_t e = a + bytes;
+        if (e < a) return 0;                     /* 回绕 */
+        if (a >= ENG_AXIDIAGF && e <= ENG_AXIDIAGFE) return 1;
+    }
+    return 0;
+}
+
+int eng_valid_raddr(uint32_t a) { return eng_valid_rrange(a, 4u); }
 
 /* SHM 内哪些区是 float 数据区 (接受 NaN/Inf 会让 LUT/MUX/EDGE 的 float→int
  * 转换触发 C 未定义行为 → 静默越界读, S3 AUDIT P1b)。外设寄存器无浮点语义, 不拦。 */

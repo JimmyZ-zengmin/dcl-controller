@@ -54,6 +54,7 @@
 #include "modbus.h"
 #include "macro.h"
 #include "faultlog.h"   /* 统一故障台账: 主循环/ISR/协议层的异常都留案底 */
+#include "manifest.h"   /* 诊断资源目录: 0x64 让板子自报"哪里出问题读什么" */
 #include "lsym.h"
 #include "adc.h"
 #include "di.h"
@@ -1391,6 +1392,44 @@ static void h_mb_diag(void)
     ack((const uint8_t *)SHM_PTR(g_shm, OFF_MB_DIAG), OFF_MB_DIAG_SZ);
 }
 
+/* 0x64 SYS_MANIFEST [page:u8 可选] → ACK [total:u8][n:u8][条目…]
+ *
+ * ★★ 这是"管理面"的入口 (2026-09-13, 见 src/manifest.h 的长注释):
+ *   板子把自己的**诊断资源目录**说出来 —— 名字 / 地址 / 长度 / 解释方式。
+ *   目的有三:
+ *     ① **消灭"PC 端硬编码地址"**: 今天两次踩到 (硬编码 SHM 基址读出台账假故障;
+ *        手抄各诊断区偏移)。按名字读 ⇒ 布局怎么挪都不会错。
+ *     ② **回答"哪里出问题读什么"**: 诊断知识从人的记忆搬进代码。
+ *     ③ **看门狗的前置**: 复位归因需要的 BOOT_AXI 在 AXI, 靠只读窗 + 本目录即可
+ *        走常规通信读到, 不需要调试器。
+ *
+ * ★ 分页而非一次全回: 目录会长大; 每页 4 条 = 82 字节, 帧小、栈占用固定。
+ *   第一字节回**总条目数**, PC 据此知道翻几页。
+ * ★ 非阻断保证: 只读 + 固定长度 + 不写 SD / 不停引擎 / 不等待任何外设。 */
+#define MF_PER_PAGE 4u
+static void h_manifest(const uint8_t *p, uint32_t n)
+{
+    static uint8_t r[2u + MF_PER_PAGE * 20u];
+    uint32_t page  = (n >= 1u) ? (uint32_t)p[0] : 0u;
+    uint32_t first = page * MF_PER_PAGE;
+    uint32_t cnt   = (first < MANIFEST_N) ? (MANIFEST_N - first) : 0u;
+    uint32_t shm   = g_shm_addr;
+    if (cnt > MF_PER_PAGE) cnt = MF_PER_PAGE;
+    r[0] = (uint8_t)MANIFEST_N;
+    r[1] = (uint8_t)cnt;
+    for (uint32_t i = 0u; i < cnt; i++) {
+        const ManifestEnt_t *e = &g_manifest[first + i];
+        uint8_t *o = r + 2u + i * 20u;
+        for (uint32_t k = 0u; k < 12u; k++) o[k] = (uint8_t)e->name[k];
+        put32(o + 12u, (e->flags & MF_F_SHM) ? (shm + e->addr) : e->addr);
+        o[16] = (uint8_t)(e->words & 0xFFu);
+        o[17] = (uint8_t)(e->words >> 8);
+        o[18] = e->kind;
+        o[19] = e->flags;
+    }
+    ack(r, 2u + cnt * 20u);
+}
+
 /* 0x62 MB_CFG — 配置通信域: [src u8][tx_uart u8][budget u8] (后两字节可选)
  *   src    : 0=RX 走物理口 FIFO, 1=RX 走隧道注入(0x60)
  *   tx_uart: 0=响应留缓冲(0x61 读回), 1=响应从物理口发 (★ LA 可抓)
@@ -1570,7 +1609,7 @@ static void h_read_w1(const uint8_t *p, uint32_t n)
 {
     if (n < 4) { g_shm_rd_nak++; g_nak_last = NAKRH_SHORT; nak("need addr"); return; }
     uint32_t a = get32(p);
-    if (!eng_valid_addr(a)) { g_shm_rd_nak++; g_nak_last = NAKRH_ADDR; nak("bad addr"); return; }
+    if (!eng_valid_raddr(a)) { g_shm_rd_nak++; g_nak_last = NAKRH_ADDR; nak("bad addr"); return; }
     uint32_t v = *(volatile uint32_t *)(uintptr_t)a;
     uint8_t r[4]; put32(r, v);
     g_shm_rd_ok++;
@@ -1584,7 +1623,7 @@ static void h_read_burst_w1(const uint8_t *p, uint32_t n)
     uint32_t a = get32(p);
     uint16_t c = get16(p + 4);
     if (!c || c > 256u) { g_shm_rd_nak++; g_nak_last = NAKRH_COUNT; nak("bad count"); return; }
-    if (!eng_valid_range(a, (uint32_t)c * 4u)) {
+    if (!eng_valid_rrange(a, (uint32_t)c * 4u)) {
         g_shm_rd_nak++; g_nak_last = NAKRH_RANGE; nak("bad range"); return;
     }
     /* 256×4 = 1024B ≤ FRAME_PAYLOAD_MAX(6150) —— 单帧放得下, S3 T19 同口径 */
@@ -2035,6 +2074,7 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_MB_RESP:       h_mb_resp(); break;
         case CMD_MB_CFG:        h_mb_cfg(p, n); break;
         case 0x63:              h_mb_diag(); break;   /* 通信域诊断区整块读回 */
+        case 0x64:              h_manifest(p, n); break; /* ★ 诊断资源目录 (管理面入口) */
         /* ---- W5: macro 字节码 VM ---- */
         case CMD_MACRO:         h_macro(p, n); break;
         case CMD_MACRO_UPLOAD:  h_macro_upload(p, n); break;

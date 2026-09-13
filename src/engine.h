@@ -1057,7 +1057,11 @@ int  shm_guard_ok(void);
 
 /** @brief 单地址可访问性 (4B 对齐 + SHM 内 或 白名单外设区) */
 int eng_valid_addr(uint32_t a);
-
+/** @brief 只读版守卫: range + AXI 诊断窗 (SD_DIAG/BB_DIAG/SD_CFG/BOOT_AXI)。
+ *  ★ 只给协议的**读**命令 (0x20/0x22) 用 —— 写路径放宽就等于一条帧能改 SD_CFG /
+ *    踩坏黑匣子环。见 engine.c 里 ENG_AXIDIAGF 的长注释。 */
+int eng_valid_rrange(uint32_t a, uint32_t bytes);
+int eng_valid_raddr(uint32_t a);
 /** @brief 区间可访问性 (burst 用: 起止必须落在**同一个**合法区内, 防跨区越界) */
 int eng_valid_range(uint32_t a, uint32_t bytes);
 
