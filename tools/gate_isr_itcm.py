@@ -119,7 +119,17 @@ def disasm_func(elf, addr, size):
                "--start-address=0x%x" % addr, "--stop-address=0x%x" % (addr + size), elf])
     calls, unresolved = set(), set()
     ldr_lit = {}          # 寄存器 → 字面量地址
+    fn_lo, fn_hi = addr, addr + size
     for ln in out.splitlines():
+        # ★★ **尾调用** (闸门第 4 个盲区): `b.w <目标>` 若目标落在**本函数之外**, 那是
+        #   编译器做的兄弟调用 —— 它同样是一次"控制转移", 目标在 flash 一样会 stall。
+        #   (第一版解析我把它连同局部跳转一起丢了 ⇒ 又一处"报无违规而漏检"。)
+        m = re.match(r"\s*([0-9a-f]+):\s+b(?:\.w|\.n)?\s+([0-9a-f]+)\s+<", ln)
+        if m:
+            tgt = int(m.group(2), 16)
+            if not (fn_lo <= tgt < fn_hi):
+                calls.add(tgt)
+            continue
         m = re.match(r"\s*([0-9a-f]+):\s+bl\s+([0-9a-f]+)\s+<", ln)
         if m:
             calls.add(int(m.group(2), 16))

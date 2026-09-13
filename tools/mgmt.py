@@ -149,8 +149,29 @@ def dcl_frame(cmd, payload=b""):
     return bytes([0xC0]) + body + bytes([x & 0xFF, x >> 8])
 
 
+def _find_board():
+    """自动找协议口。★ 认能力字, 不认"第一个 CH340" (本机有两个 CH340)。"""
+    from serial.tools import list_ports
+    from h723_client import link_alive
+    cands = [p.device for p in list_ports.comports()]
+    for d in cands:
+        try:
+            if link_alive(d, tries=1):
+                return d
+        except Exception:
+            pass
+    raise RuntimeError("自动找板子失败 (试过 %s)" % cands)
+
+
 class Board:
-    def __init__(self, port):
+    def __init__(self, port=None):
+        # ★★ 别硬编码 COM 号 (2026-09-13 实测教训): 插拔一次 USB, 枚举号就整体移位
+        #   (COM14 → COM17/COM18), 硬编码的结果是 `FileNotFoundError: 系统找不到指定的文件`
+        #   —— 症状极像"板子坏了/工具坏了", 实际只是**口换了**。
+        #   ⇒ 不给端口时**自动找板子**: 逐个 link_alive (认**能力字** 0x0DF7),
+        #     比"找第一个 CH340"可靠 —— 这台机器上就插着两个 CH340。
+        if port is None:
+            port = _find_board()
         self.s = serial.Serial(port, 115200, timeout=0.05)
         self._manifest = None
 
