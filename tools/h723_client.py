@@ -56,7 +56,10 @@ class Dcl:
     """
 
     def __init__(self, port=None, wait=0.3, timeout=2.0):
-        self.port = port or find_port(None)
+        # ★ 用 find_board() 而**不是** find_port(None): 后者取"第一个 CH340",
+        #   而本机插着两个 ⇒ 会挑错口, 现象是"板子没响应"(极像板子坏了)。
+        #   2026-09-13 实测踩过。
+        self.port = port or find_board()
         self.timeout = timeout
         if not self.port:
             raise RuntimeError("找不到串口 —— 检查 CH340 是否插好, 或用 --port 指定")
@@ -85,6 +88,24 @@ class Dcl:
 
     def __del__(self):
         self.close()
+
+
+def find_board():
+    """自动找协议口 —— ★ 认**能力字**, 不认"第一个 CH340" (本机就插着两个 CH340,
+    第一版 Dcl(None) 因此挑错口 ⇒ 现象是"板子没响应", 极像板子坏了)。
+    判据: 逐个开、发 0x01、看能力字是否等于 EXPECT_CAP。"""
+    from serial.tools import list_ports
+    cands = [p.device for p in list_ports.comports()]
+    for dev in cands:
+        try:
+            d = Dcl(dev, wait=0.05, timeout=0.3)
+            if engine_status(d) is not None:
+                d.close()
+                return dev
+            d.close()
+        except Exception:
+            pass
+    raise RuntimeError("自动找板子失败 (试过 %s)" % cands)
 
 
 def engine_status(dcl):

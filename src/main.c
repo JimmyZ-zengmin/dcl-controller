@@ -2264,6 +2264,15 @@ static void h_persist_w2(const uint8_t *p, uint32_t n)
     int save_rc = 2;   /* 2 = 本次未请求落盘 */
 
     if (mode == 1) {
+#if !DCL_PERSIST_SAVE
+        /* ★★ 显式拒绝 (2026-09-13 降级): 与其谎报成功, 不如明确说"本平台不提供"。
+         *   旧行为: 真的去擦 flash ⇒ 拍 ISR 卡死 210ms ⇒ 看门狗复位 ⇒ **"保存"= "重启"**,
+         *   且配置从未落盘。⇒ 现在直接 NAK, 板子不再被自己弄重启。 */
+        g_persist_nak++;
+        g_persist_last_err = 0xD15Au;
+        nak("persist: save disabled on this platform (flash erase vs WDT; see docs/audit/H723-PERSIST-WDT-DEFECT.md)");
+        return;
+#endif
         g_persist_saves++;
         /* ★ 声明窗口: persist 落盘端到端**实测 ~1.55s** —— 已知长阻塞, 且**大于阈值**,
          *   所以不给它开窗就会被误判成"主循环死了"并复位 (每次刷盘误复位)。

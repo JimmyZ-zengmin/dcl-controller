@@ -151,17 +151,10 @@ def dcl_frame(cmd, payload=b""):
 
 
 def _find_board():
-    """自动找协议口。★ 认能力字, 不认"第一个 CH340" (本机有两个 CH340)。"""
-    from serial.tools import list_ports
-    from h723_client import link_alive
-    cands = [p.device for p in list_ports.comports()]
-    for d in cands:
-        try:
-            if link_alive(d, tries=1):
-                return d
-        except Exception:
-            pass
-    raise RuntimeError("自动找板子失败 (试过 %s)" % cands)
+    """自动找协议口。★ 认能力字, 不认"第一个 CH340"。
+    ★ 复用 h723_client.find_board() —— **一处实现**, 免得两个工具各挑各的口 (踩过)。"""
+    from h723_client import find_board
+    return find_board()
 
 
 class Board:
@@ -565,6 +558,10 @@ def verdict(name, e, w):
         # ★★ 这个区是一次**真实误判**的直接产物: 原先 erase_ok/fail 外部读不到, 于是
         #    一次被**跳过**的落盘(引擎 RUN ⇒ persist_save 第一道门 return 1, 21ms)
         #    被读成"落盘很快" ⇒ 得出相反结论。**判据不存在时, 人只能猜, 而猜错没有提示。**
+        # ★★ 2026-09-13 起本功能**已显式降级**: 保存被明确拒绝 ⇒ writes/erase_ok 恒 0 是**预期**,
+        #   不是缺陷。原因见 docs/audit/H723-PERSIST-WDT-DEFECT.md (擦 flash vs 200ms 看门狗)。
+        out.append("★★ **本平台已显式降级: 不提供『保存配置』** —— `0x43` 落盘会 **NAK**;"
+                   " 上电只读加载保留。见 docs/audit/H723-PERSIST-WDT-DEFECT.md")
         w0, saves, skip, nak, writes, eok, efail = w[0], w[1], w[2], w[3], w[4], w[5], w[6]
         dirty, tgt = (w[7] & 1), (w[7] >> 8)
         out.append("0x43 调用=%d / 受理 save=%d (其中因**引擎RUN跳过**=%d) / 拒绝=%d"
@@ -577,8 +574,7 @@ def verdict(name, e, w):
             bad = True
         # 判据 2: 数据为空时别把"没数据"读成"很快"
         if writes == 0:
-            out.append("  △ **还没真正落过盘** ⇒ 本档的'擦除阻塞'数据为空 "
-                       "(别把'没数据'读成'落盘很快')")
+            out.append("  (writes=0 属**预期**: 保存已降级; 该数只用于将来恢复该功能后的回归)")
         # 判据 3 (直接防我犯过的错): 有跳过 ⇒ 那些请求没擦盘, 测阻塞前必须先 STOP
         if skip:
             out.append("  ★ 有 %d 次 save 因**引擎 RUN 被跳过** ⇒ 这些请求**根本没擦盘**;"
@@ -729,7 +725,9 @@ def cmd_symptom(b, s):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM14")
+    # ★ 默认**自动找板子** (2026-09-13): 插拔 USB 会让枚举号整体移位, 硬编码默认值
+    #   的症状是 `FileNotFoundError` —— 极像板子/工具坏了, 实际只是口换了。
+    ap.add_argument("--port", default=None, help="不给则自动找 (认能力字, 不认第一个 CH340)")
     ap.add_argument("--manifest", action="store_true")
     ap.add_argument("--read", default=None, metavar="NAME")
     # ★ `--raw`: 原始 dump 默认不打 (34 字十六进制对判读是噪声, 审计 P3①)

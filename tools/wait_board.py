@@ -73,12 +73,20 @@ def probe(s, wait=0.4):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM14")
+    # ★ 默认自动找板子 (同 mgmt.py; 理由: 插拔后 COM 号会移位)
+    ap.add_argument("--port", default=None)
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--need", type=int, default=3, help="连续几次合法应答才算稳")
     a = ap.parse_args()
 
-    s = serial.Serial(a.port, 115200, timeout=0.05)
+    port = a.port
+    if port is None:
+        import os, sys as _s
+        _s.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from h723_client import find_board
+        port = find_board()
+        print("  (自动找板子 → %s)" % port)
+    s = serial.Serial(port, 115200, timeout=0.05)
     t0 = time.time()
     first = None
     streak = 0

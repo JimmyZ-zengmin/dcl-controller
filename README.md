@@ -209,11 +209,11 @@ python tools/h723_proto.py          # 协议层 (需 CH340 接线)        12/12
 python tools/h723_w1.py             # 运行控制 + SHM 读写          28/28
 python tools/h723_w2_probe.py       # W2 Force (pyocd, 免串口)      14/14
 python tools/h723_seq.py            # W3 顺序域                    27/27
-python tools/h723_persist.py        # W2.4 掉电保持 (会写 flash)    26/26
+python tools/h723_persist.py        # ★ 已降级: 保存不可用 (历史 26/26, 见下方★)
 python tools/h723_modbus.py         # W4 Modbus RTU                15/15
 python tools/h723_macro.py          # W5.1 macro VM                18/18
 python tools/h723_w5.py             # W5 外设域 (DI/AI/HIL)        18/18
-python tools/h723_t26.py            # ★ PERSISTENT 落盘 (T26)      11/11
+python tools/h723_t26.py            # ★ 同上: 该档结论已被 2026-09-13 推翻
 python tools/h723_r1_actuator.py    # ★ R1-④ actuator_idx 边界     5/5
 python tools/h723_jitter.py         # ★ 确定性: ISR 入口间隔 + ov   9/9
 #   ↑ 测的是"ISR 入口间隔"(含入口延迟), **不是拍长抖动** —— 口径见
@@ -342,12 +342,20 @@ bash build.sh                  && pyocd flash ... && python tools/h723_w5.py --p
 
 1. ✅ UART + 协议帧 —— 真实串口 12/12（BRR 错 16 倍已修, 见 `docs/FIX-REPORT-usart1-brr.md`）
 2. ✅ deploy 路径 —— 成本表本平台实测 / STAGING 归组 / ISR 原子热重载 ≤1 拍 / "已生效"可观测
-3. ✅ persist —— 裸 Flash 双副本 A/B, 26/26; PERSISTENT = 运行期 0 flash 操作
+3. ⚠️ **persist —— 已显式降级: 本平台不提供"保存配置"**（2026-09-13）
+   - 原因: **擦/写内部 flash 与 200ms 看门狗不共存** —— 擦除期间拍 ISR 卡死 ~210.6ms
+     (LA 实测), 喂狗停 ⇒ 看门狗复位。即"保存"实际表现为"**重启机器**", 且配置**从未落盘**
+     (PERSIST_STAT 的 writes/erase_ok 恒 0)。完整证据: `docs/audit/H723-PERSIST-WDT-DEFECT.md`。
+   - 现在: `0x43` **查询**仍可用; `0x43` **落盘** ⇒ **明确 NAK**（板子不再重启）;
+     **上电只读加载保留**（不写 ⇒ 无 stall 风险, 且保留"恢复到 STOP 态"的安全语义）。
+   - 恢复方式: `-DDCL_PERSIST_SAVE=1`（**但必须先解决 ISR 卡死**, 否则每次保存都重启）。
+   - ★ 原先那两行 `26/26`、`T26 11/11` 是**看门狗武装之前**的记录 —— 现已失效, 保留供对照。
 4. 🟢 **S3 回归平移（20 套, 脚本零改动）—— 22/30 通过**（2026-09-11 16:xx）
    - 分布: **22 PASS / 7 项 S3 平台专属 N/A / 1 项半可修**
      - N/A: T3(DHT22) · T5 shell ×2 · T11 fs · T8/T14b/T23（都读 ESP32 GPIO 寄存器
        `0x60004004`; H723 的 GPIO 在 `0x5802xxxx` 且寄存器布局不同 —— 伪造 S3 地址 = 造假）
-     - **半可修 T15**: 落盘半段已绿（`持久化=ok`）; 重启半段需**真实复位**, 而 CH340 的 RTS
+     - **半可修 T15**: ~~落盘半段已绿~~（**2026-09-13 作废**: 该"已绿"是在看门狗武装前测的,
+       武装后落盘会让板子复位 ⇒ 现保存已降级为 NAK）; 重启半段需**真实复位**, 而 CH340 的 RTS
        **没接到 NRST**（实测 RTS 翻转后 samples 20031→31602 继续增长）⇒ **手按板上 RST**
        或补一根 RTS→RST 的线。不为过测伪造重启证据。
    - 已修: **T9** RESET 清 timing 统计 · **T17** div2 档周期 64→**100 拍 = 10ms**
