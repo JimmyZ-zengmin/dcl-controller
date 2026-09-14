@@ -705,6 +705,9 @@ OBS uint32_t g_ppat_first   = 0;   /* 首次写时刻 (算总时长) */
  *   (`DMAMUX1_C8` 换成 `TIM2_CC4`, 把锁存点移出 ISR 窗口), 而不是长期空转。
  * ★ 单位 = CPU 周期 (400MHz ⇒ 1 cyc = 2.5 ns)。0 = 关闭(交付行为)。 */
 OBS uint32_t g_isr_delay_cyc = 0;
+/* ★ 黑匣子开关 (2026-09-14, 干涉对照用): 1 = 关闭 bb_kick。
+ *   目的是做"去掉一个 AXI 写手"的单变量对照 —— 见 ARCH-TIMELINE 的双时间表分析。 */
+OBS uint32_t g_bb_off = 0;
 /* ★★ 为什么"写入是否生效"必须由固件自证、而不是用调试器读:
  * pyocd 在 `connect_mode=halt` 下读 AHB4 外设寄存器会返回无意义常数
  * (本项目实测: GPIOA/E 读回 0xABFFFFFF / 0xFFFFFFFF, RCC_AHB4ENR 读回 0),
@@ -1401,7 +1404,15 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   成本计入 isr 统计 (在 t1 之前)。 */
         adc_poll_kick();
         rtc_latch();                 /* ★ 刷新 RTC 镜像 (自带降频) ⇒ 黑匣子才记得到挂钟 */
-        bb_kick(g_tick_count);       /* ★ 黑匣子: 拍尾快照 → AXI 环形缓冲 (MDMA 后台搬运) */
+        /* ★★★ 黑匣子快照 (表 A 的 #10) —— **本拍第二个 AXI 写手**。
+         *   干涉分析见 docs/ARCH-TIMELINE-CPU-MDMA.md:
+         *   它与 MDMA 锁存链 (表 B) 都从拍边界起步、都要访问 AXI,
+         *   实测 MDMA 路径 σ ≈ 61 ns 而 CPU 直写仅 ≈ 21 ns。
+         *   ⇒ 这个开关用来做"**关掉黑匣子**"的对照: 若关掉后 σ 明显下降,
+         *     说明 AXI 争抢是主因之一。默认开 (= 交付行为)。 */
+        if (g_bb_off == 0u) {
+            bb_kick(g_tick_count);   /* ★ 黑匣子: 拍尾快照 → AXI 环形缓冲 (MDMA 后台搬运) */
+        }
 
         if (g_per_prev) {
             uint32_t p = t0 - g_per_prev;
@@ -2146,6 +2157,13 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         g_isr_delay_cyc = (n >= 5u)
             ? (uint32_t)(p[1] | ((uint32_t)p[2] << 8) | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24))
             : 0u;
+        ack(NULL, 0u);
+        return;
+    }
+    if (op == 4u) {
+        /* ★ 黑匣子开关: [op:u8][on:u8]  (1 = 关闭 bb_kick, 0 = 开启)
+         *   用途: 去掉 ISR 内**第二个 AXI 写手**, 做干涉对照。 */
+        g_bb_off = (n >= 2u && p[1] != 0u) ? 1u : 0u;
         ack(NULL, 0u);
         return;
     }
