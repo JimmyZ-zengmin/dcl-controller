@@ -66,3 +66,21 @@
 2. 串口 `op=7`（**必须**，恢复 DWT）
 3. `op=1`（开诊断）；用 `op=5`/`op=8` 配好状态，**用 `op=6` 读回自证**
 4. LA 采集 → 分析前先做**网格/同一性/形状**三项判定
+
+## 五、Git 纪律（2026-09-14 一次 .git 损坏事故）
+- ★★ **不要在本仓库用 `git stash`**（事故发生在 `git stash push -- src/` 时：
+  `.git/refs` 树 + pack 数据文件一起消失，git 报 "not a git repository"；原因未确定）。
+- ★ 任何 git 维护动作前先 `cp -r .git ../.git_bak_<日期>`。
+- ★ 事故后第一步永远是 **`git status`** 与 **读 `.git/logs/HEAD`（reflog 通常完好）**：
+  reflog 能告诉你"最后一次提交是什么"和"是否所有历史都已推送"。
+  **只要都已推送，恢复永远是无损的。**
+- ★ 恢复套路（远程有全部历史时）：
+  `mkdir -p .git/refs/{heads,tags,remotes/origin}` → `git fetch <remote>` 补对象 →
+  `git update-ref refs/heads/main <hash>` → 直接 `printf '%s\n' <hash> > .git/refs/remotes/origin/main`
+- ★★ **`git update-ref` 写 `refs/remotes/**` 不会自动建中间目录，且失败时静默返回 0** ——
+  用它之后必须 `git show-ref` 确认真的写进去了。
+- ★ 提交实验类内容时用 **`git add <具体路径>`**，绝不用 `git add -A`；
+  提交前用 `git diff --cached --name-status` 核对，提交后用
+  `git diff --stat <上一个提交> HEAD -- src/` 核验"源码一个字没动"。
+- 两个远程：`origin` = H723PLC、`dcl` = dcl-controller，**都推**（保持镜像一致）。
+
