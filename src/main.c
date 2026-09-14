@@ -684,6 +684,17 @@ OBS uint32_t g_ppat_max  = 0;              /* max */
 OBS uint32_t g_ppat_prev = 0;              /* 上一拍写时刻 (DWT) */
 OBS uint32_t g_ppat_last = 0;              /* 最近一次写时刻 */
 OBS uint32_t g_ppat_val  = 0;              /* 最近写出的码型 (0..127) */
+/* ★★★ 毛刺/异常间隔分档统计 (2026-09-14, 持久测试用)。
+ * 为什么不能只报 min/max: 一个极端样本就能把极差拉成几万 ns, 而**看不见它有多少个**。
+ * 分档同时回答"多严重"与"多频繁"两个问题 —— 这正是 LA 侧那次教训
+ * (0.117% 的毛刺把极差从 166ns 拉成 50µs) 的固件版修法。
+ * 正常拍长 = 40000 cyc; 下面以 ±250ns(=100cyc) 为正常带。 */
+OBS uint32_t g_ppat_b_short = 0;   /* d < 39000   (异常短, > 1 拍少 1000cyc) */
+OBS uint32_t g_ppat_b_low   = 0;   /* 39000..39899 */
+OBS uint32_t g_ppat_b_ok    = 0;   /* 39900..40100 (正常带 ±100cyc = ±250ns) */
+OBS uint32_t g_ppat_b_high  = 0;   /* 40101..41000 */
+OBS uint32_t g_ppat_b_long  = 0;   /* > 41000 */
+OBS uint32_t g_ppat_first   = 0;   /* 首次写时刻 (算总时长) */
 /* ★★ 为什么"写入是否生效"必须由固件自证、而不是用调试器读:
  * pyocd 在 `connect_mode=halt` 下读 AHB4 外设寄存器会返回无意义常数
  * (本项目实测: GPIOA/E 读回 0xABFFFFFF / 0xFFFFFFFF, RCC_AHB4ENR 读回 0),
@@ -1070,6 +1081,14 @@ ISR_PLACE void TIM2_IRQHandler(void)
                 uint32_t d = tp - g_ppat_prev;
                 if (d < g_ppat_min) g_ppat_min = d;
                 if (d > g_ppat_max) g_ppat_max = d;
+                /* ★★ 分档 (持久测试用): 正常拍长 40000 cyc, ±100cyc 为正常带 */
+                if (d < 39000u)       g_ppat_b_short++;
+                else if (d < 39900u)  g_ppat_b_low++;
+                else if (d <= 40100u) g_ppat_b_ok++;
+                else if (d <= 41000u) g_ppat_b_high++;
+                else                  g_ppat_b_long++;
+            } else {
+                g_ppat_first = tp;
             }
             g_ppat_prev = tp;
             g_ppat_last = tp;
@@ -2052,6 +2071,8 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
     if (op == 1u) {
         g_ppat_min  = 0xFFFFFFFFu; g_ppat_max = 0u; g_ppat_prev = 0u;
         g_ppat_wr_n = 0u; g_ppat_val = 0u; g_ppat_on = 1u;
+        g_ppat_b_short = 0u; g_ppat_b_low = 0u; g_ppat_b_ok = 0u;
+        g_ppat_b_high = 0u; g_ppat_b_long = 0u; g_ppat_first = 0u;
         /* ★★★ 必须**停掉 DO 的影子锁存 (MDMA ch0)** —— 否则本诊断的输出会被它清掉。
          *   机制 (2026-09-14 实测定位, 链条完整):
          *     `do_latch_init()` 把 MDMA ch0 配成 "SHM 的 OFF_DO_SHADOW → GPIOE_ODR",
@@ -2071,7 +2092,7 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
     }
     if (op == 0u) { g_ppat_on = 0u; ack(NULL, 0u); return; }
     if (op == 2u) {
-        uint8_t r[40];
+        uint8_t r[64];
         put32(r +  0, g_ppat_on);
         put32(r +  4, g_ppat_wr_n);
         put32(r +  8, (g_ppat_min == 0xFFFFFFFFu) ? 0u : g_ppat_min);
@@ -2092,7 +2113,14 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
          *     所以"读到 0"只可能来自"写不进去"。 */
         GPIO_BSRR(DO_GPIO_PORT) = 0x0000007Fu;      /* 置位 PE0..PE6 */
         put32(r + 36, GPIO_ODR(DO_GPIO_PORT) & 0xFFu);   /* 立刻读回 */
-        ack(r, 40u);
+        /* ★ 持久测试: 分档统计 (正常拍长 40000 cyc) */
+        put32(r + 40, g_ppat_b_short);   /* <39000 */
+        put32(r + 44, g_ppat_b_low);     /* 39000..39899 */
+        put32(r + 48, g_ppat_b_ok);      /* 39900..40100 正常带 */
+        put32(r + 52, g_ppat_b_high);    /* 40101..41000 */
+        put32(r + 56, g_ppat_b_long);    /* >41000 */
+        put32(r + 60, g_ppat_first);     /* 首次写时刻 (仅参考) */
+        ack(r, 64u);
         return;
     }
     nak("bad pin pattern op");
