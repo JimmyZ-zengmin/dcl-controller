@@ -1081,12 +1081,17 @@ ISR_PLACE void TIM2_IRQHandler(void)
                 uint32_t d = tp - g_ppat_prev;
                 if (d < g_ppat_min) g_ppat_min = d;
                 if (d > g_ppat_max) g_ppat_max = d;
-                /* ★★ 分档 (持久测试用): 正常拍长 40000 cyc, ±100cyc 为正常带 */
-                if (d < 39000u)       g_ppat_b_short++;
-                else if (d < 39900u)  g_ppat_b_low++;
-                else if (d <= 40100u) g_ppat_b_ok++;
-                else if (d <= 41000u) g_ppat_b_high++;
-                else                  g_ppat_b_long++;
+                /* ★★ 分档 (持久测试用): 正常拍长 40000 cyc。
+                 * ★ 2026-09-14 收紧: 原来的正常带 ±100cyc(±250ns) 太粗 ——
+                 *   它能报出"极差 175ns", 却**看不出典型值有多集中**。
+                 *   极差 ≠ 典型抖动: 81.7 万个样本里只要有 2~3 个偏离, 极差就成了那个数。
+                 *   现收紧到 ±10cyc(±25ns), 并保留 ±40cyc(±100ns) 档, 用来区分
+                 *   "**典型抖动**"与"**偶发极值**"这两件完全不同的事。 */
+                if (d < 39960u)       g_ppat_b_short++;   /* < -100ns */
+                else if (d < 39990u)  g_ppat_b_low++;     /* -100ns .. -25ns */
+                else if (d <= 40010u) g_ppat_b_ok++;      /* ★ ±25ns 正常带 */
+                else if (d <= 40040u) g_ppat_b_high++;    /* +25ns .. +100ns */
+                else                  g_ppat_b_long++;    /* > +100ns */
             } else {
                 g_ppat_first = tp;
             }
