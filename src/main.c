@@ -1346,8 +1346,16 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *     前半段时序完全不变, 只有"输出后到 ISR 结束"这段被让开。
          *   ★ 0 = 关闭 (交付行为); 由 `0x39 op=3` 运行期设定, 便于扫参数找最佳值。 */
         if (g_isr_delay_cyc != 0u) {
-            uint32_t dl0 = DWT_CYCCNT;
-            while ((uint32_t)(DWT_CYCCNT - dl0) < g_isr_delay_cyc) { }
+            /* ★★★ 必须用**纯 NOP 循环**, 不能用 `while ((DWT_CYCCNT - d0) < n) {}`！
+             *   实测教训 (2026-09-14): 第一版用 DWT 忙等 ⇒ 延时档的抖动**反而变大**
+             *   (PE0 58.8→64.9 ns, PA8 25.3→30.1 ns)。
+             *   原因: **`DWT_CYCCNT` 是 CoreSight 组件, 读它要过总线** ——
+             *   忙等循环每几纳秒就做一次总线访问 ⇒ "让路"变成了"**更加争抢**"。
+             *   ⇒ 让路必须**完全不碰总线**: NOP 在 ITCM 里取指+执行, 不产生数据访问。
+             *   ★ 单位换算: 每轮 ≈ 3 cyc (NOP + 循环开销), 故 `g_isr_delay_cyc` 现在
+             *     按"轮数"解释; 2.5ns/cyc × 3 ≈ 7.5ns/轮。 */
+            uint32_t n = g_isr_delay_cyc;
+            while (n-- != 0u) { __asm__ volatile("nop"); }
         }
 #endif
 
