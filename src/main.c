@@ -695,6 +695,16 @@ OBS uint32_t g_ppat_b_ok    = 0;   /* 39900..40100 (正常带 ±100cyc = ±250ns
 OBS uint32_t g_ppat_b_high  = 0;   /* 40101..41000 */
 OBS uint32_t g_ppat_b_long  = 0;   /* > 41000 */
 OBS uint32_t g_ppat_first   = 0;   /* 首次写时刻 (算总时长) */
+/* ★★★ ISR 入口让路延时 (2026-09-14, 用户提出"在输出时刻左右留时间")。
+ * 动机: MDMA 锁存链 (TIM2_UP → DMA2_S0 → MDMA → ODR, 七级) 的触发点**恰好是拍边界**,
+ *       而 ISR 也在拍边界立刻启动 ⇒ **两者抢同一段总线时间** ⇒ 实测 MDMA 路径
+ *       σ ≈ 61 ns, 而 CPU 直写只有 ≈ 21 ns。
+ * 做法: 在 ISR 最前面空转若干周期, 把"CPU 抢总线"的窗口往后推, 给 MDMA 让路。
+ * ★ 这是**诊断旋钮**, 不是交付配置: 它牺牲 ISR 时间预算换输出稳定性,
+ *   用来判定"抖动到底是不是争抢引起的"。扫出最佳值后, 正确做法是改触发源
+ *   (`DMAMUX1_C8` 换成 `TIM2_CC4`, 把锁存点移出 ISR 窗口), 而不是长期空转。
+ * ★ 单位 = CPU 周期 (400MHz ⇒ 1 cyc = 2.5 ns)。0 = 关闭(交付行为)。 */
+OBS uint32_t g_isr_delay_cyc = 0;
 /* ★★ 为什么"写入是否生效"必须由固件自证、而不是用调试器读:
  * pyocd 在 `connect_mode=halt` 下读 AHB4 外设寄存器会返回无意义常数
  * (本项目实测: GPIOA/E 读回 0xABFFFFFF / 0xFFFFFFFF, RCC_AHB4ENR 读回 0),
@@ -1323,6 +1333,22 @@ ISR_PLACE void TIM2_IRQHandler(void)
         ISR_CKPT(5);  /* ⑤ **hil_out_poll 之后** (上一轮实测卡在 ④→⑤ 之间 ⇒ 细分) */
         do_poll(g_shm, g_tick_count);
         ISR_CKPT(6);  /* ⑥ do_poll 之后 */        /* ★ P3-A: DO 输出面 ACTUATOR → GPIOE (BSRR 原子写) */
+
+        /* ★★★ 输出后让路 (2026-09-14, 诊断旋钮; 用户提出"把输出后的那个任务推后 1~2µs"):
+         *   本拍该写的都写完了 (输出面已进影子/ODR), 而 **MDMA 锁存链还在同一个拍边界上
+         *   搬运** (TIM2_UP → DMA2_S0 → MDMA → ODR, 七级串联)。ISR 若立刻继续跑后面的段
+         *   (黑匣子快照/统计/协议收尾), 就会与 MDMA **争抢总线** ——
+         *   实测: MDMA 路径 σ ≈ 61 ns, 而 CPU 直写只有 ≈ 21 ns。
+         *   ⇒ 在这里空转 N 个周期, 让 MDMA 先搬完再继续。
+         *
+         *   ★ 与"入口让路"的关键区别: 入口让路会把**整个** ISR 推后(连输入采样一起),
+         *     破坏"输入→计算→输出"的相位关系; 这里只推**输出之后**的部分 ⇒
+         *     前半段时序完全不变, 只有"输出后到 ISR 结束"这段被让开。
+         *   ★ 0 = 关闭 (交付行为); 由 `0x39 op=3` 运行期设定, 便于扫参数找最佳值。 */
+        if (g_isr_delay_cyc != 0u) {
+            uint32_t dl0 = DWT_CYCCNT;
+            while ((uint32_t)(DWT_CYCCNT - dl0) < g_isr_delay_cyc) { }
+        }
 #endif
 
         uint32_t t1 = DWT_CYCCNT;
@@ -2105,6 +2131,16 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         return;
     }
     if (op == 0u) { g_ppat_on = 0u; ack(NULL, 0u); return; }
+    if (op == 3u) {
+        /* ★ 运行期设定 "ISR 入口让路延时": [op:u8][cyc:u32 LE]
+         *   用途: 扫参数找"给 MDMA 让路"的最佳窗口, 判定抖动是否来自总线争抢。
+         *   ★ 交付档不设它 (= 0)。 */
+        g_isr_delay_cyc = (n >= 5u)
+            ? (uint32_t)(p[1] | ((uint32_t)p[2] << 8) | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24))
+            : 0u;
+        ack(NULL, 0u);
+        return;
+    }
     if (op == 2u) {
         uint8_t r[64];
         put32(r +  0, g_ppat_on);
