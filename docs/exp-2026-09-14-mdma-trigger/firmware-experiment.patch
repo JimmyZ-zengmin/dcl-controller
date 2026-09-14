@@ -1,0 +1,457 @@
+diff --git a/src/main.c b/src/main.c
+index 7de4f11..d9b9cfe 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -708,6 +708,77 @@ OBS uint32_t g_isr_delay_cyc = 0;
+ /* ★ 黑匣子开关 (2026-09-14, 干涉对照用): 1 = 关闭 bb_kick。
+  *   目的是做"去掉一个 AXI 写手"的单变量对照 —— 见 ARCH-TIMELINE 的双时间表分析。 */
+ OBS uint32_t g_bb_off = 0;
++/* ══════════ ★★★ MDMA 锁存触发源可配 (2026-09-14, 方案②) ══════════
++ * 背景 (见 docs/ARCH-TIMELINE-CPU-MDMA.md):
++ *   现状是 `DMAMUX1_C8 = TIM2_UP` ⇒ **锁存链的起点与 ISR 入口是同一个事件**
++ *   ⇒ 表 A(CPU) 与表 B(MDMA) 必然在 t=0 相交, 两条时间线互相干涉。
++ *   这是结构性缺陷, 不是"可能干涉"。
++ *
++ * 方案: 把触发源从 `TIM2_UP`(拍边界) 换成 **`TIM2_CH4`(拍内任意时刻)**,
++ *   用 `g_trig_ccr4` 指定 CC4 的比较值 ⇒ **表 B 整段移出拍边界**,
++ *   两条时间线在时间上分离 (这就是用户要的"时间表清晰不互相干涉")。
++ *
++ * ★ DMAMUX1 请求号 (三源核对: ST 官方头文件 / stm32-hal2 enum / H730 HAL 文档):
++ *     TIM2_CH1=18  TIM2_CH2=19  TIM2_CH3=20  **TIM2_CH4=21**  TIM2_UP=22
++ *
++ * ★ 时刻换算: TIM2CLK=200MHz ⇒ 1 tick = 5ns; 拍 = 20000 tick = 100µs。
++ *   例如 `g_trig_ccr4 = 10000` ⇒ 锁存发生在拍内 50µs 处。 */
++OBS uint32_t g_trig_sel  = 0;      /* 0 = TIM2_UP(现状/交付), 1 = TIM2_CH4(方案②) */
++OBS uint32_t g_trig_ccr4 = 10000u; /* CC4 比较值 (仅 g_trig_sel=1 时生效) */
++
++/* ★★★ 2026-09-14: 实测推翻"七级触发链"之后, 必须回答的最后一个问题 ——
++ *   **MDMA 是"每拍被触发一次", 还是"自己不停地搬"?**
++ *
++ * 已实测的四个事实 (每一个都推翻了 do.c 里的注释):
++ *   ① `DMAMUX1_C8 = 0` + `DIER` 无任何 DMA 使能位        → 锁存照常工作
++ *   ② `DMA2_S0_CR` 的 EN 清零                            → 锁存照常工作
++ *   ③ `MDMA CTBR.TSEL` 扫遍 0..15                        → 锁存照常工作 (!!)
++ *   ④ `MDMA_CH0_CCR` 的 EN 清零                          → **锁存停** ⇒ 写入者确实是 MDMA
++ * ⇒ 结论: MDMA 不消费任何请求源; 它在**自己循环**(`CLAR` 指回自己)。
++ *
++ * 那么剩下的唯一区别是**节奏**: 每拍一次 vs 连续追踪。
++ * 判定方法 —— **一拍内写两次影子**:
++ *   ISR 开头写 `pat`, 再隔 `g_ppat2_cyc` 轮 NOP 后写 `pat ^ 1`。
++ *   · 若 MDMA **每拍只搬一次**(事件驱动): 一拍内 PE0 只有 **1 个边沿**(锁存到其中一个值);
++ *   · 若 MDMA **连续追踪影子**      : 一拍内 PE0 会出 **2 个边沿**, 间隔 ≈ 3·g_ppat2_cyc 周期。
++ *   ★ 这条判据的优势: 数**边沿个数**, 与量化/抖动无关 —— 形状判据, 不是幅度判据。 */
++OBS uint32_t g_ppat2_cyc = 0;      /* 0 = 关闭; >0 = 第二次写影子前的 NOP 轮数 */
++OBS uint32_t g_ppat2_mode = 0;     /* 0 = 延时后写影子; 1 = **只延时、不写** (判别用) */
++OBS uint32_t g_ppat_wr2_n = 0;     /* 第二次写的次数 (活性) */
++
++/** 按 g_trig_sel 重新绑定 DMAMUX1 的请求源 (写 DMAMUX1_C8)。
++ *
++ * ★★★ 2026-09-14 修正 (方案②第一次失效的真因, 见 regs.h 的 TIM_DIER_* 注释):
++ *   第一次实现**只改了 DMAMUX1 的请求号**, 漏了 **定时器侧的门控位** ——
++ *   定时器要产生某个 DMA 请求, 必须 `TIMx_DIER` 里对应的使能位为 1:
++ *     `UDE`(bit8)   → TIM2_UP 请求   (请求号 22)
++ *     `CC4DE`(bit12)→ TIM2_CH4 请求  (请求号 21)
++ *   而 `do.c:176` 只置了 UDE。⇒ 把 DMAMUX 改指 21 之后 **那个请求根本不会产生**,
++ *   MDMA 链停在"等一个永远不来的请求"上。表现就是本项目最熟的一类故障:
++ *   **寄存器写着我要的值, 寄存器也读得回来, 功能一动不动。**
++ * ★ 由此得到一条可复用的纪律:
++ *   一个"绑定关系"如果跨了两个寄存器 (路由 + 门控), 就必须**由同一个函数改**,
++ *   并且**改完立刻自证** —— 否则下次还会只改一半。
++ *   (对照本项目既有教训: "请求上限≠响应上限" 是**一个常量两用**;
++ *    这里是**一个语义两处存放**, 同族。)
++ */
++static void trig_source_apply(void)
++{
++    /* DMAMUX1_C8 = 0x40020820 (do.c 同址; 该宏是 do.c 私有的, 故此处用绝对地址)。 */
++    uint32_t dier = TIM_DIER(TIM2_BASE);
++
++    TIM_CCR4(TIM2_BASE) = g_trig_ccr4;      /* 锁存点在拍内的位置 */
++
++    if (g_trig_sel != 0u) {
++        *(volatile uint32_t *)0x40020820u = 21u;                       /* 路由 → TIM2_CH4 */
++        dier = (dier | TIM_DIER_CC4DE) & ~TIM_DIER_UDE;                /* 门控 → CC4DE 开, UDE 关 */
++    } else {
++        *(volatile uint32_t *)0x40020820u = 22u;                       /* 路由 → TIM2_UP */
++        dier = (dier | TIM_DIER_UDE) & ~TIM_DIER_CC4DE;                /* 门控 → UDE 开, CC4DE 关 */
++    }
++    TIM_DIER(TIM2_BASE) = dier;
++    __asm__ volatile("dsb; isb" ::: "memory");
++}
+ /* ★★ 为什么"写入是否生效"必须由固件自证、而不是用调试器读:
+  * pyocd 在 `connect_mode=halt` 下读 AHB4 外设寄存器会返回无意义常数
+  * (本项目实测: GPIOA/E 读回 0xABFFFFFF / 0xFFFFFFFF, RCC_AHB4ENR 读回 0),
+@@ -799,7 +870,20 @@ static void tick_timer_init(void)
+     nvic_enable_irq(IRQ_TIM2);                 /* ★ 一律走宏: 裸移位在 IRQ≥32 时静默失效 */
+ 
+     TIM_DIER(TIM2_BASE) = TIM_DIER_UIE;
++
++    /* ★★★ CC4 —— 方案②的"第二个时间锚点" (2026-09-14)。
++     *   把 CH4 配成**只产生内部 CC4 事件**(OC4M=冻结 ⇒ 不驱动任何引脚),
++     *   供 DMAMUX 用作 MDMA 锁存的触发源 ⇒ 可把锁存点从"拍边界"挪到拍内任意处。
++     *   ★ OC4M=000 时比较匹配不改变输出引脚, 但 **CC4 事件照常产生** ✓
++     *   ★ 不配 GPIO AF ⇒ 与 PA5(HIL 反馈 ADC)/PA3 无冲突。 */
++    TIM_CCMR2(TIM2_BASE) = TIM_CCMR2_OC4M_FROZEN;
++    TIM_CCR4(TIM2_BASE)  = g_trig_ccr4;
++    TIM_CCER(TIM2_BASE) |= TIM_CCER_CC4E;      /* 使能 CH4 比较 ⇒ 产生 CC4 事件 */
++
+     TIM_CR1(TIM2_BASE)  = TIM_CR1_CEN;
++
++    /* ★ 绑定 DMAMUX 请求源 (默认 TIM2_UP = 交付行为; 切 CC4 需运行期设置) */
++    trig_source_apply();
+ }
+ 
+ /* ══════════ L1 I-cache 使能 (实验用; 生产固件不用 —— 见下方说明) ══════════
+@@ -1120,6 +1204,23 @@ ISR_PLACE void TIM2_IRQHandler(void)
+             g_ppat_last = tp;
+             g_ppat_val  = pat;
+             g_ppat_wr_n++;
++
++            /* ★★★ 一拍内**第二次**写影子 (2026-09-14, 判定"每拍一次 vs 连续追踪")。
++             *   把 bit0 取反 ⇒ 若 MDMA 连续追踪影子, 这一拍 PE0 会**多出一个边沿**;
++             *   若 MDMA 每拍只搬一次, PE0 一拍仍只有 1 个边沿。
++             *   ★ 用纯 NOP 延时 (不碰总线 —— 读 DWT 会让"让路"变成"抢总线", 见下方教训)。 */
++            if (g_ppat2_cyc != 0u) {
++                uint32_t nn = g_ppat2_cyc;
++                while (nn-- != 0u) { __asm__ volatile("nop"); }
++                /* ★★ mode=1 = **只空转、不写** —— 用来判别"相位跟随"到底跟的是
++                 *   "影子写"还是"CPU 在 ISR 里走到哪"。这是本实验最关键的一刀:
++                 *   · 若 mode=1 相位**不动** ⇒ 跟随的是**写动作** (输出时刻由写入决定);
++                 *   · 若 mode=1 相位**也动** ⇒ 与写无关, 是 ISR 内部位置/总线效应。 */
++                if (g_ppat2_mode == 0u) {
++                    *(volatile uint32_t *)(g_shm + OFF_DO_SHADOW) = pat ^ 1u;
++                    g_ppat_wr2_n++;
++                }
++            }
+         }
+ 
+         if (g_pa9_enable && ++g_pa9_div >= 32u) {
+@@ -2131,6 +2232,7 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
+         g_ppat_wr_n = 0u; g_ppat_val = 0u; g_ppat_on = 1u;
+         g_ppat_b_short = 0u; g_ppat_b_low = 0u; g_ppat_b_ok = 0u;
+         g_ppat_b_high = 0u; g_ppat_b_long = 0u; g_ppat_first = 0u;
++        g_ppat_wr2_n = 0u;
+         /* ★★★ 2026-09-14 纠正 (原则性错误, 用户指出): 第一版这里**把 MDMA ch0 停了**,
+          *   理由是"它每拍把 ODR 覆盖成 0"。**那个处置是错的** ——
+          *   `SHADOW → GPIOE_ODR` 这条硬件锁存链路 (定时器触发 + MDMA 搬运)
+@@ -2167,6 +2269,25 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
+         ack(NULL, 0u);
+         return;
+     }
++    if (op == 5u) {
++        /* ★★ 方案②: 切换 MDMA 锁存的触发源 —— [op:u8][sel:u8][ccr4:u32 LE]
++         *   sel: 0 = TIM2_UP(拍边界, 交付行为) / 1 = TIM2_CH4(拍内任意处)
++         *   ccr4: 比较值 (TIM2CLK=200MHz ⇒ 1 tick=5ns; 10000 tick = 50µs)
++         *   目的: 把表 B(MDMA 链) 整段移出拍边界 ⇒ 与表 A(CPU) 分离。
++         * ★★★ 2026-09-14: 真正干活的在 `trig_source_apply()` —— 它必须**同时**改
++         *   `DMAMUX1_C8`(路由) **和** `TIM2_DIER` 的 `UDE`/`CC4DE`(门控)。
++         *   第一版只改了路由 ⇒ 请求源不存在 ⇒ 静默失效 (详见该函数的注释)。
++         * ★ 切完务必用 `op=6` 自证, **不要**只看本命令返回 ACK ——
++         *   ACK 只说明"参数收到了", 不说明"绑定生效了"。 */
++        g_trig_sel  = (n >= 2u && p[1] != 0u) ? 1u : 0u;
++        if (n >= 6u) {
++            g_trig_ccr4 = (uint32_t)(p[2] | ((uint32_t)p[3] << 8)
++                                   | ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24));
++        }
++        trig_source_apply();
++        ack(NULL, 0u);
++        return;
++    }
+     if (op == 2u) {
+         uint8_t r[64];
+         put32(r +  0, g_ppat_on);
+@@ -2199,6 +2320,240 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
+         ack(r, 64u);
+         return;
+     }
++    if (op == 6u) {
++        /* ★★★ 触发链自证块 (2026-09-14, 方案②修正后新增) —— 32 字节, 8 个 word。
++         *
++         * 为什么必须有它 (而不是用调试器读):
++         *   ① pyocd 在 `connect_mode=halt` 下读 AHB1/AHB4 外设寄存器返回无意义常数
++         *      (本项目实测 0xABFFFFFF), 而且 `-c reset` 会复位板子破坏运行态;
++         *   ② 更根本的: 方案②第一次失效时, **"我写过了"和"它生效了"之间没有任何
++         *      观测面** —— 我只能从 LA 波形**反推**"锁存还在拍边界 ⇒ 没切成功",
++         *      绕了一大圈。凡是"写进去就不再看一眼"的量, 都必须补自证。
++         *
++         * ★ 判据 (逐项都能失败):
++         *   [0] DMAMUX1_C8 实读: sel=0 应=22, sel=1 应=21  ← 路由对不对
++         *   [4] TIM2_DIER  实读: 应含 UDE(0x100) 或 CC4DE(0x1000), **不能都没有**
++         *   [8] TIM2_SR    实读: bit4(CC4IF, 0x10) 置位 ⇒ **CC4 事件真的产生过**
++         *                        (FROZEN 模式下 CC4IF 是否照常置位 = 本实验要裁决的)
++         *   [12] TIM2_CCER: bit12(CC4E) 应为 1
++         *   [16] g_trig_sel / [20] g_trig_ccr4 —— 软件侧意图
++         *   [24] DMA2_S0_CR: bit0(EN) 应为 1 ⇒ 桥还在跑
++         *   [28] MDMA_CH0_CCR: bit0(EN) 应为 1 ⇒ 影子锁存还在 (★ 绝不能是 0) */
++        uint8_t r[32];
++        put32(r +  0, *(volatile uint32_t *)0x40020820u);   /* DMAMUX1_C8 */
++        put32(r +  4, TIM_DIER(TIM2_BASE));
++        put32(r +  8, TIM_SR(TIM2_BASE));
++        put32(r + 12, TIM_CCER(TIM2_BASE));
++        put32(r + 16, g_trig_sel);
++        put32(r + 20, g_trig_ccr4);
++        put32(r + 24, *(volatile uint32_t *)0x40020410u);   /* DMA2_S0_CR */
++        put32(r + 28, *(volatile uint32_t *)0x5200004Cu);   /* MDMA_CH0_CCR */
++        ack(r, 32u);
++        return;
++    }
++    if (op == 7u) {
++        /* ★★★ 重新校时 (2026-09-14): 把 DWT_CYCCNT 重新拉起来 + 清零引脚码型统计。
++         *
++         * 为什么必须有这个命令 (这不是"以防万一", 是**必然会发生**的事故):
++         *   本项目早就记录过这条陷阱 —— 见 `src/modbus.c:79` 与 `src/faultlog.h:75`:
++         *     "调试器(pyocd)会话会**静默停掉** DWT_CYCCNT"
++         *   机制: pyocd 退出时调试域断电 ⇒ DWT 寄存器复位 ⇒ `DWT_CTRL.CYCCNTENA` 被清。
++         *   而固件的 `dwt_enable()` 早在启动时跑过了 ⇒ **之后没有任何人再打开它**。
++         *
++         * ★ 本次实测后果 (2026-09-14 抓到): 烧录后 `g_ppat_wr_n` 一路涨到 101 万,
++         *   而 `g_ppat_min/max/last/first` **全是 0**、五个分档计数**全是 0**。
++         *   我一开始以为是统计代码写错了 —— 其实代码没问题:
++         *   `if (g_ppat_prev != 0u)` 这个门**永远进不去**, 因为 `tp = DWT_CYCCNT` 恒为 0。
++         *   ⇒ 这是教科书级的**空判据**: "b_long == 0" 这类判据会**永远通过**,
++         *     看起来像"这条路径很干净", 实际是"从没被走到"。
++         *
++         * ⇒ 所以判据里必须有**"时钟在走"本身**这一条: 连读两次 CYCCNT, 中间空转,
++         *   两次相等 ⇒ 直接判定本次统计无效 (而不是报"无异常")。
++         * ★ 返回 32 字节, 让这个判定发生在**上位机**, 而不是"我相信固件"。 */
++        dwt_enable();                       /* 重新解锁 + TRCENA + 清零 + CYCCNTENA */
++        g_ppat_min  = 0xFFFFFFFFu; g_ppat_max = 0u; g_ppat_prev = 0u;
++        g_ppat_wr_n = 0u; g_ppat_val = 0u; g_ppat_last = 0u; g_ppat_first = 0u;
++        g_ppat_b_short = 0u; g_ppat_b_low = 0u; g_ppat_b_ok = 0u;
++        g_ppat_b_high = 0u; g_ppat_b_long = 0u;
++        g_ppat_wr2_n = 0u;
++        __asm__ volatile("dsb; isb" ::: "memory");
++
++        uint8_t r[32];
++        uint32_t c1 = DWT_CYCCNT;
++        for (volatile uint32_t i = 0; i < 200u; i++) { __asm__ volatile("nop"); }
++        uint32_t c2 = DWT_CYCCNT;
++        put32(r +  0, DWT_CTRL);
++        put32(r +  4, DEMCR);
++        put32(r +  8, c1);
++        put32(r + 12, c2);
++        put32(r + 16, c2 - c1);                 /* ★ 0 ⇒ 时钟没在走 (统计无效) */
++        put32(r + 20, (c2 != c1) ? 1u : 0u);    /* ★ 唯一权威的"时基活着"判据 */
++        put32(r + 24, 0u);
++        put32(r + 28, 0u);
++        ack(r, 32u);
++        return;
++    }
++    if (op == 8u) {
++        /* ★★★ 原始触发链注入 (2026-09-14, 定位用): [op:u8][req:u8][dier:u32 LE]
++         *
++         * 起因 —— 一个**自证通过却行为不符**的矛盾:
++         *   `op=5 sel=1` 之后 `op=6` 读回 `DMAMUX1_C8=21` + `DIER=CC4DE`(UDE 已清) +
++         *   `CC4IF=1`, 全部都"对"; 但 LA 测到 PE0 边沿相对 PA8 的相位**仍是 +0.12µs**
++         *   —— 若锁存真移到拍内 50µs, 这个相位必须变成 ±50µs (一个纯**形状判据**)。
++         *   ⇒ 说明**我以为的绑定关系不是真实的绑定关系**。
++         *
++         * 这个命令把"请求号"与"DIER"变成两个**独立可注入**的量, 用来做二分:
++         *   req=0  ⇒ 若锁存**停了** ⇒ 0x40020820 确实是这条链的触发入口;
++         *            若锁存**照旧** ⇒ 这条链根本不由该寄存器驱动, 我找错门了。
++         *   req=22 + DIER=UIE|UDE   ⇒ 应恢复交付行为 (拍边界锁存)
++         *   req=21 + DIER=UIE|CC4DE ⇒ 若仍不动 ⇒ 21 不是 TIM2_CH4 的请求号
++         *
++         * ★ 纪律: 这是**诊断口**, 只在实验期用; 它能把触发链**写坏**, 所以
++         *   每次用完必须回到 req=22 + UDE (即 `op=5 sel=0`)。 */
++        if (n >= 2u) {
++            *(volatile uint32_t *)0x40020820u = (uint32_t)p[1];
++        }
++        if (n >= 6u) {
++            TIM_DIER(TIM2_BASE) = (uint32_t)(p[2] | ((uint32_t)p[3] << 8)
++                                           | ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24));
++        }
++        __asm__ volatile("dsb; isb" ::: "memory");
++        ack(NULL, 0u);
++        return;
++    }
++    if (op == 9u) {
++        /* ★★★ 桥/锁存寄存器透视 (2026-09-14): [op:u8][dma2s0_cr:u32 LE]
++         *
++         * 起因: `op=8` 的二分给出一个**推翻既有认知**的结果 ——
++         *   `DMAMUX1_C8 = 0`(连请求源都没有) + `DIER = UIE`(UDE/CC4DE 全清) 时,
++         *   MDMA 锁存**照样每拍工作**(ODR 仍跟着影子走)。
++         * ⇒ `do.c` 里那段"七级触发链"的注释至少有一半不是真的:
++         *   **MDMA 不是被 DMA2_S0 的 TC 驱动的**(或 DMA2_S0 根本不靠 DMAMUX 请求)。
++         *
++         * 本命令把"桥"的开关交给上位机, 用来做**唯一的判定**:
++         *   把 `DMA2_S0_CR` 的 EN(bit0) 清掉 ⇒ 若锁存**停了** ⇒ 链确实过 DMA2_S0;
++         *                                  若锁存**照旧** ⇒ 桥是装饰, 真凶在别处。
++         * ★ 返回 48 字节, 把整条链的**现场**一次摊开 (含 MDMA 的 CTCR/CTBR/CLAR,
++         *   用来核对"触发模式"到底被配成了什么)。 */
++        if (n >= 5u) {
++            *(volatile uint32_t *)0x40020410u = (uint32_t)(p[1] | ((uint32_t)p[2] << 8)
++                                                         | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24));
++            __asm__ volatile("dsb; isb" ::: "memory");
++        }
++        uint8_t r[48];
++        put32(r +  0, *(volatile uint32_t *)0x40020410u);   /* DMA2_S0_CR  */
++        put32(r +  4, *(volatile uint32_t *)0x40020414u);   /* DMA2_S0_NDTR */
++        put32(r +  8, *(volatile uint32_t *)0x5200004Cu);   /* MDMA_CH0_CCR */
++        put32(r + 12, *(volatile uint32_t *)0x52000040u);   /* MDMA_CH0_CISR */
++        put32(r + 16, *(volatile uint32_t *)0x52000054u);   /* MDMA_CH0_CBNDTR */
++        put32(r + 20, *(volatile uint32_t *)0x52000050u);   /* MDMA_CH0_CTCR */
++        put32(r + 24, *(volatile uint32_t *)0x52000068u);   /* MDMA_CH0_CTBR */
++        put32(r + 28, *(volatile uint32_t *)0x52000058u);   /* MDMA_CH0_CSAR */
++        put32(r + 32, *(volatile uint32_t *)0x5200005Cu);   /* MDMA_CH0_CDAR */
++        put32(r + 36, *(volatile uint32_t *)0x52000064u);   /* MDMA_CH0_CLAR */
++        put32(r + 40, *(volatile uint32_t *)0x40020820u);   /* DMAMUX1_C8 */
++        put32(r + 44, *(volatile uint32_t *)0x40020400u);   /* DMA2_LISR */
++        ack(r, 48u);
++        return;
++    }
++    if (op == 10u) {
++        /* ★★★ 触发源判定 (2026-09-14): [op:u8][idx:u8][val:u32 LE]
++         *
++         * 到这一步已经实测到的两个事实 (都推翻了既有注释):
++         *   ① `DMAMUX1_C8 = 0` + `DIER` 无 DMA 使能位 → 锁存**照常工作**
++         *   ② `DMA2_S0_CR` 的 EN 清零       → 锁存**照常工作**
++         * 而现场读回的 `DMA2_LISR = 0x20` ⇒ **DMA2 Stream0 的 TCIF0 标志置着,
++         * 且从来没有人清它** (TCIE 开了但没有中断处理, 标志就悬在那里)。
++         *
++         * ⇒ 现在的假设: MDMA 的 `CTBR.TSEL = 8`(=DMA2_S0_TC) 取的是这个**标志电平**,
++         *   而不是"一次 TC 脉冲"。电平永久为高 ⇒ **MDMA 请求被永久拉高 ⇒ 自由跑**。
++         *   若成立, 则: PE0 的边沿 = "影子写入时刻 + 自由跑相位的随机延迟"
++         *   —— 这正好解释了 PE0 σ(60~68ns) 远大于 PA8 σ(26~32ns)。
++         *
++         * 判定: 清掉那个标志 (`DMA2_LIFCR` 写 0x3D) ⇒
++         *   · 锁存**停了**  ⇒ 假设成立, 真凶找到了;
++         *   · 锁存**照旧**  ⇒ 假设推翻, 继续找。
++         *
++         * idx: 0=DMA2_LIFCR(清标志) 1=MDMA_CH0_CCR 2=MDMA_CH0_CTBR 3=MDMA_CH0_CIFCR
++         * ★ 返回 32 字节现场。 */
++        if (n >= 6u) {
++            uint32_t v = (uint32_t)(p[2] | ((uint32_t)p[3] << 8)
++                                  | ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24));
++            uint32_t addr = 0u;
++            switch (p[1]) {
++            case 0u: addr = 0x40020408u; break;   /* DMA2_LIFCR */
++            case 1u: addr = 0x5200004Cu; break;   /* MDMA_CH0_CCR */
++            case 2u: addr = 0x52000068u; break;   /* MDMA_CH0_CTBR */
++            case 3u: addr = 0x52000044u; break;   /* MDMA_CH0_CIFCR */
++            /* ★ 2026-09-14: 为了判定"MDMA 为什么不等请求", 开放 CTCR/CBNDTR/CLAR。
++             *   ★★ 纪律: MDMA 的 CTCR/CTBR/CBNDTR/CSAR/CDAR/CLAR **只在 EN=0 时可写**
++             *      —— 必须先 `idx=1 val=0` 关通道, 改完再 `idx=1 val=1` 打开。
++             *      否则写入被静默忽略 (本项目的"写进去了但没生效"同族陷阱)。 */
++            case 4u: addr = 0x52000050u; break;   /* MDMA_CH0_CTCR */
++            case 5u: addr = 0x52000054u; break;   /* MDMA_CH0_CBNDTR */
++            case 6u: addr = 0x52000064u; break;   /* MDMA_CH0_CLAR */
++            default: break;
++            }
++            if (addr != 0u) {
++                *(volatile uint32_t *)addr = v;
++                __asm__ volatile("dsb; isb" ::: "memory");
++            }
++        }
++        uint8_t r[32];
++        put32(r +  0, *(volatile uint32_t *)0x40020400u);   /* DMA2_LISR (标志现场) */
++        put32(r +  4, *(volatile uint32_t *)0x40020410u);   /* DMA2_S0_CR */
++        put32(r +  8, *(volatile uint32_t *)0x5200004Cu);   /* MDMA_CH0_CCR  */
++        put32(r + 12, *(volatile uint32_t *)0x52000068u);   /* MDMA_CH0_CTBR */
++        put32(r + 16, *(volatile uint32_t *)0x52000050u);   /* MDMA_CH0_CTCR */
++        put32(r + 20, *(volatile uint32_t *)0x52000040u);   /* MDMA_CH0_CISR */
++        put32(r + 24, GPIO_ODR(DO_GPIO_PORT) & 0xFFu);      /* 锁存结果 */
++        put32(r + 28, g_ppat_val);                          /* 影子值 */
++        ack(r, 32u);
++        return;
++    }
++    if (op == 11u) {
++        /* ★★★ 一拍双写 (2026-09-14): [op:u8][cyc:u32 LE][mode:u8]
++         *   设定 ISR 内"第二次写影子"之前的 NOP 轮数 (0 = 关闭)。
++         *   用途: 数 PE0 一拍的边沿个数 ⇒ 区分"MDMA 每拍搬一次"与"连续追踪影子"。
++         *   mode: 0 = 延时后写 `pat^1`;  1 = **只延时、不写** (判别"相位跟随的是写还是位置")
++         *   ★ 轮数换算: 每轮 ≈ 3.8 ns @400MHz (实测)。1600 轮 ≈ 6.3 µs。 */
++        g_ppat2_cyc = (n >= 5u)
++            ? (uint32_t)(p[1] | ((uint32_t)p[2] << 8) | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24))
++            : 0u;
++        g_ppat2_mode = (n >= 6u) ? ((p[5] != 0u) ? 1u : 0u) : 0u;
++        g_ppat_wr2_n = 0u;
++        ack(NULL, 0u);
++        return;
++    }
++    if (op == 13u) {
++        /* ★★★ TC 速率测量 (2026-09-14): [op:u8][cyc:u32 LE]
++         *
++         * 到这一步, 已排除了"相位跟随由 ISR 位置或总线争抢引起"(纯 NOP 对照不动),
++         * 所以**锁存时刻确实跟"影子写"绑定**。剩下的唯一问题是:
++         *   DMA2_S0 的 TC (MDMA 的请求源) 到底是 **每拍一次** 还是 **自由跑**?
++         *   · 每拍一次 ⇒ 需要一个"每拍但被写动作门控"的机制解释;
++         *   · 自由跑   ⇒ 直接解释一切 (但会预测"双写应有 2 个边沿", 与实测 1 个矛盾)。
++         * ⇒ 直接量它: 清 DMA2_LIFCR 的 S0 全部标志, 纯 NOP 空转 cyc 轮, 立刻读回 LISR。
++         *   扫 cyc 找到"标志重新出现"的最小延迟 = TC 周期。
++         * ★ 返回 16 字节: [LISR, 实测DWT周期数, CR, MDMA_CISR] */
++        *(volatile uint32_t *)0x40020408u = 0x3Du;   /* 清 DMA2_S0 全部标志 */
++        __asm__ volatile("dsb; isb" ::: "memory");
++        uint32_t c0 = DWT_CYCCNT;
++        if (n >= 5u) {
++            uint32_t nn = (uint32_t)(p[1] | ((uint32_t)p[2] << 8)
++                                   | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24));
++            while (nn-- != 0u) { __asm__ volatile("nop"); }
++        }
++        uint32_t lisr = *(volatile uint32_t *)0x40020400u;
++        uint32_t c1 = DWT_CYCCNT;
++        uint8_t r[16];
++        put32(r +  0, lisr);
++        put32(r +  4, c1 - c0);
++        put32(r +  8, *(volatile uint32_t *)0x40020410u);
++        put32(r + 12, *(volatile uint32_t *)0x52000040u);   /* MDMA_CH0_CISR */
++        ack(r, 16u);
++        return;
++    }
+     nak("bad pin pattern op");
+ }
+ 
+@@ -3309,6 +3664,12 @@ int main(void)
+      *   **第一次被真正清零** (之前它只有计数、没有动作 —— 定案②的欠账在此收清)。 */
+     g_stage = 26; do_init(g_shm);
+     do_latch_init();                    /* ★ P3-B: 影子 + MDMA 定时锁存链 (须在 do_init 后) */
++    /* ★★★ 必须在 do_latch_init() **之后**再绑一次触发源 —— do.c 内部把 `DMAMUX1_C8`
++     *   硬编码成 `TIM2_UP(22)`, 会覆盖 `tick_timer_init()` 里第一次绑定的值
++     *   (而 `tick_timer_init()` 早在 3270 行就跑完了)。
++     *   ★ 这是"两处写同一寄存器"的次序陷阱 —— 与本项目其它同类教训同族:
++     *     凡"我也写、别人也写"的量, 必须确认**最后一次写是谁**。 */
++    trig_source_apply();
+     rtc_init(g_shm);                     /* ★ RTC: LSE 32.768kHz 时基 + 事件时间戳 */
+     bb_init(g_shm);                      /* ★ 黑匣子: MDMA ch1 每拍 256B 快照 → AXI 环形缓冲 */
+     /* ★ SD 卡 (2026-09-12): 初始化 + 把黑匣子缓冲写到卡上。
+diff --git a/src/regs.h b/src/regs.h
+index 5c999e7..5449407 100644
+--- a/src/regs.h
++++ b/src/regs.h
+@@ -245,6 +245,18 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
+ 
+ #define TIM_CR1_CEN     (1u << 0)
+ #define TIM_DIER_UIE    (1u << 0)
++/* ★★★ DIER 里的 **DMA 请求使能位** —— 定时器的每个 DMA 请求都被它们单独门控。
++ *   ★ 2026-09-14 踩坑 (方案②第一次失效的真因):
++ *     只把 `DMAMUX1_C8` 从 22(TIM2_UP) 改到 21(TIM2_CH4) **不够** ——
++ *     定时器产生 DMA 请求的前提是对应 DIER 位为 1:
++ *       UDE(bit8)   ⇒ 允许"更新事件"发 DMA 请求  (TIM2_UP = 请求号 22)
++ *       CC1DE(9) CC2DE(10) CC3DE(11) **CC4DE(12)** ⇒ 允许 CCx 事件发 DMA 请求
++ *     而 `do.c` 只置了 `UDE` ⇒ 切到 CC4 后 **请求源根本不会产生**,
++ *     表现是"配置全对、寄存器全绿、功能不动" (本项目第四次同族故障)。
++ *   ★ 修正: `trig_source_apply()` 必须**同时**改 DMAMUX 请求号**和** DIER 门控位,
++ *     两者是"同一个绑定"的两半, 分开改就是半配置。 */
++#define TIM_DIER_UDE    (1u << 8)   /* 更新事件 DMA 请求使能 (TIM2_UP) */
++#define TIM_DIER_CC4DE  (1u << 12)  /* CC4 事件 DMA 请求使能 (TIM2_CH4) */
+ #define TIM_SR_UIF      (1u << 0)
+ #define TIM_EGR_UG      (1u << 0)   /* 立即产生更新事件 (把 PSC 立刻装载) */
+ 
+@@ -302,11 +314,18 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
+ 
+ #define TIM3_BASE_ADDR     0x40000400UL
+ #define TIM_CCMR1(t)       REG32((t) + 0x18)
++#define TIM_CCMR2(t)       REG32((t) + 0x1Cu)   /* ★ CH3/CH4 模式 (2026-09-14, 为 CC4 触发源加) */
+ #define TIM_CCER(t)        REG32((t) + 0x20)
+ #define TIM_CCR1(t)        REG32((t) + 0x34)
++#define TIM_CCR4(t)        REG32((t) + 0x40u)   /* ★ CH4 比较值 —— 决定锁存点在拍内的位置 */
+ #define TIM_CCMR1_OC1M_SHIFT 4u
+ #define TIM_CCMR1_OC1PE    (1u << 3)
+ #define TIM_CCER_CC1E      (1u << 0)
++#define TIM_CCER_CC4E      (1u << 12)           /* ★ CH4 使能 (产生 CC4 事件, 供 DMAMUX 用) */
++/* ★ 把 CC4 配成"比较匹配即产生事件"的最小集合:
++ *   CCMR2.OC4M=000 (冻结/无引脚作用) + CCER.CC4E=1 ⇒ 只产生**内部 CC4 事件**,
++ *   不驱动任何引脚 ⇒ 不会与 PA5(HIL 反馈)/PA3 冲突。 */
++#define TIM_CCMR2_OC4M_FROZEN  (0u << 12)       /* OC4M[2:0] 位于 CCMR2 的 bit14:12 */
+ #define TIM_CR1_ARPE       (1u << 7)
+ 
+ /* ───────────────────────── USART1 (D2/APB2, 0x40011000) ─────────────────────────
