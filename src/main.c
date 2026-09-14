@@ -1068,15 +1068,23 @@ ISR_PLACE void TIM2_IRQHandler(void)
         g_tick_count++;
 
         /* ---- ★ 引脚码型诊断 (三方对照实验) ----
-         * 在**拍 ISR 内**把递增码型写到 PE0..PE6, 并记下"写之后"的 DWT 时刻。
-         * ★ BSRR 单次 32 位写 (低 16 = 置位, 高 16 = 清零) ⇒ 7 位同时更新,
-         *   不存在"读-改-写"的中间态 (与 do.c 同一手法)。
-         * ★ 位置: 紧跟 PA8 翻转之后 ⇒ 与拍边界的关系固定, 便于 LA 对照两路。 */
+         * ★★★ 正确姿势 (2026-09-14 纠正): **写 SHADOW_GPIO, 让 MDMA 照常搬运**。
+         *
+         * 第一版我直接写 `GPIO_BSRR(4u)`, 结果是错的 —— 那等于把
+         * **"计算与输出解耦"这条核心设计原则关掉了**:
+         *   DCL 的灵魂就是 `ISR 算完只把结果写进影子缓冲(无 timing 要求)`
+         *   → `硬件定时器触发 MDMA` → `DMA 在拍边界把影子缓冲锁存进 GPIOE_ODR`。
+         *   绕过它直接写 BSRR, 测到的就是"被拆掉的架构", 数据没有意义。
+         *
+         * ⇒ 现在只写影子 + 记下"写影子的时刻"。**引脚的真实输出时刻由硬件锁存决定**,
+         *   它比软件写时刻更稳 —— 这正是本实验要用"固件 vs LA"两路去量出来的东西。 */
         if (g_ppat_on) {
             uint32_t pat  = g_tick_count & 0x7Fu;              /* 0..127 循环 */
-            uint32_t bset = pat & 0x7Fu;                       /* PE0..PE6 */
-            GPIO_BSRR(4u) = bset | ((0x7Fu & ~bset) << 16);
-            uint32_t tp = DWT_CYCCNT;                          /* ★ 写之后的时刻 */
+            /* 只写影子缓冲 —— MDMA 会在下一个拍边界把它锁存到 GPIOE_ODR。
+             * ★ 同时写 SEQ, 便于事后核对"哪个电平对应哪一拍"(do.c 的既有诊断约定)。 */
+            *(volatile uint32_t *)(g_shm + OFF_DO_SHADOW)     = pat;
+            *(volatile uint32_t *)(g_shm + OFF_DO_SHADOW_SEQ) = g_tick_count;
+            uint32_t tp = DWT_CYCCNT;                          /* ★ 写影子之后 (软件侧) */
             if (g_ppat_prev != 0u) {
                 uint32_t d = tp - g_ppat_prev;
                 if (d < g_ppat_min) g_ppat_min = d;
@@ -1084,7 +1092,7 @@ ISR_PLACE void TIM2_IRQHandler(void)
                 /* ★★ 分档 (持久测试用): 正常拍长 40000 cyc。
                  * ★ 2026-09-14 收紧: 原来的正常带 ±100cyc(±250ns) 太粗 ——
                  *   它能报出"极差 175ns", 却**看不出典型值有多集中**。
-                 *   极差 ≠ 典型抖动: 81.7 万个样本里只要有 2~3 个偏离, 极差就成了那个数。
+                 *   极差 ≠ 典型抖动: 62 万个样本里只要有 2~3 个偏离, 极差就成了那个数。
                  *   现收紧到 ±10cyc(±25ns), 并保留 ±40cyc(±100ns) 档, 用来区分
                  *   "**典型抖动**"与"**偶发极值**"这两件完全不同的事。 */
                 if (d < 39960u)       g_ppat_b_short++;   /* < -100ns */
@@ -2078,19 +2086,20 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         g_ppat_wr_n = 0u; g_ppat_val = 0u; g_ppat_on = 1u;
         g_ppat_b_short = 0u; g_ppat_b_low = 0u; g_ppat_b_ok = 0u;
         g_ppat_b_high = 0u; g_ppat_b_long = 0u; g_ppat_first = 0u;
-        /* ★★★ 必须**停掉 DO 的影子锁存 (MDMA ch0)** —— 否则本诊断的输出会被它清掉。
-         *   机制 (2026-09-14 实测定位, 链条完整):
-         *     `do_latch_init()` 把 MDMA ch0 配成 "SHM 的 OFF_DO_SHADOW → GPIOE_ODR",
-         *     触发源 = DMA2_S0_TC ⇒ **每拍**搬一次。而 GPIO_MASK=0 时 `do_poll` 早退、
-         *     从不更新 shadow ⇒ shadow 恒 0 ⇒ **每拍把 GPIOE_ODR 覆盖成 0**。
-         *   ⇒ 症状: 本诊断写的码型在下一个拍边界被抹平, 引脚上只剩极窄脉冲
-         *     (LA 侧看到"疑似噪声的随机跳变", 实为写-清竞态)。
-         *   ★ 这是"两个写者写同一个寄存器"的典型 —— 与 do.h 文件头警告的
-         *     "macro 不要写 PE" 同族, 只是这次的第二个写者藏得更深 (在 MDMA 里)。 */
-        /* ★ MDMA ch0 的 CCR —— 与 do.c 的 `MDMA_CH0_CCR` **同址**
-         *   (do.c: `MDMA_BASE 0x52000000 + 0x4C`; 该宏是 do.c 私有的, 故此处用绝对地址)。
-         *   ★ 停它的理由见下方长注释: 它每拍把 ODR 覆盖成 shadow 的值。 */
-        *(volatile uint32_t *)0x5200004Cu = 0u;
+        /* ★★★ 2026-09-14 纠正 (原则性错误, 用户指出): 第一版这里**把 MDMA ch0 停了**,
+         *   理由是"它每拍把 ODR 覆盖成 0"。**那个处置是错的** ——
+         *   `SHADOW → GPIOE_ODR` 这条硬件锁存链路 (定时器触发 + MDMA 搬运)
+         *   **正是本项目的核心设计**: 它把"计算"与"输出"解耦, 引脚输出时刻由硬件
+         *   决定而不是 CPU。**把它停掉 = 先把被测对象拆掉再测它, 数据没有意义。**
+         *
+         *   真正的问题只是"**影子缓冲是空的**":
+         *     `GPIO_MASK=0` 时 `do_poll` 早退 ⇒ 从不写 shadow ⇒ MDMA 每拍搬 0
+         *     ⇒ 引脚上是 0, 与本诊断写不进 BSRR 无关。
+         *   ⇒ **正确修法: 让 shadow 有值**(本诊断自己写 shadow, 见 ISR 段),
+         *      **而不是停 MDMA。**
+         *
+         *   所以这里改为**确保 MDMA 使能** (EN=1), 保证测的是**交付配置**。 */
+        *(volatile uint32_t *)0x5200004Cu = 1u;   /* MDMA_CH0_CCR: EN=1 (恢复影子锁存) */
         __asm__ volatile("dsb; isb" ::: "memory");
         ack(NULL, 0u);
         return;
