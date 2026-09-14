@@ -661,6 +661,35 @@ OBS uint32_t g_per_cyc_last = 0;
 OBS uint32_t g_per_cyc_min  = 0xFFFFFFFFu;
 OBS uint32_t g_per_cyc_max  = 0;
 OBS uint32_t g_per_prev     = 0;
+
+/* ══════════ ★ 引脚码型诊断 (DCL 抖动三方对照实验用) ══════════
+ * 目的: 让板子在**拍 ISR 内**往 PE0..PE6 输出一个递增码型(0..127 循环),
+ *       同时记录"写 GPIO 那一刻"的 DWT_CYCCNT。
+ *
+ * 为什么必须在 ISR 里写 (而不是复用主循环的 do_poll):
+ *   本实验要测的是"**引脚变化的时刻**"的确定性。若输出由主循环驱动,
+ *   变化时刻就由主循环调度决定 —— 测到的是调度抖动, 不是拍的确定性。
+ *
+ * ★ 与 do.c 的管辖冲突: do.c 每轮按 ACTUATOR[] 写 PE0..PE15。
+ *   诊断模式开启时**必须让 do 面让出 PE0..PE6** (把 GPIO_MASK 置 0),
+ *   否则两边互相覆盖, 引脚上是"谁后写谁赢"的竞态, 测出来毫无意义。
+ *
+ * ★ 观测口径: g_ppat_min/max 是**相邻两次"写 BSRR 之后读 DWT"的差值**,
+ *   量的是"软件写引脚的时刻"间隔 —— 与 LA 测到的**引脚真实边沿**是两回事,
+ *   两者之差 = 从寄存器写入到引脚翻转的延迟 (本次实验想首次量化的量)。 */
+OBS uint32_t g_ppat_on   = 0;              /* 1 = 诊断码型模式开 */
+OBS uint32_t g_ppat_wr_n = 0;              /* 本模式开启后写的次数 */
+OBS uint32_t g_ppat_min  = 0xFFFFFFFFu;    /* 相邻写时刻间隔 min (cyc) */
+OBS uint32_t g_ppat_max  = 0;              /* max */
+OBS uint32_t g_ppat_prev = 0;              /* 上一拍写时刻 (DWT) */
+OBS uint32_t g_ppat_last = 0;              /* 最近一次写时刻 */
+OBS uint32_t g_ppat_val  = 0;              /* 最近写出的码型 (0..127) */
+/* ★★ 为什么"写入是否生效"必须由固件自证、而不是用调试器读:
+ * pyocd 在 `connect_mode=halt` 下读 AHB4 外设寄存器会返回无意义常数
+ * (本项目实测: GPIOA/E 读回 0xABFFFFFF / 0xFFFFFFFF, RCC_AHB4ENR 读回 0),
+ * 而加 `-c reset` 又会复位板子破坏运行态。
+ * ⇒ 自证放在 `0x39 op=2` 应答尾部: 被问时**当场读** ODR/MODER/RCC,
+ *   不进 ISR ⇒ 不给被测对象加成本 (铁律 0: 观测不得改变被测对象)。 */
 OBS uint32_t g_per_glitch_n = 0;   /* 时钟不连续 (CYCCNT 回绕/被清零) 导致的无效样本数 */
 
 /* ── 阶段 3.2: deploy / 热重载 观测量 ──
@@ -1026,6 +1055,27 @@ ISR_PLACE void TIM2_IRQHandler(void)
         if (g_tick_count & 1u) pin_set(TICK_PORT, TICK_BIT, 1);
         else                   pin_set(TICK_PORT, TICK_BIT, 0);
         g_tick_count++;
+
+        /* ---- ★ 引脚码型诊断 (三方对照实验) ----
+         * 在**拍 ISR 内**把递增码型写到 PE0..PE6, 并记下"写之后"的 DWT 时刻。
+         * ★ BSRR 单次 32 位写 (低 16 = 置位, 高 16 = 清零) ⇒ 7 位同时更新,
+         *   不存在"读-改-写"的中间态 (与 do.c 同一手法)。
+         * ★ 位置: 紧跟 PA8 翻转之后 ⇒ 与拍边界的关系固定, 便于 LA 对照两路。 */
+        if (g_ppat_on) {
+            uint32_t pat  = g_tick_count & 0x7Fu;              /* 0..127 循环 */
+            uint32_t bset = pat & 0x7Fu;                       /* PE0..PE6 */
+            GPIO_BSRR(4u) = bset | ((0x7Fu & ~bset) << 16);
+            uint32_t tp = DWT_CYCCNT;                          /* ★ 写之后的时刻 */
+            if (g_ppat_prev != 0u) {
+                uint32_t d = tp - g_ppat_prev;
+                if (d < g_ppat_min) g_ppat_min = d;
+                if (d > g_ppat_max) g_ppat_max = d;
+            }
+            g_ppat_prev = tp;
+            g_ppat_last = tp;
+            g_ppat_val  = pat;
+            g_ppat_wr_n++;
+        }
 
         if (g_pa9_enable && ++g_pa9_div >= 32u) {
             g_pa9_div = 0;
@@ -1990,6 +2040,64 @@ static void h_adc_scan(const uint8_t *p, uint32_t n)
  *   所以这里**按需打包**, 而不是让 ISR 每拍去维护第二份 SHM 计时块。
  *   理由: 每拍多写 8~10 个 SHM 字段会给 ISR 加成本, 而 ISR 成本是阶段 1/2
  *   基线的一部分, 不该为一个"被轮询才需要"的视图付每拍的代价。 */
+/* 0x39 PIN_PATTERN — 引脚码型诊断（抖动三方对照实验用）
+ * 载荷 [op:u8]: 0=关 / 1=开(并清统计) / 2=读回统计
+ * op=2 应答 24B: on, wr_n, min, max, last, val（各 u32 LE）
+ * ★ 口径: min/max 是**相邻两次"写 BSRR 之后读 DWT"的差值** —— 量的是
+ *   "软件写引脚的时刻"间隔；与 LA 测到的**引脚真实边沿**是两回事，两者之差
+ *   = 从寄存器写入到引脚翻转的延迟（本次实验要首次量化的量）。 */
+static void h_pin_pattern(const uint8_t *p, uint32_t n)
+{
+    uint32_t op = (n >= 1u) ? p[0] : 0u;
+    if (op == 1u) {
+        g_ppat_min  = 0xFFFFFFFFu; g_ppat_max = 0u; g_ppat_prev = 0u;
+        g_ppat_wr_n = 0u; g_ppat_val = 0u; g_ppat_on = 1u;
+        /* ★★★ 必须**停掉 DO 的影子锁存 (MDMA ch0)** —— 否则本诊断的输出会被它清掉。
+         *   机制 (2026-09-14 实测定位, 链条完整):
+         *     `do_latch_init()` 把 MDMA ch0 配成 "SHM 的 OFF_DO_SHADOW → GPIOE_ODR",
+         *     触发源 = DMA2_S0_TC ⇒ **每拍**搬一次。而 GPIO_MASK=0 时 `do_poll` 早退、
+         *     从不更新 shadow ⇒ shadow 恒 0 ⇒ **每拍把 GPIOE_ODR 覆盖成 0**。
+         *   ⇒ 症状: 本诊断写的码型在下一个拍边界被抹平, 引脚上只剩极窄脉冲
+         *     (LA 侧看到"疑似噪声的随机跳变", 实为写-清竞态)。
+         *   ★ 这是"两个写者写同一个寄存器"的典型 —— 与 do.h 文件头警告的
+         *     "macro 不要写 PE" 同族, 只是这次的第二个写者藏得更深 (在 MDMA 里)。 */
+        /* ★ MDMA ch0 的 CCR —— 与 do.c 的 `MDMA_CH0_CCR` **同址**
+         *   (do.c: `MDMA_BASE 0x52000000 + 0x4C`; 该宏是 do.c 私有的, 故此处用绝对地址)。
+         *   ★ 停它的理由见下方长注释: 它每拍把 ODR 覆盖成 shadow 的值。 */
+        *(volatile uint32_t *)0x5200004Cu = 0u;
+        __asm__ volatile("dsb; isb" ::: "memory");
+        ack(NULL, 0u);
+        return;
+    }
+    if (op == 0u) { g_ppat_on = 0u; ack(NULL, 0u); return; }
+    if (op == 2u) {
+        uint8_t r[40];
+        put32(r +  0, g_ppat_on);
+        put32(r +  4, g_ppat_wr_n);
+        put32(r +  8, (g_ppat_min == 0xFFFFFFFFu) ? 0u : g_ppat_min);
+        put32(r + 12, g_ppat_max);
+        put32(r + 16, g_ppat_last);
+        put32(r + 20, g_ppat_val);
+        /* ★★ 自证三连 (不动 ISR, 只在被问时当场读 —— 不干扰被测对象):
+         *   ① GPIOE_ODR 低 8 位: 若在 0..127 之间变化 ⇒ **写入真的进了寄存器**
+         *   ② GPIOE_MODER 低 16 位: 应 = 0x5555 (每脚 01 = 推挽输出)
+         *   ③ RCC_AHB4ENR: bit4 (GPIOEEN) 应为 1 */
+        put32(r + 24, GPIO_ODR(DO_GPIO_PORT) & 0xFFu);
+        put32(r + 28, GPIO_MODER(DO_GPIO_PORT) & 0xFFFFu);
+        put32(r + 32, RCC_AHB4ENR);
+        /* ★★★ 自写自读 (关键判据): 写一个**已知非零值**到 BSRR, 立刻把 ODR 读回来。
+         *   若读回 0 ⇒ 这个口的写入**根本没生效** (时钟/地址/模式之外的第三种原因)。
+         *   若读回非 0 (哪怕 != 0x7F, 因为 ISR 可能插进来改) ⇒ 写入通路是通的。
+         *   ★ 为什么这个测法能无条件成立: ISR 写的值也在 0..127, 不为 0 (除非恰好 pat==0),
+         *     所以"读到 0"只可能来自"写不进去"。 */
+        GPIO_BSRR(DO_GPIO_PORT) = 0x0000007Fu;      /* 置位 PE0..PE6 */
+        put32(r + 36, GPIO_ODR(DO_GPIO_PORT) & 0xFFu);   /* 立刻读回 */
+        ack(r, 40u);
+        return;
+    }
+    nak("bad pin pattern op");
+}
+
 static void h_engine_status(void)
 {
     uint8_t r[40];
@@ -2510,6 +2618,7 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_GET_VERSION:   h_get_version(); break;
         case CMD_DEPLOY:        h_deploy(p, n); break;
         case CMD_ENGINE_STATUS: h_engine_status(); break;
+        case CMD_PIN_PATTERN:   h_pin_pattern(p, n); break;
         /* ---- W1: 运行控制 ---- */
         case CMD_START:         h_start_w1(); break;
         case CMD_STOP:          h_stop_w1(); break;

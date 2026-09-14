@@ -39,6 +39,12 @@
 #define CMD_WRITE_BURST     0x23
 #define CMD_FORCE           0x24   /* P2: 强制/释放 wire — [idx:u16][mode:u8][val:f32] */
 #define CMD_ENGINE_STATUS   0x38
+#define CMD_PIN_PATTERN     0x39   /* ★ 引脚码型诊断 (抖动三方对照实验):
+                                    *   载荷 [op:u8] 0=关 / 1=开(清统计) / 2=读回
+                                    *   开启后拍 ISR 内往 PE0..PE6 输出 0..127 递增码型,
+                                    *   并记录"写 BSRR 之后"的 DWT 时刻 (相邻间隔 min/max)。
+                                    *   op=2 应答 24B: on/wr_n/min/max/last/val (各 u32 LE)
+                                    *   ★ 前提: GPIO_MASK 必须为 0 (否则 do 面会覆盖 PE) */
 #define CMD_PERSIST         0x43   /* W2.4: 掉电保持查询/落盘 — 空=查询, [mode:u8]=1 落盘
                                     *
                                     * ★★ PC 侧必读: [mode=1] 的 **ACK 延迟 = 擦除耗时**。
