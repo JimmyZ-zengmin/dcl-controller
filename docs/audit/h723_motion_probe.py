@@ -657,13 +657,75 @@ def cmd_asdiag():
     d.ser.close()
 
 
+def cmd_pulcheck():
+    """★ 解耦: "固件到底有没有在发脉冲" —— 把"固件侧"与"驱动器侧"分开。
+
+    轴不动时, 所有人都会先去翻代码。但真正该先问的是:
+      **脉冲到底出没出 MCU?** 出来的话, 故障就在"引脚 → 电机"这一窄段。
+    判据(全部来自固件/编码器, 不依赖仪器):
+      CC1E / ARR / CCR1   ⇒ PWM 通道与频率对不对
+      PA6(PUL) 电平分布   ⇒ 引脚在不在翻 (50/50 即 50% 占空比)
+      PE8(DIR) / PE9(ENA) ⇒ 方向/使能电平
+      raw 唯一值 + 净转角 ⇒ 轴真的动没动 (编码器必须**先通过 liveness**)
+    """
+    d, _ = head("脉冲通路解耦: 固件发脉冲了吗 / 轴真的动了没")
+    hz = int(sys.argv[2]) if len(sys.argv) > 2 else 500
+    s = d.st()
+    print("  基线: 极性=%d ena=%d PE9=%d raw=%d" % (s["enapol"], s["ena"], s["pe9"], s["raw"]))
+    if s["enapol"] != 1:
+        print("  ⚠ 极性=%d ⇒ 与当前接线的使能语义相反, 自动设为 1" % s["enapol"])
+        d.enapol(1)
+        time.sleep(0.25)
+    d.ena(1)
+    time.sleep(0.3)
+    s = d.st()
+    print("  使能后: ena=%d PE9=%d (期望 1=使能)" % (s["ena"], s["pe9"]))
+    d.dirn(0)
+    d.limit(30000)
+    d.rate(hz)
+    time.sleep(0.3)
+    ones = zeros = 0
+    dirs = set()
+    enas = set()
+    raws = []
+    for i in range(60):
+        s = d.st()
+        if not s:
+            continue
+        if i == 0:
+            print("  起脉冲后: CC1E=%d CCR1=%d ARR=%d ⇒ %.1f Hz"
+                  % (s["ccer"] & 1, s["ccr1"], s["arr"], 1e6 / max(s["arr"] + 1, 1)))
+        if (s["pa_idr"] >> 6) & 1:
+            ones += 1
+        else:
+            zeros += 1
+        dirs.add((s["pe_idr"] >> 8) & 1)
+        enas.add((s["pe_idr"] >> 9) & 1)
+        raws.append(s["raw"])
+    d.stop()
+    d.ena(0)
+    print("  PA6(PUL) 采样: 高 %d / 低 %d  ⇒ %s"
+          % (ones, zeros, "✓ 引脚在翻" if ones and zeros else "★ 引脚不翻!"))
+    print("  PE8(DIR) 电平: %s    PE9(ENA) 电平: %s" % (sorted(dirs), sorted(enas)))
+    print("  raw 唯一值 %d, 范围 %d..%d  ⇒ %s"
+          % (len(set(raws)), min(raws), max(raws),
+             "★ 轴没动 (编码器是活的 ⇒ 这是真话)" if len(set(raws)) < 5 else "轴在动"))
+    print()
+    print("★ 判读:")
+    print("  · CC1E=0 或 PUL 不翻 ⇒ **固件没发脉冲** ⇒ 查 CC1E/CCMR1/step.c")
+    print("  · PUL 在翻 + 轴不动 ⇒ 故障在 **PA6 之后**: 驱动器 / 24V / PUL·DIR·ENA 接线 / 光耦")
+    print("    (此时不用再翻固件代码了 —— 已经证明它把脉冲发出来了)")
+    d.ser.close()
+
+
 def main():
     a = sys.argv
     cmd = a[1] if len(a) > 1 else "ena"
     fn = dict(ena=cmd_ena, rate=cmd_rate, timebase=cmd_timebase,
               units=cmd_units, bias=cmd_bias, repro=cmd_repro,
               startup=cmd_startup, fields=cmd_fields, bench=cmd_bench,
-              liveness=cmd_liveness, asdiag=cmd_asdiag).get(cmd)
+              liveness=cmd_liveness, asdiag=cmd_asdiag,
+              pulcheck=cmd_pulcheck).get(cmd)
     if fn is None:
         print(__doc__)
         return 2

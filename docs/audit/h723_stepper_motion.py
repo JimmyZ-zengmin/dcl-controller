@@ -431,9 +431,12 @@ def main():
         th = hz * sec / 1600.0 * 360.0
         print("  理论(8细分 1600步/圈) = %.1f°  偏差 %+.1f%%" % (th, (st["net"] - th) / th * 100))
         print("  分段速度(5 段): " + "  ".join("%.1f" % v for v in st["seg"]))
-        if st["seg"]:
+        if st["seg"] and abs(st["vavg"]) > 1e-6:
             vmin, vmax = min(st["seg"]), max(st["seg"])
-            print("  ⇒ 速度波动 %.1f%%  (max-min)/avg = %.3f" % ((vmax - vmin) / abs(st["vavg"]) * 100, (vmax - vmin) / abs(st["vavg"])))
+            print("  ⇒ 速度波动 %.1f%%  (max-min)/avg = %.3f"
+                  % ((vmax - vmin) / abs(st["vavg"]) * 100, (vmax - vmin) / abs(st["vavg"])))
+        elif st["seg"]:
+            print("  ⇒ ★ 净转角为 0 ⇒ **轴根本没动**(不是波动) ⇒ 先查驱动器/接线/24V")
         # 编码器采样质量: raw 是否卡死
         raws = set(p[1] for p in pts)
         print("  raw 唯一值 %d 个  ⇒ %s" % (len(raws), "正常(在动)" if len(raws) > 20 else "★ 可疑(编码器卡住?)"))
