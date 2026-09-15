@@ -96,6 +96,13 @@ class Dut:
                     enapol=u[12], pa_idr=u[19], pe_idr=u[20], cmr1=u[21],
                     pe9=(u[20] >> 9) & 1, ccr1=u[22], arr=u[23])
 
+    def raw24(self):
+        """应答的 24 个 u32 原始字 (用于找语义未知的字段)"""
+        s, p = self.op19(0)
+        if s != 0 or not p or len(p) < 96:
+            return None
+        return list(struct.unpack("<24I", p[:96]))
+
     def ena(self, v):    self.op19(3, v)
     def dirn(self, v):   self.op19(2, v)
     def rate(self, hz):  self.op19(1, hz)
@@ -403,12 +410,104 @@ def cmd_startup():
     d.ser.close()
 
 
+def cmd_fields():
+    """响应字段普查: 找出语义未知的字段里有没有 tick / 脉冲计数器。
+       ★ 若找到**脉冲计数器**, 则所有"脉冲数不确定"的测量问题(限时时基/命令延时)一次性解决。"""
+    d, _ = head("响应字段普查 (24 个 u32, 找 tick / 脉冲计数器)")
+
+    def phase(tag, sec, hz=None):
+        if hz:
+            d.ena(1)
+            time.sleep(0.25)
+            d.dirn(0)
+            d.limit(60000)
+            d.rate(hz)
+            time.sleep(0.3)
+        a = d.raw24()
+        t0 = time.time()
+        time.sleep(sec)
+        b = d.raw24()
+        dt = time.time() - t0
+        if hz:
+            d.stop()
+            d.ena(0)
+            time.sleep(0.3)
+        if a is None or b is None:
+            print("  %s: 读失败" % tag)
+            return
+        ch = [(i, a[i], b[i], (b[i] - a[i]) & 0xFFFFFFFF) for i in range(24) if a[i] != b[i]]
+        print("  ---- %s  (真实 %.2fs): %d/24 字段在变 ----" % (tag, dt, len(ch)))
+        print("     序号 |        前值 |        后值 |         增量 | 增量/真实秒")
+        for i, x, y, dz in ch:
+            if dz > 0x7FFFFFFF:
+                dz -= 0x100000000
+            print("     %4d | %10d | %10d | %11d | %10.1f" % (i, x, y, dz, dz / dt))
+        # 已知字段对照
+        print("     (已知: 0=hz 1=dir 2=ena 3=tleft 4=ccer 8=raw 12=enapol "
+              "19=GPIOA_IDR 20=GPIOE_IDR 21=CCMR1 22=CCR1 23=ARR)")
+        print()
+
+    phase("静置", 10.0)
+    phase("500Hz 转动", 5.0, 500)
+    phase("5000Hz 转动", 5.0, 5000)
+    print("★ 判读:")
+    print("  · 某字段增量/真实秒 ≈ 1000 / 10000 / 100000 ⇒ 那是 ms / 100µs / 1µs 计数 ⇒ 直接得到固件时基")
+    print("  · 某字段在转动时的增量 ≈ 转动秒数×Hz ⇒ **那是脉冲计数器** ⇒ 可精确核对脉冲数")
+    print("  · 若某字段是 100µs 扫描计数, 用它算出的扫描率能直接裁决 §D2 的 1.26x 慢时基")
+    d.ser.close()
+
+
+def cmd_bench():
+    """命令通路容量: 最大命令率 / 延迟分布 / 长时稳定性
+       ⇒ 决定"上位机在环"的控制环能跑多快 = 能承载多复杂的算法"""
+    d, _ = head("命令通路容量 (决定上位机在环控制环的上限)")
+    f = fr(0x39, bytes([19, 0]))
+    N = 300
+    lat = []
+    fail = 0
+    t0 = time.time()
+    for _ in range(N):
+        t1 = time.time()
+        s, _p = d.xchg(f, timeout=0.25)
+        dt = time.time() - t1
+        if s is None:
+            fail += 1
+        else:
+            lat.append(dt)
+    tot = time.time() - t0
+    if lat:
+        lat.sort()
+        print("  连续 %d 条命令: 用时 %.2fs ⇒ **%.1f 命令/s** (失败 %d)" % (N, tot, N / tot, fail))
+        print("  单条往返延迟: p50 %.1fms  p90 %.1fms  p99 %.1fms  最大 %.1fms  最小 %.1fms"
+              % (lat[len(lat) // 2] * 1000, lat[int(len(lat) * 0.9)] * 1000,
+                 lat[int(len(lat) * 0.99)] * 1000, lat[-1] * 1000, lat[0] * 1000))
+        print("  ⇒ 上位机在环控制环上限 ≈ %.1f Hz (单条查询) ; 抖动 p99-p50 = %.1fms"
+              % (1.0 / (sum(lat) / len(lat)), (lat[int(len(lat) * 0.99)] - lat[len(lat) // 2]) * 1000))
+    print()
+    print("  ---- 30s 长时稳定性 ----")
+    t0 = time.time()
+    n = 0
+    f2 = 0
+    while time.time() - t0 < 30.0:
+        s, _p = d.xchg(f, timeout=0.25)
+        n += 1
+        if s is None:
+            f2 += 1
+    el = time.time() - t0
+    print("  30s 内 %d 条命令 ⇒ %.1f 命令/s, 失败 %d (%.2f%%)"
+          % (n, n / el, f2, f2 / max(n, 1) * 100))
+    print()
+    print("★ 判读: 这个命令率就是**上位机在环闭环**的采样率上限。")
+    print("        要跑更复杂的算法(更高的环频/更细的插补), 必须把这部分搬到固件里。")
+    d.ser.close()
+
+
 def main():
     a = sys.argv
     cmd = a[1] if len(a) > 1 else "ena"
     fn = dict(ena=cmd_ena, rate=cmd_rate, timebase=cmd_timebase,
               units=cmd_units, bias=cmd_bias, repro=cmd_repro,
-              startup=cmd_startup).get(cmd)
+              startup=cmd_startup, fields=cmd_fields, bench=cmd_bench).get(cmd)
     if fn is None:
         print(__doc__)
         return 2

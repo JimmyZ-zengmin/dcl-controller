@@ -16,6 +16,10 @@ H723 步进运动测试套件 (闭环伺服验证用)
   slip <hz> [sec]              ★ 失速形态: 残差 = 实际角 − 指令角 (滑差 + 摆动)
   coast <hz>                   ★ 失能滑行: 量摩擦/阻尼减速率 (扭矩法的另一半)
   accel <tgt> [stepHz] [lo] [hi] [it] ★ 最大可跟随加速度 (力矩裕度的代理量)
+  track sine <f_Hz> <amp_Hz> <base_Hz> <sec>
+                               ★ 轨迹跟随: 上位机按环频下发正弦速度轨迹,
+                                 编码器量真实位置 ⇒ 跟随误差 + 等效滞后 + 残余
+                                 (扫 f 即可找出"上位机在环"能跟多快变化的轨迹)
   roundtrip <hz> <ms> <n>      ★ 往返复现性: n 轮定时脉冲正/反, 每轮等脉冲数
                                   (用固件"限时"字段定时 ⇒ 脉冲数严格相等,
                                    排除 Python 计时超时造成的"每段多走几度"假象)
@@ -27,6 +31,7 @@ H723 步进运动测试套件 (闭环伺服验证用)
   丢步 (lost step) → 每轮终点偏移**逐轮累积**, 累积速率 = 每轮丢的步数
   两者可同时存在: 固定分量 = 背隙, 累积分量 = 丢步
 """
+import math
 import struct
 import sys
 import time
@@ -60,7 +65,9 @@ class Dut:
         self.ser = serial.Serial(port, 115200, timeout=0.02)
 
     def xchg(self, f, timeout=0.05):
-        """发命令, 轮询到完整帧即返回 (高采样率的关键)"""
+        """★ 必须**校验帧**(长度 + CRC16) 并在缓冲里重找, 不能只看 0xC1 头。
+           血证: 不校验时, 连续紧贴发"读+写"两条命令会导致解析到错位帧,
+                 于是 raw / PE9 读出垃圾值 (曾把静止的电机报成转 3 倍)"""
         ser = self.ser
         ser.reset_input_buffer()
         ser.write(f)
@@ -71,10 +78,22 @@ class Dut:
             b = ser.read(256)
             if b:
                 buf += b
-                if len(buf) >= 6 and buf[0] == 0xC1:
-                    n = buf[2] | (buf[3] << 8)
-                    if len(buf) >= 6 + n:
-                        return buf[1], buf[4:4 + n]
+                i = 0
+                while True:
+                    j = buf.find(0xC1, i)
+                    if j < 0 or len(buf) < j + 6:
+                        break
+                    n = buf[j + 2] | (buf[j + 3] << 8)
+                    if n > 4096:
+                        i = j + 1
+                        continue
+                    if len(buf) < j + 6 + n:
+                        break
+                    body = buf[j + 1:j + 4 + n]
+                    crc = buf[j + 4 + n] | (buf[j + 5 + n] << 8)
+                    if crc16(body) == crc:
+                        return buf[j + 1], buf[j + 4:j + 4 + n]
+                    i = j + 1
             else:
                 time.sleep(0.0005)
         return None, b""
@@ -1005,6 +1024,75 @@ def main():
         print("     所以 α_max 的实测上限 ≈ %d×0.225/%.3f = %.0f °/s²"
               % (stepf, CMD_BIAS_S, stepf * 0.225 / CMD_BIAS_S))
         print("     ⇒ 要测电机**真实**加速度能力, 必须让**固件自己**做斜坡 (D4)")
+
+    elif cmd == "track":
+        shape = a[2] if len(a) > 2 else "sine"
+        f = float(a[3]) if len(a) > 3 else 0.5
+        amp = float(a[4]) if len(a) > 4 else 1200.0
+        base = float(a[5]) if len(a) > 5 else 1500.0
+        sec = float(a[6]) if len(a) > 6 else 8.0
+        K = 360.0 / SPR                    # Hz → °/s
+        print("=== 轨迹跟随 (%s): 速度 = %.0f ± %.0f Hz = %.1f ± %.1f °/s, f=%.2f Hz, %.0fs ==="
+              % (shape, base, amp, base * K, amp * K, f, sec))
+        print("  期望位置 θ(t) = %.4f×(%.0f·t + %.1f·(1−cos(2π·%.2f·t)))" %
+              (K, base, amp / (2 * math.pi * f), f))
+
+        def theta_des(t):
+            return K * (base * t + amp / (2 * math.pi * f) * (1 - math.cos(2 * math.pi * f * t)))
+
+        def omega_des(t):
+            return K * (base + amp * math.sin(2 * math.pi * f * t))
+
+        d.ena(1)
+        time.sleep(0.3)
+        d.dirn(DIR_POS)
+        d.limit(60000)
+        rec = []
+        t0 = time.time()
+        while True:
+            tt = time.time() - t0
+            if tt >= sec:
+                break
+            hz = max(30.0, base + amp * math.sin(2 * math.pi * f * tt))
+            d.rate(int(hz))                     # 写 (1 条命令)
+            s = d.st()                          # 读 (1 条命令) ⇒ 一个环周期 = 2 条
+            if s:
+                rec.append((time.time() - t0, s["raw"], hz))
+        d.stop()
+        time.sleep(0.2)
+        if len(rec) < 8:
+            print("  采样不足 (%d)" % len(rec))
+            d.ser.close()
+            return 0
+        span = rec[-1][0] - rec[0][0]
+        loop_hz = len(rec) / span
+        ang = unwrap_dir([p[1] for p in rec], DIR_POS == 0)
+        base_off = ang[0] - theta_des(rec[0][0])
+        err = [ang[i] - base_off - theta_des(rec[i][0]) for i in range(len(rec))]
+        om = [omega_des(rec[i][0]) for i in range(len(rec))]
+        n = len(err)
+        em = sum(err) / n
+        om_m = sum(om) / n
+        den = sum((x - om_m) ** 2 for x in om)
+        lag = -sum((err[i] - em) * (om[i] - om_m) for i in range(n)) / den if den > 1e-9 else 0.0
+        resid = [err[i] - em - (-lag * (om[i] - om_m)) for i in range(n)]
+        rmse = (sum(x * x for x in resid) / n) ** 0.5
+        print()
+        print("  环周期实测: %d 点 / %.2fs ⇒ **%.1f Hz 环频** (每周期 读+写 = 2 条命令)"
+              % (n, span, loop_hz))
+        print("  位置误差: 均值 %+.2f°  最大 %+.2f°  最小 %+.2f°"
+              % (em, max(err), min(err)))
+        print("  ★ 等效滞后 = %.1f ms   (由 err ≈ −lag×ω 最小二乘拟合得出)" % (lag * 1000))
+        print("     模型预测: 环周期/2 + 命令延时 = %.1f/2 + 55 = %.1f ms"
+              % (1000.0 / loop_hz, 1000.0 / loop_hz / 2 + 55))
+        print("  ★ 扣掉滞后后的残余误差: RMS %.2f°  峰峰 %.2f°"
+              % (rmse, max(resid) - min(resid)))
+        print("  ⇒ 滞后项 = 接口延迟造成(可预测); 残余项 = 采样/量化/电机造成")
+        print()
+        print("      t(s) | 期望° | 实测° | 误差° | 速度°/s")
+        for k in range(0, n, max(1, n // 20)):
+            print("    %6.2f | %7.1f | %7.1f | %+7.2f | %7.1f"
+                  % (rec[k][0], theta_des(rec[k][0]) + base_off, ang[k], err[k], om[k]))
 
     else:
         print("未知命令")
