@@ -13,6 +13,9 @@ H723 步进运动测试套件 (闭环伺服验证用)
   hold <deg> <sec>             位置锁定测试 (闭环保持 + 误差带统计)
   speed <hz_max> [step] [sec]  ★ 突加转速扫描 (找固件无加减速时的可用上限)
   ramp <target_hz> [ms] [hold] ★ 带斜坡起动 (分离"无加减速"与"驱动器/电机上限")
+  slip <hz> [sec]              ★ 失速形态: 残差 = 实际角 − 指令角 (滑差 + 摆动)
+  coast <hz>                   ★ 失能滑行: 量摩擦/阻尼减速率 (扭矩法的另一半)
+  accel <tgt> [stepHz] [lo] [hi] [it] ★ 最大可跟随加速度 (力矩裕度的代理量)
   roundtrip <hz> <ms> <n>      ★ 往返复现性: n 轮定时脉冲正/反, 每轮等脉冲数
                                   (用固件"限时"字段定时 ⇒ 脉冲数严格相等,
                                    排除 Python 计时超时造成的"每段多走几度"假象)
@@ -185,7 +188,9 @@ def move_deg(d, dir_bits, deg, gain=1.0):
 
 
 def speed_point(d, hz, sec=1.5):
-    """突加一档频率, 稳态段测速 (单向 ⇒ 用 unwrap_dir 避开 ±180° 缠绕)"""
+    """突加一档频率, 稳态段测速。
+       ★ 用 motion_shape(最短弧) 而不是 unwrap_dir(强制单向) —— 后者会把
+         『原地抖动』伪造成高速正转 (20000Hz 时曾假报 2048°/s, 实际轴不转)。"""
     d.ena(1)
     time.sleep(0.25)
     d.dirn(DIR_POS)
@@ -196,7 +201,7 @@ def speed_point(d, hz, sec=1.5):
     while time.time() - t0 < sec:
         s = d.st()
         if s:
-            pts.append((time.time() - t0, s["raw"], s["hz"], s["tleft"], s["ccer"] & 1))
+            pts.append((time.time() - t0, s["raw"], s["hz"]))
     d.stop()
     time.sleep(0.12)
     if len(pts) < 6:
@@ -204,15 +209,12 @@ def speed_point(d, hz, sec=1.5):
     w = [p for p in pts if p[0] > 0.35 and p[0] < sec - 0.15]     # 剔除突加瞬态
     if len(w) < 4:
         return None
-    ang = unwrap_dir([p[1] for p in w], DIR_POS == 0)
-    dt = w[-1][0] - w[0][0]
-    peak = 0.0
-    for i in range(1, len(w)):
-        dtt = w[i][0] - w[i - 1][0]
-        if dtt > 1e-6:
-            peak = max(peak, abs(unwrap_dir([w[i - 1][1], w[i][1]], DIR_POS == 0)[1]) / dtt)
-    return dict(hz=hz, hz_rb=w[-1][2], dps=(ang[-1] - ang[0]) / dt,
-                theo=hz / SPR * 360.0, peak=peak, wrap=max_per_sample_wrap(w))
+    m = motion_shape([(p[0], p[1]) for p in w])
+    if m is None:
+        return None
+    return dict(hz=hz, hz_rb=w[-1][2], dps=m["net_s"], wob=m["wob_s"],
+                arc=m["arc"], back=m["back_frac"], theo=hz / SPR * 360.0,
+                wrap=m["wrap"])
 
 
 def unwrap(seq):
@@ -255,6 +257,68 @@ def max_per_sample_wrap(pts):
     if not gaps:
         return 0.0
     return 360.0 / (sum(gaps) / len(gaps))
+
+
+def sstep(a, b):
+    """最短弧单步位移 (计数): ±2048 内, 双向都正确。
+       ★ 与 unwrap_dir 的区别: unwrap_dir 强制单向, 遇到"原地抖动"会把
+         向后的 10 计数算成向前的 4086 计数 ⇒ **把抖动伪造成高速正转**。"""
+    d = (b - a) & 0xFFF
+    if d > 2048:
+        d -= 4096
+    return d
+
+
+def occupied_arc(raws):
+    """轴上占用角域(度): 圆上被访问过的弧长 = 360 − 最大空缺。
+       ★ 真在转 ⇒ ≈360°; 原地抖 ⇒ 只占一小段弧。"""
+    s = sorted(set(raws))
+    if len(s) < 2:
+        return 0.0, 0.0
+    gaps = [(s[i + 1] - s[i]) for i in range(len(s) - 1)]
+    gaps.append(s[0] + 4096 - s[-1])                 # 环绕缺口
+    g = max(gaps)
+    return 360.0 * (1 - g / 4096.0), g
+
+
+def motion_shape(pts):
+    """从 (t, raw) 序列提炼"到底在转还是在抖"的一组量。
+
+    ★★ 两个速度估计量**各自都有一条失效边界**, 所以必须都算 + 用第三个量裁决:
+       · sstep(最短弧)       —— 真单向运动 >180°/采样段时**反向**
+                               (30000Hz=6750°/s, 每段 246° ⇒ 被读成 -114° ⇒ 假报负速度)
+       · unwrap_dir(强制单向) —— 原地抖动时**伪造高速正转**
+                               (20000Hz 轴不动, 却假报 +2048°/s)
+       · occupied_arc(占用角域) —— 裁决量, 无上述两种失效
+                                ⇒ >90° = 在转(取单向估计); <90° = 不转(净速度记 0)
+    """
+    if len(pts) < 4:
+        return None
+    span = pts[-1][0] - pts[0][0]
+    acc_arc = 0          # 最短弧累计   (有效区间: 每采样段 < 180°  ⇒ <~2.2万Hz)
+    acc_cmd = 0          # 强制单向累计 (有效区间: 每采样段 < 360°  ⇒ <~4.3万Hz)
+    back = 0
+    wob = 0
+    for i in range(1, len(pts)):
+        a, b = pts[i - 1][1], pts[i][1]
+        d = sstep(a, b)                                  # 最短弧 (双向正确)
+        acc_arc += d
+        wob += abs(d)
+        if d < 0:
+            back += 1
+        # ★ 强制单向: 取模 4096, 不做 ±2048 折返 ⇒ 抖动时会伪造, 但高速不混叠
+        dc = (b - a) & 0xFFF if DIR_POS == 0 else -((a - b) & 0xFFF)
+        acc_cmd += dc
+    n = len(pts) - 1
+    arc, gap = occupied_arc([p[1] for p in pts])
+    stall = arc < 90.0
+    return dict(span=span, n=n, back_frac=back / n, arc=arc, gap=gap,
+                net_arc=acc_arc / span * DEG_PER_LSB,
+                net_cmd=acc_cmd / span * DEG_PER_LSB,
+                wob_s=wob / span * DEG_PER_LSB,
+                stall=stall,
+                net_s=0.0 if stall else acc_cmd / span * DEG_PER_LSB,
+                wrap=(360.0 / (span / n)) if n else 0.0)
 
 
 def sample(dut, dur_s, gap=0.0):
@@ -644,8 +708,8 @@ def main():
         print("  换算(1600 步/圈): 1600Hz = 1 圈/s = 360°/s;  Hz × 0.225 = °/s")
         print("  ★ 突加 = 固件**无加减速**时的真实可用上限 (带斜坡的上限见 `ramp`)")
         print()
-        print("  请求Hz | 读回Hz | 实测deg/s | 比值(请求) | 比值(读回) | 峰值deg/s | 采样上限 | 判读")
-        print("  -------+--------+-----------+------------+------------+-----------+----------+-------")
+        print("  请求Hz | 读回Hz | 净速度°/s | 比值(读回) | 占用角域 | 反向步 | 判读")
+        print("  -------+--------+-----------+------------+----------+--------+-------")
         ok_hi = None
         hz = hz_beg
         while hz <= hz_max:
@@ -658,16 +722,18 @@ def main():
                 ratio_rb = r["dps"] / theo_rb if theo_rb else 0.0
                 if 0.97 <= ratio_rb <= 1.03:
                     verdict = "跟得上"; ok_hi = (hz, r)
+                elif r["arc"] < 90:
+                    verdict = "★ 轴不转(原地)"
                 elif ratio_rb < 0.9:
-                    verdict = "★ 掉步/失速"
+                    verdict = "★ 掉步"
                 else:
                     verdict = "临界"
                 warn = ""
-                if abs(r["dps"]) > r["wrap"] * 0.8:
-                    warn = " (★超采样上限, 值可疑)"
-                print("  %6d | %6d | %9.1f | %10.3f | %10.3f | %9.1f | %8.0f | %s%s"
-                      % (hz, r["hz_rb"], r["dps"], ratio, ratio_rb, r["peak"],
-                         r["wrap"], verdict, warn))
+                if abs(theo_rb) > r["wrap"] * 0.9:
+                    warn = " ⚠超采样上限"
+                print("  %6d | %6d | %9.1f | %10.3f | %7.1f° | %5.1f%% | %s%s"
+                      % (hz, r["hz_rb"], r["dps"], ratio_rb, r["arc"],
+                         r["back"] * 100, verdict, warn))
             hz += step
         print()
         if ok_hi:
@@ -710,10 +776,9 @@ def main():
         d.stop()
         time.sleep(0.12)
         theo = tgt / SPR * 360.0
-        if len(holdpts) >= 4:
-            ang = unwrap_dir([p[1] for p in holdpts], DIR_POS == 0)
-            dt = holdpts[-1][0] - holdpts[0][0]
-            dps = (ang[-1] - ang[0]) / dt
+        m = motion_shape([(p[0], p[1]) for p in holdpts]) if len(holdpts) >= 4 else None
+        if m is not None:
+            dps = m["net_s"]
             hz_rb = holdpts[-1][2]
             theo_rb = hz_rb / SPR * 360.0          # ★ 按**读回**频率折算才公平
             r_req = dps / theo if theo else 0.0
@@ -723,22 +788,223 @@ def main():
                   % (hz_rb, tgt, dev,
                      "≈请求值" if abs(dev) < 0.5 else
                      "★ 频率量化(ARR 取整), 实际比请求高 %.2f%%" % dev))
-            print("  保持段实测 %.1f °/s = %.0f rpm  |  比值(按请求) %.3f  比值(按读回) %.3f  %s"
+            print("  保持段净速度 %.1f °/s = %.0f rpm  |  比值(请求) %.3f  比值(读回) %.3f  %s"
                   % (dps, dps * 60.0 / 360.0, r_req, r_rb,
                      "跟得上 ✓" if r_rb >= 0.97 else ("★ 掉步" if r_rb < 0.9 else "临界")))
+            print("  形态: 占用角域 %.1f°/360°  反向步 %.1f%%  净速度(最短弧) %+.1f °/s  ⇒ %s"
+                  % (m["arc"], m["back_frac"] * 100, m["net_arc"],
+                     ("真在转" if m["arc"] > 300 else
+                      "★★ 轴不转(原地) —— 『嗡嗡响但轴不动』" if m["arc"] < 90 else "部分失步")))
+            if m["stall"]:
+                print("     ⚠ 占用角域 %.1f° < 90° ⇒ **转子几乎不动**, 净速度记 0"
+                      % m["arc"])
+            elif m["net_cmd"] > 0 and m["net_arc"] < 0:
+                print("     ⚠ 最短弧已**混叠**(转速 >180°/采样段) ⇒ 净速度取自强制单向累计")
+            elif m["back_frac"] > 0.3:
+                print("     ⚠ 反向步占比 %.0f%% 偏高 ⇒ 有反向滑动, 单向累计可能略偏大"
+                      % (m["back_frac"] * 100))
             if r_rb >= 0.97 and tgt > ABRUPT_CEIL_HZ:
                 print("  ⇒ ★ 该点在 %.0f Hz 突加会失速, 斜坡后能跟 ⇒ **斜坡确实扩展了上限**"
                       % ABRUPT_CEIL_HZ)
             elif r_rb < 0.97:
-                print("  ⇒ ★ 斜坡加持下也掉步 ⇒ 上限在**电机/驱动器/供电**(或本脚本采样上限)")
+                print("  ⇒ ★ 斜坡加持下也到不了 ⇒ 上限在**电机/驱动器/供电**")
         else:
             print("  保持段采样不足")
         if len(pts) >= 6:
-            ang = unwrap_dir([p[1] for p in pts], DIR_POS == 0)
-            tot = ang[-1] - ang[0]
-            span = pts[-1][0] - pts[0][0]
-            print("  全程: %.2fs 走了 %+.1f° (%.2f 圈), 平均 %.1f °/s = %.0f rpm"
-                  % (span, tot, tot / 360.0, tot / span, tot / span * 60.0 / 360.0))
+            mm = motion_shape([(p[0], p[1]) for p in pts])
+            tot = mm["net_s"] * mm["span"]
+            print("  全程: %.2fs 净走 %+.1f° (%.2f 圈), 平均 %.1f °/s = %.0f rpm ; 占用角域 %.0f°"
+                  % (mm["span"], tot, tot / 360.0, mm["net_s"],
+                     mm["net_s"] * 60.0 / 360.0, mm["arc"]))
+
+    elif cmd == "slip":
+        hz = int(a[2]) if len(a) > 2 else 20000
+        sec = float(a[3]) if len(a) > 3 else 2.0
+        print("=== 运动形态: 请求 %d Hz (指令 %.0f °/s) ===" % (hz, hz / SPR * 360.0))
+        d.ena(1)
+        time.sleep(0.3)
+        d.dirn(DIR_POS)
+        d.limit(int(sec * 1000 * 1.6) + 3000)
+        t0 = time.time()
+        d.rate(hz)
+        pts = []
+        while time.time() - t0 < sec:
+            s = d.st()
+            if s:
+                pts.append((time.time() - t0, s["raw"], s["hz"]))
+        d.stop()
+        time.sleep(0.1)
+        m = motion_shape([(p[0], p[1]) for p in pts])
+        if m is None:
+            print("  采样不足")
+        else:
+            hz_rb = pts[-1][2]
+            om = hz_rb / SPR * 360.0
+            print("  读回 %d Hz ⇒ 指令 %.0f °/s" % (hz_rb, om))
+            print("  占用角域   %6.1f° / 360°   (最大空缺 %.0f°)" % (m["arc"], m["gap"] * DEG_PER_LSB))
+            print("  反向步占比 %6.1f%%   (纯正转应 ≈0%%)" % (m["back_frac"] * 100))
+            print("  净速度(命令方向) %+8.1f °/s = 指令的 %+.1f%%" % (m["net_s"], m["net_s"] / om * 100))
+            print("  净速度(最短弧)   %+8.1f °/s   ← 仅交叉校验; >2.2万Hz 时会反向失效" % m["net_arc"])
+            print("  抖动速度     %8.1f °/s   (|每步| 之和 / 时间)" % m["wob_s"])
+            print("  抖动/净 比   %8.1f" % (m["wob_s"] / max(abs(m["net_s"]), 1e-6)))
+            print()
+            if m["net_s"] > 0.97 * om and m["back_frac"] < 0.15:
+                verdict = "✓ 真在转 (单向, 无失步)"
+            elif m["arc"] < 90 and abs(m["net_s"]) < 0.25 * om:
+                verdict = "★★ 轴在【原地抖动】—— 就是『嗡嗡响但轴不动』"
+            elif m["back_frac"] > 0.25:
+                verdict = "★ 间歇失步 (来回滑) —— 抖动为主"
+            else:
+                verdict = "临界/部分丢步"
+            print("  判据 ⇒ %s" % verdict)
+            if m["wob_s"] > 0.5 * om:
+                print("  ⇒ 抖动幅度已达指令速度的 %.0f%%: 电磁力矩与负载在拉锯"
+                      % (m["wob_s"] / om * 100))
+            if om > 0.9 * m["wrap"]:
+                print("  ⚠ 指令 %.0f °/s 已接近采样上限 %.0f °/s ⇒ 本行数值可能混叠"
+                      % (om, m["wrap"]))
+        print()
+        print("★ 判据说明 (三个量, 各有各的失效边界):")
+        print("   · 最短弧 sstep  : 真单向 >180°/采样段时**反向**失效  (>2.2万Hz)")
+        print("   · 强制单向      : 原地抖动时**伪造高速正转**      (本脚本曾假报 +2048°/s)")
+        print("   · 占用角域      : 无上述失效 ⇒ 裁决量")
+        print("        >90° 判『在转』(取强制单向值) ; <90° 判『不转』(净速度记 0)")
+
+
+    elif cmd == "coast":
+        hz = int(a[2]) if len(a) > 2 else 3000
+        print("=== 失能滑行: %d Hz 稳速后 **ena(0)** 自由滑行 ===" % hz)
+        print("  (连续采样跨越失能时刻 ⇒ 一定能看到『转 → 停』的完整过程)")
+        d.ena(1)
+        time.sleep(0.3)
+        d.dirn(DIR_POS)
+        d.limit(60000)
+        t0 = time.time()
+        d.rate(hz)
+        pts = []
+        td = None
+        while time.time() - t0 < 4.0:
+            s = d.st()
+            if s:
+                pts.append((time.time() - t0, s["raw"]))
+            # 1.2s 处失能 (此时已稳速)
+            if td is None and time.time() - t0 >= 1.2:
+                d.ena(0)
+                td = time.time() - t0
+        d.stop()
+        time.sleep(0.2)
+        if len(pts) < 6:
+            print("  采样不足")
+            d.ser.close()
+            return 0
+        v = [(pts[i][0], sstep(pts[i - 1][1], pts[i][1]) * DEG_PER_LSB
+              / max(pts[i][0] - pts[i - 1][0], 1e-6)) for i in range(1, len(pts))]
+        pre = [x[1] for x in v if x[0] < td - 0.1]
+        v0 = sum(pre) / len(pre) if pre else 0.0
+        print("  失能前稳速 (t<%.2fs) = %.1f °/s (%.2f 圈/s)  [指令 %.0f °/s]"
+              % (td, v0, v0 / 360.0, hz / SPR * 360.0))
+        print("      t(s) | 瞬时°/s | 相对失能前 | 备注")
+        for k in range(0, len(v)):
+            tag = "  ← 失能" if abs(v[k][0] - td) < 0.02 else ""
+            if k % max(1, len(v) // 22) == 0 or tag:
+                print("    %6.3f | %8.1f | %9.1f%% |%s"
+                      % (v[k][0], v[k][1], v[k][1] / max(v0, 1e-6) * 100, tag))
+        post = [x for x in v if x[0] > td]
+        if post:
+            stop_i = next((i for i in range(len(post)) if abs(post[i][1]) < 0.1 * v0), None)
+            if stop_i is not None and stop_i >= 1:
+                a_dec = (post[stop_i][1] - post[0][1]) / (post[stop_i][0] - post[0][0])
+                print()
+                print("  ★ 失能后 %.3fs 内从 %.0f 降到 %.0f °/s ⇒ 平均减速率 %.0f °/s² = %.1f 圈/s²"
+                      % (post[stop_i][0] - post[0][0], post[0][1], post[stop_i][1],
+                         abs(a_dec), abs(a_dec) / 360.0))
+                print("     (真实拐点可能更快 ⇒ 这是**下界**; 采样间隔 %.0fms 是分辨极限)"
+                      % ((pts[-1][0] - pts[0][0]) / (len(pts) - 1) * 1000))
+                print("     ⇒ 若知转动惯量 J: T_friction ≈ J × |α| ; 1 圈/s² = 6.2832 rad/s²")
+            else:
+                still = post[-1][1] if post else 0.0
+                print()
+                print("  ★ 失能后 %.2fs 仍以 %.1f °/s 转 (初速的 %.0f%%) ⇒ 滑行很长,"
+                      % (post[-1][0] - post[0][0], still, still / max(v0, 1e-6) * 100))
+                print("     摩擦/齿槽/风阻不大; 请把采样窗口拉长或初速调高再看减速率")
+        print()
+        print("★ 判读: 减速率越大 ⇒ 摩擦+齿槽吃掉的可用力矩越多; 这一步是 J·α 法的必要另一半。")
+        print()
+        print("★ 判读: 这一步给 **T_friction(ω)**, 是 J·α 法测扭矩的必要另一半;")
+        print("        减速率越大 ⇒ 摩擦/齿槽/风阻越大 ⇒ 可用于加速的力矩越少。")
+
+    elif cmd == "accel":
+        tgt = int(a[2]) if len(a) > 2 else 15000
+        stepf = int(a[3]) if len(a) > 3 else 400
+        lo = float(a[4]) if len(a) > 4 else 45.0
+        hi = float(a[5]) if len(a) > 5 else 400.0
+        iters = int(a[6]) if len(a) > 6 else 5
+        print("=== 最大可跟随加速度: 目标 %d Hz, 每级 +%d Hz, 二分休眠 %.0f~%.0fms ==="
+              % (tgt, stepf, lo, hi))
+        print("  α = Δω/Δt ; 1 Hz = 0.225 °/s ⇒ α[°/s²] = %d×0.225/休眠秒" % stepf)
+
+        def trial(dwell_ms):
+            d.ena(1)
+            time.sleep(0.25)
+            d.dirn(DIR_POS)
+            d.limit(30000)
+            d.rate(min(300, tgt))
+            t0 = time.time()
+            f = min(300, tgt)
+            while f < tgt:
+                f = min(tgt, f + stepf)
+                d.rate(f)
+                time.sleep(dwell_ms / 1000.0)
+            t_r = time.time() - t0
+            th = time.time()
+            hp = []
+            while time.time() - th < 1.0:
+                s = d.st()
+                if s:
+                    hp.append((time.time() - th, s["raw"], s["hz"]))
+            d.stop()
+            time.sleep(0.15)
+            if len(hp) < 4:
+                return None
+            a_ = unwrap_dir([p[1] for p in hp], DIR_POS == 0)
+            dps = (a_[-1] - a_[0]) / (hp[-1][0] - hp[0][0])
+            hz_rb = hp[-1][2]
+            return dict(ratio=dps / (hz_rb / SPR * 360.0), dps=dps, hz_rb=hz_rb,
+                        t_ramp=t_r, alpha=(tgt - 300) / SPR * 360.0 / max(t_r, 1e-6))
+
+        print()
+        print("  休眠ms | 请求α(°/s²) | 实测α(°/s²) | 真实斜坡s | 保持段比值 | 判读")
+        print("  -------+-------------+-------------+-----------+------------+------")
+        best = None
+        for k in range(iters):
+            mid = (lo + hi) / 2.0
+            r = trial(mid)
+            if r is None:
+                print("  %6.0f |  --- 采样不足" % mid)
+                break
+            ok = r["ratio"] >= 0.97
+            a_req = stepf * 0.225 / (mid / 1000.0)
+            print("  %6.0f | %11.0f | %11.0f | %9.2f | %10.3f | %s"
+                  % (mid, a_req, r["alpha"], r["t_ramp"], r["ratio"],
+                     "跟得上" if ok else "★ 丢步"))
+            if ok:
+                best = (mid, r)
+                hi = mid
+            else:
+                lo = mid
+        print()
+        if best:
+            m, r = best
+            print("  ★ 最小可用休眠 %.0fms ⇒ 实测 α_max ≥ %.0f °/s² = %.2f 圈/s²"
+                  % (m, r["alpha"], r["alpha"] / 360.0))
+            print("     (这是**下界**: 更短的休眠受命令通路延时限制, 见下)")
+        else:
+            print("  ★ 全部休眠都丢步 ⇒ 目标频率对该斜坡本就不稳 (先看 ramp)")
+        print("  ⚠ **上位机天花板**: 每条 rate 命令要 ~%.0fms 处理 ⇒ 休眠不可能低于它,"
+              % (CMD_BIAS_S * 1000))
+        print("     所以 α_max 的实测上限 ≈ %d×0.225/%.3f = %.0f °/s²"
+              % (stepf, CMD_BIAS_S, stepf * 0.225 / CMD_BIAS_S))
+        print("     ⇒ 要测电机**真实**加速度能力, 必须让**固件自己**做斜坡 (D4)")
 
     else:
         print("未知命令")
