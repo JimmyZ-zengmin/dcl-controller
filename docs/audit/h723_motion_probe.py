@@ -605,13 +605,65 @@ def cmd_liveness():
     d.ser.close()
 
 
+def cmd_asdiag():
+    """AS5600 上电诊断 (命令 0x39 payload=[17]) —— **固件自己**扫 4 组引脚对 + 引脚级自检。
+
+    ★ 为什么要用它而不是 SWD 直读: 本项目已记录"SWD 直读外设寄存器读不到真值"
+      (main.c:716: GPIOA/E 读回 0xABFFFFFF/0xFFFFFFFF, RCC_AHB4ENR 读回 0)。
+      固件在芯片内部读自己的 GPIO 才是可靠的。
+    应答 64B = 16 word: [0..3]4×ACK [4..7]4×RAW [8]selftest2 [9]拉低读回 [10]释放读回
+    组序: 0=PB10(SCL)/PB11(SDA)  1=接反  2=PB6/PB7  3=PB8/PB9
+    """
+    d, _ = head("AS5600 上电诊断 (0x39 op=17, 固件内自检)")
+    s, p = d.xchg(fr(0x39, bytes([17])), timeout=0.6)
+    if s is None or len(p) < 44:
+        print("  ✗ 无应答或应答过短 (len=%s)" % (len(p) if p else 0))
+        d.ser.close()
+        return
+    u = struct.unpack("<16I", p[:64])
+    pairs = ["0: PB10=SCL PB11=SDA", "1: PB11=SCL PB10=SDA (接反)",
+             "2: PB6 =SCL PB7 =SDA", "3: PB8 =SCL PB9 =SDA"]
+    print("  ---- 引脚级自检 (决定 START 条件能不能成立) ----")
+    print("    把 SCL/SDA 都拉低后读回 = 0x%03X   (期望 0x000)" % u[9])
+    print("    释放(高)后读回         = 0x%03X   (期望 0x%03X = 两根线都被外部上拉)"
+          % (u[10], 0x0C00))
+    if u[9] != 0:
+        print("    ⇒ ★★★ **拉不低** ⇒ 输出通路不通 ⇒ START 条件不成立 ⇒ 后面 ACK 全部无意义")
+    elif u[10] != 0x0C00:
+        print("    ⇒ ★★★ **释放后有脚不是高** ⇒ 没有外部上拉 / 线被拉住 / 器件未供电")
+    else:
+        print("    ⇒ ✓ 引脚级自检通过 (能拉低、能释放), 总线电气层看起来正常")
+    print()
+    print("  ---- 4 组候选引脚对的 I2C 探测 ----")
+    print("    组 | 引脚            | 写地址 ACK | RAW_ANGLE")
+    print("    ---+-----------------+------------+-----------")
+    hit = []
+    for k in range(4):
+        ack = u[k]
+        raw = u[4 + k]
+        raws = ("%d (%.2f°)" % (raw, raw * 360.0 / 4096.0)) if raw <= 4095 else "—"
+        print("    %d  | %-15s |     %d      | %s" % (k, pairs[k], ack, raws))
+        if ack:
+            hit.append(k)
+    print()
+    if hit:
+        print("  ⇒ ✅ AS5600 在**组 %d** (%s) 应答, 且能读到 RAW" % (hit[0], pairs[hit[0]]))
+    else:
+        print("  ⇒ ✗ 四组**都没有 ACK** ⇒ 器件在这一层就不应答")
+        if u[9] == 0 and u[10] == 0x0C00:
+            print("     但引脚级自检通过 ⇒ 线上有上拉、也能驱动 ⇒ **器件侧问题**")
+            print("     查: ① 器件供电(该 3.3V/5V 按模块) ② GND 是否真通 ③ 磁铁在不在")
+            print("         ④ 器件是否被锁死(断电重启一次再测)")
+    d.ser.close()
+
+
 def main():
     a = sys.argv
     cmd = a[1] if len(a) > 1 else "ena"
     fn = dict(ena=cmd_ena, rate=cmd_rate, timebase=cmd_timebase,
               units=cmd_units, bias=cmd_bias, repro=cmd_repro,
               startup=cmd_startup, fields=cmd_fields, bench=cmd_bench,
-              liveness=cmd_liveness).get(cmd)
+              liveness=cmd_liveness, asdiag=cmd_asdiag).get(cmd)
     if fn is None:
         print(__doc__)
         return 2
