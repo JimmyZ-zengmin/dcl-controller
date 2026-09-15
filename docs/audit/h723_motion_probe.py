@@ -159,6 +159,53 @@ def unwrap_dir(seq, fwd=True):
     return out
 
 
+def sstep(a, b):
+    """最短弧单步位移 (计数)"""
+    d = (b - a) & 0xFFF
+    if d > 2048:
+        d -= 4096
+    return d
+
+
+def occupied_arc(raws):
+    """轴上占用角域(度) = 360 − 最大空缺。真转 ⇒ ≈360°; 冻结/原地 ⇒ ≈0°"""
+    s = sorted(set(raws))
+    if len(s) < 2:
+        return 0.0, 0.0
+    gaps = [(s[i + 1] - s[i]) for i in range(len(s) - 1)]
+    gaps.append(s[0] + 4096 - s[-1])
+    g = max(gaps)
+    return 360.0 * (1 - g / 4096.0), g
+
+
+def motion_shape(pts):
+    """(t, raw) 序列 → 净速度/占用角域/反向步占比。
+       两个速度估计量各有失效边界 ⇒ 用占用角域裁决 (详见运动套件里的同名函数)"""
+    if len(pts) < 4:
+        return None
+    span = pts[-1][0] - pts[0][0]
+    acc_arc = 0
+    acc_cmd = 0
+    back = 0
+    wob = 0
+    for i in range(1, len(pts)):
+        a, b = pts[i - 1][1], pts[i][1]
+        d = sstep(a, b)
+        acc_arc += d
+        wob += abs(d)
+        if d < 0:
+            back += 1
+        acc_cmd += (b - a) & 0xFFF
+    n = len(pts) - 1
+    arc, gap = occupied_arc([p[1] for p in pts])
+    stall = arc < 90.0
+    return dict(span=span, n=n, back_frac=back / n, arc=arc, gap=gap,
+                net_arc=acc_arc / span * DEG_PER_LSB,
+                net_cmd=acc_cmd / span * DEG_PER_LSB,
+                wob_s=wob / span * DEG_PER_LSB, stall=stall,
+                net_s=0.0 if stall else acc_cmd / span * DEG_PER_LSB)
+
+
 def head(t):
     d = Dut()
     s = d.st()
@@ -502,12 +549,69 @@ def cmd_bench():
     d.ser.close()
 
 
+def cmd_liveness():
+    """★ 编码器通路存活检查 —— 必须先做这个, 再谈任何运动结论。
+
+    判据: 用"已知速度 × 已知时间 = 已知转角"核对 raw 是否在更新。
+    血证: raw **完全冻结**时, 我一度判成"轴不转(占用角域 0.0°)",
+          而现场清楚看到轴在转 ⇒ **是读路径挂了, 不是轴不动**。
+    标志: 所有采样点 raw **完全相同**(唯一值=1) ⇒ 传感器不可能如此 ⇒ 读路径冻结。
+          另一标志: tleft 倒数速率显著偏离 ~780/真实秒 ⇒ 固件时基/主循环异常。
+    """
+    d, _ = head("编码器通路存活检查 (raw 到底有没有在更新)")
+    print("  判据: raw 唯一值=1 ⇒ 冻结;  理论转角 vs 实测转角;  tleft 倒数应 ≈780/真实秒")
+    print()
+    print("   请求Hz | 采样点 | raw唯一值 |  首raw |  末raw | 理论转角 | 实测净转角 |  tleft/s | 判定")
+    print("  --------+--------+-----------+--------+--------+----------+------------+----------+------")
+    for hz in (500, 5000, 16000):
+        d.ena(1)
+        time.sleep(0.3)
+        d.dirn(0)
+        d.limit(30000)
+        pts = []
+        t0 = time.time()
+        d.rate(hz)
+        while time.time() - t0 < 4.0:
+            s = d.st()
+            if s:
+                pts.append((time.time() - t0, s["raw"], s["tleft"]))
+        d.stop()
+        time.sleep(0.15)
+        if len(pts) < 5:
+            print("  %6d | 采样不足" % hz)
+            continue
+        span = pts[-1][0] - pts[0][0]
+        uniq = len(set(p[1] for p in pts))
+        m = motion_shape([(p[0], p[1]) for p in pts])
+        exp = hz / SPR * 360.0 * span
+        tl = (pts[0][2] - pts[-1][2]) / span if span else 0
+        if uniq == 1:
+            verdict = "★ raw 冻结 ⇒ **读路径挂了**"
+        elif abs(m["net_s"]) > 0.9 * hz / SPR * 360.0 and m["arc"] > 300:
+            verdict = "✓ 正常(在更新)"
+        elif m["arc"] < 90:
+            verdict = "★ raw 几乎不动 ⇒ 读路径疑似不更新"
+        else:
+            verdict = "部分更新/丢步"
+        print("  %6d | %6d | %9d | %6d | %6d | %8.1f | %10.1f | %8.1f | %s"
+              % (hz, len(pts), uniq, pts[0][1], pts[-1][1], exp, m["net_s"], tl, verdict))
+    print()
+    print("★ 判读:")
+    print("  · raw 唯一值=1 或 占用角域≈0 ⇒ **先查 AS5600 读路径(I2C)**,")
+    print("    尤其是 bit-bang I2C 缺超时/总线恢复 ⇒ 一旦 NAK/时钟拉伸就永久卡死,")
+    print("    固件会一直返回**最后一次的好值** ⇒ 数据看起来像'轴不动', 其实轴在转。")
+    print("  · tleft 倒数显著偏离 780/真实秒 ⇒ 扫描节拍/时基异常, 该轮所有速度值都不可信。")
+    d.ena(0)
+    d.ser.close()
+
+
 def main():
     a = sys.argv
     cmd = a[1] if len(a) > 1 else "ena"
     fn = dict(ena=cmd_ena, rate=cmd_rate, timebase=cmd_timebase,
               units=cmd_units, bias=cmd_bias, repro=cmd_repro,
-              startup=cmd_startup, fields=cmd_fields, bench=cmd_bench).get(cmd)
+              startup=cmd_startup, fields=cmd_fields, bench=cmd_bench,
+              liveness=cmd_liveness).get(cmd)
     if fn is None:
         print(__doc__)
         return 2

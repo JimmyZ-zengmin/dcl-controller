@@ -14,6 +14,9 @@ H723 步进运动测试套件 (闭环伺服验证用)
   speed <hz_max> [step] [sec]  ★ 突加转速扫描 (找固件无加减速时的可用上限)
   ramp <target_hz> [ms] [hold] ★ 带斜坡起动 (分离"无加减速"与"驱动器/电机上限")
   slip <hz> [sec]              ★ 失速形态: 残差 = 实际角 − 指令角 (滑差 + 摆动)
+  slipcurve <lo> <hi> <step> [sec]
+                               ★ 滑差率扫描: 滑差率 = 1 − 净速度/指令速度
+                                 (连续量 ⇒ 能看出"轴动但慢"的过渡带, 不是二元的转/不转)
   coast <hz>                   ★ 失能滑行: 量摩擦/阻尼减速率 (扭矩法的另一半)
   accel <tgt> [stepHz] [lo] [hi] [it] ★ 最大可跟随加速度 (力矩裕度的代理量)
   track sine <f_Hz> <amp_Hz> <base_Hz> <sec>
@@ -1093,6 +1096,43 @@ def main():
         for k in range(0, n, max(1, n // 20)):
             print("    %6.2f | %7.1f | %7.1f | %+7.2f | %7.1f"
                   % (rec[k][0], theta_des(rec[k][0]) + base_off, ang[k], err[k], om[k]))
+
+    elif cmd == "slipcurve":
+        lo = int(a[2]) if len(a) > 2 else 16200
+        hi = int(a[3]) if len(a) > 3 else 17200
+        step = int(a[4]) if len(a) > 4 else 50
+        sec = float(a[5]) if len(a) > 5 else 2.0
+        print("=== 滑差率扫描: %d → %d Hz (步进 %d, 每档 %.1fs, 突加) ===" % (lo, hi, step, sec))
+        print("  ★ 滑差率 = 1 − 净速度/指令速度 —— 连续量, 能看出『轴动但慢』的过渡带")
+        print("  ⚠ 采样 27Hz ⇒ 高于 ~13.5Hz 的振动本通路**看不见**(Nyquist);")
+        print("    高频振动只会被压成一个平均净速度 ⇒ 下面每一行都是**时间平均**, 不是瞬时")
+        print()
+        print("  请求Hz | 读回Hz | 净deg/s | 指令deg/s | 滑差率 | 占用角域 | 反向步 | 抖动°/s | 判读")
+        print("  -------+--------+---------+-----------+--------+----------+--------+---------+-------")
+        hz = lo
+        while hz <= hi:
+            r = speed_point(d, hz, sec)
+            if r is None:
+                print("  %6d | 采样不足" % hz)
+            else:
+                cmd = r["hz_rb"] / SPR * 360.0
+                slip = 1.0 - r["dps"] / cmd if cmd else 1.0
+                if r["arc"] < 90 and abs(r["dps"]) < 0.05 * cmd:
+                    verdict = "不转(原地)"
+                elif slip < 0.03:
+                    verdict = "全跟"
+                elif slip < 0.97:
+                    verdict = "★ 部分滑移"
+                else:
+                    verdict = "完全滑移"
+                print("  %6d | %6d | %7.1f | %9.1f | %6.3f | %7.1f° | %5.1f%% | %7.1f | %s"
+                      % (hz, r["hz_rb"], r["dps"], cmd, slip, r["arc"],
+                         r["back"] * 100, r["wob"], verdict))
+            hz += step
+        print()
+        print("★ 判读: 滑差率在 0→1 之间**连续变化**的频段 = 『轴动但慢』的过渡带;")
+        print("        若滑差率从 0 直接跳到 1 ⇒ 是突变式失速(无过渡带)。")
+        print("        抖动°/s 是**每采样段 |位移| 之和/时间** ⇒ 只能反映 <13.5Hz 的成分。")
 
     else:
         print("未知命令")
