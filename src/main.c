@@ -61,6 +61,9 @@
 #include "di.h"
 #include "hil.h"
 #include "do.h"
+#include "i2c_bb.h"
+#include "as5600.h"
+#include "step.h"
 #include "rtc.h"
 #include "blackbox.h"
 #include "sd.h"
@@ -2199,6 +2202,158 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         ack(r, 64u);
         return;
     }
+    if (op == 17u) {
+        /* ★ AS5600 上电诊断: 扫 4 组候选引脚对 (初次接线定位用) — 2026-09-15
+         *   64 字节 = 16 word: [4×ACK][4×RAW][自检][拉低读回][释放读回][0,0]
+         *   组序: 0=(PB10 SCL,PB11 SDA) 1=(接反) 2=(PB6,PB7) 3=(PB8,PB9)
+         * ★ 判读: 自检必须通过(拉低读到 0), 否则 START 条件不成立, 谈 ACK 没意义。 */
+        uint32_t a4[4] = {0}, rw[4] = {0}, st2 = 0u;
+        as5600_scan(a4, NULL, rw, &st2);      /* ★ 别叫 ack —— 会遮蔽协议应答函数 ack() */
+        uint8_t r[64];
+        for (uint32_t k = 0u; k < 4u; k++) put32(r + k * 4u, a4[k]);
+        for (uint32_t k = 0u; k < 4u; k++) put32(r + 16 + k * 4u, rw[k]);
+        put32(r + 32, st2);
+        put32(r + 36, g_as_scan_lo);
+        put32(r + 40, g_as_scan_hi);
+        put32(r + 44, 0u);
+        put32(r + 48, 0u);
+        put32(r + 52, 0u);
+        put32(r + 56, 0u);
+        put32(r + 60, 0u);
+        ack(r, 64u);
+        return;
+    }
+    if (op == 18u) {
+        /* ★ AS5600 运行态 (2026-09-15): 40 字节 = 10 word
+         *   [0]raw(0..4095) [1]deg×1000 [2]STATUS [3]MD磁铁OK [4]成功次数 [5]失败次数
+         *   [6]最后错误码 [7]I2C事务数 [8]I2C成功 [9]I2C NAK次数
+         * ★ 判读: ok_n 在涨且 err_n 不涨 ⇒ 稳定; deg×1000 转轴时应跟着变。 */
+        uint8_t r[40];
+        put32(r +  0, g_as_raw_v);
+        put32(r +  4, g_as_deg_x1000);
+        put32(r +  8, g_as_status);
+        put32(r + 12, g_as_mag_ok);
+        put32(r + 16, g_as_ok_n);
+        put32(r + 20, g_as_err_n);
+        put32(r + 24, g_as_last_err);
+        put32(r + 28, g_i2c_tx_n);
+        put32(r + 32, g_i2c_ok_n);
+        put32(r + 36, g_i2c_nak_n);
+        ack(r, 40u);
+        return;
+    }
+    if (op == 19u) {
+        /* ★★ 步进控制 (2026-09-15): [op][sub][arg:u32 LE]
+         *   ★★★ sub=0 = **只查询(无动作)** —— 这个改动是被坑出来的:
+         *     最初 sub=0 是"停止", 于是任何"只想读状态"的工具 (裸发一个 op=19) **都在悄悄停脉冲**。
+         *     症状: 刚起脉冲, 下一次查询就变成"已停" —— 看起来像"限时逻辑坏了/电机不转",
+         *     实际是**查询自己把脉冲关了**。★ 教训: **"读取"必须是零副作用的**, 否则它就是陷阱。
+         *   sub=1 arg=频率Hz(0=停)  sub=2 arg=方向0/1  sub=3 arg=使能0/1
+         *   sub=4 arg=限时毫秒(0=不限)  sub=5 arg=ENA极性  sub=6 = 停止+失能(安全态)
+         * ★ 判据: 返回的是**实际**频率(由 ARR 反算), 不是请求值。
+         * ★ 安全: 脉冲只由 CC1E 决定; 有了限时, 到点自动 step_stop_safe()。 */
+        uint32_t sub = (n >= 2u) ? p[1] : 0u;
+        uint32_t arg = (uint32_t)((n >= 6u)
+            ? (uint32_t)(p[2] | ((uint32_t)p[3] << 8) | ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24))
+            : 0u);
+        switch (sub) {
+        case 0u: break;                            /* ★ 只查询, 零副作用 */
+        case 1u: step_set_rate(arg); break;
+        case 2u: step_set_dir(arg); break;
+        case 3u: step_set_ena(arg); break;
+        case 4u: step_set_deadline_ms(arg); break;
+        case 5u: step_set_ena_pol(arg); break;     /* ENA 极性: 0=拉低使能 1=拉高使能 */
+        case 6u: step_stop_safe(); break;          /* ★ 停止+失能 (安全态) */
+        /* ★★★ 2026-09-15 新增 sub=7/8/9/10: **PA6 静态电平探针** —— 为"万用表判接线"而设。
+         *   动机: 500Hz 方波在万用表 DC 档上读的是**平均值**(50% 占空 ⇒ 约 1.65V), 于是
+         *   "接通"与"断路"被平均值糊成一团; 而且"脉冲还在不在跑"本身也是个变量
+         *   (带限时, 到点自动停)。⇒ 把 PA6 从 TIM3 上摘下来, 输出一个**确定的静态电平**:
+         *       PA6 = 0V   ⇒ 接通的 PUL− 会被光耦 LED 钳到 ~1.0~1.5V; 断路的 PUL− 停在 ~4.5~5V
+         *       PA6 = 3.3V ⇒ 接通的 PUL− 抬到 ~2~4V;                断路的 PUL− 纹丝不动
+         *   ⇒ 两个读数**一起看**, 一次判死: 线通不通 / 端子插错没 / 3.3V 高电平关不关得掉光耦。
+         *   ★ 零风险: 进入前先关 CC1E(保证无脉冲), 只切 MODER/AFRL/OTYPER, 不碰别的资源。 */
+        case 7u:                                   /* PA6 → GPIO 输出 **静态低 (0V)** */
+        case 8u: {                                 /* PA6 → GPIO 输出 **静态高 (3.3V)** */
+            step_set_rate(0u);                     /* 先停脉冲 (CC1E=0) */
+            uint32_t b2 = 6u;                      /* PA6 */
+            GPIO_MODER(0)  = (GPIO_MODER(0) & ~(3u << (b2 * 2u))) | (1u << (b2 * 2u));  /* 01=输出 */
+            GPIO_PUPDR(0) &= ~(3u << (b2 * 2u));   /* ★ 无内部上下拉 —— 否则"高"可能是被拉出来的 */
+            GPIO_OTYPER(0) &= ~(1u << b2);         /* 推挽 */
+            if (sub == 8u) { GPIO_ODR(0) |=  (1u << b2); }
+            else           { GPIO_ODR(0) &= ~(1u << b2); }
+            break;
+        }
+        case 9u: {                                 /* PA6 → 还原 TIM3_CH1 (AF2, 无脉冲) */
+            step_set_rate(0u);
+            uint32_t b2 = 6u;
+            GPIO_OTYPER(0) &= ~(1u << b2);         /* 还原推挽 */
+            GPIO_MODER(0)  = (GPIO_MODER(0) & ~(3u << (b2 * 2u))) | (2u << (b2 * 2u));  /* 10=AF */
+            GPIO_AFRL(0)   = (GPIO_AFRL(0)  & ~(0xFu << (b2 * 4u))) | (2u << (b2 * 4u)); /* AF2=TIM3 */
+            break;
+        }
+        case 10u: {                                /* PA6 输出类型: arg=1 ⇒ **开漏** (候选修复) */
+            uint32_t b2 = 6u;
+            if (arg) { GPIO_OTYPER(0) |=  (1u << b2); }
+            else     { GPIO_OTYPER(0) &= ~(1u << b2); }
+            break;
+        }
+        default: break;
+        }
+        /* ★★★ 修 (2026-09-15): 原为 `uint8_t r[40]` 而本块写了 **68 字节** (r+0..r+67)
+         *   ⇒ **栈上越界 28 字节**。它不报错、不崩, 只会把调用者的局部量/保存寄存器写坏 ——
+         *   正是"跑着跑着行为不对、却查不出谁写坏的"那一类。
+         *   ★ 最阴的地方: 读回来的 17 个字段**全是合理值** ⇒ 越界在观测面上**完全看不见**。
+         *   判据只能来自"数一数最多写到哪个偏移"这种静态检查, 而非"读数看着对不对"。 */
+        uint8_t r[112];
+        put32(r +  0, g_step_rate_hz);
+        put32(r +  4, g_step_dir);
+        put32(r +  8, g_step_ena);
+        put32(r + 12, g_step_deadline_tick);
+        put32(r + 16, TIM_CCER(TIM3_BASE_ADDR));   /* 看 CC1E: 1=有脉冲 0=停 */
+        put32(r + 20, g_step_arr);
+        put32(r + 24, g_step_ccr1);
+        put32(r + 28, SHM_U32(g_shm, OFF_CTRL_GPIO_MASK));
+        put32(r + 32, g_as_raw_v);
+        put32(r + 36, g_step_stop_n);
+        /* ★ 上电安全态的直接证据: **引脚的实际电平**。r+40 的低半字节 = PE0..PE15。
+         *   PE8..PE11 应为 1 (共阳接法下 = 光耦不导通 = ENA 失效 / 继电器不吸合)。 */
+        put32(r + 40, GPIO_ODR(DO_GPIO_PORT));
+        put32(r + 44, GPIO_MODER(DO_GPIO_PORT));
+        put32(r + 48, g_step_ena_pol);      /* ENA 极性 (0=拉低使能) */
+        /* ★ 诊断: PA6(TIM3_CH1) 到底有没有在动。
+         *   判据三件套: TIM3_CNT 在变(计数器在跑) + PA6 MODER=10(AF) + AFRL=2(TIM3)。
+         *   ★★★ 2026-09-15 更正: 上面那句"三者都对 ⇒ 引脚必然在翻转"**是错的**,
+         *     而且是本项目"配置全对 ≠ 功能可用"的第 N 次复现 ——
+         *     `MODER=AF` + `AFRL=2` + `CNT` 在跑 + `CC1E=1` **四件套全绿, 引脚仍然可能
+         *     一个电平都不输出**(AF 号不对 / 通道没真正接到脚上 ⇒ 该脚一直是**高阻**)。
+         *     ★ 唯一能证伪它的量是 **`GPIOx_IDR`**: IDR 读的是**引脚上的真实电平**,
+         *       与"谁在驱动它"无关。把 IDR 读回来, 再对比 ODR:
+         *         · ODR 说 1 / IDR 读 0  ⇒ 被外部拉低
+         *         · ODR 说 0 / IDR 读 1  ⇒ **不是我们在驱动**(高阻 + 外部上拉) ← 关键判据
+         *     ⇒ 见 r+76/r+80。 */
+        put32(r + 52, TIM_CNT(TIM3_BASE_ADDR));
+        put32(r + 56, GPIO_MODER(0));       /* GPIOA: PA6 = bit[13:12] */
+        put32(r + 60, GPIO_AFRL(0));        /* PA6 在 AFRL: bit[27:24] */
+        put32(r + 64, g_step_dt_max);       /* ★ step_tick 见过的最大 dt */
+        put32(r + 68, GPIO_ODR(0));         /* ★ PA6 静态探针: **实际输出电平** (bit6) */
+        put32(r + 72, GPIO_OTYPER(0));      /* ★ PA6 输出类型: bit6=1 开漏 / 0 推挽 */
+        /* ★★★ 引脚**真实**电平 (IDR 与谁在驱动无关) —— 判"高阻 vs 被驱动"的唯一硬判据。
+         *   比对 ODR: ODR=0 而 IDR=1 ⇒ **不是 MCU 在驱动这个脚**(高阻 + 外部上拉)。 */
+        put32(r + 76, GPIO_IDR(0));             /* GPIOA: PA6 = bit6 */
+        put32(r + 80, GPIO_IDR(DO_GPIO_PORT));  /* GPIOE: PE8..PE11 = bit8..11 */
+        /* ★★★ 实时寄存器透视 (2026-09-15, 审计用)。动机:
+         *   上面 r+20/r+24 报的是 **缓存** `g_step_arr`/`g_step_ccr1`(step_set_rate 自己记的),
+         *   而**任何别处**改 TIM3 的运行期寄存器都不会反映到缓存里 ——
+         *   典型如 `hil_outputs_safe()` 把 `TIM_CCR1` 清零 (它**没有** g_step_owns_tim3 门)。
+         *   那样脉冲会变成**恒定低**(光耦持续导通), 而缓存读回依然显示"50% 占空比"。
+         *   ⇒ 必须同时给出**实时**寄存器值, 否则"脉冲看着在出、轴不动"这类现象无从区分。
+         *   ★ 同族教训: "同一个量两处存放"(缓存 vs 硬件) ⇒ 只改一处就静默失效。 */
+        put32(r + 84, TIM_CCMR1(TIM3_BASE_ADDR));  /* OC1M/OC1PE/CC1S: 通道模式是否还是 PWM1 */
+        put32(r + 88, TIM_CCR1(TIM3_BASE_ADDR));   /* ★ **实时** CCR1 (与 r+24 的缓存对比) */
+        put32(r + 92, TIM_ARR(TIM3_BASE_ADDR));    /* ★ **实时** ARR  (与 r+20 的缓存对比) */
+        ack(r, 96u);
+        return;
+    }
     nak("bad pin pattern op");
 }
 
@@ -2963,6 +3118,7 @@ void SystemInit(void)
     __asm__ volatile("dsb; isb");
 }
 
+
 int main(void)
 {
     /* ★★★ 向量表搬进 ITCM + VTOR 指过去 —— **必须在使能任何中断之前** (见 ld 里的说明)。
@@ -3291,6 +3447,7 @@ int main(void)
     g_stage = 22; ai_init(g_shm);
     g_stage = 23; di_init(g_shm);
     g_stage = 24; hil_init(g_shm);
+ as5600_init();                  /* AS5600 磁编码器: 绑定 PB10/PB11 */
     /* ★★ 把 HIL 的物理输出登记为"安全态必须覆盖的面" (审计 #1)。
      *   必须在 hil_init **之后** —— 登记的是一个会写 TIM3_CCR1 的回调,
      *   TIM3 时钟/引脚未配置时调用它只是往未使能的外设写, 语义上不该发生。
@@ -3309,6 +3466,12 @@ int main(void)
      *   **第一次被真正清零** (之前它只有计数、没有动作 —— 定案②的欠账在此收清)。 */
     g_stage = 26; do_init(g_shm);
     do_latch_init();                    /* ★ P3-B: 影子 + MDMA 定时锁存链 (须在 do_init 后) */
+    /* ★★ 2026-09-15 步进脉冲源: **必须在 do_init() 之后** ——
+     *   它要写 OFF_CTRL_GPIO_MASK(接通 DO 面) 并预置 ACTUATOR[8..11]。
+     *   ★ 踩过: 第一次把本调用插在 hil_init 之后, 而那次替换**没匹配上、静默没生效**
+     *     ⇒ GPIO_MASK 一直是 0 ⇒ do_poll 早退 ⇒ PE8~PE11 停在 0(光耦导通!)
+     *     ⇒ 如果那时接了 24V, 电机会上使能。**安全态验收** 才把它抓出来。 */
+    step_init(g_shm);
     rtc_init(g_shm);                     /* ★ RTC: LSE 32.768kHz 时基 + 事件时间戳 */
     bb_init(g_shm);                      /* ★ 黑匣子: MDMA ch1 每拍 256B 快照 → AXI 环形缓冲 */
     /* ★ SD 卡 (2026-09-12): 初始化 + 把黑匣子缓冲写到卡上。
@@ -3339,6 +3502,21 @@ int main(void)
         /* ★★ 主循环进入标记 —— **必须放在本轮最前面** (在任何可能阻塞的调用之前),
          *   否则"第一轮就卡住"依然会被当成"还没进入"。见 g_loop_entered 的注释。 */
         g_loop_entered = 1u;
+
+        step_tick(g_tick_count);        /* 限时截止 (只做一次比较, 极短) */
+
+        /* ★ AS5600: 每 10ms 读一次。单次 ≈250µs ⇒ 占主循环 ~2.5%, 远低于停滞阈值。
+         * ★★ 必须用**边沿触发**, 不能用 `g_tick_count % 100 == 0`:
+         *   主循环一拍内会转很多圈, 那种写法在"命中的那一拍"里会**反复调用**,
+         *   实测采样率变成 ~190/s(期望 100/s) —— 即"模运算当调度器"的经典坑。
+         *   `(now - last) >= N` 的无符号减法天然处理回绕, 且保证"每 N 拍恰好一次"。 */
+        {
+            static uint32_t s_as_next = 0u;
+            if ((int32_t)(g_tick_count - s_as_next) >= 0) {
+                s_as_next = g_tick_count + 100u;
+                as5600_poll(g_shm);
+            }
+        }
 
         /* ★ 主循环间隔**实测** (回应审计 P1① 的"阈值得先测"): 阈值不能拍。
          *   为什么在主循环里量就够: 它只需上报**已经完成**的间隔; 而"永久停滞"由拍 ISR 判

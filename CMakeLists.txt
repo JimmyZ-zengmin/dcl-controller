@@ -236,6 +236,9 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/blackbox.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/sd.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/hil.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/i2c_bb.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/as5600.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/step.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/uart.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.c

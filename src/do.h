@@ -43,7 +43,11 @@ void do_latch_init(void);
  *   硬件锁存 (输出沿与计算时长解耦); =0 时 do_poll 直接写 BSRR (P3-A 行为, 对照档)。
  *   放这里用 #ifndef 兜底, 可被 CMake -DDCL_DO_LATCH=0 覆盖。 */
 #ifndef DCL_DO_LATCH
-#define DCL_DO_LATCH 1   /* ★ 影子模式开启 (软触发验证 ODR=0xFF; TSEL 触发待调) */
+#define DCL_DO_LATCH 0   /* ★★ 2026-09-15 改交付档: CPU 一次 32 位 BSRR 直写。
+                            *  理由有二: ① 影子+MDMA 锁存**只覆盖 ODR 低字节** ⇒ PE8~PE15 死;
+                            *  而 DIR/ENA 接在 PE8/PE9(高字节), 用锁存档根本驱动不了;
+                            *  ② 实测 CPU 直写抖动 3.6ns vs 锁存 54~60ns, 且是原子 16 位写。
+                            *  详见 docs/ASSESS-architecture-as-controller-2026-09-14.md */
 #endif
 
 extern volatile uint32_t g_do_poll_n;    /* 活性计数 (就绪门后每拍+1) */

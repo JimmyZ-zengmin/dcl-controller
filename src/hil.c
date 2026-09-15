@@ -2,6 +2,7 @@
  * hil.c — HIL 硬件在环 (W5 外设域)。见 hil.h 说明 (语义保留 S3)。
  */
 #include "hil.h"
+#include "step.h"
 #include "itcm.h"   /* ★ ISR 调用树必须住 ITCM —— 见该头文件 */
 #include "adc.h"
 #include "engine.h"
@@ -98,6 +99,11 @@ DCL_ITCM static void hil_out_apply(uint8_t *base)
 {
     /* ★ 硬件未就绪直接返回 —— 见 s_hil_ready 的说明 (少了这一句会整机卡死) */
     if (!s_hil_ready) return;
+    /* ★★ 2026-09-15: TIM3_CH1 已交给**步进脉冲源**(step.c) ⇒ 本输出臂必须让出。
+     *   否则它每拍都把 TIM_CCR1 改回 HIL 占空比, 步进脉冲被**静默毁掉**
+     *   (寄存器写进去了、读回来也对, 但波形不对 —— 本项目的老族)。
+     *   与 PA6 上同时挂 HIL PWM 和步进脉冲是**同一个引脚的排他使用**, 必须显式串行化。 */
+    if (g_step_owns_tim3) { return; }
     /* 输出臂: WIRE[HIL_U_WIRE] → 占空比 (钳到 [0, RES]) */
     float u = hil_read_f(base, OFF_WIRE_MAP + (uint32_t)HIL_U_WIRE * 4u);
 #if HIL_SAFE
