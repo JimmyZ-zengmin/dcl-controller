@@ -1,5 +1,12 @@
 # H723 阶段 2 审计报告（对照 esp32-core0 最后两轮审计口径）
 
+> ## ⚠️ 计时结论需 DWT 校时前置（2026-09-15 加）
+> 本文的计时/抖动类结论都依赖 `DWT_CYCCNT`。后来发现 **pyocd 调试会话退出会让调试域断电
+> ⇒ `DWT_CTRL.CYCCNTENA` 被清 ⇒ `CYCCNT` 冻结在 0**，于是所有计时量读 0 而其余一切正常。
+> ⇒ 引用本文任何时间量之前，必须先确认当时**时基在走**（现用 `0x39 op=7`：它返回两次
+> `CYCCNT`，Δ=0 即无效）。依据：`docs/FIX-REPORT-R5-overrun-and-timebase.md` §3、
+> `docs/exp-2026-09-14-mdma-trigger/README.md` §2。
+
 日期: 2026-09-10 · 被审对象: `9.10 H723newest` 阶段 2 交付（`5ef63c3` + 本轮 `audit` 提交）
 审计依据（老文档最后两轮）:
 - **第二十五 / 二十六轮**（`6c39f81`）：OA16–OA19；★`cold_start_reset()` 单一入口纪律；

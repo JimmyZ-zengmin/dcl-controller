@@ -1,5 +1,12 @@
 # 阶段 2 报告 — ITCM / DTCM 落位 + 路由扫描移植 + 同镜像 A/B 实验
 
+> ## ⚠️ 计时结论需 DWT 校时前置（2026-09-15 加）
+> 本文的计时/抖动类结论都依赖 `DWT_CYCCNT`。后来发现 **pyocd 调试会话退出会让调试域断电
+> ⇒ `DWT_CTRL.CYCCNTENA` 被清 ⇒ `CYCCNT` 冻结在 0**，于是所有计时量读 0 而其余一切正常。
+> ⇒ 引用本文任何时间量之前，必须先确认当时**时基在走**（现用 `0x39 op=7`：它返回两次
+> `CYCCNT`，Δ=0 即无效）。依据：`docs/FIX-REPORT-R5-overrun-and-timebase.md` §3、
+> `docs/exp-2026-09-14-mdma-trigger/README.md` §2。
+
 日期: 2026-09-10 · 项目: 9.10 H723newest
 平台: STM32H723ZGT6 @ **400MHz**（HSE 25MHz → PLL M=5/N=80/P=1 → HCLK 200 / TIMxCLK 200）
 目标: 把 esp32-core0 的**路由扫描**移植过来，并把阶段 1 提出的假设

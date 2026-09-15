@@ -1,5 +1,15 @@
 # 修复报告 — T26 (PERSISTENT 落盘) + 向量表进 ITCM
 
+> ## ⚠️ 已修正（2026-09-15 加）—— 计时前提 + 落盘结论降级
+> ① **计时结论需 DWT 校时前置**：本文的计时/抖动类结论都依赖 `DWT_CYCCNT`。后来发现
+> **pyocd 调试会话退出会让调试域断电 ⇒ `DWT_CTRL.CYCCNTENA` 被清 ⇒ `CYCCNT` 冻结在 0**，
+> 于是所有计时量读 0 而其余一切正常。⇒ 引用本文任何时间量之前，必须先确认当时**时基在走**
+> （现用 `0x39 op=7`：它返回两次 `CYCCNT`，Δ=0 即无效）。依据：
+> `docs/FIX-REPORT-R5-overrun-and-timebase.md` §3、`docs/exp-2026-09-14-mdma-trigger/README.md` §2。
+> ② ★ 另：**掉电保持的"保存"在交付档已被降级** —— `DCL_PERSIST_SAVE=0`，`0x43` 落盘**明确 NAK**
+> （真因：擦 128KB 内部 flash 期间拍 ISR 卡死 210.6 ms ⇒ 喂狗停 ⇒ 看门狗复位 ⇒
+> "保存"实测等于"重启机器且配置从未落盘"）。依据：`src/persist.h` 顶部、`docs/audit/H723-PERSIST-WDT-DEFECT.md`。
+
 日期: 2026-09-11 · 项目: `D:\STM\8.29 AIAutoFactior\9.10 H723newest`
 
 ---
