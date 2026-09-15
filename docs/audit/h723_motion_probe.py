@@ -138,6 +138,20 @@ def unwrap(seq):
     return out
 
 
+def unwrap_dir(seq, fwd=True):
+    """★ 单调解卷绕: 已知全程单向 ⇒ 每步取优势方向的模。
+       `unwrap` 要求相邻两点位移 < 半圈, 本函数放宽到 < 整圈 (高速必用)。"""
+    out = [0.0]
+    acc = 0
+    for i in range(1, len(seq)):
+        d = (seq[i] - seq[i - 1]) & 0xFFF
+        if not fwd:
+            d = d - 4096
+        acc += d
+        out.append(acc * 360.0 / 4096.0)
+    return out
+
+
 def head(t):
     d = Dut()
     s = d.st()
@@ -355,11 +369,46 @@ def cmd_repro():
     d.ser.close()
 
 
+def cmd_startup():
+    """起动剖面: 逐点看"从发命令到满速"用了多久 ⇒ 判固件有没有内部加减速。
+       ★ 这是解释"突加上限"的前提: 若内部有斜坡, 突加上限 ≠ 电机 pull-in 上限。"""
+    d, _ = head("起动剖面 (判固件有无内部加减速)")
+    for hz in (5000, 15000):
+        d.ena(1)
+        time.sleep(0.3)
+        d.dirn(0)
+        d.limit(20000)
+        t0 = time.time()
+        d.rate(hz)
+        pts = []
+        while time.time() - t0 < 1.0:
+            s = d.st()
+            if s:
+                pts.append((time.time() - t0, s["raw"]))
+        d.stop()
+        time.sleep(0.25)
+        print("  请求 %d Hz (理论 %.0f °/s):" % (hz, hz / SPR * 360.0))
+        print("      t(s) | 瞬时deg/s | 相对满速")
+        ang = unwrap_dir([p[1] for p in pts], True)
+        for i in range(1, min(len(pts), 22)):
+            dtt = pts[i][0] - pts[i - 1][0]
+            if dtt <= 1e-6:
+                continue
+            v = (ang[i] - ang[i - 1]) / dtt
+            print("    %6.3f | %9.1f | %7.1f%%" % (pts[i][0], v, v / (hz / SPR * 360.0) * 100))
+        print()
+    print("★ 判读: 第 1~2 个采样点(≈35ms 间隔)就到 ~100%% ⇒ **无内部加减速** (硬突加);")
+    print("        需要几百 ms 才爬上去 ⇒ 有内部斜坡, 此时『突加上限』其实是**斜坡能力上限**。")
+    d.ena(0)
+    d.ser.close()
+
+
 def main():
     a = sys.argv
     cmd = a[1] if len(a) > 1 else "ena"
     fn = dict(ena=cmd_ena, rate=cmd_rate, timebase=cmd_timebase,
-              units=cmd_units, bias=cmd_bias, repro=cmd_repro).get(cmd)
+              units=cmd_units, bias=cmd_bias, repro=cmd_repro,
+              startup=cmd_startup).get(cmd)
     if fn is None:
         print(__doc__)
         return 2

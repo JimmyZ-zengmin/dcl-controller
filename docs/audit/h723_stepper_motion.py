@@ -11,6 +11,8 @@ H723 步进运动测试套件 (闭环伺服验证用)
   reverse <hz> <sec_each>      正转→反转→正转 (变向)
   pos <target_deg> [tol]       上位机闭环位置控制 (读编码器→调脉冲→逼近)
   hold <deg> <sec>             位置锁定测试 (闭环保持 + 误差带统计)
+  speed <hz_max> [step] [sec]  ★ 突加转速扫描 (找固件无加减速时的可用上限)
+  ramp <target_hz> [ms] [hold] ★ 带斜坡起动 (分离"无加减速"与"驱动器/电机上限")
   roundtrip <hz> <ms> <n>      ★ 往返复现性: n 轮定时脉冲正/反, 每轮等脉冲数
                                   (用固件"限时"字段定时 ⇒ 脉冲数严格相等,
                                    排除 Python 计时超时造成的"每段多走几度"假象)
@@ -115,6 +117,7 @@ LIMIT_SCALE = 1.26            # 固件"限时 ms" 1 单位 ≈ 1.26 真实 ms (�
 PULSES_PER_UNIT = 0.637       # 限时字段每消耗 1 单位 ≈ 0.637 个脉冲 (500/785)
 SAFE_LIMIT = 200000           # 当"安全网"用的超大限时 (不会到期)
 CMD_BIAS_S = 0.0553           # ★ 实测: 命令通路等效延时 (8 次标定: +6.218°/56.25° @500Hz)
+ABRUPT_CEIL_HZ = 16650        # ★ 实测: **突加**(无加减速)可跟随上限; 超过即失速
 
 # ★ 方向映射 (必须实测, 不能假设): dir=0 ⇒ 编码器 raw **增大**; dir=1 ⇒ raw **减小**
 #   依据: dir=0 长跑 +1122° / dir=1 脉冲串 −868 计数
@@ -181,6 +184,37 @@ def move_deg(d, dir_bits, deg, gain=1.0):
     return hz
 
 
+def speed_point(d, hz, sec=1.5):
+    """突加一档频率, 稳态段测速 (单向 ⇒ 用 unwrap_dir 避开 ±180° 缠绕)"""
+    d.ena(1)
+    time.sleep(0.25)
+    d.dirn(DIR_POS)
+    d.limit(int(sec * 1000 * 1.6) + 3000)      # 安全网, sec 内不到期
+    d.rate(int(hz))
+    pts = []
+    t0 = time.time()
+    while time.time() - t0 < sec:
+        s = d.st()
+        if s:
+            pts.append((time.time() - t0, s["raw"], s["hz"], s["tleft"], s["ccer"] & 1))
+    d.stop()
+    time.sleep(0.12)
+    if len(pts) < 6:
+        return None
+    w = [p for p in pts if p[0] > 0.35 and p[0] < sec - 0.15]     # 剔除突加瞬态
+    if len(w) < 4:
+        return None
+    ang = unwrap_dir([p[1] for p in w], DIR_POS == 0)
+    dt = w[-1][0] - w[0][0]
+    peak = 0.0
+    for i in range(1, len(w)):
+        dtt = w[i][0] - w[i - 1][0]
+        if dtt > 1e-6:
+            peak = max(peak, abs(unwrap_dir([w[i - 1][1], w[i][1]], DIR_POS == 0)[1]) / dtt)
+    return dict(hz=hz, hz_rb=w[-1][2], dps=(ang[-1] - ang[0]) / dt,
+                theo=hz / SPR * 360.0, peak=peak, wrap=max_per_sample_wrap(w))
+
+
 def unwrap(seq):
     """raw 序列 → 累计角度(deg)"""
     out = [0.0]
@@ -196,6 +230,31 @@ def unwrap(seq):
         out.append(acc * 360.0 / 4096.0)
         prev = r
     return out
+
+
+def unwrap_dir(seq, fwd=True):
+    """★ 单调解卷绕 (高速必用): 已知全程单向 ⇒ 每步只取优势方向的模。
+       `unwrap` 要求相邻两点位移 < 半圈(2048 计数), 本函数放宽到 < 整圈(4096),
+       因为 27Hz 采样在 ~4900°/s 时就会跨 2048。"""
+    out = [0.0]
+    acc = 0
+    for i in range(1, len(seq)):
+        d = (seq[i] - seq[i - 1]) & 0xFFF
+        if not fwd:
+            d = d - 4096
+        acc += d
+        out.append(acc * 360.0 / 4096.0)
+    return out
+
+
+def max_per_sample_wrap(pts):
+    """按相邻采样间隔估算"每采样段最大可测速度"(°/s), 用于给结果标可信度"""
+    if len(pts) < 3:
+        return 0.0
+    gaps = [pts[i][0] - pts[i - 1][0] for i in range(1, len(pts)) if pts[i][0] > pts[i - 1][0]]
+    if not gaps:
+        return 0.0
+    return 360.0 / (sum(gaps) / len(gaps))
 
 
 def sample(dut, dur_s, gap=0.0):
@@ -575,6 +634,111 @@ def main():
               % (sum(gs) / n, tot, sum(us) / n, max(us) - min(us)))
         print("  ⇒ 同向每段若也系统性偏离 ⇒ 偏差来自**每段起步/停止**, 与换向无关;")
         print("    同向精确而往返才偏 ⇒ 偏差是**换向特有**的。")
+
+    elif cmd == "speed":
+        hz_max = int(a[2]) if len(a) > 2 else 8000
+        step = int(a[3]) if len(a) > 3 else 500
+        sec = float(a[4]) if len(a) > 4 else 1.5
+        hz_beg = int(a[5]) if len(a) > 5 else 500
+        print("=== 突加转速扫描: %d → %d Hz (步进 %d, 每档 %.1fs) ===" % (hz_beg, hz_max, step, sec))
+        print("  换算(1600 步/圈): 1600Hz = 1 圈/s = 360°/s;  Hz × 0.225 = °/s")
+        print("  ★ 突加 = 固件**无加减速**时的真实可用上限 (带斜坡的上限见 `ramp`)")
+        print()
+        print("  请求Hz | 读回Hz | 实测deg/s | 比值(请求) | 比值(读回) | 峰值deg/s | 采样上限 | 判读")
+        print("  -------+--------+-----------+------------+------------+-----------+----------+-------")
+        ok_hi = None
+        hz = hz_beg
+        while hz <= hz_max:
+            r = speed_point(d, hz, sec)
+            if r is None:
+                print("  %6d | 采样不足" % hz)
+            else:
+                ratio = r["dps"] / r["theo"] if r["theo"] else 0.0
+                theo_rb = r["hz_rb"] / SPR * 360.0
+                ratio_rb = r["dps"] / theo_rb if theo_rb else 0.0
+                if 0.97 <= ratio_rb <= 1.03:
+                    verdict = "跟得上"; ok_hi = (hz, r)
+                elif ratio_rb < 0.9:
+                    verdict = "★ 掉步/失速"
+                else:
+                    verdict = "临界"
+                warn = ""
+                if abs(r["dps"]) > r["wrap"] * 0.8:
+                    warn = " (★超采样上限, 值可疑)"
+                print("  %6d | %6d | %9.1f | %10.3f | %10.3f | %9.1f | %8.0f | %s%s"
+                      % (hz, r["hz_rb"], r["dps"], ratio, ratio_rb, r["peak"],
+                         r["wrap"], verdict, warn))
+            hz += step
+        print()
+        if ok_hi:
+            h, r = ok_hi
+            print("  ★ 突加稳定上限: %d Hz = %.0f °/s = %.2f 圈/s = %.0f rpm"
+                  % (h, r["dps"], r["dps"] / 360.0, r["dps"] * 60.0 / 360.0))
+            print("     2min 长跑窗口已单独验证 500Hz 累计偏差 -0.0%% (见 longrun)")
+        else:
+            print("  ★ 突加: 最低档 500Hz 就已掉步 ⇒ 先查供电/电流/机械")
+
+    elif cmd == "ramp":
+        tgt = int(a[2]) if len(a) > 2 else 4000
+        ramp_ms = float(a[3]) if len(a) > 3 else 1200.0
+        hold = float(a[4]) if len(a) > 4 else 1.5
+        start = min(300, tgt)
+        nseg = max(4, int(ramp_ms / 80))
+        print("=== 带斜坡起动: %d → %d Hz, 斜坡 %.0fms (%d 级), 保持 %.1fs ==="
+              % (start, tgt, ramp_ms, nseg, hold))
+        d.ena(1)
+        time.sleep(0.25)
+        d.dirn(DIR_POS)
+        d.limit(int((ramp_ms + hold * 1000) * 1.8) + 3000)
+        d.rate(start)
+        t0 = time.time()
+        pts = []
+        for k in range(1, nseg + 1):
+            d.rate(int(start + (tgt - start) * k / nseg))
+            t1 = time.time()
+            while time.time() - t1 < (ramp_ms / 1000.0) / nseg:
+                s = d.st()
+                if s:
+                    pts.append((time.time() - t0, s["raw"], s["hz"], s["ccer"] & 1))
+        th = time.time()
+        holdpts = []
+        while time.time() - th < hold:
+            s = d.st()
+            if s:
+                pts.append((time.time() - t0, s["raw"], s["hz"], s["ccer"] & 1))
+                holdpts.append((time.time() - th, s["raw"], s["hz"]))
+        d.stop()
+        time.sleep(0.12)
+        theo = tgt / SPR * 360.0
+        if len(holdpts) >= 4:
+            ang = unwrap_dir([p[1] for p in holdpts], DIR_POS == 0)
+            dt = holdpts[-1][0] - holdpts[0][0]
+            dps = (ang[-1] - ang[0]) / dt
+            hz_rb = holdpts[-1][2]
+            theo_rb = hz_rb / SPR * 360.0          # ★ 按**读回**频率折算才公平
+            r_req = dps / theo if theo else 0.0
+            r_rb = dps / theo_rb if theo_rb else 0.0
+            dev = (hz_rb - tgt) / tgt * 100.0
+            print("  读回 hz = %d (请求 %d, 偏差 %+.2f%%)  ⇒ %s"
+                  % (hz_rb, tgt, dev,
+                     "≈请求值" if abs(dev) < 0.5 else
+                     "★ 频率量化(ARR 取整), 实际比请求高 %.2f%%" % dev))
+            print("  保持段实测 %.1f °/s = %.0f rpm  |  比值(按请求) %.3f  比值(按读回) %.3f  %s"
+                  % (dps, dps * 60.0 / 360.0, r_req, r_rb,
+                     "跟得上 ✓" if r_rb >= 0.97 else ("★ 掉步" if r_rb < 0.9 else "临界")))
+            if r_rb >= 0.97 and tgt > ABRUPT_CEIL_HZ:
+                print("  ⇒ ★ 该点在 %.0f Hz 突加会失速, 斜坡后能跟 ⇒ **斜坡确实扩展了上限**"
+                      % ABRUPT_CEIL_HZ)
+            elif r_rb < 0.97:
+                print("  ⇒ ★ 斜坡加持下也掉步 ⇒ 上限在**电机/驱动器/供电**(或本脚本采样上限)")
+        else:
+            print("  保持段采样不足")
+        if len(pts) >= 6:
+            ang = unwrap_dir([p[1] for p in pts], DIR_POS == 0)
+            tot = ang[-1] - ang[0]
+            span = pts[-1][0] - pts[0][0]
+            print("  全程: %.2fs 走了 %+.1f° (%.2f 圈), 平均 %.1f °/s = %.0f rpm"
+                  % (span, tot, tot / 360.0, tot / span, tot / span * 60.0 / 360.0))
 
     else:
         print("未知命令")
