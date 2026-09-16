@@ -56,12 +56,16 @@
 #include "faultlog.h"   /* 统一故障台账: 主循环/ISR/协议层的异常都留案底 */
 #include "manifest.h"   /* 诊断资源目录: 0x64 让板子自报"哪里出问题读什么" */
 #include "i2c_sm.h"     /* ★ G6-1: 拍内 I2C 事务状态机 (契约 §3.6 四条约束 / §3.7 实施) */
+#include "i2c_bb.h"     /* ★ G6-2: 总线独占门 i2c_bus_owner()/I2C_OWNER_SM */
 #include "timebase.h"   /* ★ 生产时基 = TIM5 (不再押在调试单元 DWT 上) —— 见该头文件的说明 */
 
-/* ★ 总线独占门（契约 §3.6 约束③「总线独占门」）——
- *   = "阻塞路径正在用总线"。**唯一写者**是主循环里包住 `as5600_poll` 的那一段（公理②）。
- *   看门狗/ISR 都不写它。状态机在 `i2c_sm_request()` 里读它, 占用中 ⇒ 明确拒绝(能失败的判据)。 */
-volatile uint8_t g_i2c_blk_active = 0u;
+/* ★★ 总线独占门已**移到资源处**（`src/i2c_bb.c` 的 `i2c_bus_acquire/release`，声明在 `i2c_bb.h`）。
+ *   早先在这里定义一个 `g_i2c_blk_active` 标志、由状态机去读 —— 那是"**守卫放错层**":
+ *   只在"我以为的那个调用点"有效, 多一个调用者就静默穿透。本项目的同族教训不止一次
+ *   （`do_latch_init` 无条件启动 / `0x43` 那条链）。⇒ **谁拥有引脚, 谁守门。** */
+
+/* ★ G6-2 诊断占用（`0x39 op=22`）的到期 tick：0 = 未占用。**有界**，见 ISR 尾部的自动释放。 */
+static volatile uint32_t g_i2c_hold_until = 0u;
 #include "wdt.h"        /* 独立看门狗: 喂狗点=拍 ISR (契约见 wdt.h 文件头) */
 #include "lsym.h"
 #include "adc.h"
@@ -2446,6 +2450,45 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         ack(r, 96u);
         return;
     }
+    if (op == 22u) {
+        /* ★★★ G6-2 判据面: **人工占住总线**, 好让"占用期再申请必须被拒"这条判据能被跑到。
+         * 为什么需要它: 真实的重叠窗口只有 ~250µs(阻塞)/~800µs(状态机), 从串口根本抓不到 ⇒
+         *   没有这个诊断口, 那条判据就**永远无法执行**（"判据不能失败 = 判据不存在"）。
+         * 载荷 [op][sub][arg]: sub=0 占住(arg=拍数, 默认 500=50ms, 上限 2000) · 1 释放 · 2 只查询
+         * ★ 安全: 占用**有界** —— ISR 尾部按 tick 到期自动释放, 忘了解也不会把总线永久占死。
+         * 应答 32B:
+         *   +0 acquire 结果(1=拿到 0=被占) +4 当前 owner(0=NONE 1=BLOCKING 2=SM)
+         *   +8 被门拦下的次数(**占用期再申请 ⇒ 这个数必须涨**)
+         *   +12 状态机被门拒的次数 +16 状态机 status +20 状态机 phase
+         *   +24 阻塞路径 tx 计数 +28 阻塞路径 nak 计数（占用期间它们不应增长）
+         *   +32 引用计数（**正常空闲必须 == 0** —— 给"引用计数泄漏"准备的判据）*/
+        uint32_t sub = (n >= 2u) ? p[1] : 0u;
+        uint32_t arg = (uint32_t)((n >= 6u)
+            ? (uint32_t)(p[2] | ((uint32_t)p[3] << 8) | ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24))
+            : 500u);
+        uint8_t rx[36];
+        uint32_t got = 1u;
+        if (sub == 0u) {
+            if (arg == 0u) { arg = 500u; }
+            if (arg > 2000u) { arg = 2000u; }        /* ≤200ms: 有界 */
+            got = i2c_bus_acquire(I2C_OWNER_BLOCKING);
+            g_i2c_hold_until = got ? (g_tick_count + arg) : 0u;
+        } else if (sub == 1u) {
+            i2c_bus_release(I2C_OWNER_BLOCKING);
+            g_i2c_hold_until = 0u;
+        }
+        put32(rx +  0, got);
+        put32(rx +  4, (uint32_t)i2c_bus_owner());
+        put32(rx +  8, g_i2c_bus_busy_n);
+        put32(rx + 12, g_i2c_sm_gate_n);
+        put32(rx + 16, i2c_sm_status());
+        put32(rx + 20, i2c_sm_phase());
+        put32(rx + 24, g_i2c_tx_n);
+        put32(rx + 28, g_i2c_nak_n);
+        put32(rx + 32, (uint32_t)i2c_bus_refs());
+        ack(rx, 36u);
+        return;
+    }
     if (op == 21u) {
         /* ★★★ 时基健康度（2026-09-16）—— 交付固件此前**没有**"时基在走"的可读量:
          *   `0x39 op=7`(重新校时)只活在实验补丁里 ⇒ 时基死了在协议面上**无法自证**
@@ -3842,8 +3885,8 @@ int main(void)
     g_stage = 22; ai_init(g_shm);
     g_stage = 23; di_init(g_shm);
     g_stage = 24; hil_init(g_shm);
- as5600_init();
-    i2c_sm_init();                  /* ★ G6-1: 拍内 I2C 事务状态机（同一对引脚; 靠 g_i2c_blk_active 互斥）*/                  /* AS5600 磁编码器: 绑定 PB10/PB11 */
+ as5600_init();                  /* AS5600 磁编码器: 绑定 PB10/PB11 */
+    i2c_sm_init();                  /* ★ G6-1: 拍内 I2C 事务状态机（同一对引脚; 与阻塞路径共用 i2c_bb 的总线门）*/
     /* ★★ 把 HIL 的物理输出登记为"安全态必须覆盖的面" (审计 #1)。
      *   必须在 hil_init **之后** —— 登记的是一个会写 TIM3_CCR1 的回调,
      *   TIM3 时钟/引脚未配置时调用它只是往未使能的外设写, 语义上不该发生。
@@ -3936,17 +3979,23 @@ int main(void)
             static uint32_t s_as_next = 0u;
             if ((int32_t)(g_tick_count - s_as_next) >= 0) {
                 s_as_next = g_tick_count + 100u;
-                /* ★★★ 总线独占门（契约 §3.6 约束③）—— I2C 状态机事务在飞时**不碰总线**。
-                 * 必要性: 状态机在**拍 ISR** 里推进, 而 `as5600_poll` 在**主循环**里阻塞 ~250µs
-                 *   ⇒ 两者交叠就会在同一对引脚上互相踩（公理② 单写者；
-                 *     本项目已因"一条线两个写者"栽过两次: TIM3 / SD 卡）。
-                 * ★ 只需单向: 状态机的**请求**同样来自主循环(协议派发) ⇒ 两者不可能同时"开始";
-                 *   要防的是"状态机在飞 + 主循环又开一次阻塞事务"。
-                 * ★ 判据（能失败）: 状态机的 8 拍窗口内, as5600 的 tx 计数**不得增长**。 */
-                if (!g_i2c_sm_active) {
-                    g_i2c_blk_active = 1u;
+                /* ★ G6-2: 延迟放门（状态机在 ISR 里收尾, 放门必须由主循环做 —— 见 i2c_sm.h）*/
+                i2c_sm_service();
+                /* ★★ G6-2 诊断占用的**有界**释放（`0x39 op=22 sub=0`）——
+                 *   占用到 tick 到期就自动放门, 不依赖"上位机记得来释放"。
+                 *   ★ 为什么放在**主循环**而不是 ISR 尾部: `i2c_bus_release()` 在 flash 里,
+                 *     放进 ISR 就违反 ISR 调用树不变量（擦 flash 期间取指被 stall ⇒ 喂狗停）。
+                 *     —— 这是**闸门当场拦下来**的（`gate_isr_itcm.py` 点了 `i2c_bus_release@0x08008BDC`）。
+                 *     而 ≤200ms 的诊断占用本来也不需要拍级精度, 主循环(~1.3ms 一圈)足够。 */
+                if (g_i2c_hold_until != 0u && (int32_t)(g_tick_count - g_i2c_hold_until) >= 0) {
+                    g_i2c_hold_until = 0u;
+                    i2c_bus_release(I2C_OWNER_BLOCKING);
+                }
+                /* ★★ G6-2: 状态机持有总线时**连调用都不发起** —— 门本身已经能拒绝
+                 *   （`i2c_bb_*` 内部 acquire），这里只是省掉一次必然失败的 250µs 往返,
+                 *   并避免污染 AS5600 的错误计数（那是判据, err 必须保持 0）。 */
+                if (i2c_bus_owner() != I2C_OWNER_SM) {
                     as5600_poll(g_shm);
-                    g_i2c_blk_active = 0u;
                 }
             }
         }

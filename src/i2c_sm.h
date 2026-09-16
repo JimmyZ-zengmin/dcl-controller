@@ -63,15 +63,22 @@ uint32_t i2c_sm_phase_cnt(void);   /* 本次事务已推进的相位数 */
 uint32_t i2c_sm_tick_cnt(void);    /* 本次事务已耗的拍数 */
 uint32_t i2c_sm_result(uint8_t *buf, uint32_t n);   /* 拷回接收数据, 返回实际字节数 */
 
-/* ★ 总线独占门的另一半（契约 §3.6 约束③）：
- *   `g_i2c_blk_active` = "**阻塞路径正在用总线**"，由**主循环里包住 as5600_poll 的那一段**置/清
- *   （唯一一处写者 ⇒ 公理②），状态机在 request() 时读它。
- *   ★ 只需**单向**：状态机的请求也来自主循环（协议派发）⇒ 两者不可能同时"开始"；
- *     真正要防的是"状态机在飞 + 主循环又开一次阻塞事务"。 */
-extern volatile uint8_t g_i2c_blk_active;
-/* ★ 门的另一侧: "状态机事务在飞"。由本模块维护;**主循环包住 as5600_poll 的那段读它**
- *   —— 在飞时不得再开一次阻塞事务（否则同一对引脚两个写者）。 */
-extern volatile uint8_t g_i2c_sm_active;
+/* ★★ 总线独占门住在 **`i2c_bb`**（= 资源的定义处），本模块只是它的**使用者** —— 见 `i2c_bb.h` 的门 API。
+ *   ★ 为什么改到这里: 早先那版把"阻塞路径在忙"的标志放在**主循环**、把判断放在**状态机**
+ *     ⇒ 属于"守卫放错了层": 只要再多一个调用者就静默穿透。
+ *     本项目的同族教训: `do_latch_init` 的无条件启动 / `0x43` 那条链 —— 守卫必须住在资源处。 */
+extern volatile uint8_t g_i2c_sm_active;   /* **只作观测**: 1 = 状态机事务在飞（不再充当门）*/
+
+/* ★★★ 放门必须由**主循环**做，不能由 ISR 做（2026-09-16，闸门当场拦下的）：
+ *   状态机在**拍 ISR** 里收尾, 而总线门的 `i2c_bus_release()` 住在 **flash**（i2c_bb.c）
+ *   ⇒ 放进 ISR 就违反 ISR 调用树不变量（擦 flash 期间取指被 stall ⇒ 喂狗停 ⇒ 复位）。
+ *   ★ 而"给它加 DCL_ITCM"这条路**走不通**: 实测 **ITCM 已 100% 占满**（64KB/64KB）。
+ *   ⇒ 于是改成**延迟释放**: ISR 只置 `g_i2c_sm_release_pending`, 主循环调 `i2c_sm_service()` 放门。
+ *   ★ 代价（已权衡并接受）: 事务结束后总线最多再被持 ~1 圈主循环（~1.3ms）。
+ *     影响面很小 —— 同 owner 再申请**照样成功**(acquire 允许同 owner 重入),
+ *     只有阻塞路径会被多跳一次（而它本来 10ms 才轮一次）。 */
+extern volatile uint8_t g_i2c_sm_release_pending;
+void i2c_sm_service(void);   /* ★ 主循环每次循环调用: 需要时放门 */
 
 /* 计数器：每个都能失败 ⇒ 都可作判据 */
 extern volatile uint32_t g_i2c_sm_req_n;      /* 受理的请求数 */

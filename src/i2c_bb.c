@@ -12,6 +12,50 @@ static uint8_t s_port = 1u, s_scl = 10u, s_sda = 11u;
 volatile uint32_t g_i2c_tx_n = 0u, g_i2c_ok_n = 0u, g_i2c_nak_n = 0u,
                   g_i2c_stuck_n = 0u, g_i2c_timeout_n = 0u;
 
+/* ══════════ 总线独占门（说明见 i2c_bb.h）══════════
+ * ★★ **必须带引用计数** —— 这是实测踩出来的（G6-2 验收首跑 G2/G5 双 FAIL）：
+ *   阻塞路径的 `i2c_bb_read()` 是 `acquire(BLOCKING) … release(BLOCKING)` 成对的,
+ *   而 `as5600_poll` 每 10ms 就跑一次 ⇒ **它的一次读会把别人的占用顺手放掉**。
+ *   现象: `0x39 op=22 sub=0` 占住后, 下一个 `op=22 sub=2` 读到的 owner 已经是 0,
+ *   于是"占用期再申请必须被拒"这条判据**永远测不到**（门形同虚设）。
+ *   ⇒ 单一 owner 只能表达"谁在用", 表达不了"**有几层在用**"。
+ *   ★ 代价与缓解: 引用计数怕"释放不配对 ⇒ 永久占死"。本项目里 acquire/release 只出现在
+ *     三个配对完整的包装函数 + 状态机的两处, 且诊断占用**有界自动释放** ⇒ 风险可控。
+ *   ★ 观测量 `i2c_bus_refs()` 就是给"泄漏"准备的判据（正常空闲时必须 == 0）。 */
+static volatile uint8_t  s_i2c_owner = I2C_OWNER_NONE;
+static volatile uint16_t s_i2c_refs  = 0u;
+volatile uint32_t g_i2c_bus_busy_n = 0u;
+
+uint32_t i2c_bus_acquire(uint8_t owner)
+{
+    if (owner == I2C_OWNER_NONE) { return 0u; }
+    uint8_t cur = s_i2c_owner;
+    if (cur == I2C_OWNER_NONE) {
+        s_i2c_owner = owner;
+        s_i2c_refs  = 1u;
+        __asm__ volatile("dsb" ::: "memory");
+        return 1u;
+    }
+    if (cur == owner) {                    /* 同 owner 重入 ⇒ 只加计数 */
+        if (s_i2c_refs < 0xFFFFu) { s_i2c_refs++; }
+        return 1u;
+    }
+    g_i2c_bus_busy_n++;                    /* ★ 判据: 占用期再申请必须失败且计数 +1 */
+    return 0u;
+}
+
+void i2c_bus_release(uint8_t owner)
+{
+    /* 只有持有者能释放 —— 否则"晚到的释放"会把别人的占用误放掉 */
+    if (s_i2c_owner != owner) { return; }
+    if (s_i2c_refs > 0u) { s_i2c_refs--; }
+    if (s_i2c_refs == 0u) { s_i2c_owner = I2C_OWNER_NONE; }
+    __asm__ volatile("dsb" ::: "memory");
+}
+
+uint8_t  i2c_bus_owner(void) { return s_i2c_owner; }
+uint16_t i2c_bus_refs(void)  { return s_i2c_refs; }
+
 static inline void dly(void)
 {
     for (volatile uint32_t i = 0u; i < 400u; i++) { __asm__ volatile("nop"); }
@@ -123,7 +167,7 @@ static uint32_t rd(uint32_t ack)
     return v;
 }
 
-uint32_t i2c_bb_ping(uint8_t addr7)
+static uint32_t ping_body(uint8_t addr7)
 {
     od_out();
     bus_recover();
@@ -133,7 +177,18 @@ uint32_t i2c_bb_ping(uint8_t addr7)
     return ack;
 }
 
-uint32_t i2c_bb_read(uint8_t addr7, uint8_t reg, uint8_t *buf, uint32_t n)
+/* ★ 公开入口一律"**持门 → 干活 → 放门**"（三个入口同款）。
+ *   门在**资源处**守着 ⇒ 后来再多一个调用者也不会静默穿透。
+ *   拿不到门 ⇒ 返回 `I2C_BB_ERR_BUSY`（非 0 = 失败，与既有调用方的约定一致）。 */
+uint32_t i2c_bb_ping(uint8_t addr7)
+{
+    if (!i2c_bus_acquire(I2C_OWNER_BLOCKING)) { return I2C_BB_ERR_BUSY; }
+    uint32_t r = ping_body(addr7);
+    i2c_bus_release(I2C_OWNER_BLOCKING);
+    return r;
+}
+
+static uint32_t read_body(uint8_t addr7, uint8_t reg, uint8_t *buf, uint32_t n)
 {
     g_i2c_tx_n++;
     od_out();
@@ -150,7 +205,7 @@ uint32_t i2c_bb_read(uint8_t addr7, uint8_t reg, uint8_t *buf, uint32_t n)
     return 0u;
 }
 
-uint32_t i2c_bb_write(uint8_t addr7, uint8_t reg, const uint8_t *buf, uint32_t n)
+static uint32_t write_body(uint8_t addr7, uint8_t reg, const uint8_t *buf, uint32_t n)
 {
     g_i2c_tx_n++;
     od_out();
@@ -163,4 +218,21 @@ uint32_t i2c_bb_write(uint8_t addr7, uint8_t reg, const uint8_t *buf, uint32_t n
     st_stop();
     g_i2c_ok_n++;
     return 0u;
+}
+
+/* ★ 读/写的公开入口 —— 与 ping 同款：持门 → 干活 → 放门。 */
+uint32_t i2c_bb_read(uint8_t addr7, uint8_t reg, uint8_t *buf, uint32_t n)
+{
+    if (!i2c_bus_acquire(I2C_OWNER_BLOCKING)) { return I2C_BB_ERR_BUSY; }
+    uint32_t r = read_body(addr7, reg, buf, n);
+    i2c_bus_release(I2C_OWNER_BLOCKING);
+    return r;
+}
+
+uint32_t i2c_bb_write(uint8_t addr7, uint8_t reg, const uint8_t *buf, uint32_t n)
+{
+    if (!i2c_bus_acquire(I2C_OWNER_BLOCKING)) { return I2C_BB_ERR_BUSY; }
+    uint32_t r = write_body(addr7, reg, buf, n);
+    i2c_bus_release(I2C_OWNER_BLOCKING);
+    return r;
 }

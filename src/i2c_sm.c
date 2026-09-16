@@ -7,6 +7,7 @@
  *    所以本模块**不替换** i2c_bb，两者并存; 总线靠 g_i2c_active 门互斥。
  */
 #include "i2c_sm.h"
+#include "i2c_bb.h"    /* ★ G6-2: 总线独占门（住在资源处）—— 两条路走同一道门 */
 #include <stddef.h>
 #include "regs.h"
 #include "itcm.h"      /* ★ tick 在拍 ISR 内 ⇒ 必须住 ITCM（构建期闸门会查调用树）*/
@@ -47,6 +48,7 @@ static uint32_t s_pcnt, s_tcnt;
 static uint32_t s_run;
 
 volatile uint8_t  g_i2c_sm_active = 0u;    /* 1 = 状态机事务在飞（阻塞路径要等它）*/
+volatile uint8_t  g_i2c_sm_release_pending = 0u;  /* ★ ISR 置位, 主循环放门（见 i2c_sm.h）*/
 volatile uint32_t g_i2c_sm_req_n = 0u, g_i2c_sm_ok_n = 0u, g_i2c_sm_nak_n = 0u,
                   g_i2c_sm_stuck_n = 0u, g_i2c_sm_gate_n = 0u, g_i2c_sm_ticks_n = 0u,
                   g_i2c_sm_clk_cyc_max = 0u;
@@ -121,8 +123,11 @@ uint32_t i2c_sm_request(uint8_t addr7, uint8_t op, uint8_t reg, const uint8_t *t
 {
     if (!s_run) { return 0u; }
     if (s_phase != PH_IDLE && s_phase != PH_DONE) { return 0u; }   /* 上一个还在飞 */
-    /* ★ 总线独占门（契约 §3.6 约束③）—— 能失败的判据: 占用期再来一次必须被拒 + 计数 */
-    if (g_i2c_blk_active) {
+    /* ★★★ 总线独占门（契约 §3.6 约束③ / §3.7 G6-2）——
+     *   与阻塞路径(i2c_bb_*)走**同一道门**。占用中 ⇒ 明确拒绝 + 计数(能失败的判据)。
+     *   ★ 判据怎么跑: `0x39 op=22 sub=0` 人工占住总线, 再发 `op=20 sub=0` ⇒
+     *     必须被拒(本函数返回 0、status=GATE_BUSY、op=20 应答里的 gate_n +1)。 */
+    if (!i2c_bus_acquire(I2C_OWNER_SM)) {
         g_i2c_sm_gate_n++;
         s_status = I2C_SM_ST_GATE_BUSY;
         s_phase  = PH_DONE;
@@ -138,6 +143,9 @@ uint32_t i2c_sm_request(uint8_t addr7, uint8_t op, uint8_t reg, const uint8_t *t
 
     s_addr = addr7; s_op = op; s_reg = reg; s_len = n; s_idx = 0u; s_seq = 0u;
     s_rxpend = 0u; s_byte = 0u; s_rx = 0u; s_bit = 8u;
+    /* ★ 门已拿到（上面 acquire 过）⇒ 清掉上一次次留下的"待释放" —— 否则主循环
+     *   会把**本次在飞的事务**的门放掉（延迟释放引入的新竞态, 必须在这里堵住）。 */
+    g_i2c_sm_release_pending = 0u;
     if (op == I2C_SM_OP_WRITE) { for (uint32_t i = 0u; i < n; i++) { s_tbuf[i] = tx[i]; } }
     s_pcnt = 0u; s_tcnt = 0u;
     s_status = I2C_SM_ST_BUSY;
@@ -220,18 +228,34 @@ DCL_ITCM void i2c_sm_tick(void)
         sda_hi(); ndly(I2C_SM_HI_ITERS);
         if (s_status == I2C_SM_ST_BUSY) { s_status = I2C_SM_ST_OK; g_i2c_sm_ok_n++; }
         g_i2c_sm_active = 0u;
+        /* ★ 放门**不在这里做** —— `i2c_bus_release()` 在 flash 里, 而本函数跑在拍 ISR:
+         *   直接调它会违反 ISR 调用树不变量（闸门已当场拦下 `i2c_bus_release@0x08008C04`）;
+         *   而"加 DCL_ITCM"走不通（**ITCM 已 100% 占满**）⇒ 改成置标志, 由主循环放门。 */
+        g_i2c_sm_release_pending = 1u;
         s_phase = PH_DONE;
         return;
 
     default:
         g_i2c_sm_active = 0u;
+        /* ★ 放门**不在这里做** —— `i2c_bus_release()` 在 flash 里, 而本函数跑在拍 ISR:
+         *   直接调它会违反 ISR 调用树不变量（闸门已当场拦下 `i2c_bus_release@0x08008C04`）;
+         *   而"加 DCL_ITCM"走不通（**ITCM 已 100% 占满**）⇒ 改成置标志, 由主循环放门。 */
+        g_i2c_sm_release_pending = 1u;
         s_phase = PH_DONE;
         return;
     }
 }
 
 uint32_t i2c_sm_status(void)    { return s_status; }
-uint32_t i2c_sm_phase(void)     { return s_phase; }
+
+/* ★ G6-2: 延迟放门 —— **只能在主循环调用**（本函数会碰 flash 里的门, 不能进 ISR）。 */
+void i2c_sm_service(void)
+{
+    if (g_i2c_sm_release_pending != 0u) {
+        g_i2c_sm_release_pending = 0u;
+        i2c_bus_release(I2C_OWNER_SM);
+    }
+}uint32_t i2c_sm_phase(void)     { return s_phase; }
 uint32_t i2c_sm_phase_cnt(void) { return s_pcnt; }
 uint32_t i2c_sm_tick_cnt(void)  { return s_tcnt; }
 
