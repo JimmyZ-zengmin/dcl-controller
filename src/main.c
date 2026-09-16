@@ -55,6 +55,12 @@
 #include "macro.h"
 #include "faultlog.h"   /* 统一故障台账: 主循环/ISR/协议层的异常都留案底 */
 #include "manifest.h"   /* 诊断资源目录: 0x64 让板子自报"哪里出问题读什么" */
+#include "i2c_sm.h"     /* ★ G6-1: 拍内 I2C 事务状态机 (契约 §3.6 四条约束 / §3.7 实施) */
+
+/* ★ 总线独占门（契约 §3.6 约束③「总线独占门」）——
+ *   = "阻塞路径正在用总线"。**唯一写者**是主循环里包住 `as5600_poll` 的那一段（公理②）。
+ *   看门狗/ISR 都不写它。状态机在 `i2c_sm_request()` 里读它, 占用中 ⇒ 明确拒绝(能失败的判据)。 */
+volatile uint8_t g_i2c_blk_active = 0u;
 #include "wdt.h"        /* 独立看门狗: 喂狗点=拍 ISR (契约见 wdt.h 文件头) */
 #include "lsym.h"
 #include "adc.h"
@@ -1426,6 +1432,15 @@ ISR_PLACE void TIM2_IRQHandler(void)
             bb_kick(g_tick_count);   /* ★ 黑匣子: 拍尾快照 → AXI 环形缓冲 (MDMA 后台搬运) */
         }
 
+        /* ★★★ G6-1: I2C 事务状态机 —— **每拍推进一个相位**（契约 §3.6 约束①）。
+         *   放在 ISR **最尾部**: 它不属于数据链（不参与采样→计算→输出），
+         *   放这里才能保证它**不扰动扫描段的时序**（本项目反复强调的"别把实时量挂错位置"）。
+         *   ★ 开销有界: 一个相位最多一个字节(9 位) ≈ 9000 cyc @400kHz ≈ 预算(32000)的 28%;
+         *     空闲时它是 `s_phase == PH_IDLE` 的早退 ⇒ 常数级。
+         *   ★ 就绪门: 事务**跨拍**（一次 2 字节读 = 8 拍 ≈ 800µs）⇒ 使用者必须等
+         *     `i2c_sm_status() == OK` 才能取结果, **不能假设"发请求即得值"**。 */
+        i2c_sm_tick();
+
         if (g_per_prev) {
             uint32_t p = t0 - g_per_prev;
             /* ★★★ 时钟不连续保护 (2026-09-11 实测缺陷修复):
@@ -2397,6 +2412,47 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         put32(r + 88, TIM_CCR1(TIM3_BASE_ADDR));   /* ★ **实时** CCR1 (与 r+24 的缓存对比) */
         put32(r + 92, TIM_ARR(TIM3_BASE_ADDR));    /* ★ **实时** ARR  (与 r+20 的缓存对比) */
         ack(r, 96u);
+        return;
+    }
+    if (op == 20u) {
+        /* ★★★ G6-1 诊断面: I2C 事务状态机（契约 §3.6 四条约束 / §3.7 实施与验收）
+         * ★ 为什么先放**诊断族**而不开新协议命令: 契约 §3.7 定案 ——
+         *   **在状态机被证明之前, 不得把它挂上契约面**（否则等于把未验证的东西写进契约）。
+         *   本族已声明"临时脚手架, 不是架构的一部分" ⇒ 放这里合规。
+         * 载荷 [op][sub][arg]:
+         *   sub=0 发起一次读 (AS5600 0x36 / reg 0x0C / 2B = RAW ANGLE)
+         *   sub=1 只读回状态与结果（**等就绪门**: 2 字节读 = 8 拍后再读才有值）
+         *   sub=2 ping 0x36（只验 ACK, 不读数据）
+         * 应答 48B（全部是"能失败"的量）:
+         *   +0 status +4 phase +8 phase_cnt +12 tick_cnt
+         *   +16 req_n +20 ok_n +24 nak_n +28 stuck_n +32 gate_n +36 ticks_n
+         *   +40 result_len +44 data(4B 打包) */
+        uint32_t sub = (n >= 2u) ? p[1] : 0u;
+        uint8_t rx[48];        /* ★ 名字必须与本函数内 op=19 的 `r[112]` 区分开 ——
+                                *   否则 ackbuf 静态判据**按名字合并**两个缓冲, 报假阳性
+                                *   （已实测: 它把"48 字节缓冲写到 96"报了出来, 那是误报）。
+                                *   判据本身也已加固: 同名缓冲现在会被判为"不可判定"。 */
+        if (sub == 0u) {
+            (void)i2c_sm_request(0x36u, I2C_SM_OP_READ, 0x0Cu, NULL, 2u);
+        } else if (sub == 2u) {
+            (void)i2c_sm_request(0x36u, I2C_SM_OP_PING, 0u, NULL, 0u);
+        }
+        put32(rx +  0, i2c_sm_status());
+        put32(rx +  4, i2c_sm_phase());
+        put32(rx +  8, i2c_sm_phase_cnt());
+        put32(rx + 12, i2c_sm_tick_cnt());
+        put32(rx + 16, g_i2c_sm_req_n);
+        put32(rx + 20, g_i2c_sm_ok_n);
+        put32(rx + 24, g_i2c_sm_nak_n);
+        put32(rx + 28, g_i2c_sm_stuck_n);
+        put32(rx + 32, g_i2c_sm_gate_n);
+        put32(rx + 36, g_i2c_sm_ticks_n);
+        uint8_t d[4] = { 0u, 0u, 0u, 0u };
+        uint32_t got = i2c_sm_result(d, 4u);
+        put32(rx + 40, got);
+        put32(rx + 44, (uint32_t)d[0] | ((uint32_t)d[1] << 8)
+                     | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24));
+        ack(rx, 48u);
         return;
     }
     nak("bad pin pattern op");
@@ -3717,7 +3773,8 @@ int main(void)
     g_stage = 22; ai_init(g_shm);
     g_stage = 23; di_init(g_shm);
     g_stage = 24; hil_init(g_shm);
- as5600_init();                  /* AS5600 磁编码器: 绑定 PB10/PB11 */
+ as5600_init();
+    i2c_sm_init();                  /* ★ G6-1: 拍内 I2C 事务状态机（同一对引脚; 靠 g_i2c_blk_active 互斥）*/                  /* AS5600 磁编码器: 绑定 PB10/PB11 */
     /* ★★ 把 HIL 的物理输出登记为"安全态必须覆盖的面" (审计 #1)。
      *   必须在 hil_init **之后** —— 登记的是一个会写 TIM3_CCR1 的回调,
      *   TIM3 时钟/引脚未配置时调用它只是往未使能的外设写, 语义上不该发生。
@@ -3810,7 +3867,18 @@ int main(void)
             static uint32_t s_as_next = 0u;
             if ((int32_t)(g_tick_count - s_as_next) >= 0) {
                 s_as_next = g_tick_count + 100u;
-                as5600_poll(g_shm);
+                /* ★★★ 总线独占门（契约 §3.6 约束③）—— I2C 状态机事务在飞时**不碰总线**。
+                 * 必要性: 状态机在**拍 ISR** 里推进, 而 `as5600_poll` 在**主循环**里阻塞 ~250µs
+                 *   ⇒ 两者交叠就会在同一对引脚上互相踩（公理② 单写者；
+                 *     本项目已因"一条线两个写者"栽过两次: TIM3 / SD 卡）。
+                 * ★ 只需单向: 状态机的**请求**同样来自主循环(协议派发) ⇒ 两者不可能同时"开始";
+                 *   要防的是"状态机在飞 + 主循环又开一次阻塞事务"。
+                 * ★ 判据（能失败）: 状态机的 8 拍窗口内, as5600 的 tx 计数**不得增长**。 */
+                if (!g_i2c_sm_active) {
+                    g_i2c_blk_active = 1u;
+                    as5600_poll(g_shm);
+                    g_i2c_blk_active = 0u;
+                }
             }
         }
 

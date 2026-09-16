@@ -86,23 +86,44 @@ def parse_funcs(lines):
 
 
 def scan_lines(lines, tag):
-    """返回 (发现列表, 统计)。发现项 = (函数名, 缓冲名, 声明大小, 声明行, 需要字节, 触发行)"""
+    """返回 (发现列表, 重名列表, 统计)。
+    发现项 = (函数名, 缓冲名, 声明大小, 声明行, 需要字节, 触发行)
+
+    ★★ 归属规则:**每个写入记到"它之前最近的那个同名声明"上**（C 的词汇作用域近似）。
+      为什么必须这样: 同一个函数里出现多个同名局部缓冲是**合法写法**
+      （实测: `h_pin_pattern` 里 op=2/17/18/19 各有自己的 `r[...]`），
+      而"按名字合并"会把它们的最长写入压到一个声明上 ⇒ **假阳性**
+      （实测报过"48 字节缓冲写到 96"）。**假阳性会让人关掉闸门**, 所以必须按声明归属。
+      ★ 这条也说明: 判据的"精度"本身是要花代价做对的, 不是顺手写个正则就行。
+    """
     funcs = parse_funcs(lines)
     findings = []
+    dups = []
     n_buf = 0
     for fn in funcs:
-        bufs = {}
+        # 按出现顺序收集声明: name -> [(行号, 大小), ...]
+        decls = {}
         for ln, line in fn["body"]:
             for m in RE_BUF.finditer(line):
-                bufs[m.group(1)] = (int(m.group(2)), ln)
-        if not bufs:
+                decls.setdefault(m.group(1), []).append((ln, int(m.group(2))))
+        if not decls:
             continue
         n_buf += 1
-        need = {k: (0, 0) for k in bufs}
+        for nm, lst in decls.items():
+            if len(lst) > 1:
+                dups.append((fn["name"], nm, lst[0][0], lst[-1][0]))
+        need = {nm: {d[0]: [0, 0] for d in lst} for nm, lst in decls.items()}
 
         def bump(name, n, ln):
-            if name in need and n > need[name][0]:
-                need[name] = (n, ln)
+            lst = decls.get(name)
+            if not lst:
+                return
+            # 最近的前一个声明（找不到更早的就用第一个）
+            cand = [d for d in lst if d[0] <= ln]
+            dln = (cand[-1][0] if cand else lst[0][0])
+            slot = need[name][dln]
+            if n > slot[0]:
+                slot[0], slot[1] = n, ln
 
         for ln, line in fn["body"]:
             for m in re.finditer(r'\back\s*\(\s*(\w+)\s*,\s*(\d+)\s*\)', line):
@@ -119,13 +140,13 @@ def scan_lines(lines, tag):
                     continue
                 bump(m.group(1), int(m.group(2)) + 1, ln)
 
-        for name, (size, decl_ln) in bufs.items():
-            if need[name][0] > size:
-                findings.append(
-                    (fn["name"], name, size, decl_ln, need[name][0], need[name][1])
-                )
+        for nm, lst in decls.items():
+            for dln, size in lst:
+                nd, trig = need[nm][dln]
+                if nd > size:
+                    findings.append((fn["name"], nm, size, dln, nd, trig))
     stats = {"funcs": len(funcs), "with_buf": n_buf, "tag": tag}
-    return findings, stats
+    return findings, dups, stats
 
 
 SELFTEST_SRC = """#include <x.h>
@@ -145,8 +166,33 @@ static void known_good(void)
 """
 
 
+# ★ 同名缓冲夹具 A: 两个同名缓冲**各自都不越界** ⇒ 必须绿。
+#   若判据"按名字合并", 这里会被误报（实测报过"48 字节缓冲写到 96"）⇒ 误报会让人关掉闸门。
+DUP_NAME_SRC = """\
+static void two_bufs(void)
+{
+    uint8_t r[112];
+    ack(r, 96);
+    uint8_t r[48];
+    ack(r, 48);
+}
+"""
+
+# ★ 同名缓冲夹具 B: **第二个**同名缓冲越界 ⇒ 必须红, 且报的是第二个（证明归属规则真的生效）。
+DUP_BAD_SRC = """\
+static void two_bufs_bad(void)
+{
+    uint8_t r[112];
+    ack(r, 96);
+    uint8_t r[8];
+    put32(r + 47, 1u);
+    ack(r, 51);
+}
+"""
+
+
 def selftest():
-    findings, stats = scan_lines(SELFTEST_SRC.split("\n"), "selftest")
+    findings, dups, stats = scan_lines(SELFTEST_SRC.split("\n"), "selftest")
     print("=== 自检: 必须报出 known_bad 的越界 ===")
     for fn, name, size, decl_ln, need, trig_ln in findings:
         print(f"  [X] {fn}()  uint8_t {name}[{size}] -> 需 {need} (L{trig_ln})")
@@ -159,6 +205,15 @@ def selftest():
     if good_hit:
         print("  [FAIL] 误报: 干净夹具被报为越界")
         return 4
+    _f, d2, _s = scan_lines(DUP_NAME_SRC.split("\n"), "selftest")
+    if not d2:
+        print("  [FAIL] 同名缓冲没被识别 ⇒ '按声明归属'这条规则没生效")
+        return 4
+    f3, _d3, _s3 = scan_lines(DUP_BAD_SRC.split("\n"), "selftest")
+    if not f3:
+        print("  [FAIL] 同名缓冲夹具 B **没报越界** ⇒ 归属规则无效（会漏掉真缺陷）")
+        return 4
+    print(f"  [OK] 同名缓冲: A 全绿(不误报) / B 报出第二个声明的越界 {f3[0][2]} < {f3[0][4]}")
     print("  [OK] 判据有效: 造好的红必红, 造好的绿必绿")
     return 0
 
@@ -183,6 +238,7 @@ def main():
     total = 0
     t_funcs = 0
     t_buf = 0
+    t_dup = 0
     for path in files:
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
@@ -190,9 +246,13 @@ def main():
         except OSError as exc:
             print(f"  ! 读不了 {path}: {exc}", file=sys.stderr)
             continue
-        findings, stats = scan_lines(lines, path)
+        findings, dups, stats = scan_lines(lines, path)
         t_funcs += stats["funcs"]
         t_buf += stats["with_buf"]
+        t_dup += len(dups)
+        for fn, name, ln_a, ln_b in dups:
+            print(f"  [i] {path}:{ln_a}/{ln_b}  {fn}()  同名局部缓冲 `{name}` 声明多次"
+                  f"  ⇒ 已**按声明归属**(记到最近的前一个声明), 不是判据盲区")
         for fn, name, size, decl_ln, need, trig_ln in findings:
             total += 1
             print(f"  [X] {path}:{decl_ln}  {fn}()  uint8_t {name}[{size}]"
