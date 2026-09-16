@@ -163,6 +163,15 @@ v2 应答 [C3][CMD][SEQ][STS][LEN:2][payload][CRC:2] CRC 覆盖 [CMD][SEQ][STS][
 | `tools/h723_frame_attrib_test.py --port COM21` | **18 / 0** | 帧归属 v2 + **v1 逐字节不变** | 把第一条应答当第二条核对**必须不匹配** |
 | `tools/h723_i2c_leak_check.py --port COM21` | PASS | 总线门引用计数不泄漏 | 发一次非法请求 ⇒ `refs` 必须仍为 0 |
 
+**一键全量回归**（20+ 套件串行、独占串口、末尾自动探活）：
+```bash
+bash tools/h723_full_regress.sh                 # 默认 COM21
+DCL_PORT=COM7 bash tools/h723_full_regress.sh
+```
+★ 它把"**看什么**"写在文件头：**看有没有新的失败模式，不是看 PASS 数**；
+并把**设计内的失败**（内部 flash 持久化已降级 / modbus 需 485 回路 / w5 的 HIL 输出臂需接线）
+逐条列出 —— 免得下一个人把"设计内"当成"回归"。
+
 **变异体自测**（离线，不需要板子）：
 `python tools/h723_dev_bind_test_selftest.py`（注入 10 种固件缺陷，每种都必须让对应判据变红）
 · `python tools/h723_devbind_persist_sim.py`（7 个故意做错的固件，各自把目标判据打红）。
