@@ -217,7 +217,15 @@ pyocd flash -t stm32h723xx -O connect_mode=under-reset build/dcl_h723.hex
   ★ 定位 = **临时脚手架，不是架构的一部分**：未进 SHM、无 `obs_anchor()` 登记、不占能力位、**③层程序不得依赖它**。
 - **工具**：`tools/` 有 `h723_trig_verify.py`、`h723_stepper_test.py`、`dclc.py`、`h723_audit_m234.py`；`docs/audit/` 有 `h723_prog_store_test.py`、`h723_limit_tick_probe.py`，该目录沿用 AUDIT/RESPONSE 配对惯例。
 - **协议**：帧 `[SYNC 0xC0/0xC1][CMD][LEN:2][PAYLOAD][CRC16-CCITT]`，`FRAME_PAYLOAD_MAX=6150`。`0x38` 已 39 → **51 B**（尾部追加 `uart_ore/uart_drop/frame_bad`，前 31 B 布局未动 ⇒ `len>=39` 读法兼容）。
-- **发布基线**：**`v2.0.0`**（2026-09-16）。**构建闸门现在有四道**：ISR 调用树 / 应答缓冲区越界（`tools/h723_ackbuf_check.py`）/ ③层静态判据（`tools/dcl_static_check.py`）+ 零警告。★ 两个工具都**自带 `--selftest` 与覆盖度自报**（覆盖不足 ⇒ 判据判为**无效**，不是"干净"）。
+- **发布基线**：**`v2.1.0`**（GAP-6 收口，见 `docs/RELEASE-v2.1.0.md`）。**构建闸门现在有五道**：
+  零警告 + ISR 调用树 + 应答缓冲区越界（`tools/h723_ackbuf_check.py`）+ ③层静态判据（`tools/dcl_static_check.py`）
+  + ★ **契据可机检**（`tools/ref_claims_check.py` ⇄ `docs/claims.md`，2026-09-16 接入）。
+  ★ **后四道都自带 `--selftest` 与覆盖度自报**（覆盖不足 ⇒ 判**无效**，不是"干净"）。
+  ★★ **契据改了必须同步 `docs/claims.md`**，否则构建会红 —— 这一步把"忘了同步"从
+  "下一个人照契据改坏"变成"**构建失败**"（`PLAN-consistency-v1` C 线，已完成）。
+  ★ 未覆盖项必须 `--allow-uncovered <理由>`：**不允许沉默地留着**。
+  ★ claimed 五类：A 结构（符号存在；`OFF_*` 须被 `_Static_assert` 守住）/ B 拒绝码（定义+被赋值+有判据读到）/
+  C 能力位（定义+并入 IMPL+不在 NOTYET）/ D 文档 `file:line` 漂移 / E 判据存在性。
 
 ## 九、回归跑测规程（**11 条，全是踩过才写的**；细则见 `docs/STATUS-2026-09-16.md` §11/§13）
 
