@@ -257,14 +257,21 @@ def main():
         #   `record(..., True, ...)`" —— 判据本身不参与判定, 形式上就是**恒真**。
         #   机械审计抓到了它, 而且抓得对: 只要将来有人把那个 guard 改成 print 而不 return,
         #   这行会继续报 PASS ⇒ 假 PASS。
-        #   现在把**解析结果**当判据: ACK + 载荷够长 + **cap 与期望一致**
-        #   (cap 一致还额外证明对端就是这台固件 —— 避免"别的设备在回话"被判成链路活)。
+        #   现在把**解析结果**当判据: ACK + 载荷够长 + **cap 含全部必备位**
+        #   (必备位还给"对端就是这台固件"背书 —— 避免"别的设备在回话"被判成链路活)。
+        #   ★★ 2026-09-16 改为**必备位掩码**语义 (`cap & EXPECT_CAP == EXPECT_CAP`):
+        #     原来是等值。等值下固件**新增一个能力位**就会让 T0 判否 ⇒
+        #     整个套件在 T0 处 return 2, 打印"T0 链路不活 —— 后续全部无法判定"
+        #     —— 把一个"工具期望值没跟上固件"的问题，伪装成**链路/接线**故障
+        #     (与 BRR 事故引向同一方向)。掩码下"新增能力位不破坏 T0"。
+        #     ★ 分工: "宣称 = 实现"(多一位也算错) 由 h723_proto.py 的 T1.4 用**等值**审;
+        #       本处只审"必备能力在不在", 两处语义不同、刻意不合并。
         fw = cap = None
         if sts == STS_ACK and len(p) >= 4:
             fw, cap = struct.unpack("<HH", p[:4])
-        t0_ok = (fw is not None) and (cap == EXPECT_CAP)
-        record("T0 链路活性 (0x01 → ACK + cap 内容匹配)", t0_ok,
-               ("fw=0x%04X cap=0x%04X (期望 0x%04X)" % (fw, cap, EXPECT_CAP)) if fw is not None
+        t0_ok = (fw is not None) and ((cap & EXPECT_CAP) == EXPECT_CAP)
+        record("T0 链路活性 (0x01 → ACK + cap 必备位齐全)", t0_ok,
+               ("fw=0x%04X cap=0x%04X (必备位 0x%04X)" % (fw, cap, EXPECT_CAP)) if fw is not None
                else "无有效应答帧 (sts=%s len=%d)" % (sts, len(p)))
         if not t0_ok:
             print("  [FAIL] T0 链路不活 —— 后续全部无法判定")

@@ -168,6 +168,29 @@ static const ManifestEnt_t g_manifest[] = {
      *   ★★ 复位原因判据权威: RM0468 **Table52 (Reset source identification)** ——
      *     单次事件会置起**多个**位 (引脚复位=CPURSTF+PINRSTF; IWDG 超时=+IWDG1RSTF),
      *     所以"原因位恰好 1 个"是**假判据** (见 tools/mgmt.py 的 SIG 表)。 */
+    /* ── ⑦ 外设事务面: I2C 状态机与具名设备绑定表 (GAP-6 / G6-3 / G6-4) ──
+     *   ★★ 为什么这两条必须在目录里: G6-1..G6-4 的**全部判据**都要靠它们读回
+     *     （"表有没有被拒"、"轮询成功了几次"、"事务归属对不对"）—— 缺了目录,
+     *     排障又要回到"手抄偏移 + 硬编码 g_shm 地址"那条老路（本文件的立身之本）。 */
+    MF_ENTRY("I2C_XACT",  OFF_I2C_XACT, 16u, MF_K_U32, MF_F_SHM),
+    /*   [0]"IXAC" [1]req_seq [2]done_seq(==req 即空闲) [3]status(I2C_SM_ST_*)
+     *   [4]完成时相位 [5]本次耗拍(**就绪门的直接证据**) [6]最近 OK 的序号
+     *   [7]打包请求(addr7|op<<8|reg<<16|len<<24) [8..9]数据(由 seq 分时复用方向)
+     *   [10..15]计数器: req / ok / nak / stuck / gate(门拒) / busy
+     *   ★★ 判据: 一次 n 字节读的 `[5]` 必须 == `6+n`（证明"每拍只推进一步"）,
+     *     若它远小于 6+n ⇒ 一拍跑完整个事务（"每拍有界"没实现）。 */
+    MF_ENTRY("DEV_BIND",  OFF_DEV_BIND, 20u, MF_K_U32, MF_F_SHM),
+    /*   [0]"DBND" [1]n_valid(**当前生效**的槽数) [2]crc(FNV-1a over 8 条目) [3]req_seq
+     *   [4]done_seq(==req 才表示**已生效**) [5]reject(DB_RC_*) [6]period(拍) [7]ok_n
+     *   [8..15]条目 u32×8: dev<<28 | dst<<24 | len<<16 | reg<<8 | addr7
+     *   [16]err_n(轮询失败) [17]last_err(I2C_SM_ST_*) [18]skip_n(轮空) [19]rej_n(表被拒次数)
+     *   ★★ 三个计数必须分开看（"一个计数只回答一个问题"）:
+     *     ok_n = 真的执行成功 / err_n = **器件或通信**故障 / skip_n = **调度**现象(总线忙、被抢)
+     *     / rej_n = **上传面**被拒。混在一起时"err 在涨"无法解释 ⇒ 判据作废。
+     *   ★★ 关键判据（都能失败）: ① 坏 crc 提交 ⇒ reject=1 且 n_valid **不变**（不半装载）
+     *     ② 回退的 req_seq ⇒ reject=2 且 done_seq **不回退** ③ 读失败 ⇒ SENSOR[dst] **保留旧值**
+     *     ④ 任意时刻 ok_n+err_n+skip_n 单调且 err_n 只应因**器件**而涨。 */
+
     MF_ENTRY("WDT_STAT",  OFF_WDT_STAT, 48u, MF_K_U32, MF_F_SHM),
     /*   [0]g_wdt_armed (0=已启动; 负数=失败码) [1]实际超时 ms [2]主循环心跳(单调)
      *   [3]注入挂起标志 [4]主循环停滞事件计数 [5]**喂狗计数(单调)** ← 它不涨 ⇒ ISR 没在喂

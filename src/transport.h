@@ -146,6 +146,15 @@
                                       *   (S3 把 macro 当"永远可用"、不单独声明)。本平台按
                                       *   "宣称 = 实现"补一位 —— 实现了就该报 (A4 事故教训)。
                                       *   旧上位机忽略未知位, 不受影响。 */
+#define DCL_CAP_DEVBIND     0x1000   /* ★ G6-4: 具名设备绑定表 (SHM 0x7300, 上位机可写)
+                                      *   = "接一个新器件 = 上传一段配置"（契约 §3.8）。
+                                      *   证据: SHM 区 `DB_MAGIC 'DBND'` + `tools/h723_dev_bind_test.py`。
+                                      * ★ **H723 扩展位**, S3 无对应位。
+                                      * ★★ 加位这件事本身暴露过一个**潜伏缺陷**（已修）:
+                                      *   工具侧认口原先是 `cap == 0x0DF7` **精确等值** ⇒ 只要固件
+                                      *   新增一位, **全部工具的认口一起坏**, 而症状是"找不到板子"
+                                      *   （会把人引向接线/驱动方向）。已把 `h723_client.link_alive()`
+                                      *   的 `expect_cap` 改成**必备位掩码**语义。 */
 
 /* N2 (外部审计): 原 1024 使 WRITE_BURST count=255/256 的请求帧 (6+count×4 > 1024)
  * 在解析层被静默丢弃 (TIMEOUT 无 NAK), 与 READ_BURST 响应 1030B 不对称。
@@ -206,12 +215,17 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
  *   ★ W5 (2026-09-11): DCL_CAP_AI (0x0400) 从上面未声明清单**移入宏** (0x02F7→0x0DF7)
  *     —— ADC1 16bit + AI 3 通道 (SENSOR[8..10]) 落地; 证据见 tools/h723_w5.py。
  *     ★ DI/HIL 与 S3 一样**无专用能力位** (S3 的 11 位本就没有它们); 其存在经
- *       0x36 零接线自检 (AI/DI 通路) 与 SENSOR 观测证明。 */
+ *       0x36 零接线自检 (AI/DI 通路) 与 SENSOR 观测证明。
+ *   ★ G6-4 (2026-09-16): DCL_CAP_DEVBIND 新开一位 (0x1000) 并入宏 (0x0DF7→0x1DF7)
+ *     —— 具名设备绑定表落地 (SHM 0x7300 / `src/dev_bind.c`); 证据见 tools/h723_dev_bind_test.py。
+ *     ★★ 同时修掉一个**潜伏缺陷**: `tools/h723_client.link_alive()` 原按 `cap == 0x0DF7`
+ *       **精确等值**认板 ⇒ 新位一生效, **所有工具当场认不到板子**。已改为**必备位掩码**。
+ *       判据: `python -c` 验 `cap=0x1DF7 & 0x0DF7 == 0x0DF7` 为真。 */
 #define DCL_CAP_H723_IMPL   (DCL_CAP_MULTICYCLE | DCL_CAP_HOTRELOAD | \
                              DCL_CAP_PERSISTENT | DCL_CAP_WIRE2_FLAG | \
                              DCL_CAP_VERINFO | DCL_CAP_FORCE | \
                              DCL_CAP_SEQ | DCL_CAP_COMM | DCL_CAP_MACRO | \
-                             DCL_CAP_AI)                                  /* = 0x0DF7 */
+                             DCL_CAP_AI | DCL_CAP_DEVBIND)                /* = 0x1DF7 */
 
 /* ★ 上线的各项说明 (写清楚"为什么现在可以报"):
  *   DCL_CAP_HOTRELOAD (0x0002) — 阶段 3.2: engine_reload_active() 在 ITCM 内

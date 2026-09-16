@@ -29,6 +29,8 @@
 #include "lsym.h"
 #include "primitives.h"
 #include "faultlog.h"   /* 统一故障台账: cold_start_reset 是本域的登记入口 */
+#include "i2c_sm.h"     /* G6-3: I2C 事务区 (OFF_I2C_XACT) 的登记入口 */
+#include "dev_bind.h"   /* G6-4: 具名设备绑定表 (OFF_DEV_BIND) 的登记入口 */
 
 /* ITCM 段属性 (阶段 3 的分档调度也住在热路径上) */
 #define ATTR_ITCM __attribute__((section(".itcm_text"), noinline))
@@ -111,6 +113,17 @@ void cold_start_reset(void)
      *   ★ 台账必须活在**任何清零路径**之后仍然已登记: 上电 / 0x13 RESET /
      *     deploy 装载 / engine_fill_tables 都经过本函数 ⇒ 放在这里是唯一正确位置。 */
     fault_init(g_shm);
+    /* ★ G6-3: I2C 事务区登记 (2026-09-16)。
+     *   这条是**补登记** —— 缺陷原貌: `IX_MAGIC` 原来只在 main 的开机序列里写一次,
+     *   于是**一次普通的 `0x13 RESET` 之后 magic 就变 0**, 整个事务区在协议面上"消失"。
+     *   根因就是本函数注释里那条纪律的漏网: "新增域必须登记到单一入口"。
+     *   ⇒ 收进 `i2c_xact_reset()`, 在这里登记, main 侧改为**调用同一个函数**
+     *     (不再各写一份初始化 —— 那又是"一个语义两处存放")。 */
+    i2c_xact_reset(g_shm);
+    /* ★ G6-4: 具名设备绑定表登记 (2026-09-16)。同上理由。
+     *   ★ 它同时是"表校验和不符 ⇒ 整表不生效"的必要前提: 若 RESET 后 magic 丢了
+     *     而条目还在, 上位机就会按"没有这个区"去解释, 反而掩盖了真状态。 */
+    dev_bind_reset(g_shm);
 }
 
 /* ══════════ 栈边界哨兵 (设防) ══════════

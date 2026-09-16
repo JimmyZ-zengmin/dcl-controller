@@ -94,8 +94,13 @@ FRAME_PAYLOAD_MAX = **6150**
 
 ### 2.4 ★★ 能力位里**没有"外设"这一类** —— 这正是 I2C 事件的制度性原因
 
-现有能力位（`DCL_CAP_H723_IMPL = 0x0DF7`）：`MULTICYCLE / HOTRELOAD / PERSISTENT /
-STATE_COLD / WIRE2_FLAG / VERINFO / SEQ / FORCE / COMM / HMI / AI / MACRO`。
+现有能力位（`DCL_CAP_H723_IMPL`，2026-09-16 起 = **`0x1DF7`**；本文写就时为 `0x0DF7`）：
+`MULTICYCLE / HOTRELOAD / PERSISTENT / STATE_COLD / WIRE2_FLAG / VERINFO / SEQ / FORCE /
+COMM / HMI / AI / MACRO` + ★ **`DEVBIND`（G6-4 新增，0x1000）**。
+
+★★ **本文 §2.4 就是"外设这一类没有能力位"的制度性诊断，而 GAP-6 正是它的修复**：
+2026-09-16 已落地 `DCL_CAP_DEVBIND` + 具名设备绑定表（`OFF_DEV_BIND=0x7300`）——
+"接一个新器件 = 上传一段配置"现在**兑得出来**（契约 §3.6–§3.8、`src/dev_bind.c`）。
 
 **没有 I2C、没有 SPI、没有 SD、没有 RTC、没有 CAN/ETH。**
 ⇒ 一个"要读 AS5600"的程序**无法声明自己的需求**，上位机**无法在下载前拒绝**，

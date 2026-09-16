@@ -625,6 +625,68 @@ _Static_assert(OFF_I2C_XACT < OFF_I2C_XACT + OFF_I2C_XACT_SZ,
 _Static_assert(OFF_I2C_XACT >= OFF_PERSIST_STAT + 32u,
                "SHM: I2C 事务区与 PERSIST_STAT 重叠 (PERSIST_STAT 占 32B)");
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 具名设备绑定表（GAP-6 / G6-4, 2026-09-16）—— **契约 §3.8**
+ *
+ * ## 它解决什么
+ * 契约 §3.2-C 承诺"接一个新器件 = **写一段程序**"。但源码事实（见 `REVIEW-project-comprehension`）：
+ * ③层只能 `src → op → dst`，**没有任何机制发起 I2C 事务** ⇒ 一条 raw 事务命令兑现不了那句话。
+ * ⇒ 正解是**数据驱动的具名设备绑定**：上位机下发"每 N 拍读 `设备地址/寄存器/长度` → 写 `SENSOR[z]`"，
+ *   由拍内状态机执行（G6-1）。于是"接新器件" = **上传一段配置**（不改固件、不写代码）。
+ *
+ * ## 形态照 `bb_map_bind()`（`blackbox.c:161-193`）—— 本项目**已有**这个范式
+ *  打包 u32 条目 + 一次性解析 + 非法兜底 + 范围校验 + **与 PC 共用的表校验和** + 有效槽计数。
+ *  ★ 唯一差异：**本表上位机可写**（`bb_map_def` 是 `static const`，改它要重烧核心 = "换机器"）。
+ *
+ * ## 条目编码（契约 §3.8.2）
+ *   [31:28] dev(0=空槽 1=通用 I2C 读) | [27:24] dst(目标 SENSOR 槽) | [23:16] len(1..2)
+ *   | [15:8] reg | [7:0] addr7(≤0x7F)
+ *   ⇒ **"具名设备"就是它的地址+寄存器**：AS5600 RAW = addr7=0x36, reg=0x0C, len=2
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define OFF_DEV_BIND            0x7300
+#define DB_MAGIC      (OFF_DEV_BIND +  0u)   /* u32 'DBND' —— 区存在自证（由 cold_start_reset 写）*/
+#define DB_N_VALID    (OFF_DEV_BIND +  4u)   /* u32 服务方回填: **有效槽数**（登记数）*/
+#define DB_CRC        (OFF_DEV_BIND +  8u)   /* u32 PC 写: 条目 FNV-1a（与 bb_map_sum 同算法）*/
+#define DB_REQ_SEQ    (OFF_DEV_BIND + 12u)   /* u32 PC 写: 单调非 0；改表后必须递增 */
+#define DB_DONE_SEQ   (OFF_DEV_BIND + 16u)   /* u32 服务方写: == req_seq 即已生效 */
+#define DB_REJECT     (OFF_DEV_BIND + 20u)   /* u32 服务方写: 拒绝原因码（契约 §3.8.4）*/
+#define DB_PERIOD     (OFF_DEV_BIND + 24u)   /* u32 PC 写: 两次发起的最小间隔(拍), 钳 1..1000 */
+#define DB_OK_N       (OFF_DEV_BIND + 28u)   /* u32 服务方写: **实际执行**的成功轮询数（执行数）*/
+#define DB_ENTRIES    (OFF_DEV_BIND + 32u)   /* u32[8] PC 写 */
+#define DB_ERR_N      (OFF_DEV_BIND + 64u)   /* u32 服务方写: 失败轮询数 */
+#define DB_LAST_ERR   (OFF_DEV_BIND + 68u)   /* u32 服务方写: 最近状态码 */
+#define DB_SKIP_N     (OFF_DEV_BIND + 72u)   /* u32 服务方写: **轮空数**（总线门忙 / 事务被别人取走）
+                                              *   ★ 为什么必须与 DB_ERR_N 分开（"一个计数只回答一个问题"）：
+                                              *     总线忙 / 被抢是**调度现象**，不是器件/通信故障。混进 err
+                                              *     会让"err 在涨"这条判据退化成**无法解释**（既可能是器件坏，
+                                              *     也可能是有人占了总线）⇒ 判据就废了。同族先例：
+                                              *     `g_safe_mask_nonzero` 与 `g_safe_mask_oob` 拆成两个量。 */
+#define DB_REJ_N      (OFF_DEV_BIND + 76u)   /* u32 服务方写: **表被拒次数**（上传面）
+                                              *   ★ 同一条理由: "上传被拒" 与 "轮询失败" 是两个问题。
+                                              *     早先把拒绝计进 `DB_ERR_N` ⇒ 一次被拒的上传会让
+                                              *     "err 保持 0"这条判据**无法解释**（违反"一个计数一个问题"）。
+                                              *     `DB_REJECT` 只给**最近一次**的码, 给不了"发生了几次"。
+                                              *   ★ 与 `DB_LAST_ERR` 的类型也必须分开（曾把两者混用一个槽）：
+                                              *     拒绝码是 `DB_RC_*`(0..8)，轮询状态是 `I2C_SM_ST_*`(0..7)，
+                                              *     两个码空间**数值重叠** ⇒ 混在一个槽里，"last_err=2" 到底是
+                                              *     "序号非单调" 还是 "事务成功" 分不出来。 */
+#define OFF_DEV_BIND_SZ         0x50u        /* 80 B */
+#define DB_SLOTS                8u
+#define DB_MAGIC_VAL  0x444E4244u            /* 'DBND'（LE 字节序 D,B,N,D）*/
+#define DB_PERIOD_DEF   10u                  /* 默认 10 拍 = 1 ms */
+#define DB_PERIOD_MAX 1000u
+
+_Static_assert(OFF_DEV_BIND + OFF_DEV_BIND_SZ <= SHM_SIZE,
+               "SHM: 设备绑定表越出 SHM 末尾");
+_Static_assert(OFF_DEV_BIND >= OFF_I2C_XACT + OFF_I2C_XACT_SZ,
+               "SHM: 设备绑定表与 I2C 事务区重叠");
+/* ★ 本项目的"容量类注释活不过两周"处置: 表内**最后一个字段**也必须被断言守住 ——
+ *   否则将来往表尾加字段时, 只有"越出 SHM 末尾"那一层保险, 而它管不到"越出本区"。 */
+_Static_assert(OFF_DEV_BIND + OFF_DEV_BIND_SZ <= SHM_SIZE &&
+               DB_REJ_N + 4u <= OFF_DEV_BIND + OFF_DEV_BIND_SZ,
+               "SHM: 设备绑定表尾字段 (DB_REJ_N) 越出本区");
+
+
 #define OFF_PERSIST_STAT_SZ     32u      /* 8 字: 见 manifest.h 的字段说明 */
 _Static_assert(OFF_WDT_STAT + OFF_WDT_STAT_SZ <= OFF_PERSIST_STAT,
                "SHM: PERSIST_STAT 与 WDT 状态区重叠");

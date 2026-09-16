@@ -42,6 +42,11 @@
 #define I2C_SM_ST_STUCK     4u  /* SCL 被别处拉低（时钟延展）超界 */
 #define I2C_SM_ST_BADARG    5u  /* 参数非法（len 越界 / op 未知） */
 #define I2C_SM_ST_GATE_BUSY 6u  /* ★ 被**总线独占门**拦下（阻塞路径正在用总线）*/
+#define I2C_SM_ST_STOLEN    7u  /* ★★ 结果被**后一个事务**覆盖（收尾前被别人抢先发起并完成）
+                                 *   ⇒ **不得当成功用**（数据是别人的）, 由使用者重发。
+                                 *   ★ 为什么要有这个独立状态码: 没有它, 那条静默错数据路径
+                                 *     在协议面上**完全不可观测** —— 上位机只会看到一个"正常"的值。
+                                 *   判据: 用 `i2c_sm_done_req()` 与自己的受理序号比对（见下）。 */
 
 #define I2C_SM_MAX_DATA  8u     /* 单次事务最大数据字节 */
 
@@ -63,6 +68,19 @@ uint32_t i2c_sm_phase_cnt(void);   /* 本次事务已推进的相位数 */
 uint32_t i2c_sm_tick_cnt(void);    /* 本次事务已耗的拍数 */
 uint32_t i2c_sm_result(uint8_t *buf, uint32_t n);   /* 拷回接收数据, 返回实际字节数 */
 
+/* ★★★ 事务归属令牌（2026-09-16）。**每个使用者都必须用它收尾**，不能只看 status。
+ *
+ * 反例（真缺陷，不是理论风险）：本状态机只有一个 `s_rbuf`/`s_status`/`s_len`，而使用者有
+ * **两个**（`i2c_shm_service` 与 `dev_bind_service`）。只查 `status == I2C_SM_ST_OK` 时：
+ *   我发起 → 完成(OK, 数据是我的) → **别人发起并完成**(数据被换成他的) → 我按 OK 收尾
+ *   ⇒ 把**他的**读数写进我的目标槽。全程无错、计数器全绿，只有值是错的。
+ * 用法：
+ *   ① `i2c_sm_request()` 返回 1 之后立刻记下 `my = g_i2c_sm_req_n`;
+ *   ② 收尾时要求 `i2c_sm_done_req() == my`，否则**丢弃结果并重发**（不得当成功）。
+ * ★ 放在资源处（而不是在每个调用点各判一次）是本项目 §4.5 铁律：
+ *   "守卫必须住在资源的定义处" —— 否则多一个调用者就静默穿透。 */
+uint32_t i2c_sm_done_req(void);    /* 刚完成的事务的受理序号（= g_i2c_sm_req_n 的快照）*/
+
 /* ★★ 总线独占门住在 **`i2c_bb`**（= 资源的定义处），本模块只是它的**使用者** —— 见 `i2c_bb.h` 的门 API。
  *   ★ 为什么改到这里: 早先那版把"阻塞路径在忙"的标志放在**主循环**、把判断放在**状态机**
  *     ⇒ 属于"守卫放错了层": 只要再多一个调用者就静默穿透。
@@ -79,6 +97,14 @@ extern volatile uint8_t g_i2c_sm_active;   /* **只作观测**: 1 = 状态机事
  *     只有阻塞路径会被多跳一次（而它本来 10ms 才轮一次）。 */
 extern volatile uint8_t g_i2c_sm_release_pending;
 void i2c_sm_service(void);   /* ★ 主循环每次循环调用: 需要时放门 */
+
+/* ★★ I2C 事务区的**冷启动登记** —— 必须由 `cold_start_reset()` 调用。
+ *   理由（本项目"新增域必须登记到单一入口"的纪律，与 mb_config / macro_reset / fault_init 同款）：
+ *   `cold_start_reset` 是 SHM 整段清零的**唯一**入口（上电 / 0x13 RESET / reinit 都经过它）。
+ *   ★ 2026-09-16 自查发现的真缺陷: 第一版只在开机把 IX_MAGIC 写一次 ⇒
+ *     **一次普通的 `0x13 RESET` 之后 magic 就变 0** ⇒ 上位机读不到它, 会以为"该区不存在"
+ *     —— 一个会**撒谎**的"区存在自证"。登记到这里之后, 任何清零路径都会立刻恢复它。 */
+void i2c_xact_reset(uint8_t *shm);
 
 /* 计数器：每个都能失败 ⇒ 都可作判据 */
 extern volatile uint32_t g_i2c_sm_req_n;      /* 受理的请求数 */

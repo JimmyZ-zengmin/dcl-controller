@@ -266,6 +266,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/hil.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/i2c_bb.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/i2c_sm.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dev_bind.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/timebase.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/as5600.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/step.c

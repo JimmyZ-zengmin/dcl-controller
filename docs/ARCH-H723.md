@@ -616,8 +616,15 @@ CRC16-CCITT: poly 0x1021, init 0xFFFF, MSB-first
 | 10 | `AI` | IMPL |
 | 11 | `MACRO` | IMPL（H723 扩展位） |
 
-`DCL_CAP_H723_IMPL = 0x0DF7`；两条清单**不能同时含某一位**，由
-`_Static_assert((IMPL & NOTYET) == 0u, ...)` 兜底（`transport.h:198-199`）。
+`DCL_CAP_H723_IMPL = 0x1DF7`（★ 2026-09-16 G6-4 由 `0x0DF7` 扩展一位 `DEVBIND=0x1000`；
+下表第 12 位 = 具名设备绑定表）；两条清单**不能同时含某一位**，由
+`_Static_assert((IMPL & NOTYET) == 0u, ...)` 兜底（`transport.h`）。
+
+★★ **做工具时不要写能力字等值判断**：`cap == 0x0DF7` 这种写法在固件**新增一位**时会让
+"**所有工具一起认不到板子**"，而症状是"找不到板子"（会把人引向接线/驱动方向）。
+（该缺陷 2026-09-16 真的发生了 —— 已把 `h723_client.link_alive()` 的 `expect_cap`
+改成**必备位掩码** `(cap & expect) == expect`。）
+要审"宣称 = 实现"（多一位/少一位都算错）请用 `h723_proto.py` 的 **T1.4**，那里是**等值**比较。
 
 ## 5.5 UART 层
 
@@ -832,7 +839,9 @@ CRC16-CCITT: poly 0x1021, init 0xFFFF, MSB-first
 ★ **跑串口套件一律显式 `--port <口名>`**，别依赖自动找口：
 `find_port()` 只按 VID `1A86` 匹配，而 CH343(ESP32) 也是 `1A86` ⇒ **会认错口**
 ⇒ 现象是"板子没响应"，**极像板子坏了**。
-★ **本平台正确的认口方式 = 认能力字 `0x0DF7`**（`h723_client.find_board()` / `link_alive()`），
+★ **本平台正确的认口方式 = 认能力字**（`h723_client.find_board()` / `link_alive()`），
+判据是**必备位掩码**：`(cap & 0x0DF7) == 0x0DF7`（2026-09-16 起；此前是等值，
+加一位就让全部工具一起认不到板子）。当前实现字是 `0x1DF7`。
 不是认"第一个 CH340"。本机常年插着两个 CH340。
 ★ **口名会变，不要写死在文档里**：原文写 `--port COM14`，2026-09-16 实测板子在 **COM21**。
 用 `python tools/h723_client.py` 或 `link_alive()` 现查。

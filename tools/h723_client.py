@@ -93,7 +93,8 @@ class Dcl:
 def find_board():
     """自动找协议口 —— ★ 认**能力字**, 不认"第一个 CH340" (本机就插着两个 CH340,
     第一版 Dcl(None) 因此挑错口 ⇒ 现象是"板子没响应", 极像板子坏了)。
-    判据: 逐个开、发 0x01、看能力字是否等于 EXPECT_CAP。"""
+    判据: 逐个开、发 0x01、看能力字是否**包含** EXPECT_CAP 的每一个必备位
+    (★ 必备位掩码, **不是**等值 —— 理由见 link_alive 的 docstring)。"""
     from serial.tools import list_ports
     cands = [p.device for p in list_ports.comports()]
     for dev in cands:
@@ -153,7 +154,25 @@ def link_alive(port=None, tries=3, expect_cap=0x0DF7):
       (本项目 BRR 事故就是这么被带偏一整轮的: "AB 两端都收不到" 与 "时基全错"
        在 PC 侧表现完全一样。)
     ⇒ 判据 = 解析出帧 + 状态字节是 ACK + 载荷长度 ≥4 + **独立实现**的 CRC 通过
-      (+ 可选: cap 与期望一致, 说明对端确实是这台固件)。
+      (+ 可选: cap 含期望位, 说明对端确实是这台固件)。
+
+    ★★★ `expect_cap` 的语义 = **必备位掩码 (required bits)**，**不是等值比较** ——
+      判据是 `(cap & expect_cap) == expect_cap`（缺任何一位即判否）。
+
+      · 为什么**必须**是掩码 (这是本函数第二版踩的坑):
+        固件新增一个能力位时实现字会**变大**（例: 加 `DCL_CAP_DEVBIND=0x1000`
+        后 0x0DF7 → 0x1DF7）。若写成 `cap == expect_cap`，一个新增位就让
+        **所有**调用本函数的工具同时认不到板子，而症状是"**找不到板子**"
+        —— 会把人引向接线/驱动/端口方向，与真实原因(固件的能力字多了一位)
+        完全相反。掩码语义下"新增能力位不破坏认口"。
+      · 为什么不干脆 `expect_cap=None`（只看帧合法）:
+        那样"别的设备在回话"也会被判成这台固件活着 —— 判据退化成空判据。
+        必备位是"对端身份"这一层的最弱但**仍可失败**的判据。
+      · 语义边界（有意为之）: 本函数只问"必备位在不在"，**不问**"有没有多余位"。
+        要审"宣称 = 实现"（多一位/少一位都算错）请用 `h723_proto.py` 的 T1.4
+        —— 那里是**等值**比较，与本函数的分工不同、刻意不合并。
+      · 调用方若需要更严的必备集: 传自己的 `expect_cap`（掩码，或起来即可）。
+        想要求"某位**不存在**"则超出本函数语义（会给认口加脆性，故不提供）。
 
     返回 True/False；不抛异常（调用方通常在"准备阶段"用它）。
     """
@@ -166,7 +185,9 @@ def link_alive(port=None, tries=3, expect_cap=0x0DF7):
             sts, p = d.send(CMD_GET_VERSION)
             if sts == "ACK" and len(p) >= 4:
                 cap = p[2] | (p[3] << 8)
-                if expect_cap is None or cap == expect_cap:
+                # ★ 必备位掩码 (不是等值) —— 见 docstring: 等值语义会让"固件新增
+                #   能力位"这一个动作把**所有**工具一起打成"找不到板子"。
+                if expect_cap is None or (cap & expect_cap) == expect_cap:
                     return True
             time.sleep(0.15)
         return False

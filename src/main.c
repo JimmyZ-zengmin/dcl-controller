@@ -57,6 +57,7 @@
 #include "manifest.h"   /* 诊断资源目录: 0x64 让板子自报"哪里出问题读什么" */
 #include "i2c_sm.h"     /* ★ G6-1: 拍内 I2C 事务状态机 (契约 §3.6 四条约束 / §3.7 实施) */
 #include "i2c_bb.h"     /* ★ G6-2: 总线独占门 i2c_bus_owner()/I2C_OWNER_SM */
+#include "dev_bind.h"   /* ★ G6-4: 具名设备绑定表 (契约 §3.8) */
 #include "timebase.h"   /* ★ 生产时基 = TIM5 (不再押在调试单元 DWT 上) —— 见该头文件的说明 */
 
 /* ★★ 总线独占门已**移到资源处**（`src/i2c_bb.c` 的 `i2c_bus_acquire/release`，声明在 `i2c_bb.h`）。
@@ -2756,6 +2757,18 @@ static void h_device_desc(void)
         put16le(r + k, k_dev[i][1]); k += 2u;
         put16le(r + k, k_dev[i][2]); k += 2u;
     }
+    /* ★★ G6-4 尾部扩展块（**只追加, 不改前面任何一个字节** —— 旧上位机按 `n_dev` 读完就停,
+     *   多出来的尾巴它不解析; 新上位机凭 `n_devbind` 判断本机是否支持设备绑定表）。
+     *   目的与 0x4A 的初衷一致: 让上位机在**上传期**就知道"这台机有没有这张表、几个槽、怎么访问",
+     *   而不是跑起来才发现（"未实现的能力必须在上传期失败"）。
+     *   布局（相对本块起点, 全小端）:
+     *     [0:2] n_devbind(恒 1 表示本块存在) [2:4] 槽数 [4:6] ops 位图(bit0=通用I2C读)
+     *     [6:10] SHM 偏移 OFF_DEV_BIND
+     *   ★ 判据（可失败）: 不认这一块的上位机读到 n_dev 就停 ⇒ 行为与 G6-4 之前**逐字节相同**。 */
+    put16le(r + k, 1u); k += 2u;                     /* n_devbind */
+    put16le(r + k, (uint16_t)DB_SLOTS); k += 2u;     /* 槽数 */
+    put16le(r + k, 0x0001u); k += 2u;                /* ops 位图: bit0 = 通用 I2C 读 */
+    put32(r + k, (uint32_t)OFF_DEV_BIND); k += 4u;   /* SHM 偏移 (0x7300) */
     ack(r, k);
 }
 
@@ -3415,6 +3428,10 @@ static void proto_selftest(void)
  * ★ 计数器每圈镜像一次（6 次 SHM 写 ≈ 可忽略）, 这样使用者**不发起事务也能看到计数**。 */
 static volatile uint8_t s_ix_busy = 0u;
 static uint32_t s_ix_seq = 0u;
+/* ★★ 归属令牌（2026-09-16, 与 `dev_bind.c` 同一处修复）: 记下"我这一号", 收尾时核对。
+ *   原因见 `i2c_sm.h` 的 `i2c_sm_done_req()`: 本状态机只有一个 `s_rbuf`, 而使用者有两个
+ *   （本函数与 `dev_bind_service`）⇒ 只查 `status==OK` 会把**别人的读数**当成自己的。 */
+static uint32_t s_ix_my_req = 0u;
 
 static void i2c_shm_service(void)
 {
@@ -3447,10 +3464,24 @@ static void i2c_shm_service(void)
         s_ix_seq  = rq;
         s_ix_busy = (uint8_t)(i2c_sm_request(addr, op, reg,
                                              (op == I2C_SM_OP_WRITE) ? tx : NULL, len) != 0u);
-        if (s_ix_busy != 0u) { return; }               /* 已发起 ⇒ 等它跨拍跑完 */
+        if (s_ix_busy != 0u) {
+            s_ix_my_req = g_i2c_sm_req_n;      /* ★ 受理序号 = 归属令牌（收尾时核对）*/
+            return;                            /* 已发起 ⇒ 等它跨拍跑完 */
+        }
         /* 被拒（门忙 / 参数非法）⇒ 立刻收尾, 把拒绝原因交回使用者 */
     } else if (i2c_sm_status() == I2C_SM_ST_BUSY) {
         return;                                        /* 还在飞 ⇒ 继续等（这就是"就绪门"）*/
+    } else if (i2c_sm_done_req() != s_ix_my_req) {
+        /* ★★ 我的结果在收尾前被**后一个事务**覆盖了（另一个使用者抢先发起并完成）。
+         *   ⇒ 绝不能按 OK 报成功（那会把别人的读数当成我的交回上位机）。
+         *   ★ 但**仍然要回 done_seq** —— 否则上位机分不清"还在等"与"被判无效", 判据永远等下去
+         *     （"判据必须能终止"）。数据留在 IX_DATA 里是陈旧的, 由状态码 I2C_SM_ST_STOLEN 标掉。 */
+        SHM_U32(g_shm, IX_STATUS) = I2C_SM_ST_STOLEN;
+        SHM_U32(g_shm, IX_PHASE)  = i2c_sm_phase();
+        SHM_U32(g_shm, IX_TICKS)  = i2c_sm_tick_cnt();
+        SHM_U32(g_shm, IX_DONE_SEQ) = s_ix_seq;
+        s_ix_busy = 0u;
+        return;
     }
 
     /* ── 收尾: 回写结果, **最后**写 done_seq（顺序很重要: 先数据后完成号）── */
@@ -3494,6 +3525,9 @@ static void obs_anchor(void)
     sink ^= g_i2c_sm_ticks_n;             sink ^= g_i2c_bus_busy_n;
     sink ^= (uint32_t)g_i2c_sm_active;    sink ^= (uint32_t)g_i2c_sm_release_pending;
     sink ^= (uint32_t)s_ix_busy;          sink ^= s_ix_seq;
+    /* ★ G6-4 新增观测量 —— 同样不加这几行它们可能悄悄从符号表消失 */
+    sink ^= g_db_ok_n;                    sink ^= g_db_err_n;
+    sink ^= g_db_last_err;                sink ^= g_db_skip_n;
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
     sink ^= g_engine_gate;                sink ^= g_engine_sel;
     sink ^= g_n_routes;                   sink ^= g_table_profile;
@@ -4031,15 +4065,19 @@ int main(void)
     g_stage = 12;
 
     /* ⑧ 统一锚定全部观测变量 (防 --gc-sections 回收; 见 obs_anchor 注释) */
-    /* ★★★ G6-3: I2C 事务区初始化 —— 放在开机序列**末尾**（此刻 SHM 已就绪、g_shm 有效）。
-     *   `magic` 是"区存在"的自证: 上位机读不到它就不该按本布局解析（防"布局假设"变成静默错）。 */
-    SHM_U32(g_shm, IX_MAGIC)       = IX_MAGIC_VAL;
-    SHM_U32(g_shm, IX_REQ_SEQ)     = 0u;
-    SHM_U32(g_shm, IX_DONE_SEQ)    = 0u;
-    SHM_U32(g_shm, IX_STATUS)      = I2C_SM_ST_IDLE;
-    SHM_U32(g_shm, IX_PHASE)       = 0u;
-    SHM_U32(g_shm, IX_TICKS)       = 0u;
-    SHM_U32(g_shm, IX_LAST_OK_SEQ) = 0u;
+    /* ★★★ G6-3: I2C 事务区 —— **改为调用 `i2c_xact_reset()`**（`cold_start_reset()`
+     *   已登记同一函数）, 而不再在这里手写那七个字段。
+     *   ★ 为什么必须收掉这段手写: 它正是缺陷本体 —— 初始化**只**在这里发生,
+     *     于是"新增 SHM 域必须登记到 cold_start_reset 单一入口"这条纪律被漏掉,
+     *     后果是**一次普通的 `0x13 RESET` 之后 `IX_MAGIC` 变 0**, 事务区在协议面上
+     *     直接"消失"(而上位机只会把它解释成"这台机没有这个区")。
+     *   ⇒ 现在初始化与服务方**同一份实现**; 留这一次调用只是让开机序列自明(幂等)。
+     *   `magic` 是"区存在"的自证: 上位机读不到它就不该按本布局解析(防"布局假设"变成静默错)。 */
+    i2c_xact_reset(g_shm);
+    /* ★ G6-4: 具名设备绑定表 —— `cold_start_reset()` 同样已登记 `dev_bind_reset()`。
+     *   这里额外调 `dev_bind_init()` 把 shm 指针显式绑一次(幂等), 让"表在哪块 SHM"
+     *   在开机序列里一眼可见 —— 与上面同一种"登记点可见"的写法。 */
+    dev_bind_init(g_shm);
 
     obs_anchor();
 
@@ -4059,6 +4097,15 @@ int main(void)
          *   而 ITCM 已 100% 占满, 没有"搬进 ITCM"这条退路。 */
         i2c_sm_service();               /* G6-2: 延迟放门 */
         i2c_shm_service();              /* G6-3: SHM 事务区握手 */
+        /* ★★ G6-4: 具名设备绑定表的两件服务性工作 —— **同样必须在循环顶层**。
+         *   ① `submit`: 校验 PC 下发的表（crc + 字段范围 + seq 单调）; 不通过 ⇒ **保持上一次绑定**
+         *   ② `service`: round-robin 轮询一个槽（速率闸 = DB_PERIOD 拍）
+         *   ★ 都在主循环而不是 ISR: 它们会经总线门碰 flash（`i2c_bb.c`）, 而 ITCM 已 100% 占满,
+         *     没有"搬进 ITCM"这条退路 —— 与上面三句**完全同一条理由**（G6-2 那次的教训）。
+         *   ★ 位置纪律（踩过第三次）: 必须写在**循环顶层**。写进任何"每 N 拍"的分支里,
+         *     服务的实际分辨率就从 ~0.37ms 悄悄变成 N×100µs, 而注释还是写着 0.37ms。 */
+        dev_bind_submit();              /* G6-4: 表提交/拒绝（绝不半装载）*/
+        dev_bind_service(g_tick_count); /* G6-4: 轮询一个槽（归属令牌核对 + 失败保旧值）*/
         if (g_i2c_hold_until != 0u && (int32_t)(g_tick_count - g_i2c_hold_until) >= 0) {
             g_i2c_hold_until = 0u;      /* G6-2: 诊断占用有界自动释放 */
             i2c_bus_release(I2C_OWNER_BLOCKING);

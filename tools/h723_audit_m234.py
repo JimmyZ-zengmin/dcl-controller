@@ -89,8 +89,10 @@ def serial_alive(port, tries=3):
        **用"有没有字节"判活性**, 违反本项目铁律"判据用内容匹配, 不用字节数"。
        后果: 噪声、波特率不匹配、打开端口的瞬态**都会产生字节** ⇒ 一条时基全错的链路
        会被判成"活" (BRR 事故就是这么被带偏一整轮的)。
-       现在复用 `h723_client.link_alive`: 必须**解析出 ACK 帧**且 **cap 与期望一致**
-       (cap 一致还额外证明对端就是这台固件, 不是别的设备在回话)。
+       现在复用 `h723_client.link_alive`: 必须**解析出 ACK 帧**且 **cap 含全部必备位**
+       (必备位还给"对端就是这台固件"背书, 不是别的设备在回话)。
+       ★ 2026-09-16: 认口改为**必备位掩码**语义 ⇒ 固件新增能力位(如 DEVBIND=0x1000)
+         不再让本判据(以及整条工具的 T0)误判成"链路不活"。
        ★ 对 M4 的语义没有削弱: 核被 halt 时不会有任何合法帧 ⇒ 仍判"死"。
     """
     from h723_client import link_alive
@@ -115,8 +117,8 @@ def main():
         pass
     # ★ 审计轴1 F1 修复: 判据本身参与判定 (而不是"检查完再无条件记一行 True")。
     alive = serial_alive(port)
-    record("T0 链路活性 (0x01 → ACK 帧 + cap 内容匹配)", alive,
-           "已确认 (ACK 帧 + cap=0x0DF7)" if alive else "无有效应答帧")
+    record("T0 链路活性 (0x01 → ACK 帧 + cap 必备位)", alive,
+           "已确认 (ACK 帧 + cap ⊇ 0x0DF7, 必备位掩码)" if alive else "无有效应答帧")
     if not alive:
         print("  !! 链路不活 —— 先跑 python tools/h723_revive.py 看诊断, 再重试。")
         return 2

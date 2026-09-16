@@ -10,6 +10,10 @@
 #include "i2c_bb.h"    /* ★ G6-2: 总线独占门（住在资源处）—— 两条路走同一道门 */
 #include <stddef.h>
 #include "regs.h"
+#include "engine.h"    /* ★ `i2c_xact_reset()` 要用 OFF_I2C_XACT / IX_* / SHM_U32 —— 
+                        *   本模块是 SHM 事务区的**定义者之一**, 这些符号都在这里。
+                        *   ★ 缺这一行时 `i2c_xact_reset()` 根本编不过（本项目纪律:
+                        *     "声明了却没人编过" 与 "实现了却没接线" 是同一族缺陷）。 */
 #include "itcm.h"      /* ★ tick 在拍 ISR 内 ⇒ 必须住 ITCM（构建期闸门会查调用树）*/
 
 /* ── 时序参数 ────────────────────────────────────────────────────────────
@@ -52,6 +56,28 @@ volatile uint8_t  g_i2c_sm_release_pending = 0u;  /* ★ ISR 置位, 主循环�
 volatile uint32_t g_i2c_sm_req_n = 0u, g_i2c_sm_ok_n = 0u, g_i2c_sm_nak_n = 0u,
                   g_i2c_sm_stuck_n = 0u, g_i2c_sm_gate_n = 0u, g_i2c_sm_ticks_n = 0u,
                   g_i2c_sm_clk_cyc_max = 0u;
+/* ★★★ 事务归属令牌（2026-09-16，G6-4 落地时发现）—— **必须住在资源处**（本项目 §4.5 铁律）。
+ *
+ * ## 它挡的是什么（真缺陷，不是理论风险）
+ * 本状态机只有**一个** `s_rbuf` / `s_status` / `s_len`，而现在有**两个使用者**：
+ *   `i2c_shm_service()`（G6-3 SHM 事务区）与 `dev_bind_service()`（G6-4 设备绑定表）。
+ * 完成判据一直是 `i2c_sm_status() == I2C_SM_ST_OK` —— 它只回答"**有没有人**跑完了一次全 ACK 的
+ * 事务"，**不回答"跑完的是不是我要的那次"**。
+ * ⇒ 于是存在这条静默错数据路径：
+ *     ① 我发起 → ② 事务完成(OK, `s_rbuf` = 我的数据) → ③ 另一个使用者在我收尾前
+ *     发了新事务并且也完成了(`s_rbuf` = **他的**数据) → ④ 我按 OK 判据收尾,
+ *     把**他的**读数写进我的 `SENSOR[dst]`。
+ *     全程无报错、计数器全绿、寄存器全对 —— 只有值悄悄是错的。
+ * 判据：两步之间**别的使用者能不能插入**。能插入 ⇒ 就一定会发生（本项目"守护放错层"同族）。
+ *
+ * ## 修法 = 给事务发号，并广播"**哪一号**完成了"
+ *   `i2c_sm_request()` 受理时 `g_i2c_sm_req_n++`（既有）⇒ 发起方记下自己那一号；
+ *   完成时把该号快照到 `g_i2c_sm_done_req` ⇒ 发起方只需 `done_req == my_req` 才能收尾。
+ *   别人的事务完成后 `done_req != my_req` ⇒ 发起方判为"我的那次被覆盖了"（丢了, 需重发），
+ *   **绝不会把别人的值当成自己的**。
+ * ★ 为什么放这里而不是在调用点各加一个判断: 调用点会越加越多（现在就两个, 将来三个）,
+ *   而"守卫必须住在资源的定义处"正是为了"多一个调用者不会静默穿透"。 */
+volatile uint32_t g_i2c_sm_done_req = 0u;
 
 static inline uint32_t bit1_m(void) { return (1u << s_scl) | (1u << s_sda); }
 static inline uint32_t bit2_m(void) { return (3u << (s_scl * 2u)) | (3u << (s_sda * 2u)); }
@@ -228,6 +254,8 @@ DCL_ITCM void i2c_sm_tick(void)
         sda_hi(); ndly(I2C_SM_HI_ITERS);
         if (s_status == I2C_SM_ST_BUSY) { s_status = I2C_SM_ST_OK; g_i2c_sm_ok_n++; }
         g_i2c_sm_active = 0u;
+        /* ★ 归属令牌: 完成的一刻宣告"是我这一号跑完了" —— 收尾方据此确认结果归属。 */
+        g_i2c_sm_done_req = g_i2c_sm_req_n;
         /* ★ 放门**不在这里做** —— `i2c_bus_release()` 在 flash 里, 而本函数跑在拍 ISR:
          *   直接调它会违反 ISR 调用树不变量（闸门已当场拦下 `i2c_bus_release@0x08008C04`）;
          *   而"加 DCL_ITCM"走不通（**ITCM 已 100% 占满**）⇒ 改成置标志, 由主循环放门。 */
@@ -237,6 +265,7 @@ DCL_ITCM void i2c_sm_tick(void)
 
     default:
         g_i2c_sm_active = 0u;
+        g_i2c_sm_done_req = g_i2c_sm_req_n;   /* ★ 归属令牌（见 g_i2c_sm_done_req 的说明）*/
         /* ★ 放门**不在这里做** —— `i2c_bus_release()` 在 flash 里, 而本函数跑在拍 ISR:
          *   直接调它会违反 ISR 调用树不变量（闸门已当场拦下 `i2c_bus_release@0x08008C04`）;
          *   而"加 DCL_ITCM"走不通（**ITCM 已 100% 占满**）⇒ 改成置标志, 由主循环放门。 */
@@ -247,6 +276,25 @@ DCL_ITCM void i2c_sm_tick(void)
 }
 
 uint32_t i2c_sm_status(void)    { return s_status; }
+
+/* ★★★ 归属令牌读取口（2026-09-16）。语义: **刚完成的那个事务的受理序号**。
+ * 用法（收尾方必须两步都做）:
+ *   ① 发起成功后记下 `my = g_i2c_sm_req_n`（= 自己那一号）;
+ *   ② 收尾时要求 `i2c_sm_done_req() == my`, 否则**不得**用 `i2c_sm_result()` 的值。
+ * ★ 只查 `status == I2C_SM_ST_OK` 是不够的 —— 那只能证明"有人成功了", 不能证明"是你要的那次"
+ *   （见 i2c_sm.c 里 `g_i2c_sm_done_req` 的完整反例）。缺少第 ② 步 = **静默错数据**。 */
+uint32_t i2c_sm_done_req(void)  { return g_i2c_sm_done_req; }
+
+/* ★★ I2C 事务区的冷启动登记（由 cold_start_reset 调用）—— 见 i2c_sm.h 的说明。
+ *   ★ 只碰 SHM，不碰硬件：`cold_start_reset()` 在启动序列的**阶段③**（早于 `i2c_sm_init()`），
+ *     此刻引脚/外设都还没配，任何硬件动作都不该在这里发生。 */
+void i2c_xact_reset(uint8_t *shm)
+{
+    for (uint32_t i = 0u; i < OFF_I2C_XACT_SZ; i++) { shm[OFF_I2C_XACT + i] = 0u; }
+    SHM_U32(shm, IX_MAGIC)  = IX_MAGIC_VAL;
+    SHM_U32(shm, IX_STATUS) = I2C_SM_ST_IDLE;
+    g_i2c_sm_release_pending = 0u;
+}
 
 /* ★ G6-2: 延迟放门 —— **只能在主循环调用**（本函数会碰 flash 里的门, 不能进 ISR）。 */
 void i2c_sm_service(void)
