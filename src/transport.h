@@ -39,12 +39,21 @@
 #define CMD_WRITE_BURST     0x23
 #define CMD_FORCE           0x24   /* P2: 强制/释放 wire — [idx:u16][mode:u8][val:f32] */
 #define CMD_ENGINE_STATUS   0x38
-#define CMD_PIN_PATTERN     0x39   /* ★ 引脚码型诊断 (抖动三方对照实验):
-                                    *   载荷 [op:u8] 0=关 / 1=开(清统计) / 2=读回
-                                    *   开启后拍 ISR 内往 PE0..PE6 输出 0..127 递增码型,
-                                    *   并记录"写 BSRR 之后"的 DWT 时刻 (相邻间隔 min/max)。
-                                    *   op=2 应答 24B: on/wr_n/min/max/last/val (各 u32 LE)
-                                    *   ★ 前提: GPIO_MASK 必须为 0 (否则 do 面会覆盖 PE) */
+#define CMD_PIN_PATTERN     0x39   /* ★ 引脚/器件**诊断命令族** —— 逐条见 docs/ARCH-H723.md §5.2.1
+                                    *   载荷 [op:u8] + op 专属字段; 应答 0 / 40 / 64 / 96 B 不等。
+                                    * ★★ **交付固件实际只有 8 个 op**:
+                                    *     0=关 · 1=开+清统计 · 2=引脚快照(64B) · 3=ISR 让路延时
+                                    *     4=黑匣子开关 · 17=AS5600 上电诊断(64B)
+                                    *     18=AS5600 运行态(40B) · 19=步进+静态探针+寄存器透视(96B)
+                                    *   ★ 曾经存在过的 op=5..13 **只活在实验补丁里**
+                                    *     (docs/exp-2026-09-14-mdma-trigger, README 明确"不提交");
+                                    *     op=12/14/15/16 全仓查无 ⇒ **别写"支持 op=1..19"**(那是错的)。
+                                    *   ★★★ **定位: 临时脚手架, 不是架构的一部分。**
+                                    *     (依据 docs/ASSESS-exp-standardization-2026-09-15.md 与
+                                    *      docs/PLAN-dcl-standardization.md 的明确要求)
+                                    *     ⇒ 诊断量**未进 SHM、无 obs_anchor() 登记、不占能力位**;
+                                    *       **③层程序不得依赖它**; `op=19` 保留为兼容壳。
+                                    *   ★ 本注释原只写 op 0/1/2 且与实现不符 —— 2026-09-16 跟平。 */
 #define CMD_PERSIST         0x43   /* W2.4: 掉电保持查询/落盘 — 空=查询, [mode:u8]=1 落盘
                                     *
                                     * ★★ PC 侧必读: [mode=1] 的 **ACK 延迟 = 擦除耗时**。

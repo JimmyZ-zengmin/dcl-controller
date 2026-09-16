@@ -829,8 +829,13 @@ CRC16-CCITT: poly 0x1021, init 0xFFFF, MSB-first
 `h723_seq`(27) · `h723_persist`(26) · `h723_modbus`(15) · `h723_macro`(18) ·
 `h723_w5`(18) · `h723_t26`(11) · `h723_r1_actuator`(5) · `h723_jitter`(9)
 
-★ **跑串口套件一律显式 `--port COM14`**（`find_port()` 只按 VID `1A86` 匹配，
-而 CH343(COM7，ESP32) 也是 1A86 ⇒ 会认错口）
+★ **跑串口套件一律显式 `--port <口名>`**，别依赖自动找口：
+`find_port()` 只按 VID `1A86` 匹配，而 CH343(ESP32) 也是 `1A86` ⇒ **会认错口**
+⇒ 现象是"板子没响应"，**极像板子坏了**。
+★ **本平台正确的认口方式 = 认能力字 `0x0DF7`**（`h723_client.find_board()` / `link_alive()`），
+不是认"第一个 CH340"。本机常年插着两个 CH340。
+★ **口名会变，不要写死在文档里**：原文写 `--port COM14`，2026-09-16 实测板子在 **COM21**。
+用 `python tools/h723_client.py` 或 `link_alive()` 现查。
 
 ## 10.2 LA 外部复核（需 Saleae + CH4←PA8，单通道，≤24 MS/s）
 
