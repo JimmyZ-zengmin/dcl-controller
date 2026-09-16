@@ -96,6 +96,7 @@ uint32_t dev_bind_load_bad(void);      /* ★ 段在但校验不过的次数（�
 
 /* ── 计数器本体（`obs_anchor()` 必须读一遍, 否则被 --gc-sections 回收 —— 本项目已踩三次）── */
 extern volatile uint32_t g_db_ok_n, g_db_err_n, g_db_last_err,
-                         g_db_skip_n, g_db_rej_n, g_db_load_ok_n, g_db_load_bad_n;
+                         g_db_skip_n, g_db_rej_n, g_db_load_ok_n, g_db_load_bad_n,
+                         g_db_seg_len;   /* 最近一次装载看到的段长度（0/48）*/
 
 #endif /* DEV_BIND_H */

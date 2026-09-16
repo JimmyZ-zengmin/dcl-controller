@@ -2749,7 +2749,7 @@ static uint32_t prog_boot_load_apply(void)
 static void h_prog_status(void)
 {
     ProgStoreInfo_t o;
-    uint8_t r[112];       /* ★ 2026-09-16: 64 → 96 (尾部追加开机装载结果, 见下方注释) */
+    uint8_t r[112];       /* ★ 2026-09-16: 64 → 96 → **104** (尾部两次追加: 开机装载结果 / 绑定表段可见性) */
     prog_store_probe(&o);
     put32(r +  0, o.part_ok);
     put32(r +  4, o.ab_valid);
@@ -2773,6 +2773,13 @@ static void h_prog_status(void)
      *   ⇒ 尾巴追加 4 字, 长度 64 → 80。 */
     put32(r + 64, g_prog_boot_rc);       /* 开机装载返回码 (PROG_RC_*) */
     put32(r + 68, g_prog_boot_loaded);   /* 1 = 开机确实把一份程序装进了 STAGING */
+    /* ★ GAP-11 尾部扩展（**只追加, 不改前面任何字节** —— 旧上位机按老长度读不受影响）:
+     *   +96 = `g_db_boot_seg`（最近一次装载对"绑定表段"的处理: 0=无段 1=恢复成功 2=段坏被拒）
+     *   +100 = `g_db_seg_len`（载荷尾部**实际**看到的段长度: 0 或 48）
+     *   ★ 为什么要报（工具侧提的意见，我采纳）: 否则"段存在"只能靠"落盘长度比裸包多 48"
+     *     去**间接推** —— 那是偏弱的证据, 且与"写坏了"难区分。直接报出来就没有歧义。 */
+    put32(r + 96,  g_db_boot_seg);
+    put32(r + 100, g_db_seg_len);
     put32(r + 72, g_deploy_routes);      /* engine_stage_program 回报的 ACTIVE 条数 */
     put32(r + 76, g_deploy_seq);         /* 部署序号 */
     /* ★★★ 2026-09-16: **"我们从卡上到底读回了什么"必须能被看见。**
@@ -2786,7 +2793,7 @@ static void h_prog_status(void)
         put32(r + 88, (uint32_t)(pl[8] | ((uint16_t)pl[9] << 8) | ((uint32_t)pl[10] << 16) | ((uint32_t)pl[11] << 24)));
         put32(r + 92, (uint32_t)(pl[12] | ((uint16_t)pl[13] << 8) | ((uint32_t)pl[14] << 16) | ((uint32_t)pl[15] << 24)));
     }
-    ack(r, 96);
+    ack(r, 104);
 }
 
 static void h_prog_erase(void)
@@ -3622,7 +3629,7 @@ static void obs_anchor(void)
     sink ^= g_db_last_err;                sink ^= g_db_skip_n;
     sink ^= g_db_rej_n;                   /* ★ 第二轮审计指出漏登记（dev_bind.h 自述要求）→ 已补 */
     sink ^= g_db_load_ok_n;               sink ^= g_db_load_bad_n;   /* ★ GAP-11 装载结果 */
-    sink ^= g_db_boot_seg;
+    sink ^= g_db_boot_seg;               sink ^= g_db_seg_len;
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
     sink ^= g_engine_gate;                sink ^= g_engine_sel;
     sink ^= g_n_routes;                   sink ^= g_table_profile;

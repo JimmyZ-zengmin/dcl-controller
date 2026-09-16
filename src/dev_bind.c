@@ -42,6 +42,10 @@ static uint32_t  s_pend_valid = 0u;
 volatile uint32_t g_db_ok_n = 0u, g_db_err_n = 0u, g_db_last_err = 0u,
                   g_db_skip_n = 0u, g_db_rej_n = 0u,
                   g_db_load_ok_n = 0u, g_db_load_bad_n = 0u;
+/* ★ 最近一次装载**看到的段长度**（0 = 载荷里没有段；48 = 有）。
+ *   为什么要有它（工具侧提的意见，我采纳）: 否则"段存在"只能靠"0x48 的落盘长度比裸包多 48"
+ *   **间接推** —— 那是偏弱的证据, 且与"写坏了"难以区分。直接报出来就没有歧义。 */
+volatile uint32_t g_db_seg_len = 0u;
 
 /* FNV-1a —— **与上位机同算法**（照 bb_map_sum 的用途: 判"表与固件是不是同一份映射"）*/
 static uint32_t db_crc(const uint8_t *shm)
@@ -94,10 +98,18 @@ static void db_apply(const db_lane_t *t, uint32_t n, uint32_t seq)
      *   早先它在提交函数里写、还被 `s_busy!=0` 挡掉 ⇒ 会出现"表换了但登记数还是旧的"
      *   （审计：顺序依赖导致计数永远停旧值）。现在它跟着**生效**这一步走, 二者不可能不一致。 */
     SHM_U32(s_shm, DB_N_VALID) = s_n;
-    SHM_U32(s_shm, DB_DONE_SEQ) = seq;      /* ★ 生效才算"回执"（就绪门语义）*/
+    /* ★★ `seq == 0` = **装载路径**（来自程序包/`dev_bind_unpack`）⇒ **不碰** `DONE_SEQ`：
+     *   那是**上位机握手**的字段（"你提交的哪一号已生效"），装载并不是一次上位机提交。
+     *   ★ 为什么必须区分（工具侧实测踩到的真坑）: 装载若也去动 `REQ_SEQ`/`DONE_SEQ`,
+     *     而 `dev_bind_submit()` 在 `req == done` 时**静默 return** ⇒ 上位机若自己维护序号,
+     *     第一次恢复后就会撞号 ⇒ **之后每条判据都在旧表上跑 ⇒ 全假 PASS 且无任何症状**。 */
+    if (seq != 0u) { SHM_U32(s_shm, DB_DONE_SEQ) = seq; }   /* ★ 生效才算"回执"（就绪门语义）*/
 }
 
-/* ── 校验并绑定 ── */
+/* ── 校验并绑定 ──
+ * ★ 前向声明：`db_validate_apply()` 定义在下面（它被"上传"与"装载"两条路共用）。 */
+static uint32_t db_validate_apply(uint32_t seq);
+
 void dev_bind_submit(void)
 {
     if (s_shm == NULL) { return; }
@@ -124,6 +136,20 @@ void dev_bind_submit(void)
         return;
     }
 
+    uint32_t rc = db_validate_apply(rq);
+    if (rc != DB_RC_OK) {
+        /* ★★ ③ 拒绝也必须回 `done_seq`（`rq == dn` 是上位机的"已处理"判据）。
+         *   否则判据永远等下去 —— "判据必须能终止"（契约 §3.8.4 末段）。 */
+        SHM_U32(s_shm, DB_DONE_SEQ) = rq;
+    }
+    return;
+}
+
+/* ★★★ 校验并应用"SHM 里的那张表" —— **上传路径与装载路径共用的唯一实现**（2026-09-16）。
+ *   `seq != 0` ⇒ 上位机提交（生效时回写 `DONE_SEQ`）；`seq == 0` ⇒ 装载恢复（不碰握手）。
+ *   ★ 共用它而不是各写一份，是闸5 的同款纪律（"装载时与上传时跑同一套校验"）。 */
+static uint32_t db_validate_apply(uint32_t seq)
+{
     uint32_t rc = DB_RC_OK;
     /* ① crc —— **"半个表"最危险**: 没有它, "写了一半"与"完整的表"在固件看来一模一样 */
     if (db_crc(s_shm) != SHM_U32(s_shm, DB_CRC)) { rc = DB_RC_CRC; }
@@ -157,17 +183,14 @@ void dev_bind_submit(void)
         g_db_rej_n++;
         SHM_U32(s_shm, DB_REJ_N)   = g_db_rej_n;
         SHM_U32(s_shm, DB_REJECT)  = rc;
-        /* ★★ ③ 拒绝也必须回 `done_seq`（`rq == dn` 是上位机的"已处理"判据）。
-         *   否则判据永远等下去 —— "判据必须能终止"（契约 §3.8.4 末段）。 */
-        SHM_U32(s_shm, DB_DONE_SEQ) = rq;
-        return;
+        return rc;
     }
 
-    SHM_U32(s_shm, DB_REJECT) = DB_RC_OK;   /* 最近一次提交被接受 */
+    SHM_U32(s_shm, DB_REJECT) = DB_RC_OK;   /* 最近一次提交/装载被接受 */
 
     if (s_busy == 0u) {
-        db_apply(tmp, tn, rq);              /* 无在飞 ⇒ 立即生效 */
-        return;
+        db_apply(tmp, tn, seq);             /* 无在飞 ⇒ 立即生效 */
+        return rc;
     }
 
     /* ★★★ ① 有事务在飞 ⇒ **暂存, 绝不立刻换表**。
@@ -181,9 +204,10 @@ void dev_bind_submit(void)
      *     而等待是**有界**的（在飞事务最多 6+n 拍 ≈ 800 µs）⇒ 判据仍能终止。 */
     for (uint32_t i = 0u; i < tn; i++) { s_pend[i] = tmp[i]; }
     s_pend_n     = tn;
-    s_pend_seq   = rq;
+    s_pend_seq   = seq;
     s_pend_valid = 1u;
     /* ★ 注意这里**不写** `DONE_SEQ` / `N_VALID` —— 等收尾后再由 `db_apply()` 写。 */
+    return rc;
 }
 
 /* ── 轮询一个槽（round-robin）── */
@@ -358,7 +382,11 @@ uint32_t dev_bind_unpack(const uint8_t *payload, uint32_t len)
     /* ★ 段的位置：载荷**尾部**最后 48 字节。先按"尾部"取, 再看 magic —— 这样即使
      *   将来载荷前面又加了别的东西, 判据也不变（只依赖"段在最后"这一条约定）。 */
     const uint8_t *seg = payload + len - DB_SEG_LEN;
-    if (get32le(seg + 0) != DB_MAGIC_VAL) { return DB_SEG_NONE; }   /* 没有段 */
+    if (get32le(seg + 0) != DB_MAGIC_VAL) {
+        g_db_seg_len = 0u;                       /* 明确"没有段"（老包）*/
+        return DB_SEG_NONE;
+    }
+    g_db_seg_len = DB_SEG_LEN;                   /* ★ 直接可观测："段在"*/
 
     /* 段在 ⇒ 从这里开始, 任何不符都必须**明确拒绝且不半装载**（可观测：DB_LOAD_BAD_N + DB_REJECT）*/
     uint32_t bad = 0u;
@@ -383,11 +411,13 @@ uint32_t dev_bind_unpack(const uint8_t *payload, uint32_t len)
     uint32_t period = get32le(seg + 8);
     SHM_U32(s_shm, DB_PERIOD) = period;
     SHM_U32(s_shm, DB_CRC)    = db_crc(s_shm);
-    /* ★★ 关键：**不自己判合法性**, 而是把"提交"这件事交给**上传路径用的同一个函数**。
-     *   于是段里的非法条目会以 `DB_REJECT` 如实报出来（闸5 的同一条纪律：装载与上传共用一份校验）。*/
-    SHM_U32(s_shm, DB_REQ_SEQ) = SHM_U32(s_shm, DB_REQ_SEQ) + 1u;
-    dev_bind_submit();
-    if (SHM_U32(s_shm, DB_REJECT) != DB_RC_OK) {
+    /* ★★ 关键：**不自己判合法性**, 而是调**上传路径用的同一个实现** `db_validate_apply(0)`。
+     *   于是段里的非法条目会以 `DB_REJECT` 如实报出来（闸5 的同一条纪律：装载与上传共用一份校验）。
+     *   ★★★ 且**必须传 `seq = 0`**：装载**不是**一次上位机提交, 绝不许去动 `REQ_SEQ`/`DONE_SEQ`。
+     *     踩过（工具侧实测）: 原实现每次恢复都 `REQ_SEQ + 1u` 再调 `dev_bind_submit()`,
+     *     而上位机若自己维护序号 ⇒ 第一次恢复后**撞号** ⇒ `submit` 静默 return
+     *     ⇒ 之后每条判据都在**旧表**上跑 ⇒ **全假 PASS 且没有任何症状**。 */
+    if (db_validate_apply(0u) != DB_RC_OK) {
         g_db_load_bad_n++;
         SHM_U32(s_shm, DB_LOAD_BAD_N) = g_db_load_bad_n;
         return DB_SEG_BAD;
