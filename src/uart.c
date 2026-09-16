@@ -32,7 +32,15 @@ static uint32_t  s_brr = 0;
 
 /* 环形缓冲: 主循环排空。512B 足够 —— 主循环每轮只做几十条指令的事,
  * 而一字节要 86.8μs 才到。写满即丢弃并计数(不覆盖, 避免"看起来正常"的静默损坏)。 */
-#define RX_RING_SZ   512u
+/* ★★★ 2026-09-16: 512 → **4096**。
+ * 为什么（有实测依据）: 512 B 只装得下 ≈44 ms 的数据（115200 bps），
+ *   而主循环里的 `sd_log_poll()` 等**会停顿数十~数百 ms** ⇒ 环溢出、丢字节
+ *   （`uart_drop` 实测累积到 767）⇒ 帧被截断 ⇒ 设备"失聪"。
+ *   4096 B ≈ 355 ms 的容忍度，足以盖住一次 SD 批写。
+ * ★ 配套：`transport.h` 的**帧组装超时**（万一还是溢出，也会自愈而不是永久失聪）。
+ * ★ 空间: DTCM 128 KB 仅用 41%（53.7 KB）⇒ +3.5 KB 无压力。
+ *   （★ 这**不是**根治：真正的根治是"别让主循环停那么久"，那是另一刀。）*/
+#define RX_RING_SZ   4096u
 #define RX_RING_MASK (RX_RING_SZ - 1u)
 static volatile uint8_t  s_ring[RX_RING_SZ];
 static volatile uint32_t s_head = 0, s_tail = 0;

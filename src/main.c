@@ -1525,6 +1525,8 @@ static FrameParser_t  s_parser;
 /* ★★★ 2026-09-16 起按 **v2 尺寸**声明（GAP-12 帧归属）: v1 帧 = payload+6，
  *   而 v2 应答 = payload+8 —— 原声明**正好等于 v1 帧长** ⇒ 发 v2 应答会**越界写 2 字节**。
  *   （同族教训："固定缓冲 + 更大的帧"；本项目在这一族上已栽过两次。） */
+static uint32_t       s_assy_last_tick = 0u;   /* 帧组装超时用: 最后一拍"有字节进来" */
+static uint8_t        s_consumed_any  = 0u;   /* 本圈 proto_poll 是否消费过字节 */
 static uint8_t        s_txbuf[FRAME_TOTAL_MAX_V2];
 _Static_assert(FRAME_TOTAL_MAX_V2 >= FRAME_TOTAL_MAX, "v2 帧长必须 >= v1");
 static volatile uint32_t s_selftest_active = 0;
@@ -1555,6 +1557,8 @@ OBS uint32_t g_nak_count     = 0;
 /* ★ GAP-12: 收到的 v2 帧数（`0x39 op=24` 可读当前模式；这个计数证明"确实在用 v2"）
  *   ★ 必须登记进 `obs_anchor()`，否则被 --gc-sections 回收（本项目已踩三次）。 */
 OBS uint32_t g_frame_v2_n    = 0;
+/* ★ 帧组装超时**触发次数**（>0 就说明确实发生过"环溢出致半帧"；可观测 = 判据能失败）*/
+OBS uint32_t g_frame_assy_to_n = 0;
 OBS uint32_t g_banner_count  = 0;
 /* ★ 组帧自检结果 (1=通过): 用独立实现算出的期望值校验 CRC 覆盖范围。
  *   "覆盖长度写错"这类 bug 不会崩、不会报警, 只会让**每一帧都被对端判为 CRC 错**
@@ -2569,6 +2573,14 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         ack(rx, 36u);
         return;
     }
+    if (op == 25u) {
+        /* ★ 帧组装超时次数（0 = 没发生过；>0 = 确实撞上过"环溢出致半帧"）。
+         *   应答 4 B: [count] */
+        uint8_t rx[4];
+        put32(rx + 0, g_frame_assy_to_n);
+        ack(rx, 4u);
+        return;
+    }
     if (op == 24u) {
         /* ★ GAP-12: 读**设备侧**的帧模式与 v2 帧计数。
          *   ★ 为什么要这条: 客户端"以为切过去了"**不构成证据** —— 有可能请求压根没被受理。
@@ -3528,7 +3540,9 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
 static void proto_poll(void)
 {
     uint8_t b;
+    s_consumed_any = 0u;
     while (uart1_rx_pop(&b)) {
+        s_consumed_any = 1u;             /* ★ 本轮有字节 ⇒ 刷新"最后一拍"（见下方超时判据）*/
         g_uart_rx_bytes++;
         int r = fp_feed(&s_parser, b);
         if (r == 1) {
@@ -3546,6 +3560,24 @@ static void proto_poll(void)
             g_frame_bad++;
         }
     }
+    /* ★★★ 帧组装超时（2026-09-16）—— 防"环溢出致半帧 ⇒ 永久失聪"。
+     *   完整推导见 `transport.h` 的 `FRAME_ASSY_TIMEOUT_TICKS`。一句话：
+     *   环溢出会丢字节 ⇒ 帧被截断；而解析器**没有超时**时会**停在半帧上永久失聪**
+     *   （实测注入半帧后等 5 s 也不恢复，只有把剩余字节喂完才行）。
+     *   ⇒ 只要"非 WAIT_SYNC 且超过阈值没有新字节"，就复位解析器重新等 SYNC。
+     *   ★ 放在**排空循环之后**：此刻才反映"这一轮有没有新字节"。 */
+    /* ★★★ 判"有没有新字节"必须看"**本轮真的消费了字节**"，不能看 `payload_idx` 变没变 ——
+     *   帧头阶段（state 1..3）`payload_idx` **恒为 0**，于是"最后一拍"永远是陈旧值
+     *   ⇒ **任何分段发送的帧都会被立刻误杀**。
+     *   ★ 这个 bug 是**我自己写的反向判据（T5：分两段发、中间停 20 ms）当场抓出来的** ——
+     *     没有那条判据，我只会在"半帧能自愈"上收工，而实际上把"慢但合法的帧"全打死了。 */
+    if (s_consumed_any != 0u) { s_assy_last_tick = g_tick_count; }
+    if (s_parser.state != 0u &&
+        (uint32_t)(g_tick_count - s_assy_last_tick) > FRAME_ASSY_TIMEOUT_TICKS) {
+        fp_init(&s_parser);              /* 复位：回到等 SYNC（自愈, 不再永久失聪）*/
+        g_frame_assy_to_n++;
+    }
+
     g_uart_ore    = uart1_ore_count();
     g_uart_drop   = uart1_drop_count();
     g_uart_isr_n     = uart1_isr_count();

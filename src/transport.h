@@ -184,6 +184,16 @@
 #define FRAME_SYNC_MCU2PC_V2  0xC3
 #define CMD_FRAME_MODE        0x05   /* [mode:u8] 1=进入 v2, 0=回到 v1 */
 #define FRAME_TOTAL_MAX_V2    (FRAME_PAYLOAD_MAX + 8)
+/* ★★★ 帧组装超时（2026-09-16，**确定性复现过**的缺陷的正解）
+ * 背景：接收环 `RX_RING_SZ=512`（≈44 ms 的数据量），而主循环里的 `sd_log_poll()` 等**会停顿**
+ *   ⇒ 环溢出、丢字节（`uart_drop` 计数在涨）⇒ 帧被截断。
+ *   ★ 而 `fp_feed()` 在 PAYLOAD 状态**只存字节、不重同步、也没有超时** ⇒ 解析器**停在半帧上**，
+ *   表现得像"设备失聪"：实测（注入半帧后）**等 2 s / 5 s 都不恢复**，
+ *   只有把剩余字节喂完才恢复（下一次大 deploy 正好把它喂完 ⇒ 看起来"下一次又好了"）。
+ * ⇒ 处方：帧组装中若**超过本阈值没有新字节**，就复位解析器、重新等 SYNC。
+ * ★ 阈值取 50 ms（500 拍）：正常帧内字节间隔仅 ~87 µs（115200 bps），
+ *   6174 字节的大帧**只要字节连续就不会触发**；只有真的"断了"才触发。 */
+#define FRAME_ASSY_TIMEOUT_TICKS  500u   /* 50 ms @100µs/拍 */
 #define FRAME_CRC_COVER_V2Q(n)  (4u + (n))   /* 请求: [CMD][SEQ][LEN:2][payload] */
 #define FRAME_CRC_COVER_V2A(n)  (5u + (n))   /* 应答: [CMD][SEQ][STS][LEN:2][payload] */
 
