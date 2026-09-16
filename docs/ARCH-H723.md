@@ -482,6 +482,16 @@ CRC16-CCITT: poly 0x1021, init 0xFFFF, MSB-first
 | 0x60 | MB_INJECT | 原始 RTU 帧 → 空（忙碌 NAK `mb: busy`） |
 | 0x61 | MB_RESP | 空 → `[state][tx_len][tx…][rx u32][tx u32][crc u32][exc u32]` |
 | 0x62 | MB_CFG | `[src][tx_uart?][budget?]` → `[src][tx_uart][budget]` |
+| **0x45** | **PROG_BEGIN** | `[total_len:u32][crc32:u32][prog_id:u32][prog_ver:u16][min_fw:u16][req_caps:u32]` → `[total_len:u32]` |
+| **0x46** | **PROG_DATA** | `[offset:u32][chunk…]` → `[next_offset:u32]`（★ 必须**顺序**，不跳不重） |
+| **0x47** | **PROG_COMMIT** | 空 → `[rc:u32][budget:u32]` |
+| **0x48** | **PROG_STATUS** | 空 → **96 B**（程序存储体检 + 事务对账 + 开机装载结果 + 读回的载荷头；逐偏移见 `docs/STATUS-2026-09-16.md` §1） |
+| **0x49** | **PROG_ERASE** | 空 → `[rc:u32]` |
+| **0x4A** | **DEVICE_DESC** | 空 → `[fw:u16][cap_lo:u16][cap_hi:u16][n:u16]` + `n×[device_type:u16][product_code:u16][revision:u16]`（★ 我们的 **ESI 等价物**） |
+
+> ★ **`0x45–0x4A` = DCL 程序持久化（2026-09-16 打通）**：程序走通信上传 → 落 SD 卡 A/B 双副本
+> → 上电自动装载进引擎，**不碰 flash 烧录**。契约 `docs/REF-program-contract.md`，
+> 状态与 AXI 地图 `docs/STATUS-2026-09-16.md`。
 
 未实现命令 → `default: nak("bad cmd")`（**显式 NAK 而非超时**）。
 `0x51/0x52/0x53`（display）标 `DCL_RESERVED`，本平台不实现。
