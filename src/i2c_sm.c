@@ -52,7 +52,9 @@ static uint32_t s_pcnt, s_tcnt;
 static uint32_t s_run;
 
 volatile uint8_t  g_i2c_sm_active = 0u;    /* 1 = 状态机事务在飞（阻塞路径要等它）*/
-volatile uint8_t  g_i2c_sm_release_pending = 0u;  /* ★ ISR 置位, 主循环放门（见 i2c_sm.h）*/
+/* ★★★ 欠释放**计数**（不是 bool）—— 2026-09-16 实测"泄漏 61 个引用"后改成计数。见 i2c_sm.h 的说明。 */
+volatile uint16_t g_i2c_sm_release_pending = 0u;
+volatile uint32_t g_i2c_ref_leak_n = 0u;   /* 主循环对账发现"空闲却仍被 SM 占"的次数（可读、有界）*/
 volatile uint32_t g_i2c_sm_req_n = 0u, g_i2c_sm_ok_n = 0u, g_i2c_sm_nak_n = 0u,
                   g_i2c_sm_stuck_n = 0u, g_i2c_sm_gate_n = 0u, g_i2c_sm_ticks_n = 0u,
                   g_i2c_sm_clk_cyc_max = 0u;
@@ -192,9 +194,13 @@ uint32_t i2c_sm_request(uint8_t addr7, uint8_t op, uint8_t reg, const uint8_t *t
 
     s_addr = addr7; s_op = op; s_reg = reg; s_len = n; s_idx = 0u; s_seq = 0u;
     s_rxpend = 0u; s_byte = 0u; s_rx = 0u; s_bit = 8u;
-    /* ★ 门已拿到（上面 acquire 过）⇒ 清掉上一次次留下的"待释放" —— 否则主循环
-     *   会把**本次在飞的事务**的门放掉（延迟释放引入的新竞态, 必须在这里堵住）。 */
-    g_i2c_sm_release_pending = 0u;
+    /* ★★★ 这里**不能**清 `g_i2c_sm_release_pending`（2026-09-16 实测：清了会泄漏引用计数）。
+     *   原意图是"别让主循环把本次在飞事务的门放掉"，但那样会**丢掉上一次欠的释放**：
+     *   上一个事务若恰在 `i2c_sm_service()` **之后**、本次请求**之前**完成，它的释放就永远没人做。
+     *   实测累积到 **refs=61**（`owner=2(SM)` 冻结、表为空、状态机 idle）⇒ **阻塞路径永久拿不到总线**
+     *   —— 而症状表现为"G6-2/G6-3 一起变红"，离真因很远。
+     *   ⇒ 改为**配对计数**：欠几次就在 `i2c_sm_service()` 里还几次。语义天然正确
+     *     （每次 acquire 最终恰好对应一次 release），受理处**不需要**任何补偿动作。 */
     if (op == I2C_SM_OP_WRITE) { for (uint32_t i = 0u; i < n; i++) { s_tbuf[i] = tx[i]; } }
     s_pcnt = 0u; s_tcnt = 0u;
     s_status = I2C_SM_ST_BUSY;
@@ -290,8 +296,8 @@ DCL_ITCM void i2c_sm_tick(void)
         s_done_len           = s_len;
         /* ★ 放门**不在这里做** —— `i2c_bus_release()` 在 flash 里, 而本函数跑在拍 ISR:
          *   直接调它会违反 ISR 调用树不变量（闸门已当场拦下 `i2c_bus_release@0x08008C04`）;
-         *   而"加 DCL_ITCM"走不通（**ITCM 已 100% 占满**）⇒ 改成置标志, 由主循环放门。 */
-        g_i2c_sm_release_pending = 1u;
+         *   而"加 DCL_ITCM"走不通（**ITCM 已 100% 占满**）⇒ 改成**记一笔欠释放**, 由主循环还。 */
+        if (g_i2c_sm_release_pending < 0xFFFFu) { g_i2c_sm_release_pending++; }
         s_phase = PH_DONE;
         return;
 
@@ -301,10 +307,8 @@ DCL_ITCM void i2c_sm_tick(void)
         g_i2c_sm_done_req    = g_i2c_sm_req_n;
         g_i2c_sm_done_status = s_status;
         s_done_len           = s_len;
-        /* ★ 放门**不在这里做** —— `i2c_bus_release()` 在 flash 里, 而本函数跑在拍 ISR:
-         *   直接调它会违反 ISR 调用树不变量（闸门已当场拦下 `i2c_bus_release@0x08008C04`）;
-         *   而"加 DCL_ITCM"走不通（**ITCM 已 100% 占满**）⇒ 改成置标志, 由主循环放门。 */
-        g_i2c_sm_release_pending = 1u;
+        /* ★ 放门**不在这里做**（同 PH_STOP）⇒ 记一笔欠释放, 主循环还。 */
+        if (g_i2c_sm_release_pending < 0xFFFFu) { g_i2c_sm_release_pending++; }
         s_phase = PH_DONE;
         return;
     }
@@ -349,7 +353,9 @@ void i2c_xact_reset(uint8_t *shm)
     for (uint32_t i = 0u; i < OFF_I2C_XACT_SZ; i++) { shm[OFF_I2C_XACT + i] = 0u; }
     SHM_U32(shm, IX_MAGIC)  = IX_MAGIC_VAL;
     SHM_U32(shm, IX_STATUS) = I2C_SM_ST_IDLE;
-    g_i2c_sm_release_pending = 0u;
+    /* ★ 这里**不**清 `g_i2c_sm_release_pending`：欠的释放必须**还掉**，清掉就是泄漏
+     *   （与 `i2c_sm_request` 里那处是同一个错，别再犯一次）。
+     *   真正的对账交给主循环：空闲却仍被 SM 占 ⇒ `g_i2c_ref_leak_n` 增加并当圈归还。 */
     /* ★ 完成记录也要**作废**（新纪元: 上一轮的完成号/状态不该被当成"刚发生的事"）。
      *   `g_i2c_sm_req_n` 本身**不清**（它是累计量, 与 DTCM 统计同族: 清它反而会造出
      *   "序号回绕"的假象）；真正要紧的是把**完成记录**置空, 让所有收尾方判为"无结果"。 */
@@ -358,11 +364,13 @@ void i2c_xact_reset(uint8_t *shm)
     s_done_len           = 0u;
 }
 
-/* ★ G6-2: 延迟放门 —— **只能在主循环调用**（本函数会碰 flash 里的门, 不能进 ISR）。 */
+/* ★ G6-2: 延迟放门 —— **只能在主循环调用**（本函数会碰 flash 里的门, 不能进 ISR）。
+ * ★ 把**欠的**释放**全部**还掉（不是"有就放一次"）—— 计数语义要求这样：欠几次还几次。
+ *   ★ 为什么不能用 `if (...) { pending = 0; release(); }`：那会把"欠了 2 次"只还 1 次 ⇒ 泄漏。 */
 void i2c_sm_service(void)
 {
-    if (g_i2c_sm_release_pending != 0u) {
-        g_i2c_sm_release_pending = 0u;
+    while (g_i2c_sm_release_pending != 0u) {
+        g_i2c_sm_release_pending--;
         i2c_bus_release(I2C_OWNER_SM);
     }
 }uint32_t i2c_sm_phase(void)     { return s_phase; }

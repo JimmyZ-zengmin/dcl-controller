@@ -3543,6 +3543,7 @@ static void obs_anchor(void)
     sink ^= g_i2c_sm_stuck_n;             sink ^= g_i2c_sm_gate_n;
     sink ^= g_i2c_sm_ticks_n;             sink ^= g_i2c_bus_busy_n;
     sink ^= (uint32_t)g_i2c_sm_active;    sink ^= (uint32_t)g_i2c_sm_release_pending;
+    sink ^= g_i2c_ref_leak_n;             /* ★ 引用计数泄漏对账次数（0 表示这一轮没泄漏）*/
     sink ^= (uint32_t)s_ix_busy;          sink ^= s_ix_seq;
     /* ★ G6-4 新增观测量 —— 同样不加这几行它们可能悄悄从符号表消失 */
     sink ^= g_db_ok_n;                    sink ^= g_db_err_n;
@@ -4116,6 +4117,17 @@ int main(void)
          *   ISR 调用树不变量（闸门当场拦过 `i2c_bus_release@0x08008BDC`）,
          *   而 ITCM 已 100% 占满, 没有"搬进 ITCM"这条退路。 */
         i2c_sm_service();               /* G6-2: 延迟放门 */
+        /* ★★★ 引用计数对账（2026-09-16，实测"泄漏 61 个引用"之后加的）：
+         *   不变式 = **SM 空闲 且 没有欠释放 ⇒ 它不该占着门**。
+         *   违反 ⇒ 有泄漏（本轮实测的根因是"受理请求时把欠释放清 0"，已修）；
+         *   这里**当圈归还**，让"永久占死总线"退化成"最多多占一圈主循环（~0.37ms）"。
+         *   ★ 关键：**归还也计数**（`g_i2c_ref_leak_n`，可由 `0x38`/pyocd 读回）——
+         *     自愈绝不能是静默的，否则下一次泄漏又变成"查不出来"。 */
+        if (g_i2c_sm_active == 0u && g_i2c_sm_release_pending == 0u &&
+            i2c_bus_owner() == I2C_OWNER_SM) {
+            g_i2c_ref_leak_n++;
+            i2c_bus_release(I2C_OWNER_SM);
+        }
         i2c_shm_service();              /* G6-3: SHM 事务区握手 */
         /* ★★ G6-4: 具名设备绑定表的两件服务性工作 —— **同样必须在循环顶层**。
          *   ① `submit`: 校验 PC 下发的表（crc + 字段范围 + seq 单调）; 不通过 ⇒ **保持上一次绑定**

@@ -110,8 +110,20 @@ extern volatile uint8_t g_i2c_sm_active;   /* **只作观测**: 1 = 状态机事
  *   ★ 代价（已权衡并接受）: 事务结束后总线最多再被持 ~1 圈主循环（**~0.37ms**）。
  *     影响面很小 —— 同 owner 再申请**照样成功**(acquire 允许同 owner 重入),
  *     只有阻塞路径会被多跳一次（而它本来 10ms 才轮一次）。 */
-extern volatile uint8_t g_i2c_sm_release_pending;
-void i2c_sm_service(void);   /* ★ 主循环每次循环调用: 需要时放门 */
+extern volatile uint16_t g_i2c_sm_release_pending;
+void i2c_sm_service(void);   /* ★ 主循环每次循环调用: 把**欠的**释放都还掉 */
+
+/* ★★★ 它为什么是"欠释放**计数**"而不是一个 bool（2026-09-16 上机抓到泄漏 61 个引用后改）：
+ *   延迟释放的记账必须是**配对计数**。原实现是 bool，且 `i2c_sm_request()` 在受理新请求时
+ *   把它**清 0**（本意：别把刚拿到的那次占用放掉）。但若上一个事务恰好在
+ *   `i2c_sm_service()` **之后**、本次请求**之前**完成，那次"欠的释放"就被**丢掉**
+ *   ⇒ `i2c_bus_refs()` 每次泄漏 1 ⇒ 累积到 61 后**阻塞路径永久拿不到总线**
+ *   （实测症状：`owner=2(SM)` 冻结、`refs=61`，而状态机早已 idle、表也是空的）。
+ *   ★ 改法：**计数**——完成一次 +1，主循环每圈把欠的**全部**还掉（`while`）。
+ *     配对计数的语义天然正确：每次acquire最终恰好对应一次 release。
+ *   ★ 观测量 `0x39 op=22 +32` = `refs`（空闲必须 0）+ 主循环的引用计数对账
+ *     （`g_i2c_ref_leak_n`）—— "泄漏"这件事**既不静默也不永久**。 */
+extern volatile uint32_t g_i2c_ref_leak_n;   /* 主循环对账发现"空闲却仍被 SM 占"的次数 */
 
 /* ★★ I2C 事务区的**冷启动登记** —— 必须由 `cold_start_reset()` 调用。
  *   理由（本项目"新增域必须登记到单一入口"的纪律，与 mb_config / macro_reset / fault_init 同款）：
