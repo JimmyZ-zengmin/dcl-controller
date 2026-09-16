@@ -58,11 +58,30 @@
                                     *   (本次实测踩到: 0.6s 超时被脚本判成 NAK, 而 flash 里
                                     *    确实已经写好了 8 条 —— "命令没回" ≠ "命令没做"。) */
 #define CMD_SEQ_DEPLOY      0x44   /* Sequencer v0: 部署顺序域 (设计 D6: 独立命令
-                                      不往 0x10 塞 — 3078B 压线教训) */
+                                    *   不往 0x10 塞 — 3078B 压线教训) */
 #define CMD_MACRO           0x40   /* W5: 一次性执行字节码 → ACK 返回栈内容 (同 S3)
                                     * 载荷 = 原始字节码 (≤ MACRO_MAX_CODE=512) */
 #define CMD_MACRO_UPLOAD    0x41   /* W5: 上传 [loop_ms u16][code...] → SHM 并停循环 (同 S3) */
 #define CMD_MACRO_CTRL      0x42   /* W5: 控制 [action u8] (0=stop 1=start) (同 S3) */
+
+/* ══════════ S5 (2026-09-15): **DCL 程序持久化 —— 事务式上传** ══════════
+ * 契约: docs/REF-program-contract.md §4.2 + §7。
+ * 为什么是事务式而不是一条 0x10 大帧:
+ *   0x10 的载荷**满配** = 6 + 128*16*3 = 6150 = FRAME_PAYLOAD_MAX
+ *   ⇒ **一个字节余量都没有**, 塞不进清单/版本/CRC (契约 GAP-2)。
+ * ⇒ 拆成 BEGIN(清单) / DATA(分片) / COMMIT(定稿), 顺带解决"零余量"。
+ * ★ 三道闸的位置: 闸1 帧 CRC16 在传输层; 闸2 清单 CRC32+total_len 在 COMMIT;
+ *   闸5 (落盘/装载前重跑同一套静态校验) 在 COMMIT 与开机装载两处, 都调 `prog_validate`。 */
+#define CMD_PROG_BEGIN      0x45   /* [total_len:u32][crc32:u32][prog_id:u32]
+                                    * [prog_ver:u16][min_fw:u16][req_caps:u32]
+                                    *   → ACK [total_len:u32] */
+#define CMD_PROG_DATA       0x46   /* [offset:u32][chunk...] → ACK [next_offset:u32]
+                                    *   ★ 必须顺序、不跳不重 (off 必须等于已收字节数) */
+#define CMD_PROG_COMMIT     0x47   /* 空 → ACK [rc:u32][budget:u32] */
+#define CMD_PROG_STATUS     0x48   /* 空 → ACK ProgStoreInfo (13×u32) */
+#define CMD_PROG_ERASE      0x49   /* 空 → ACK [rc:u32] (两份头清零) */
+#define CMD_DEVICE_DESC     0x4A   /* 空 → ACK [fw:u16][cap_lo:u16][cap_hi:u16]
+                                    *        + 具名设备表 (我们的 ESI 等价物, 见契约 §3.5) */
 #define CMD_PIN_SELFTEST    0x36   /* W5: **零接线自检** —— 用 GPIO 内部上拉/下拉把引脚拉到
                                     * 已知电平, 验证 DI 输入通路与 ADC 输入通路。
                                     * 载荷 [method u8] (ADC 用: 0=引脚 analog 1=input)。

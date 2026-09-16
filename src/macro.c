@@ -13,7 +13,9 @@
  *   · 无跳转指令 ⇒ 任何程序都是直线、必然终止 (不会无限循环把主循环拖死)。
  *
  * H723 加固 (相对 S3 的有意差异, 见 macro.h):
- *   · 裸地址 load/store 限定 SHM 窗口 (无 MMU, 越界 = HardFault)。
+ *   · 裸地址 load/store 限定 SHM 窗口 (无 MMU, 越界 = HardFault);
+ *     ★ 写额外收窄为"SENSOR / ACTUATOR / WIRE 三个数据区"(读宽写窄, 见 m_waddr_ok
+ *     上方注释) —— 收紧前它能写任意 SHM 槽, 会破坏"单写者"红线。
  *   · SPI op (0x20-0x23) 不迁移 → 返回 -4 (S3 里它只服务 display)。
  *
  * 返回码: -1 截断/栈错 · -2 裸地址越界 · -3 非有限 float · -4 未迁移 op · -5 未知 op
@@ -27,6 +29,21 @@
 static inline MacroCtrl_t *m_ctrl(uint8_t *base) { return (MacroCtrl_t *)M_PTR(base, OFF_MACRO_CTRL); }
 
 static inline uint32_t m_cyc(void) { return DWT_CYCCNT; }
+
+/* ══════════ 定位自述 (B 档: 调试工具, 非实时) ══════════
+ * 依据: docs/REF-program-contract.md §1.2 · docs/PLAN-dcl-standardization.md §4。
+ *   `0` = 本 VM **不保证实时** —— 它的循环挂在**主循环** macro_tick 上 (不是 ISR 拍),
+ *         指令集里含忙等 (0x06 忙等 N 周期 / 0x07 忙等 N ms), 且**没有标价、没有
+ *         静态门、也没有动态门**;
+ *   `0` 还表示它**不参与持久化** (持久化开关 DCL_PERSIST_SAVE 与 macro 无关);
+ *   以上合起来 = 它**不得用于控制回路**。
+ * ★ 为什么必须 `volatile` 且在代码里真被读一次 (见 macro_reset):
+ *   本工程开了 -fdata-sections + -Wl,--gc-sections, "固件内无人读也无人写"的全局
+ *   会被**整段回收** ⇒ 符号从 ELF 里消失、外部就再也读不到 (main.c 的 OBS 族为此
+ *   踩过两次, 见其注释)。`volatile` 让这次读成为**不可消除的副作用** ⇒ 段被引用而
+ *   存活。实测落位: `.data.g_macro_realtime` @ 0x2000_0034 (与 g_wdt_armed /
+ *   g_persist_target 这些"外部可读"的 OBS 族同段), 且值恒为 0。 */
+volatile const uint32_t g_macro_realtime = 0u;
 
 /* ---- 引脚编码: 0..15=PA, 16..31=PB, 32..47=PC, 48..63=PD ---- */
 #define M_PORT_OF(pin) (((uint32_t)(pin)) >> 4)
@@ -69,13 +86,38 @@ static uint32_t m_pin_read(uint32_t pin)
     return (GPIO_IDR(M_PORT_OF(pin)) >> M_BIT_OF(pin)) & 1u;
 }
 
-/* ---- 裸地址访问的 SHM 窗口守卫 (H723 加固) ---- */
+/* ---- 裸地址访问守卫 (H723 加固) ----
+ * ★ 为什么要把"写"收紧 (2026-09-15, 依据 docs/PLAN-dcl-standardization.md §4):
+ *   收紧前 load(0x10) / store(0x11) 共用同一个"4B 对齐 + 落在 [shm, shm+SHM_SIZE-4]"
+ *   的判据 ⇒ 字节码可以 store 到 SHM 里**任意**一个槽 —— 包括别人的路由表、桶表、
+ *   控制块、持久化登记区。这直接打破 MEMORY.md §9.5 红线 2"同一 SHM 槽只允许一个
+ *   权威写者"。
+ *   收紧后 store 只能落进下面三个**数据区** (SENSOR_MAP / ACTUATOR_STATUS /
+ *   WIRE_MAP), 其余一律沿用 -2 ⇒ 与"macro 本轮定为 B 档: 只作调试工具、不得用于
+ *   控制回路"这个定位一致。
+ * ★ **读宽、写窄 —— 这是有意的**: load(0x10) 仍允许读整个 SHM 窗口 (只读无害, 且
+ *   调试时有用, 收紧它没有收益); 只有 store(0x11) 被限制到三个数据区。 */
+
+/* 读守卫: 4B 对齐 + 落在 SHM 窗口内 (有意不收紧, 见上) */
 static int m_addr_ok(uint8_t *base, uint32_t a)
 {
     uint32_t b = (uint32_t)(uintptr_t)base;
     if (a & 3u) return 0;
     if (a < b || a > (uint32_t)(b + SHM_SIZE - 4u)) return 0;
     return 1;
+}
+
+/* 写守卫: 先过读守卫, 再要求偏移落在下面三个数据区之一。
+ * 每个区都写成 **[起点宏, 起点宏 + 项数×4)** 的"区间 + 长度"形式 —— 长度由
+ * MAX_x 推出, 不写魔数; 布局的真源仍是 engine.h, 这里只引用它的偏移宏。 */
+static int m_waddr_ok(uint8_t *base, uint32_t a)
+{
+    if (!m_addr_ok(base, a)) return 0;
+    uint32_t off = a - (uint32_t)(uintptr_t)base;
+    if (off >= OFF_SENSOR_MAP      && off < OFF_SENSOR_MAP      + MAX_SENSORS   * 4u) return 1;
+    if (off >= OFF_ACTUATOR_STATUS && off < OFF_ACTUATOR_STATUS + MAX_ACTUATORS * 4u) return 1;
+    if (off >= OFF_WIRE_MAP        && off < OFF_WIRE_MAP        + MAX_WIRES     * 4u) return 1;
+    return 0;
 }
 
 /* ---- NaN/Inf 与 float 区判定 (S3 的 _me_finite32 / _me_shm_off_is_float) ---- */
@@ -150,14 +192,14 @@ int macro_exec(uint8_t *base, const uint8_t *code, uint16_t clen,
             uint32_t a = (uint32_t)code[pc] | ((uint32_t)code[pc + 1] << 8)
                        | ((uint32_t)code[pc + 2] << 16) | ((uint32_t)code[pc + 3] << 24);
             pc += 4;
-            if (!m_addr_ok(base, a)) return -2;
+            if (!m_addr_ok(base, a)) return -2;   /* 读宽 (有意): 整个 SHM 窗口都允许读 */
             PUSH(*(volatile uint32_t *)a);
             break;
         }
         case 0x11: {                                                 /* store(addr, val) */
             if (sp < 2) return -1;
             uint32_t v = POP(), a = POP();
-            if (!m_addr_ok(base, a)) return -2;
+            if (!m_waddr_ok(base, a)) return -2;  /* 写窄 (有意): 只许三个数据区 */
             /* N4: 目标是 SHM float 区且写非有限 → 拒 (与 0x33 同规则) */
             if (!m_finite32(v) && m_is_float_off(a - (uint32_t)(uintptr_t)base)) return -3;
             *(volatile uint32_t *)a = v;
@@ -261,4 +303,8 @@ void macro_reset(uint8_t *base)
     uint8_t *p = (uint8_t *)c;
     for (uint32_t i = 0; i < sizeof(MacroCtrl_t); i++) p[i] = 0;
     __asm__ volatile("dsb" ::: "memory");
+    /* ★ 真实读一次定位自述常量: 这里是"新域登记入口"(cold_start_reset 调用), 在此
+     *   把 g_macro_realtime 钉住, 它才不会因"无人引用"被 --gc-sections 回收
+     *   (volatile 使这次读成为不可消除的副作用 —— 理由见该常量的定义处)。 */
+    (void)g_macro_realtime;
 }

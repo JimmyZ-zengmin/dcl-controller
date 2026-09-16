@@ -67,6 +67,7 @@
 #include "rtc.h"
 #include "blackbox.h"
 #include "sd.h"
+#include "prog_store.h"   /* S5: DCL 程序持久化 (SD A/B 双副本 + 事务式上传) */
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -325,6 +326,14 @@ ISR_PLACE void dcl_default_handler_anchor(uint32_t exc_return)
 #define DCL_LOOP_RESET  1               /* 1 = 交付 (停滞⇒安全态+复位) / 0 = 能失败的对照构建 */
 #endif
 #define LOOP_STALL_TICKS      12000u    /* 停滞阈值 (拍) = 1.2s, 依据见 ① */
+/* ★★★ 2026-09-16 (S5 实测事故): **程序存储的 SD 操作也是一个"声明式阻塞窗口"。**
+ *   起因: `COMMIT` 落盘(写 1 块 + 读回 1 块) 若 SD 侧超时, 累计 > LOOP_STALL_TICKS
+ *   ⇒ 被判"主循环死了" ⇒ `eng_outputs_safe()` + 复位 ⇒ 串口上表现为"COMMIT 返回假应答后失联"。
+ *   ★ 与 persist 落盘**同一条纪律**: 已知会阻塞的动作, 由调用者**显式声明窗口**,
+ *     而不是让停滞判据去猜。★ begin/end 成对; 块内死掉则 end 不执行、到点自动失效 ⇒ 判据恢复。
+ *   ★ 取值: 单块写 ≈0.5 ms、15 块 ≈8 ms、读回同量级 ⇒ **2 s 是极宽的界**,
+ *     留足余量又能在真死时 2 s 内恢复判据(而不是永远挂着)。 */
+#define PROG_BLOCK_TICKS      20000u    /* 程序存储窗口 = 2s */
 #define PERSIST_BLOCK_TICKS   80000u    /* persist 落盘窗口 = **8s, 必须 ≥ flash.c 的擦除超时预算**
                                          *   (FL_ERASE_TIMEOUT_CYC = 8s) —— 两者是同一件事的两种单位,
                                          *   改一个必须改另一个, 否则 3s 的擦除会在 2.5s 处被停滞自愈复位。
@@ -1626,24 +1635,27 @@ static inline uint32_t get32(const uint8_t *p)
  *     0x38 的尾部扩展会把它带回来 ⇒ "已生效"变成可观测, 不再是假设。
  *  ③ 校验里 SRC_HMI 直接拒 (H723 未实现该源, 放行 = 静默给恒 0 的假信号)。
  *  ④ 预算模型的除数 div2 用 **64** 而不是 100 (H9)。 */
-static void h_deploy(const uint8_t *p, uint32_t n)
+/* ★★★ 2026-09-15 (S5): 把 h_deploy 的全部静态校验**抽成一个函数**。
+ *   动机: 契约 §7 第 5 道闸要求"**装载持久化程序时, 重跑与上传时同一套静态校验**"。
+ *   如果那条路径另写一份校验, 就是本项目的老族 —— "同一个语义两处存放, 只改一处就静默失效"。
+ *   ⇒ 唯一的校验实现就是这一个函数, 上传路径(h_deploy)与装载路径都调它。
+ *   ★ 本函数**不碰任何计数器** —— 计数由调用者按自己的语义记 (deploy_nak / load_reject)。
+ *   @param budget_out 非空时输出算出的每拍成本 (仅在返回 NULL 时有意义)
+ *   @retval NULL = 通过; 否则 = 拒绝串 (与旧 h_deploy 逐字一致, 老上位机不受影响) */
+static const char *prog_validate(const uint8_t *p, uint32_t n, uint32_t *budget_out)
 {
-    if (n < 6) { g_deploy_nak++; nak("short"); return; }
+    if (n < 6) return "short";
     uint16_t nr = get16(p), np = get16(p + 2), ns = get16(p + 4);
-    if (nr > MAX_ROUTES || np > MAX_PARAMS || ns > MAX_STATES) {
-        g_deploy_nak++; nak("counts exceed max"); return;
-    }
+    if (nr > MAX_ROUTES || np > MAX_PARAMS || ns > MAX_STATES) return "counts exceed max";
     uint32_t need = 6u + ((uint32_t)nr + np + ns) * 16u;
-    if (n < need) { g_deploy_nak++; nak("payload short"); return; }
+    if (n < need) return "payload short";
     const uint8_t *d = p + 6;
     const uint8_t *pd = d + (size_t)nr * 16u;
 
     /* ① 参数有限性: NaN/Inf 会经 DIRECT/SCALE/积分直接传播成 NaN 输出。
      *    只查每字的高 8 位全 1 (即指数 0xFF) —— 不用浮点比较, 也不依赖 FPU 状态。 */
     for (uint16_t i = 0; i < (uint16_t)(np * 4u); i++) {
-        if (((get32(pd + (size_t)i * 4u) >> 23) & 0xFFu) == 0xFFu) {
-            g_deploy_nak++; nak("param not finite"); return;
-        }
+        if (((get32(pd + (size_t)i * 4u) >> 23) & 0xFFu) == 0xFFu) return "param not finite";
     }
 
     /* ② 逐条校验 + dst 唯一写者 (两条路由写同一个 wire = 结果取决于表序, 非确定性) */
@@ -1653,20 +1665,19 @@ static void h_deploy(const uint8_t *p, uint32_t n)
         memcpy(&r, d + (size_t)i * 16u, 16u);
         if (!(r.flags & ROUTE_FLAG_ACTIVE)) continue;
         const char *err = engine_route_validate(&r);
-        if (err) { g_deploy_nak++; nak(err); return; }
+        if (err) return err;
         if (r.op == OP_LPF) {                       /* v0.2: LPF 参数是时间常数 τ 秒, 必须 > 0 */
             uint32_t tb = get32(pd + (size_t)r.param_idx * 16u);
-            if ((tb & 0x7FFFFFFFu) == 0u) { g_deploy_nak++; nak("lpf tau must be >0"); return; }
+            if ((tb & 0x7FFFFFFFu) == 0u) return "lpf tau must be >0";
         }
         uint64_t bit = 1ULL << (r.dst_channel & 63u);
-        if (dst_seen[r.dst_channel >> 6] & bit) { g_deploy_nak++; nak("dst conflict"); return; }
+        if (dst_seen[r.dst_channel >> 6] & bit) return "dst conflict";
         dst_seen[r.dst_channel >> 6] |= bit;
     }
 
     /* ★★ 跨档速率检查 (S3 语义, 由 S3 回归套件 T18 发现 H723 **漏了这一步**):
      *   慢消费者读快生产者 = **欠采样** → 混叠/发散。判据: 生产者 div_idx < 消费者 div_idx 即拒。
-     *   ★ 这是**程序级**检查 —— 单看一条路由看不出来, 必须先知道"那个 wire 的生产者是谁"。
-     *   ★ 与 S3 的唯一差别是报错串更短 (S3 带 wire 号); 语义逐字一致。 */
+     *   ★ 这是**程序级**检查 —— 单看一条路由看不出来, 必须先知道"那个 wire 的生产者是谁"。 */
     {
         int8_t prod_div[MAX_WIRES];              /* 各 wire 的生产者档位; -1 = 该 wire 无生产者 */
         for (int i = 0; i < MAX_WIRES; i++) prod_div[i] = -1;
@@ -1683,7 +1694,7 @@ static void h_deploy(const uint8_t *p, uint32_t n)
             if (rr.src_type != SRC_WIRE) continue;      /* 只有跨路由的 wire 依赖才可能欠采样 */
             int8_t pdiv = prod_div[rr.src_index];
             int8_t cdiv = (int8_t)(rr.period & PERIOD_DIV_MASK);
-            if (pdiv >= 0 && pdiv < cdiv) { g_deploy_nak++; nak("rate mismatch"); return; }
+            if (pdiv >= 0 && pdiv < cdiv) return "rate mismatch";
         }
     }
 
@@ -1691,23 +1702,48 @@ static void h_deploy(const uint8_t *p, uint32_t n)
      *    Σ ceil((op_cost+src_cost)/div倍率) 必须 ≤ EXEC_DEPLOY_BUDGET,
      *    否则放行的程序会把拍吃掉 (阶段 2 审计真的踩到过一次 102.9% 超载)。 */
     uint32_t budget = engine_prog_budget(d, nr);
-    g_deploy_budget = budget;
-    if (budget > EXEC_DEPLOY_BUDGET) { g_deploy_nak++; nak("exec budget exceeded"); return; }
+    if (budget_out) *budget_out = budget;
+    if (budget > EXEC_DEPLOY_BUDGET) return "exec budget exceeded";
+    return NULL;
+}
 
-    /* ④ 装载 STAGING (不碰 ACTIVE) → 置 RELOAD 让 ISR 在下一拍原子切换 */
-    uint16_t nw = engine_stage_program(g_shm, d, nr, np, ns);
+/* ★★★ 2026-09-16: **"把一份程序装载并生效"的序列只能有一份。**
+ *   起因(实测): 我的开机自动装载是**手抄** `h_deploy` 的收尾, 结果**漏掉了
+ *   `SHM_U8(OFF_CTRL_RELOAD) = 1`** ⇒ staging 写好了, 但 ISR 永远不把它换到 ACTIVE
+ *   ⇒ `0x38` 的 `n_routes` 一直是 0, 而 `deploy_seq` 已经是 1（"装而不生效"）。
+ *   ⇒ 抽成这一个函数：`h_deploy`（上位机部署）与开机装载都调它。
+ *   ★ 与 `prog_validate` 完全同一条纪律 —— 本项目的老族
+ *     "**同一个语义两处存放 ⇒ 只改一处就静默失效**", 我这次又踩了一次。
+ * @retval 实际装进去的路由条数（= engine_stage_program 的返回值） */
+static uint16_t eng_apply_program(const uint8_t *payload, uint16_t nr, uint16_t np, uint16_t ns)
+{
+    uint16_t nw = engine_stage_program(g_shm, payload, nr, np, ns);
     g_deploy_routes = nw;
-    /* ★ W2: 新程序 = 新语义, 旧的 force 点位可能指向新程序里根本不存在的 wire。
-     *   留着它会在下一拍把无关 wire 钉住, 而 PC 完全看不到 (MASK 位还在但程序换了)。
-     *   位置在装载**之后**: 此刻表已就绪, 清 force 与下一拍的扫描无竞争窗口。*/
+    /* 新程序 = 新语义: 旧的 force 点位可能指向新程序里根本不存在的 wire。
+     * 留着它会在下一拍把无关 wire 钉住, 而 PC 完全看不到(MASK 位还在但程序换了)。 */
     eng_force_clear(g_shm);
     g_force_clears++;
     g_deploy_seq++;
     SHM_U16(g_shm, OFF_CTRL_DEPLOY_SEQ) = (uint16_t)g_deploy_seq;
     g_deploy_set_tick = g_tick_count;
-    __asm__ volatile("dsb" ::: "memory");   /* ARM: dsb (S3 的 Xtensa `memw` 在 ARM 上不存在) */
-    SHM_U8(g_shm, OFF_CTRL_RELOAD) = 1;             /* 单字节写 = 原子 */
-    __asm__ volatile("dsb" ::: "memory");   /* ARM: dsb (S3 的 Xtensa `memw` 在 ARM 上不存在) */
+    __asm__ volatile("dsb" ::: "memory");
+    SHM_U8(g_shm, OFF_CTRL_RELOAD) = 1;      /* ★ 单字节写 = 原子。**少了这句就是"装而不生效"** */
+    __asm__ volatile("dsb" ::: "memory");
+    return nw;
+}
+
+static void h_deploy(const uint8_t *p, uint32_t n)
+{
+    uint32_t budget = 0u;
+    const char *verr = prog_validate(p, n, &budget);
+    if (verr) { g_deploy_nak++; nak(verr); return; }
+    g_deploy_budget = budget;
+    const uint8_t *d = p + 6;
+    uint16_t nr = get16(p), np = get16(p + 2), ns = get16(p + 4);
+
+    /* ④ 装载 STAGING (不碰 ACTIVE) → 置 RELOAD 让 ISR 在下一拍原子切换
+     * ★ 序列在 eng_apply_program 里, 与**开机自动装载**共用同一份 (见该函数注释) */
+    (void)eng_apply_program(d, nr, np, ns);
 
     /* ★ W2.4: 标 dirty —— **不在 deploy 里落盘**。理由两条:
      *   ① deploy 通常发生在引擎 RUN 时; 擦一个扇区 1~4 秒 = 拍长的上万倍,
@@ -2357,6 +2393,200 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
     nak("bad pin pattern op");
 }
 
+/* ══════════ S5 (2026-09-15): DCL 程序持久化 —— 事务式上传 ══════════
+ * 契约: docs/REF-program-contract.md §4.2 / §7。传输层成帧细节见 transport.h 的 0x45–0x49。
+ *
+ * 为什么事务式: 0x10 载荷满配 = 6150 = FRAME_PAYLOAD_MAX ⇒ 零余量 (契约 GAP-2)。
+ * 五道闸在这里怎么落:
+ *   闸1 帧 CRC16        → 传输层 (已有)
+ *   闸2 清单 CRC32+len  → h_prog_commit: 收齐长度 + 对**收到的字节**算 CRC32
+ *   闸3 写完回读比对    → prog_store_save 内部
+ *   闸4 A/B 双副本+seq  → prog_store_save 内部
+ *   闸5 同一套静态校验  → h_prog_commit 与开机装载**都调 `prog_validate`** (同一个函数, 不是两份)
+ *
+ * ★ 上传事务与落盘**共用同一个载荷缓冲** (`prog_store_buf()`), 不在 DTCM 里摆两份 7.5KB。
+ */
+static uint8_t  s_txn_busy = 0u;
+static uint32_t s_txn_total = 0u;
+static uint32_t s_txn_got = 0u;
+static uint32_t s_txn_crc = 0u;
+static ProgManifest_t s_txn_mf;
+
+OBS uint32_t g_prog_txn_begin  = 0;   /* 收到 BEGIN 的次数 */
+OBS uint32_t g_prog_txn_commit = 0;   /* 成功落盘的次数 */
+OBS uint32_t g_prog_txn_abort  = 0;   /* 中途弃掉的次数 (长度不符/CRC 错/校验拒/写失败) */
+OBS uint32_t g_prog_reject_why = 0;   /* 最近一次拒绝的原因码 (见 prog_store.h 的 PROG_RC_*) */
+OBS uint32_t g_prog_boot_rc    = 0xFFFFFFFFu;  /* 开机装载返回码 (PROG_RC_*) */
+OBS uint32_t g_prog_boot_loaded = 0;  /* 1 = 开机确实装载了一份程序到 STAGING */
+
+static void put16le(uint8_t *b, uint16_t v)
+{
+    b[0] = (uint8_t)(v & 0xFFu);
+    b[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static void h_prog_begin(const uint8_t *p, uint32_t n)
+{
+    if (n < 16u) { nak("need manifest"); return; }
+    s_txn_total = get32(p);
+    s_txn_crc   = get32(p + 4);
+    s_txn_mf.prog_id  = get32(p + 8);
+    s_txn_mf.prog_ver = get16(p + 12);
+    s_txn_mf.min_fw   = get16(p + 14);
+    s_txn_mf.req_caps = (n >= 20u) ? get32(p + 16) : 0u;
+
+    if (s_txn_total < 6u || s_txn_total > prog_store_buf_sz()) { nak("bad total"); return; }
+    /* ★ R3: 版本门与能力门必须在**上传期**判 —— 契约 §4.5「任何不满足必须在上传期失败,
+     *   禁止运行期静默给假值」。这是 SRC_HMI 已经立下的好范式, 这里推广。 */
+    if (s_txn_mf.min_fw != 0u && (uint32_t)s_txn_mf.min_fw > (uint32_t)DCL_FW_VERSION_H723) {
+        g_prog_reject_why = PROG_RC_MINF; nak("min_fw too high"); return;
+    }
+    if ((s_txn_mf.req_caps & ~(uint32_t)DCL_CAP_H723_IMPL) != 0u) {
+        g_prog_reject_why = PROG_RC_CAPS; nak("cap missing"); return;
+    }
+    s_txn_got = 0u; s_txn_busy = 1u;
+    g_prog_txn_begin++;
+    uint8_t r[4]; put32(r, s_txn_total);
+    ack(r, 4);
+}
+
+static void h_prog_data(const uint8_t *p, uint32_t n)
+{
+    if (!s_txn_busy) { nak("no txn"); return; }
+    if (n < 5u) { nak("need offset+data"); return; }
+    uint32_t off = get32(p);
+    uint32_t len = n - 4u;
+    /* ★ 必须顺序、不跳不重: 允许跳会让"洞"因为后面的 CRC 也算不出来而变成静默损坏 */
+    if (off != s_txn_got) { g_prog_txn_abort++; s_txn_busy = 0u; nak("bad offset"); return; }
+    if (s_txn_got + len > s_txn_total) {
+        g_prog_txn_abort++; s_txn_busy = 0u;
+        g_prog_reject_why = PROG_RC_LEN; nak("overflow"); return;
+    }
+    memcpy(prog_store_buf() + s_txn_got, p + 4, len);
+    s_txn_got += len;
+    uint8_t r[4]; put32(r, s_txn_got);
+    ack(r, 4);
+}
+
+static void h_prog_commit(void)
+{
+    uint8_t r[8];
+    uint32_t budget = 0u;
+    if (!s_txn_busy) { nak("no txn"); return; }
+    if (s_txn_got != s_txn_total) {
+        s_txn_busy = 0u; g_prog_txn_abort++; g_prog_reject_why = PROG_RC_LEN;
+        nak("incomplete"); return;
+    }
+    /* ★闸2: 对**收到的字节**算 CRC32 (不是信客户端报的) */
+    if (dcl_crc32(prog_store_buf(), s_txn_total) != s_txn_crc) {
+        s_txn_busy = 0u; g_prog_txn_abort++; g_prog_reject_why = PROG_RC_CRC;
+        nak("crc mismatch"); return;
+    }
+    /* ★闸5 (落盘前): 存进去的东西必须是"能跑的" —— 调的是上传路径同一个 prog_validate */
+    {   const char *err = prog_validate(prog_store_buf(), s_txn_total, &budget);
+        if (err) { s_txn_busy = 0u; g_prog_txn_abort++;
+                   g_prog_reject_why = PROG_RC_VALIDATE; nak(err); return; } }
+    /* 落盘 (内部含闸3 回读比对 + 闸4 A/B+seq, 头最后写)
+     * ★★ 必须开**阻塞窗口**: 这里是"写 1 块 + 读回 1 块", SD 侧一旦超时就会超过
+     *    1.2 s 的停滞阈值 ⇒ 被判主循环死了 ⇒ 复位(实测事故)。窗口让停滞判据在这段时间不判。 */
+    {   int rc;
+        uint32_t _w = block_window_begin(PROG_BLOCK_TICKS);
+        rc = prog_store_save(prog_store_buf(), s_txn_total, &s_txn_mf);
+        block_window_end(_w);
+        s_txn_busy = 0u;
+        if (rc != PROG_RC_OK) { g_prog_txn_abort++; g_prog_reject_why = (uint32_t)rc;
+                                nak("store failed"); return; }
+        put32(r, (uint32_t)rc); put32(r + 4, budget);
+        g_prog_txn_commit++;
+        ack(r, 8); }
+}
+
+static void h_prog_status(void)
+{
+    ProgStoreInfo_t o;
+    uint8_t r[112];       /* ★ 2026-09-16: 64 → 96 (尾部追加开机装载结果, 见下方注释) */
+    prog_store_probe(&o);
+    put32(r +  0, o.part_ok);
+    put32(r +  4, o.ab_valid);
+    put32(r +  8, o.seq_a);
+    put32(r + 12, o.seq_b);
+    put32(r + 16, o.crc_a);
+    put32(r + 20, o.crc_b);
+    put32(r + 24, o.len_a);
+    put32(r + 28, o.len_b);
+    put32(r + 32, o.active);
+    put32(r + 36, o.ok_n);
+    put32(r + 40, o.fail_n);
+    put32(r + 44, o.reject_n);
+    put32(r + 48, o.last_rc);
+    put32(r + 52, g_prog_txn_begin);
+    put32(r + 56, g_prog_txn_commit);
+    put32(r + 60, g_prog_txn_abort);
+    /* ★★★ 2026-09-16 追加 (一直缺的那块可观测性): **开机自动装载的结果必须能被外部读走**。
+     *   规格: 契约要求"装载失败/结果必须可被外部读走 —— 否则装载失败在观测面上不可见"。
+     *   之前只能靠 SWD 读 DTCM 里的 `g_prog_boot_*`/`g_deploy_routes`, 而 SWD 会停核(踩过)。
+     *   ⇒ 尾巴追加 4 字, 长度 64 → 80。 */
+    put32(r + 64, g_prog_boot_rc);       /* 开机装载返回码 (PROG_RC_*) */
+    put32(r + 68, g_prog_boot_loaded);   /* 1 = 开机确实把一份程序装进了 STAGING */
+    put32(r + 72, g_deploy_routes);      /* engine_stage_program 回报的 ACTIVE 条数 */
+    put32(r + 76, g_deploy_seq);         /* 部署序号 */
+    /* ★★★ 2026-09-16: **"我们从卡上到底读回了什么"必须能被看见。**
+     *   起因: `boot_rc=0`(成功) `boot_loaded=1`(装了) 而 `deploy_routes=0` —— 三者看似矛盾。
+     *   矛盾的唯一去处就是**载荷内容**: 若 `payload[0..1]`(nr) 是 0, 那 stage 数出 0 条就完全自洽。
+     *   ⇒ 尾巴再追加载荷头 16 字节 (4 字), 长度 80 → 96。
+     *   ★ 判据: 读回来的 `pl[0..1]` 必须等于上传时声明的 nr。 */
+    {   const uint8_t *pl = prog_store_buf();
+        put32(r + 80, (uint32_t)(pl[0] | ((uint16_t)pl[1] << 8) | ((uint32_t)pl[2] << 16) | ((uint32_t)pl[3] << 24)));
+        put32(r + 84, (uint32_t)(pl[4] | ((uint16_t)pl[5] << 8) | ((uint32_t)pl[6] << 16) | ((uint32_t)pl[7] << 24)));
+        put32(r + 88, (uint32_t)(pl[8] | ((uint16_t)pl[9] << 8) | ((uint32_t)pl[10] << 16) | ((uint32_t)pl[11] << 24)));
+        put32(r + 92, (uint32_t)(pl[12] | ((uint16_t)pl[13] << 8) | ((uint32_t)pl[14] << 16) | ((uint32_t)pl[15] << 24)));
+    }
+    ack(r, 96);
+}
+
+static void h_prog_erase(void)
+{
+    uint8_t r[4];
+    int rc;
+    uint32_t _w = block_window_begin(PROG_BLOCK_TICKS);   /* ★ SD 双块写: 见 PROG_BLOCK_TICKS */
+    rc = prog_store_erase();
+    block_window_end(_w);
+    put32(r, (uint32_t)rc);
+    if (rc == PROG_RC_OK) { g_prog_reject_why = PROG_RC_OK; ack(r, 4); }
+    else { nak("erase failed"); }
+}
+
+/* 0x4A DEVICE_DESC —— 我们的 "ESI 等价物" (契约 §3.5)。
+ * 目的: 让上位机在**编译期/上传期**就知道本机有什么能力、有什么具名设备,
+ *       而不是跑起来才发现。★ 这是把"未实现的能力必须在上传期失败"做成机器可判的一步。 */
+static void h_device_desc(void)
+{
+    uint8_t r[64];
+    uint32_t k = 0u;
+    uint16_t caps = (uint16_t)(DCL_CAP_H723_IMPL & 0xFFFFu);
+    put16le(r + k, (uint16_t)DCL_FW_VERSION_H723); k += 2u;   /* fw_ver */
+    put16le(r + k, caps); k += 2u;                            /* cap_lo */
+    put16le(r + k, 0u); k += 2u;                              /* cap_hi (为 u32 扩展预留) */
+    put16le(r + k, 6u); k += 2u;                              /* 具名设备条数 */
+    /* 具名设备表: [device_type:u16][product_code:u16][revision:u16] × N
+     * ★ 这是"本机有什么"的**声明**; 槽号/op 号见各设备自己的头文件。
+     *   revision 变了就表示行为变了 —— 与 CiA 301 的 Identity Object(0x1018) 同一语义。 */
+    static const uint16_t k_dev[6][3] = {
+        { 1u, 1u, 1u },   /* DI   4ch            */
+        { 2u, 1u, 1u },   /* AI   3ch            */
+        { 3u, 1u, 1u },   /* DO  16ch (A 档下 0..7 不可用, 见 GAP) */
+        { 4u, 1u, 1u },   /* PWM  HIL / TIM3_CH1 */
+        { 5u, 1u, 2u },   /* AS5600 磁编码器 rev2 (SCL/SDA 更正后) */
+        { 6u, 1u, 2u },   /* TB6600 步进     rev2 (光耦正端改 3.3V) */
+    };
+    for (uint32_t i = 0; i < 6u; i++) {
+        put16le(r + k, k_dev[i][0]); k += 2u;
+        put16le(r + k, k_dev[i][1]); k += 2u;
+        put16le(r + k, k_dev[i][2]); k += 2u;
+    }
+    ack(r, k);
+}
+
 static void h_engine_status(void)
 {
     uint8_t r[40];
@@ -2893,6 +3123,14 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
         case CMD_PERSIST:       h_persist_w2(p, n); break;
         /* ---- W3: 顺序域 ---- */
         case CMD_SEQ_DEPLOY:    h_seq_deploy(p, n); break;
+
+        /* ★ S5: DCL 程序持久化 (事务式上传 → SD A/B 双副本) */
+        case CMD_PROG_BEGIN:    h_prog_begin(p, n); break;
+        case CMD_PROG_DATA:     h_prog_data(p, n); break;
+        case CMD_PROG_COMMIT:   h_prog_commit(); break;
+        case CMD_PROG_STATUS:   h_prog_status(); break;
+        case CMD_PROG_ERASE:    h_prog_erase(); break;
+        case CMD_DEVICE_DESC:   h_device_desc(); break;
         /* ---- W4: 通信域 (Modbus RTU 从站) ---- */
         case CMD_MB_INJECT:     h_mb_inject(p, n); break;
         case CMD_MB_RESP:       h_mb_resp(); break;
@@ -3487,6 +3725,32 @@ int main(void)
         /* ★ 打开日志: 之后由**主循环**每轮 sd_log_poll() 把新产出的快照
          *   (RAM 环) 成批冻结并追加落盘, 卡满则回卷覆盖最旧。 */
         (void)sd_log_open();
+        /* ★★★ S5: 开机装载持久化程序。
+         *   ★ 顺序不能反: 分区边界是在 `sd_log_open` → `sd_part_layout` 里算出来的,
+         *     所以本段必须在它之后。
+         *   ★ 这里**只装载不启动**: 装载 = stage + RELOAD(下一拍原子切到 ACTIVE)。
+         *     是否上电就 RUN 是**策略问题**(上电即动机械), 留给上位机显式 0x11 决定。
+         *   ★ 闸5 在这里生效: `prog_store_boot_load` 会调 `prog_validate`
+         *     —— 与上传路径**同一个函数**, 不是第二份实现。不过就**不装载**,
+         *     保持旧程序运行, 并把原因留在 g_prog_boot_rc / g_prog_reject_str。 */
+        {
+            int prc;
+            uint32_t _w = block_window_begin(PROG_BLOCK_TICKS);  /* ★ SD 读: 见 PROG_BLOCK_TICKS */
+            prc = prog_store_boot_load(prog_store_buf(), prog_store_buf_sz(), prog_validate);
+            block_window_end(_w);
+            g_prog_boot_rc = (uint32_t)prc;
+            g_prog_reject_why = (uint32_t)prc;
+            if (prc == PROG_RC_OK) {
+                const uint8_t *pl = prog_store_buf();
+                uint16_t nr = (uint16_t)(pl[0] | ((uint16_t)pl[1] << 8));
+                uint16_t np = (uint16_t)(pl[2] | ((uint16_t)pl[3] << 8));
+                uint16_t ns = (uint16_t)(pl[4] | ((uint16_t)pl[5] << 8));
+                uint16_t nw = eng_apply_program(pl + 6u, nr, np, ns);
+                (void)nw;
+                g_prog_boot_loaded = 1u;
+                __asm__ volatile("dsb" ::: "memory");
+            }
+        }
     }
 #if HIL_SAFE
     eng_register_output_surface(do_outputs_safe);

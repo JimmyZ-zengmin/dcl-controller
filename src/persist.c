@@ -63,7 +63,7 @@ static const uint32_t k_crc32_tab[256] = {
     0xB3667A2Eu,0xC4614AB8u,0x5D681B02u,0x2A6F2B94u,0xB40BBE37u,0xC30C8EA1u,0x5A05DF1Bu,0x2D02EF8Du
 };
 
-static uint32_t crc32_ieee(const uint8_t *d, size_t n)
+uint32_t dcl_crc32(const uint8_t *d, size_t n)
 {
     uint32_t c = 0xFFFFFFFFu;
     for (size_t i = 0; i < n; i++) c = k_crc32_tab[(c ^ d[i]) & 0xFFu] ^ (c >> 8);
@@ -122,7 +122,7 @@ static int copy_valid(const PersistHdr_t *h, uint32_t sector, uint32_t *crc_out)
     uint32_t plen = ((uint32_t)h->n_routes + h->n_params + h->n_states) * 16u;
     if (plen > PERSIST_PAYLOAD_MAX) return 0;
     const uint8_t *p = (const uint8_t *)(uintptr_t)(flash_sector_base(sector) + PERSIST_HDR_SIZE);
-    uint32_t c = crc32_ieee(p, plen);
+    uint32_t c = dcl_crc32(p, plen);
     if (crc_out) *crc_out = c;
     return (c == h->crc32) ? 1 : 0;
 }
@@ -355,7 +355,7 @@ int persist_save(uint8_t *base)
     h.n_states   = ns;
     h.prog_magic = SHM_U32(g_shm, OFF_CTRL_PROG_MAGIC);
     if (plen) __builtin_memcpy(s_blob + PERSIST_HDR_SIZE, s_snap, plen);
-    h.crc32 = crc32_ieee(s_blob + PERSIST_HDR_SIZE, plen);
+    h.crc32 = dcl_crc32(s_blob + PERSIST_HDR_SIZE, plen);
     __builtin_memcpy(s_blob, &h, sizeof(h));
 
     /* blob 总长: header + payload 补齐到 32B 倍数 */

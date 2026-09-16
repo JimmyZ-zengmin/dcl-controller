@@ -239,6 +239,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/i2c_bb.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/as5600.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/step.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/prog_store.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/uart.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/syscalls.c

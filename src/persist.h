@@ -145,6 +145,12 @@ typedef struct {
 } PersistInfo_t;
 
 /* ---- 观测面 (pyocd 读; 每个都必须"被读过一次"否则被 --gc-sections 回收) ---- */
+/* ★★★ 2026-09-15: CRC32 **导出** (单一来源)。
+ *   原为 persist.c 里的 static —— 而 `prog_store` 也要用 CRC32 校验落盘的程序。
+ *   "再写一份"就是本项目"同一个语义两处存放 ⇒ 只改一处就静默失效"的老族。
+ *   ⇒ 导出这一个, 两边都用它。★ 与 Python 侧 `zlib.crc32()` 逐位一致。 */
+uint32_t dcl_crc32(const uint8_t *d, size_t n);
+
 extern volatile uint32_t g_persist_save_ok;
 extern volatile uint32_t g_persist_save_fail;
 extern volatile uint32_t g_persist_load_ok;

@@ -11,6 +11,24 @@
 
 #define SD_BLK_SZ   512u
 
+/* ══════════ S3 (2026-09-15): SD 分区 —— 日志上限 + 卡尾程序区 ══════════
+ * 卡布局 (LBA):
+ *      LBA0                = 日志头
+ *      LBA1 .. g_sd_log_end = 日志数据区 (环形回卷, **上限受此约束**)
+ *      g_sd_prog_a .. +15   = 程序副本 A
+ *      g_sd_prog_b .. +15   = 程序副本 B
+ * ⇒ **日志从此碰不到程序区**。区间由**容量**算出 (不是硬编码), 保证换卡自洽。
+ * ★ 这组量必须能被外部读走 —— 否则"日志有没有被关进笼子"这件事不可观测。 */
+#define SD_PROG_BLOCKS        16u            /* 每程序副本的块数: 1 头 + 15 数据 = 8KB */
+#define SD_PROG_NEED_BLOCKS   (2u * SD_PROG_BLOCKS)
+/* ★ 单一来源: sd.c 用这里的定义, 不许在 .c 里再写一份。 */
+
+extern volatile uint32_t g_sd_log_end;      /* 日志可用的最后 LBA (0 = 未划区, 用满整卡) */
+extern volatile uint32_t g_sd_prog_a;       /* 程序副本 A 起始 LBA */
+extern volatile uint32_t g_sd_prog_b;       /* 程序副本 B 起始 LBA */
+extern volatile uint32_t g_sd_part_ok;      /* 1 = 本卡已划出程序区 */
+extern volatile uint32_t g_sd_log_shrink;   /* 1 = 本次上电缩过日志上限 (触发了钳位) */
+
 /* 初始化结果 (诊断用) */
 extern volatile uint32_t g_sd_init_stage;   /* 卡在识别的哪一步停住 */
 extern volatile uint32_t g_sd_status;       /* 最近一次 SDMMC_STA 快照 */

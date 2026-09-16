@@ -242,9 +242,68 @@ static uint32_t s_log_batch = LOG_BATCH_SLOTS;  /* 本批槽数 (可由 SD_CFG[9
 #define LOG_BATCH_MIN 32u
 #define LOG_BATCH_MAX LOG_BATCH_SLOTS          /* 上限 = 冻结区能装下的槽数 (64KB/256B) */
 
+/* ══════════ S3 (2026-09-15): **SD 分区 —— 把日志关进笼子** ══════════
+ * 动机: 改前日志数据区 = LBA1..capacity-1, **占满整张卡并环形回卷**
+ *       ⇒ 卡上没有任何位置能长期存别的东西 (用户点名的风险: "记录满了会覆盖程序")。
+ * 做法: 由**容量**算出三区边界 (卡尾划给程序), 日志只允许写到 LOG_END 为止。
+ *
+ *      LBA0                    = 日志头
+ *      LBA1 .. LOG_END         = 日志数据区 (环形回卷, 上限 = LOG_END)
+ *      PROG_A .. PROG_A+15     = 程序副本 A (16 块 = 8KB)
+ *      PROG_B .. PROG_B+15     = 程序副本 B (16 块 = 8KB)
+ *      LOG_END = capacity - 1 - 2*SD_PROG_BLOCKS
+ *
+ * ★★★ 两条硬纪律:
+ *   ① **绝不升 LOG_VERSION** —— 一升版本 `sd_log_open` 就判"版本不符" ⇒ 当新卡重建
+ *      ⇒ 从 LBA1 覆写, 把卡上已有记录逐步毁掉。加字段必须**不改 h[0..15] 的语义**。
+ *   ② 分区边界是 **容量的纯函数**, 不依赖头部状态 ⇒ 换卡/换容量都自洽, 也不会因
+ *      头部损坏而"忘了分区"。写进头部只是为了**外部可审计** (PC/审计读 LBA0 即知边界)。
+ *   ★ 向后兼容: 旧卡的头在 h[112]/h[113] 上是 0, 不影响任何既有校验 (h[0]/h[1]/h[2]/h[6]
+ *     四条判据照旧成立); 代价只是"卡尾那 16KB 里原本的旧日志数据会被程序区覆盖" ——
+ *     那是环形日志里的旧数据, 可接受且必须 (否则程序永远没有安全的位置)。
+ */
+#define LOG_HDR_EXT_OFF       112u   /* 扩展段起点: h[78..111] 是故障台账, 之后空闲 */
+#define LOG_HDR_LOG_END_OFF   (LOG_HDR_EXT_OFF + 0u)
+#define LOG_HDR_EXT_MAGIC_OFF (LOG_HDR_EXT_OFF + 1u)
+#define LOG_HDR_EXT_MAGIC     0x444E454Cu    /* "LEND" */
+/* ★ SD_PROG_BLOCKS / SD_PROG_NEED_BLOCKS 定义在 sd.h —— 单一来源, 不许在这里再写一份
+ *   (本项目"同一个常量两处存放 ⇒ 只改一处就静默失效"的老族)。 */
+#define SD_PART_MIN_CAP       (1024u + SD_PROG_NEED_BLOCKS)   /* 低于此容量不划程序区 */
+
+static uint32_t s_log_cap_data = 0u;   /* ★ **有效**数据区块数上限 (= LOG_END) */
+
+volatile uint32_t g_sd_log_end  = 0u;  /* 日志可用的最后 LBA (0 = 没划, 用满整卡) */
+volatile uint32_t g_sd_prog_a   = 0u;  /* 程序副本 A 起始 LBA */
+volatile uint32_t g_sd_prog_b   = 0u;  /* 程序副本 B 起始 LBA */
+volatile uint32_t g_sd_part_ok  = 0u;  /* 1 = 本卡已划出程序区 */
+volatile uint32_t g_sd_log_shrink = 0u;/* 1 = 本次上电把日志上限**缩小**过 (钳位发生) */
+
 #define SD_PWRUP_DLY   60000u       /* ~1ms @400MHz (HAL 用 HAL_Delay(1)) */
 #define SD_TMOUT_CMD   4000000u     /* 命令/RESP 等待上限 (循环计数) */
-#define SD_TMOUT_DATA  40000000u    /* 数据期等待上限 */
+/* ★★★ 2026-09-16: 原来 40000000。每次循环读一次外设寄存器 ≈10~20 周期 @400MHz
+ *   ⇒ **单次超时 ≈ 1~2 秒** —— 而主循环的停滞阈值只有 **1.2 s**（`LOOP_STALL_TICKS`）
+ *   ⇒ SD 一超时, 主循环就被判"死了" ⇒ `eng_outputs_safe()` + 复位。
+ *   改了之后: ≈50~100 ms, 对真实传输(单块 ~0.5 ms / 15 块 ~8 ms)仍是极宽的界,
+ *   而且**多次超时也能落在 `PROG_BLOCK_TICKS` 窗口内**。
+ *   ★ 这是"**别用循环计数当时间**"那条纪律在 SD 域的应用 —— 循环计数的实际时长
+ *     取决于编译器与流水线, 不可控也不可审计。 */
+#define SD_TMOUT_DATA  40000000u    /* 数据期等待上限 (循环计数)
+                                     * ★★★ 2026-09-16 第三次定这个值 —— **别再来回改**。
+                                     *   实测结论(基线 vs 我的改动, 经协议读 SD_DIAG 对照):
+                                     *     基线(4000万): `blk_this_boot=5632, batch_err=0` ✓ 日志在写
+                                     *     我改成 200万: `blk_this_boot=0,   batch_err=3099` ✗ 一个块都写不进
+                                     *     我改成 2000万: 仍然 `blk_this_boot=0` ✗
+                                     *   ⇒ **这个值不能往小里挤**: 循环体只有 `ldr/ands/beq` 约 3~6 周期,
+                                     *     2000 万次 ≈ **~250 ms**, 而**128 块批量写 + 卡内部编程**经常超过它
+                                     *     ⇒ 正常写被当成超时 ⇒ 整条日志彻底停摆。
+                                     *   ★ 而"原值 4000 万会不会让主循环停滞超阈值(1.2s)"这个担心 ——
+                                     *     **已经由调用方的阻塞窗口解决**, 不该再回到改超时这条路上来:
+                                     *       · 程序存储: `PROG_BLOCK_TICKS`(2s) 包住 save/erase/boot_load
+                                     *       · 日志: 正常路径**根本不会走到超时**(写成功就 DATAEND 退出)
+                                     *     ⇒ 只有"卡真的坏了"时才会长时间等待, 那时**本来也该报错**,
+                                     *       而不是为了让判据好看去把超时调小、结果把正常路径一起杀掉。
+                                     *   ★ 一般化: **"给够超时 + 由调用方声明阻塞窗口"** 才是正解;
+                                     *     "把超时往小里挤"是用判据去掩盖慢, 会连带杀掉正常路径。 */
 
 static void sd_delay(uint32_t n) { volatile uint32_t i = n; while (i--) { } }
 
@@ -547,6 +606,32 @@ static int sd_wait_ready(void)
  *     DCTRL=0 → ConfigData(DPSM=DISABLE) → CMDTRANS → IDMABASE0=buf →
  *     IDMACTRL=ENABLE → 再发 CMD24   (`stm32h7xx_hal_sd.c:1361-1399`)
  *   ⇒ 数据搬运交给硬件, 时序不再由软件决定。本实现采用同一结构。 */
+/* ★★★ 2026-09-15（实测事故的根因，S5 程序存储第一次撞上）
+ *
+ * 症状: 一次 `sd_read_block` 之后紧接着 `sd_write_multi` ⇒ **DATAEND 永不置位**（超时）。
+ *   现场证据（SD_DIAG）: `[39] STA@DATAEND = 0`（既非 DATAERR 也非 DATAEND）、
+ *   `[58] blk_this_boot = 0`（一个块都没写成功）、
+ *   **`[38] STA@CMD25 = 0x00081000` —— bit12 = `DPSMACT`、bit15 = `RXFIFOHF` 仍置位**
+ *   ⇒ **上一次"读"的数据通路根本没关，本次多块写的 DPSM 就启动不了。**
+ * 后果: 主循环卡在 `sd_log_poll` 里 >1.2 s ⇒ 触发 `DCL_LOOP_RESET`（停滞⇒安全态+复位）
+ *   ⇒ 板子进 ~1.5 s 周期的复位循环（实测 `g_loop_reset_cnt=20`、串口上反复出现开机 banner）。
+ *
+ * ★ 为什么以前从没暴露: 基线里"多块写"之前的最后一次 SD 操作**总是写**
+ *   （`sd_log_open` 读 LBA0 之后紧接写 LBA0），所以"读 → 多块写"这个转移从未出现过。
+ *   程序存储开机要读卡片，才第一次把它踩出来。
+ *
+ * ★ 修法（照抄 ST HAL 的顺序）: DPSM_DISABLE → 等 `DPSMACT` 落下 → 清静态标志。
+ *   这是"厂商例程当权威"那条纪律的应用（见 skill `baremetal-periph-align-to-vendor-ref`）。 */
+static void __attribute__((unused)) sd_data_path_idle(void)
+{
+    uint32_t g;
+    SD_DCTRL &= ~1u;                                  /* DPSM = DISABLE (DTEN=0) */
+    for (g = 0; g < SD_TMOUT_CMD; g++) {
+        if (!(SD_STA & STA_DPSMACT)) break;           /* 等数据通路真的停下 */
+    }
+    SD_ICR = STA_STATIC;                              /* 清残留数据标志 */
+}
+
 int sd_write_block(uint32_t lba, const uint8_t *buf)
 {
     uint32_t g;
@@ -554,6 +639,13 @@ int sd_write_block(uint32_t lba, const uint8_t *buf)
     if (!s_sd_ready) return -1;
     SD_DIAG[12] = lba;
 
+    /* ★★★ 2026-09-16 回退: 这里**不再**调 `sd_data_path_idle()`。
+     *   原因: 原始 bug 只在"**读完之后**紧接多块写"这个转移上（见该函数注释）；
+     *   而**写路径原先一直是好的**（日志每拍都在写）。
+     *   我用 replace_all 把那个前导加进了 3 处写路径, 结果**日志的写挂了**
+     *   ⇒ 主循环卡在 `sd_log_poll` ⇒ `g_tick_count` 冻结（ISR 停）⇒ 系统失去自愈。
+     *   ⇒ 纪律: **修一个转移, 不要顺手改另一个已经好的转移。**
+     *   读路径（`sd_read_block`）仍保留"进入前停干净 + 读完之后收干净"。 */
     SD_DCTRL = 0u;
     SD_DTIMER = 0xFFFFFFFFu;
     SD_DLEN   = SD_BLK_SZ;
@@ -587,9 +679,43 @@ int sd_write_block(uint32_t lba, const uint8_t *buf)
     return 0;
 }
 
+/* 单块读 (CMD17) —— ★★★ 2026-09-15 按 ST `HAL_SD_ReadBlocks` 的 polling 路径**逐句重写**。
+ *
+ * 为什么重写（实测事故，见 sd_data_path_idle 的注释）: 旧实现有三处偏离厂商实现，
+ *   三处指向**同一个后果 —— 读完之后数据通路没收干净**:
+ *     ① 轮询条件用了 `STA_DATAOK = DATAEND|DBCKEND`。而 **DBCKEND 是"每块结束"就置位**
+ *        （本项目在**写**路径上已经记过这条），单块读时它可能先于 DATAEND 命中 ⇒ 提前收工。
+ *     ② 开了 IDMA (`SD_IDMABASE0/IDMACTRL`) 却**从不排空 RX FIFO** —— 而厂商 polling 路径
+ *        **根本不用 IDMA**，它是"看到 `RXFIFOHF` 就手工读 8 个字"。不排 ⇒ FIFO 一直挂着。
+ *     ③ 收尾只关了 `CMDTRANS`，**不清残留 FIFO、不等 DPSM 落下**。
+ *   实测后果: 读完之后 `SD_DIAG[38]` 里 `DPSMACT(bit12)+RXFIFOHF(bit15)` 仍置位
+ *   ⇒ 紧接的**多块写**永远等不到 DATAEND ⇒ `sd_log_poll` 卡 >1.2 s
+ *   ⇒ 触发 `DCL_LOOP_RESET`（停滞⇒安全态+复位）⇒ 板子进复位循环。
+ *
+ * ★ 本函数现在与 `HAL_SD_ReadBlocks` 的 while 循环一一对应（含手工排 FIFO），
+ *   并按"进入前停干净 + 读完之后收干净"两头都补上。
+ * ★ 代价与取舍: 放弃 IDMA 改用 8 字一批的 FIFO 搬运 —— 这是**厂商在这个板子上验证过的**
+ *   那条路（例程 9.SDMMC），读是低频操作（开机 + 程序装载），不值得为它冒 IDMA 的风险。 */
+/* 单块读 (CMD17) —— ★★★ 2026-09-16 **回退到原实现 + 一处最小外科修复**。
+ *
+ * 前情: 我按 HAL 的 polling 路径"逐句对齐"重写过一版（不用 IDMA、手工排 RX FIFO）。
+ *   ★★ **那一版是错的**, 实测代价很大（经协议读 SD_DIAG 对照基线）:
+ *      基线                     `blk_this_boot=5632, batch_err=0`   ✓ 日志在写
+ *      我的"HAL 对齐"版          `blk_this_boot=0,   batch_err=519`, 且 `[45]=2`(当新卡重建)
+ *     `[45]=2` 是关键指纹: `sd_log_open` 读 LBA0 **没读到有效头** ⇒ 判定"卡不对"
+ *     ⇒ 重建日志 ⇒ 再写又失败。⇒ **是读出来的数据不对**。
+ *   ★ 教训: "对齐厂商例程"要**整条路径一起对齐**（含 IDMA/缓存/时钟前提），
+ *     只照抄 while 循环的骨架、换掉其下的数据搬运机制，是**半个对齐 = 更坏**。
+ *
+ * 现在的做法: **保持原来的 IDMA 读**（它本来能工作）, 只改**两处**真正的缺陷:
+ *   ① 退出条件原来用 `STA_DATAOK = DATAEND|DBCKEND` —— 而 **DBCKEND 是"每块结束"就置位**,
+ *      单块读时可能**先于 DATAEND** 命中 ⇒ 提前收工 ⇒ 数据可能没搬完。
+ *      ⇒ 改成**只认 DATAEND**（与写路径用 DATAEND 是同一条纪律）。
+ *   ② 读完之后**显式把数据通路关掉**（DPSM 落 + 清标志）—— 这是原来真正缺的那半
+ *      （"读完 → 紧接多块写"会卡死, 就是它造成的）。 */
 int sd_read_block(uint32_t lba, uint8_t *buf)
 {
-    uint32_t g;
+    uint32_t g, st;
 
     if (!s_sd_ready) return -1;
 
@@ -599,28 +725,31 @@ int sd_read_block(uint32_t lba, uint8_t *buf)
     SD_DCTRL  = (SD_BLK_BITS << 4) | (1u << 1) | (0u << 2);  /* 512B / 读 / 块 / DTEN=0 */
     SD_ICR    = STA_STATIC;
     SD_CMD   |= CMD_CMDTRANS;
-    SD_IDMABASE0 = (uint32_t)buf;                /* ★ IDMA 目的 = 接收缓冲 */
+    SD_IDMABASE0 = (uint32_t)buf;                /* IDMA 目的 = 接收缓冲 (与基线同) */
     SD_IDMACTRL  = 1u;
 
     if (sd_cmd(17, lba, CMD_WAITRESP_S, 0, 1) != 0) {       /* CMD17 READ_SINGLE_BLOCK */
         SD_CMD &= ~CMD_CMDTRANS; SD_IDMACTRL = 0u;
+        SD_ICR = STA_STATIC;
         return -2;
     }
+    /* ★ 修复①: 只认 DATAEND (不再认 DBCKEND) */
     for (g = 0; g < SD_TMOUT_DATA; g++) {
-        uint32_t st = SD_STA;
-        if (st & STA_DATAERR) {
-            SD_DIAG[28] = st;
-            SD_CMD &= ~CMD_CMDTRANS; SD_IDMACTRL = 0u; return -4;
-        }
-        if (st & STA_DATAOK) break;
+        st = SD_STA;
+        if (st & (STA_DATAERR | STA_DATAEND)) break;
     }
-    {   uint32_t st = SD_STA;
-        SD_DIAG[28] = st;
-        SD_CMD &= ~CMD_CMDTRANS; SD_IDMACTRL = 0u;
-        SD_ICR = STA_STATIC;
-        if (st & STA_DATAERR) return -6;
-        return (st & STA_DATAOK) ? 0 : -5;
-    }
+    SD_DIAG[28] = st;
+    SD_CMD &= ~CMD_CMDTRANS;
+    SD_IDMACTRL = 0u;
+    /* ★ 修复②: 读完之后**把数据通路关干净** —— 原来缺的正是这半。
+     *   症状: 读完之后 `DPSMACT(bit12)` 还挂着 ⇒ 紧接的多块写永远等不到 DATAEND
+     *   ⇒ `sd_log_poll` 卡死 ⇒ 主循环停滞判据触发。 */
+    SD_DCTRL &= ~1u;                             /* DPSM = DISABLE */
+    for (g = 0; g < SD_TMOUT_CMD; g++) { if (!(SD_STA & STA_DPSMACT)) break; }
+    SD_ICR = STA_STATIC;
+
+    if (st & STA_DATAERR) return -6;
+    return (st & STA_DATAEND) ? 0 : -5;
 }
 
 #define SD_BURST_BLKS 64u    /* 每批块数: 小一点便于失败定位 */
@@ -643,6 +772,13 @@ int sd_write_multi(uint32_t lba, const uint8_t *buf, uint32_t nblk)
     if (nblk == 0u || nblk > 1024u) return -1;
     if (((uint32_t)buf & 3u) != 0u) return -1;
 
+    /* ★★★ 2026-09-16 回退: 这里**不再**调 `sd_data_path_idle()`。
+     *   原因: 原始 bug 只在"**读完之后**紧接多块写"这个转移上（见该函数注释）；
+     *   而**写路径原先一直是好的**（日志每拍都在写）。
+     *   我用 replace_all 把那个前导加进了 3 处写路径, 结果**日志的写挂了**
+     *   ⇒ 主循环卡在 `sd_log_poll` ⇒ `g_tick_count` 冻结（ISR 停）⇒ 系统失去自愈。
+     *   ⇒ 纪律: **修一个转移, 不要顺手改另一个已经好的转移。**
+     *   读路径（`sd_read_block`）仍保留"进入前停干净 + 读完之后收干净"。 */
     SD_DCTRL = 0u;
     SD_DTIMER = 0xFFFFFFFFu;
     SD_DLEN   = nblk * SD_BLK_SZ;
@@ -703,6 +839,13 @@ fail:
     { uint32_t gg; for (gg = 0; gg < 200000u; gg++) { if (!(SD_STA & STA_CPSMACT)) break; } }
     SD_CMD &= ~CMD_CMDSTOP;
     SD_ICR = STA_STATIC;
+    /* ★★★ 2026-09-16 回退: 这里**不再**调 `sd_data_path_idle()`。
+     *   原因: 原始 bug 只在"**读完之后**紧接多块写"这个转移上（见该函数注释）；
+     *   而**写路径原先一直是好的**（日志每拍都在写）。
+     *   我用 replace_all 把那个前导加进了 3 处写路径, 结果**日志的写挂了**
+     *   ⇒ 主循环卡在 `sd_log_poll` ⇒ `g_tick_count` 冻结（ISR 停）⇒ 系统失去自愈。
+     *   ⇒ 纪律: **修一个转移, 不要顺手改另一个已经好的转移。**
+     *   读路径（`sd_read_block`）仍保留"进入前停干净 + 读完之后收干净"。 */
     SD_DCTRL = 0u;
     return -8;
 }
@@ -791,6 +934,11 @@ static int sd_log_flush_header(void)
      *   ★ 放在**头校验和之后**是必须的 —— h[15] 只校验 h[0..14], 本段不参与校验,
      *     所以加它不会破坏任何既有判据, **不必升 LOG_VERSION** (升版本会毁卡上数据)。 */
     bb_flt_into_hdr(h);
+    /* ★★ S3: 分区边界写进头部 —— 只为一件事: **让外部 (PC/审计) 读一次 LBA0 就知道边界**,
+     *   不必去反推代码。★ 放在 h[15] 校验和**之后**: h[15] 只校验 h[0..14], 本段不参与,
+     *   所以加它不破坏任何既有判据, 也就**不必升 LOG_VERSION** (升了会毁卡上数据)。 */
+    h[LOG_HDR_LOG_END_OFF]   = s_log_cap_data;
+    h[LOG_HDR_EXT_MAGIC_OFF] = LOG_HDR_EXT_MAGIC;
     s_log_hdr_flush++;
     return sd_write_block(0u, (const uint8_t *)h);
 }
@@ -806,12 +954,29 @@ int sd_flt_snapshot(void)
     return sd_log_flush_header();
 }
 
+/* ★ S3: 由**容量**算出三区边界 (卡尾留给程序)。返回 1 = 已划出程序区。
+ *   ★ 为什么是容量的纯函数而不是"读头部": 换卡、换容量、头部损坏都不该让分区丢失。
+ *     写进头部只是给外部审计看的 (见 sd_log_flush_header)。 */
+static int sd_part_layout(uint32_t cap)
+{
+    g_sd_part_ok = 0u; g_sd_log_end = 0u; g_sd_prog_a = 0u; g_sd_prog_b = 0u;
+    if (cap < SD_PART_MIN_CAP) return 0;          /* 小卡: 不划, 日志仍用满整卡 */
+    g_sd_prog_b  = cap - SD_PROG_BLOCKS;          /* 卡尾最后 16 块 */
+    g_sd_prog_a  = g_sd_prog_b - SD_PROG_BLOCKS;
+    g_sd_log_end = g_sd_prog_a - 1u;              /* 日志最后可用的 LBA */
+    g_sd_part_ok = 1u;
+    return 1;
+}
+
 /* 打开日志: 读头部, 能对上就续写, 否则新建 */
 int sd_log_open(void)
 {
     uint32_t *h = (uint32_t *)SD_STAGE;
     int rc;
     if (!s_sd_ready || g_sd_capacity_blocks < 1024u) { SD_DIAG[53] = 0xE001u; return -1; }
+    /* ★★★ S3: 先划区, 再定日志上限 —— 顺序不能反 */
+    (void)sd_part_layout(g_sd_capacity_blocks);
+    s_log_cap_data = g_sd_part_ok ? g_sd_log_end : (g_sd_capacity_blocks - 1u);
     rc = sd_read_block(0u, (uint8_t *)SD_STAGE);
     if (rc == 0 && h[0] == LOG_HDR_MAGIC && h[1] == LOG_VERSION
         && h[2] == BB_SLOT_SZ && h[6] == (g_sd_capacity_blocks - 1u)) {
@@ -828,6 +993,15 @@ int sd_log_open(void)
         s_log_blk = 0u; s_log_total = 0u; s_log_last_tick = 0u; s_log_last_seq = 0u;
         s_log_dropped = 0u; s_log_wrapped = 0u; s_log_batches = 0u; s_log_hdr_flush = 0u;
         SD_DIAG[45] = 2u;                                      /* 2 = 新建日志 */
+    }
+    /* ★★★ S3 必须钳位: 这张卡可能被**旧固件**写过, 于是 s_log_blk 可能已经超过新上限。
+     *   不钳的话 `sd_log_one_batch` 里 `cap_data - s_log_blk` 会**下溢**成天文数字
+     *   ⇒ 那一次写直接飞出卡外 (或被 SD 拒绝并留下半截状态)。
+     *   ⇒ 钳到 0 并置 wrapped (语义: 环形日志在新的、更小的圈里从头开始)。 */
+    if (s_log_blk >= s_log_cap_data) {
+        s_log_blk = 0u;
+        s_log_wrapped = 1u;
+        g_sd_log_shrink = 1u;
     }
     s_log_ready = 1;
     {   /* ★ 批大小可由 SD_CFG[9] 覆盖 (扫"批大小 vs 单批卡顿"用; 有魔数门) */
@@ -854,7 +1028,8 @@ int sd_log_open(void)
 static uint32_t sd_log_one_batch(void)
 {
     uint32_t p, avail, n, i, k, nblk, rc, cap_data;
-    cap_data = g_sd_capacity_blocks - 1u;
+    /* ★ S3: 上限改用分区后的有效值 (没划区时才退化为"用满整卡") */
+    cap_data = (s_log_cap_data != 0u) ? s_log_cap_data : (g_sd_capacity_blocks - 1u);
     p = bb_slots_produced();
     avail = p - s_log_slot_base;
     if (avail > s_log_max_avail) s_log_max_avail = avail;
