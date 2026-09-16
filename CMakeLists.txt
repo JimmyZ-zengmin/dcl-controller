@@ -152,6 +152,25 @@ set(DCL_IO_IN_ISR "1" CACHE STRING "I/O 驱动位置 (1 ISR 拍内 / 0 主循环
 #     ⇒ **PE0~PE7 被静默清零, DO 0..7 永不可用**（观测面看不出来, 寄存器读回全对）。
 set(DCL_DO_LATCH "0" CACHE STRING "DO 输出路径 (0 CPU直写=交付 / 1 影子+MDMA锁存=对照)")
 
+# ---- ★★★ 步进 ENA 极性 + 停止保持力矩 (2026-09-17, PLAN-device-config-v1 P0) ----
+#   起因: 现场"电机响但轴不动" = `g_step_ena_pol` 的**隐藏默认值**与实机接线相反,
+#         把「使能 / 失能 / 上电安全态」**三处同时弄反** (H723-MOTION-QUALITY-AUDIT §16)。
+#   ★ 工业做法(雷赛 DMC2210"板卡跳线设置" / ADLINK 限位 NO/NC 板上 DIP / PCI-8132 `8132.cfg`):
+#     **极性是接线属性, 必须显式给出** ⇒ 这里把它从"藏在 .c 里的字面量"变成**出厂声明**;
+#     未声明就**不许使能**(fail-closed), 而不是"猜一个值"。
+#   DCL_STEP_ENA_POL  三态:
+#     -1 = **未配置** ⇒ fail-closed: 拒绝 ena(1) + 上电**物理失能**
+#      0 = 光耦导通(MCU 拉低) = 使能
+#      1 = 光耦不导通(MCU 高)   = 使能   ← ★ **本台实机**(光耦正端接 3.3V, 实测)
+#   DCL_STEP_STOP_HOLD 停止/上电时是否**保持力矩**(通电):
+#      1 = 保持 (= 今天的行为; **垂直轴必须** —— 去使能 = 掉力滑车)
+#      0 = 去使能 (省热; 仅水平轴且已评估时用)
+#   ★★ 两者**正交**: 极性只决定"怎么通电", 保不保力矩是按轴决定的**安全策略**。
+#   ★ 判据(都能失败): 未声明 ⇒ ena(1) 必拒且 PE9 物理失能; 两种极性下上电态都要满足 stop_hold;
+#     "指令 vs PE9 实读"不一致 ⇒ g_step_ena_mismatch_n 必涨（见 src/step.c 的 step_tick）。
+set(DCL_STEP_ENA_POL "1" CACHE STRING "步进 ENA 极性 (-1=未配置/fail-closed, 0=拉低使能, 1=拉高使能)")
+set(DCL_STEP_STOP_HOLD "1" CACHE STRING "停止/上电是否保持力矩 (1=通电保持, 0=去使能)")
+
 # ---- ★★★ 生产时基 A/B 对照开关 (2026-09-16) ----
 #   1 = **交付**: 生产时基 = **TIM5**（普通 32 位定时器, 200MHz ⇒ 5ns）—— **不受调试器影响**
 #   0 = **改前行为对照**: 生产时基 = **DWT_CYCCNT**（400MHz ⇒ 2.5ns）—— 调试器会话收尾会清
@@ -213,6 +232,8 @@ add_compile_options(
     -DIO_IN_ISR=${DCL_IO_IN_ISR}
     -DDCL_DO_LATCH=${DCL_DO_LATCH}
     -DDCL_TIMEBASE=${DCL_TIMEBASE}
+    -DDCL_STEP_ENA_POL=${DCL_STEP_ENA_POL}
+    -DDCL_STEP_STOP_HOLD=${DCL_STEP_STOP_HOLD}
 )
 
 # syscalls.c 是 newlib 桩: 函数签名由 newlib 规定, 参数天然用不上。

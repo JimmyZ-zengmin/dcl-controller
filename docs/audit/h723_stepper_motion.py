@@ -47,7 +47,28 @@ except Exception:
 import serial
 import serial.tools.list_ports as lp
 
+import os as _os
+sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "tools"))
+from h723_modbus import open_serial as _open_serial   # noqa: E402
+
 PORT = "COM21" if "COM21" in [p.device for p in lp.comports()] else "COM14"
+
+
+# ★★ 仓库约定（`docs/claims.md` 的 E 类闸门）：**判据发射器必须叫 `record(...)`** ——
+#   闸门按"该行含 `record(` 且含证据串"来找判据。**用 print 说出的结论不算判据**
+#   （那不是误报：契据追不到判据 = 闸门白建）。
+N_PASS = 0
+N_FAIL = 0
+
+
+def record(name, ok, detail=""):
+    global N_PASS, N_FAIL
+    if ok:
+        N_PASS += 1
+        print("    [PASS] %s%s" % (name, ("  " + detail) if detail else ""))
+    else:
+        N_FAIL += 1
+        print("    [FAIL] %s%s" % (name, ("  " + detail) if detail else ""))
 
 
 def crc16(d, c=0xFFFF):
@@ -65,12 +86,22 @@ def fr(cmd, pl=b""):
 
 class Dut:
     def __init__(self, port=PORT):
-        self.ser = serial.Serial(port, 115200, timeout=0.02)
+        # ★★ 用项目的 `open_serial`（打开后**立刻释放 DTR/RTS**）—— 不是裸 `serial.Serial`。
+        #   血证(2026-09-11，2026-09-17 本套件又命中一次): CH340 的 RTS 若接到板子 NRST,
+        #   裸开串口会 assert RTS ⇒ **把板子按在复位上** ⇒ 串口 0 字节 + SWD 也失败,
+        #   症状像"固件挂了/探针坏了", 排查方向被完全带偏。
+        self.ser = _open_serial(port, 115200, timeout=0.02)
 
-    def xchg(self, f, timeout=0.05):
+    def xchg(self, f, timeout=0.15):
         """★ 必须**校验帧**(长度 + CRC16) 并在缓冲里重找, 不能只看 0xC1 头。
            血证: 不校验时, 连续紧贴发"读+写"两条命令会导致解析到错位帧,
-                 于是 raw / PE9 读出垃圾值 (曾把静止的电机报成转 3 倍)"""
+                 于是 raw / PE9 读出垃圾值 (曾把静止的电机报成转 3 倍)
+
+        ★★ 超时 0.05 → 0.15 (2026-09-16): 本报告 §9.1 实测命令通路往返
+           p50 36.4ms / p90 46.1ms / **p99 56.8ms / max 63.6ms** ⇒
+           **50ms 低于 p99 ⇒ 约 1~2% 的读"必然"超时** —— 表现为
+           "偶发 `st()` 返回 None"、采样丢点、以及前置条件**误判链路异常**。
+           0.15s = max 的 2.4 倍; 成功路径不受影响(收到帧立刻返回)。"""
         ser = self.ser
         ser.reset_input_buffer()
         ser.write(f)
@@ -122,12 +153,79 @@ class Dut:
     def stop(self): self.op19(1, 0)
     def enapol(self, v): self.op19(5, v)
 
+    def st_retry(self, n=4, gap=0.05):
+        """★ `st()` 加重试: **一次读失败 ≠ 链路异常**。
+
+        命令通路往返实测 p99 = 56.8 ms(§9.1) ⇒ 任何单次读都有 ~1% 概率超时。
+        判"链路异常"前必须先重试 —— 否则会把"一次 USB/调度抖动"判成"板子坏了"
+        (2026-09-16 我的 `ensure_enabled()` 第一版就这么把 `slip` 整条判废了)。"""
+        for k in range(n):
+            s = self.st()
+            if s is not None:
+                return s
+            if k + 1 < n:
+                time.sleep(gap)
+        return None
+
+    def ensure_enabled(self):
+        """★★★ 前置条件: 让驱动器**真的**处于『使能』, 并且**回读验证**。
+
+        血证 (2026-09-16, 现场"电机响但轴不动"):
+          本接线下 `PE9 = (ena == enapol)`, `PE9=1` 才是使能。
+          板子一复位 `enapol` 默认 **0** ⇒ `ena(1)` 落成 `PE9=0` = **失能**。
+          本套件原先只 `ena(1)`、**不设极性** ⇒ 整轮测试都在"驱动器失能"下跑,
+          现象 = "轴不动", 而**脉冲其实一直在发** (CC1E=1 / PA6 在翻)
+          ⇒ 极易误判成"驱动器 / 接线 / 24V 坏了"。A/B 见
+          `h723_motion_probe.py enapol`。
+
+        Why 回读断言 ("我设过了"不算): 本项目反复吃过"看着设了其实没设"
+        (`enapol` 默认值 / `BRR` 16× / ADC `PCSEL` / 限时小值静默失效)。
+        """
+        s = self.st_retry()
+        if s is None:
+            raise RuntimeError("状态读不回来(已重试 4 次) ⇒ 链路异常, 本轮判**无效**")
+        if s["enapol"] != 1:
+            print("⚠ 极性=%d(复位默认) ⇒ 与接线使能语义相反, 自动设为 1" % s["enapol"])
+            self.enapol(1)
+            time.sleep(0.2)
+        self.ena(1)
+        time.sleep(0.3)
+        s = self.st_retry()
+        if s is None:
+            raise RuntimeError("使能后状态读不回来(已重试) ⇒ 判**无效**")
+        if s["pe9"] != 1:
+            raise RuntimeError(
+                "★★★ 前置条件不成立: 要求使能(PE9=1), 实读 PE9=%d (enapol=%d ena=%d)"
+                " ⇒ 驱动器处于【失能】⇒ 后面量到的『轴不动』与硬件故障同形,"
+                " **不许**据此判驱动器/接线有问题" % (s["pe9"], s["enapol"], s["ena"]))
+        return s
+
+    def safe_stop(self):
+        """★ 安全收尾: 停脉冲 + 让驱动器**物理**去使能, 并且**回读断言**。
+
+        血证 (2026-09-16): 原收尾写 `stop(); ena(0)`, 而 `ena(0)` 只是"**逻辑**失能" ——
+        在 `enapol=0` 时它落成 `PE9=1` = 光耦不导通 = **物理使能**
+        (固件 `step_set_ena`: `conducting = (pol==0) ? ena : ena^1`)。
+        ⇒ 脚本一退出电机反而**通电被磁化、嗡嗡响**("电机自己在动"), 而轴不转。
+        ⇒ 安全态必须**按引脚实际电平**判, 不能只看逻辑位 —— 与"安全态判据用 IDR"同族
+          (固件侧 `step_stop_safe()` 有同一处反相, 见 RELEASE 已知问题)。
+        """
+        self.stop()
+        self.enapol(1)          # 工作配置: 本接线下 PE9=0 才是物理失能
+        self.ena(0)
+        time.sleep(0.2)
+        s = self.st()
+        if s is not None and s["pe9"] != 0:
+            print("  ⚠ 安全收尾未达成: PE9=%d (期望 0 = 光耦导通 = 失能)" % s["pe9"])
+
     def close(self):
         try:
-            self.stop()
-            self.ena(0)
+            self.safe_stop()
         except Exception:
-            pass
+            try:
+                self.stop()
+            except Exception:
+                pass
         self.ser.close()
 
 
@@ -406,11 +504,58 @@ def main():
         d.ser.close()
         return 0
 
-    d.ena(1)
-    time.sleep(0.2)
-    s = d.st()
-    print("使能后: PE9=%d  (本接线: 1 = 高 = 光耦不导通 = 使能)" % s["pe9"])
+    # ★★★ 前置条件 (2026-09-16 血证): 板子一复位 `enapol` 默认 0, 而本接线 `PE9=1` 才是
+    #   使能 ⇒ 不设极性的 `ena(1)` 实际执行的是【失能】⇒ 整轮测试"轴不动"而脉冲照发。
+    #   ⇒ 必须"设极性 + 回读断言 PE9=1"; 不成立时**抛错**(判无效), 不许当硬件故障解读。
+    s = d.ensure_enabled()
+    print("前置条件: enapol=%d(已纠正/回读验证) ena=%d PE9=%d ⇒ %s"
+          % (s["enapol"], s["ena"], s["pe9"],
+             "✓ 驱动器使能" if s["pe9"] == 1 else "✗ 未使能"))
     print()
+
+    if cmd == "stophold":
+        # ★★★ 按轴『停止是否保力矩』策略 —— 修审计缺陷 D1 的**能失败的判据**。
+        #   D1（原报告 P0）: "限时到期/停止 ⇒ **无条件失能**" ⇒ 垂直轴掉力滑车、
+        #   停机位置从微步退化到整步齿槽。修法 = 由**按轴**的 `stop_hold` 决定。
+        #   ★ 判据要求**两臂给出相反的电平** —— 只跑一臂证明不了"策略在起作用"。
+        def dev11():
+            s, p = d.op19(11)
+            if s != 0 or len(p) < 32:
+                return None
+            return struct.unpack("<8I", p[:32])
+
+        u0 = dev11()
+        if u0 is None:
+            print("★ `op=19 sub=11` 不可读 ⇒ 固件不是本版（PLAN-device-config-v1 P0）⇒ 本项判**无效**")
+            d.close()
+            return 1
+        hold0 = u0[3]
+        print("=== 按轴『停止是否保力矩』策略（审计缺陷 D1 的修复判据）===")
+        print("  编译期声明的 stop_hold = %d" % hold0)
+        res = {}
+        for hold in (1, 0):
+            d.op19(12, hold)          # 设策略
+            time.sleep(0.25)
+            d.op19(6)                 # 停止 + 按策略进入静止态
+            time.sleep(0.40)
+            s = d.st()
+            res[hold] = s["pe9"]
+            print("    stop_hold=%d ⇒ 停止后 ena=%d PE9=%d" % (hold, s["ena"], s["pe9"]))
+        d.op19(12, hold0)             # ★ 恢复原策略（脚本的状态复原）
+        d.op19(6)
+        time.sleep(0.30)
+        print()
+        nf0 = N_FAIL
+        record("P0-d stop_hold=1 ⇒ 停止后仍保力矩 (PE9=1)",
+               res.get(1) == 1, "PE9=%s" % res.get(1))
+        record("P0-d stop_hold=0 ⇒ 停止后物理去使能 (PE9=0)",
+               res.get(0) == 0, "PE9=%s" % res.get(0))
+        record("P0-d 两臂相反 ⇒ 策略真的在起作用（**D1 修复**）",
+               res.get(1) == 1 and res.get(0) == 0, "PE9 = %s / %s" % (res.get(1), res.get(0)))
+        ok = (N_FAIL == nf0)
+        print("  ★ 这条同时证明 D1 已修: 停止**不再无条件失能**, 而由**按轴**策略决定。")
+        d.close()
+        return 0 if ok else 1
 
     if cmd == "longrun":
         hz = int(a[2]) if len(a) > 2 else 500
@@ -428,8 +573,15 @@ def main():
         print("  采样 %d 点 / %.2fs  ⇒ %.1f Hz 采样率" % (st["n"], st["dur"], st["rate"]))
         print("  净转角 = %.1f°  (%.2f 圈)   平均速度 = %.2f °/s" % (st["net"], st["net"] / 360, st["vavg"]))
         # 8 细分假设
-        th = hz * sec / 1600.0 * 360.0
-        print("  理论(8细分 1600步/圈) = %.1f°  偏差 %+.1f%%" % (th, (st["net"] - th) / th * 100))
+        # ★★ 2026-09-17 修（口径缺陷）: 原来理论值**恒取正**，而本模块不设 `dir`
+        #   ⇒ 接着上一轮跑过 `dir=1` 的命令时，实测净转角为负，于是报出
+        #   "偏差 **−199.4%**" —— 那是**方向没对齐**，不是丢步。
+        #   ★ 本项目早有这条纪律: "凡方向/极性/符号，一律**实测**再写死常量"。⇒ 按**实际 dir** 取符号。
+        s_now = d.st()
+        sgn = 1.0 if s_now["dir"] == 0 else -1.0
+        th = sgn * hz * sec / 1600.0 * 360.0
+        print("  理论(8细分 1600步/圈, 实际方向=%d ⇒ %s向) = %.1f°  偏差 %+.1f%%"
+              % (s_now["dir"], "正" if sgn > 0 else "负", th, (st["net"] - th) / th * 100))
         print("  分段速度(5 段): " + "  ".join("%.1f" % v for v in st["seg"]))
         if st["seg"] and abs(st["vavg"]) > 1e-6:
             vmin, vmax = min(st["seg"]), max(st["seg"])
@@ -583,25 +735,38 @@ def main():
                 print("     %5.2fs  %+7.3f°  %s" % (t, ed, bar(ed, 0.5, 30)))
 
         # ③ 保持使能时的自由观察 (噪声底 + 保持能力)
+        #   ★★ 必须**显式**恢复使能并回读断言 PE9=1: D1「限时到期 ⇒ 自动失能」可能
+        #      已经把驱动器关掉, 而只看**逻辑位** `ena` 会把"物理失能"标成"仍使能"
+        #      ⇒ ③/④ 两臂都变成"失能", 对照消失, 却仍照原结论打印 = **空判据**。
+        #      (与"安全态判据用 IDR"同族: 逻辑位 ≠ 引脚实读。)
+        d.ena(1)
+        time.sleep(0.35)
+        s0 = d.st()
+        hold_ok = (s0["pe9"] == 1)
+        print("  ③ 自由观察 3.0s (无脉冲, 保持使能): ena=%d PE9=%d  %s"
+              % (s0["ena"], s0["pe9"],
+                 "✓ 物理使能" if hold_ok else "★★ 实读为【失能】⇒ 本臂无效(不是『轴很稳』)"))
         g0 = sample(d, 3.0)
         if g0:
             a0 = unwrap([p[1] for p in g0])
-            s0 = d.st()
-            print("  ③ 自由观察 3.0s (无脉冲, **仍使能** ena=%d PE9=%d): 漂移 %+.3f°  峰峰 %.3f°"
-                  % (s0["ena"], s0["pe9"], a0[-1] - a0[0], max(a0) - min(a0)))
+            print("     ⇒ 漂移 %+.3f°  峰峰 %.3f°" % (a0[-1] - a0[0], max(a0) - min(a0)))
 
-        # ④ A/B 对照: 主动失能后再观察 ⇒ 直接检验「到期/失能是否掉保持力」
+        # ④ A/B 对照: 主动**物理**失能后再观察 ⇒ 直接检验「失能是否掉保持力」
         d.ena(0)
         time.sleep(0.4)
         b0 = d.st()
+        off_ok = (b0["pe9"] == 0)
+        print("  ④ 对照 (物理失能): ena=%d PE9=%d  %s"
+              % (b0["ena"], b0["pe9"],
+                 "✓ 已去使能" if off_ok else "★★ 实读仍为使能 ⇒ 本臂无效"))
         g1 = sample(d, 3.0)
         if g1:
             a1 = unwrap([p[1] for p in g1])
-            print("  ④ 对照 (失能 ena=%d PE9=%d): 漂移 %+.3f°  峰峰 %.3f°"
-                  % (b0["ena"], b0["pe9"], a1[-1] - a1[0], max(a1) - min(a1)))
-            print("     ⇒ 两者之差 = 『保持力』被卸掉后转子退到整步齿槽的位移")
-            print("     ⇒ 编码器噪声底 ≈ %.3f° (±%.1f LSB, 1LSB=%.4f°)"
-                  % (max(max(a0) - min(a0), max(a1) - min(a1)) if g0 else 0.0,
+            print("     ⇒ 漂移 %+.3f°  峰峰 %.3f°" % (a1[-1] - a1[0], max(a1) - min(a1)))
+            if hold_ok and off_ok and g0:
+                print("     ⇒ 两者之差 = 『保持力』被卸掉后转子退到整步齿槽的位移")
+                print("     ⇒ 编码器噪声底 ≈ %.3f° (±%.1f LSB, 1LSB=%.4f°)"
+                      % (max(max(a0) - min(a0), max(a1) - min(a1)),
                      (max(a1) - min(a1)) / 2 / DEG_PER_LSB, DEG_PER_LSB))
 
     elif cmd == "roundtrip":

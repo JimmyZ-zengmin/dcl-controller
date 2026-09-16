@@ -13,6 +13,17 @@ H723 闭环伺服 · 运动品质审计探针 (证据生成器)
   units      限时单位 → 实际转角 标定 (判『限时』能否作定时基准)
   bias       PC 定时通路的系统偏差与抖动 (判闭环定位精度天花板)
   repro      3 轮 × 10s 长脉冲复现性 (判速率与使能稳定性)
+  liveness   ★ 编码器读路径是否在更新 (每次开工第一步)
+  asdiag     ★ AS5600 引脚级自检 + 4 组候选引脚对 (判器件/接线, 固件内自检)
+  pulcheck   ★ "固件到底发没发脉冲" 解耦 (含极性纠正 + PE9 回读断言)
+  enapol     ★★ 使能语义 A/B: 复位默认态 vs 工作配置 (裁决"轴不动"是不是板态问题)
+  devcfg     ★★ 装置/使能状态: 极性是否**声明** / 保力矩策略 / **指令 vs 引脚实读** (P0 判据入口)
+
+★★★ 开工铁律 (2026-09-16 现场血证): **板子一复位 `enapol` 就默认 0**, 而本接线
+   下 `PE9=1` 才是使能 ⇒ 默认态里 `ena(1)` 执行的是**失能**。
+   ⇒ 任何"要动电机"的脚本**必须先把 enapol 置 1 并回读断言 PE9=1**,
+     否则整轮测试跑在驱动器失能下, 现象与"驱动器/接线坏了"完全同形。
+   (`Dut.ensure_enabled()` 已内建这条前置条件; `enapol` 子命令给出能失败的 A/B 对照。)
 
 硬件: STM32H723 + TB6600(光耦输入) + AS5600(12bit 磁编码器), 串口 115200
 接线前提: 光耦正端(PUL+/DIR+/ENA+) 接**板 3.3V** (不是 5V) —— 见 8.7 节
@@ -35,6 +46,10 @@ except Exception:
 
 import serial
 import serial.tools.list_ports as lp
+
+import os as _os
+sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "tools"))
+from h723_modbus import open_serial as _open_serial   # noqa: E402
 
 PORT = "COM21" if "COM21" in [p.device for p in lp.comports()] else "COM14"
 
@@ -62,9 +77,16 @@ class Dut:
        偏移 76/80/84/88/92 = GPIOA_IDR / GPIOE_IDR / TIM3_CCMR1 / TIM3_CCR1 / TIM3_ARR"""
 
     def __init__(self, port=PORT):
-        self.ser = serial.Serial(port, 115200, timeout=0.02)
+        # ★★ 用项目的 `open_serial`（打开后**立刻释放 DTR/RTS**）—— 不是裸 `serial.Serial`。
+        #   血证(2026-09-11，2026-09-17 又命中一次): CH340 的 RTS 若接到板子 NRST,
+        #   裸开串口会 assert RTS ⇒ **把板子按在复位上** ⇒ 串口 0 字节 + SWD 也失败,
+        #   症状像"固件挂了/探针坏了"。本探针此前一直没做这一步。
+        self.ser = _open_serial(port, 115200, timeout=0.02)
 
-    def xchg(self, f, timeout=0.05):
+    def xchg(self, f, timeout=0.15):
+        """★ 超时 0.05 → 0.15 (2026-09-16): 命令通路往返实测
+        p50 36.4 / p90 46.1 / **p99 56.8 / max 63.6 ms** ⇒ 50ms **低于 p99**
+        ⇒ 约 1~2% 的读必然超时(表现为"偶发 `st()` 返回 None")。0.15s = max 的 2.4 倍。"""
         ser = self.ser
         ser.reset_input_buffer()
         ser.write(f)
@@ -108,13 +130,74 @@ class Dut:
     def rate(self, hz):  self.op19(1, hz)
     def limit(self, ms): self.op19(4, ms)
     def stop(self):      self.op19(1, 0)
+    def enapol(self, v): self.op19(5, v)
+
+    def st_retry(self, n=4, gap=0.05):
+        """★ `st()` 加重试: **一次读失败 ≠ 链路异常** —— 命令通路往返 p99=56.8 ms
+        ⇒ 单次读有 ~1% 概率超时。判"链路异常"前必须重试。"""
+        for k in range(n):
+            s = self.st()
+            if s is not None:
+                return s
+            if k + 1 < n:
+                time.sleep(gap)
+        return None
+
+    def ensure_enabled(self):
+        """★★★ 前置条件: 让驱动器**真的**处于『使能』, 并且**回读验证**。
+
+        血证 (2026-09-16, 现场"电机响但轴不动"):
+          本接线下 `PE9 = (ena == enapol)`, 而 `PE9=1` 才是使能 (§13.4 锚点)。
+          板子一复位 `enapol` 默认 **0** ⇒ `ena(1)` 落成 `PE9=0` = **失能**。
+          标准化套件与 `liveness` 都只 `ena(1)`、**不设极性** ⇒ 整轮测试都在
+          "驱动器失能"下跑, 现象就是"轴不动" —— 而**脉冲其实一直在发**。
+
+        Why 回读断言 (不是"我设过了"): 本项目反复吃过"看着设了其实没设"
+        (`enapol` 默认值 / `BRR` 16× / ADC `PCSEL` / 限时小值静默失效) ⇒
+        **凡"设了就算"的量, 必须用"目标值 vs 读回值"核对**。
+        """
+        s = self.st_retry()
+        if s is None:
+            raise RuntimeError("状态读不回来(已重试 4 次) ⇒ 链路异常, 本轮判**无效**")
+        if s["enapol"] != 1:
+            print("  ⚠ 极性=%d(复位默认) ⇒ 与当前接线的使能语义相反, 自动设为 1" % s["enapol"])
+            self.enapol(1)
+            time.sleep(0.2)
+        self.ena(1)
+        time.sleep(0.3)
+        s = self.st_retry()
+        if s is None:
+            raise RuntimeError("使能后状态读不回来(已重试) ⇒ 判**无效**")
+        if s["pe9"] != 1:
+            raise RuntimeError(
+                "★★★ 前置条件不成立: 要求 F=使能(PE9=1), 实读 PE9=%d (enapol=%d ena=%d)"
+                " ⇒ 驱动器处于【失能】⇒ 之后量到的『轴不动』与硬件故障同形,"
+                " **不许**据此判驱动器/接线有问题" % (s["pe9"], s["enapol"], s["ena"]))
+        return s
+
+    def safe_stop(self):
+        """★ 安全收尾: 停脉冲 + 让驱动器**物理**去使能 (并按引脚实读确认)。
+
+        血证: `ena(0)` 只是"**逻辑**失能" —— `enapol=0` 时它落成 `PE9=1`
+        = 光耦不导通 = **物理使能** ⇒ 脚本退出后电机反而通电磁化、嗡嗡响。
+        ⇒ 安全态按**引脚实际电平**判, 不按逻辑位 (与"安全态判据用 IDR"同族)。
+        """
+        self.stop()
+        self.enapol(1)              # 工作配置: 本接线下 PE9=0 才是物理失能
+        self.ena(0)
+        time.sleep(0.2)
+        s = self.st()
+        if s is not None and s["pe9"] != 0:
+            print("  ⚠ 安全收尾未达成: PE9=%d (期望 0 = 光耦导通 = 失能)" % s["pe9"])
 
     def close(self):
         try:
-            self.stop()
-            self.ena(0)
+            self.safe_stop()
         except Exception:
-            pass
+            try:
+                self.stop()
+            except Exception:
+                pass
         self.ser.close()
 
 
@@ -564,8 +647,7 @@ def cmd_liveness():
     print("   请求Hz | 采样点 | raw唯一值 |  首raw |  末raw | 理论转角 | 实测净转角 |  tleft/s | 判定")
     print("  --------+--------+-----------+--------+--------+----------+------------+----------+------")
     for hz in (500, 5000, 16000):
-        d.ena(1)
-        time.sleep(0.3)
+        d.ensure_enabled()          # ★ 含 enapol 纠正 + PE9 回读断言 (否则测的是"失能")
         d.dirn(0)
         d.limit(30000)
         pts = []
@@ -672,14 +754,8 @@ def cmd_pulcheck():
     hz = int(sys.argv[2]) if len(sys.argv) > 2 else 500
     s = d.st()
     print("  基线: 极性=%d ena=%d PE9=%d raw=%d" % (s["enapol"], s["ena"], s["pe9"], s["raw"]))
-    if s["enapol"] != 1:
-        print("  ⚠ 极性=%d ⇒ 与当前接线的使能语义相反, 自动设为 1" % s["enapol"])
-        d.enapol(1)
-        time.sleep(0.25)
-    d.ena(1)
-    time.sleep(0.3)
-    s = d.st()
-    print("  使能后: ena=%d PE9=%d (期望 1=使能)" % (s["ena"], s["pe9"]))
+    s = d.ensure_enabled()          # ★ 前置条件: 纠正极性 + 回读断言 PE9=1
+    print("  使能后: ena=%d PE9=%d (期望 1=使能)  [前置条件已回读验证]" % (s["ena"], s["pe9"]))
     d.dirn(0)
     d.limit(30000)
     d.rate(hz)
@@ -718,6 +794,133 @@ def cmd_pulcheck():
     d.ser.close()
 
 
+def cmd_enapol():
+    """★★★ A/B 解耦: 『使能语义』由哪个位决定 —— 复位默认态 vs 工作配置。
+
+    ## 为什么必须做成 A/B (不能只看 B 组)
+    现场报告"电机响但轴不动"。若我只跑 B 组(enapol=1)看到轴在转, 那只证明
+    "**某个**配置能让轴转", **不能**证明"默认配置就是坏的" —— 两者都可能, 结论会漂。
+    ⇒ A 组必须**真的不动**, B 组必须**真的在转**, 因果才被钉死。(判据要能失败)
+
+    ## 映射 (本接线, §13.4 锚点)
+        PE9 = (ena == enapol)      PE9=1(高) = 光耦不导通 = **使能**
+        enapol=0 + ena=1 ⇒ PE9=0 ⇒ **失能**   ← 复位默认态
+        enapol=1 + ena=1 ⇒ PE9=1 ⇒ **使能**   ← 工作配置
+
+    ## 血证 (2026-09-16)
+    板子一复位 `enapol=0`, 而标准化套件/`liveness` **都不设极性** ⇒
+    `ena(1)` 落成『失能』⇒ **整轮测试在驱动器失能下跑**, 现象 = "轴不动",
+    而脉冲其实一直在发 (CC1E=1、PA6 在翻) ⇒ 极易误判成"驱动器/接线坏了"。
+    """
+    d, _ = head("★ 使能语义 A/B: 复位默认态 vs 工作配置 (裁决量 = 占用角域)")
+    hz = int(sys.argv[2]) if len(sys.argv) > 2 else 500
+    sec = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
+    print("  每臂: dir=0, %dHz × %.1fs, 同板同频同时长 ⇒ 唯一变量 = enapol" % (hz, sec))
+    print()
+    print("   组 | enapol | ena | PE9(实读) | 占用角域 |  净转角  | 判定")
+    print("  ----+--------+-----+-----------+----------+----------+------")
+    res = {}
+    for pol in (0, 1):
+        d.enapol(pol)
+        d.ena(1)
+        time.sleep(0.35)
+        s = d.st()
+        d.dirn(0)
+        d.limit(int(sec * 1000) + 2000)
+        pts = []
+        t0 = time.time()
+        d.rate(hz)
+        while time.time() - t0 < sec:
+            st = d.st()
+            if st:
+                pts.append((time.time() - t0, st["raw"]))
+        d.stop()
+        time.sleep(0.2)
+        m = motion_shape(pts) if len(pts) >= 4 else None
+        arc = m["arc"] if m else 0.0
+        net = m["net_s"] if m else 0.0
+        turning = arc >= 90.0
+        tag = "A(复位默认)" if pol == 0 else "B(工作配置)"
+        print("   %s |   %d    |  %d  |     %d     |  %6.1f° | %+7.1f° | %s"
+              % (tag, s["enapol"], s["ena"], s["pe9"], arc, net,
+                 "★ 轴不转(如预期)" if (pol == 0 and not turning)
+                 else ("✓ 轴在转(如预期)" if (pol == 1 and turning)
+                       else "★★ 与预期不符 ⇒ 本判据的因果假设错了")))
+        res[pol] = (s["pe9"], arc, turning)
+    print()
+    a_ok = (res[0][0] == 0 and not res[0][2])
+    b_ok = (res[1][0] == 1 and res[1][2])
+    if a_ok and b_ok:
+        print("  ★★ 定案: **PE9 是唯一变量** —— enapol=0⇒PE9=0⇒失能⇒轴不转;")
+        print("           enapol=1⇒PE9=1⇒使能⇒轴转。⇒ 『轴不动』的根因 = **复位默认极性**。")
+        print("     修法: 任何要驱动电机的脚本, **开工先设 enapol=1 并回读断言 PE9=1**")
+        print("           (本探针 `ensure_enabled()` 已内建; 见 `pulcheck`/`liveness`)。")
+    else:
+        print("  ★ 对照未成立 (A PE9=%d 转=%s / B PE9=%d 转=%s) ⇒ **本判据的因果假设不成立**，"
+              % (res[0][0], res[0][2], res[1][0], res[1][2]))
+        print("     不要据此下结论 —— 回到 pulcheck 逐项查。")
+    # 收尾: 留**工作配置**(enapol=1) + 失能(脉冲=0) —— 否则下一次测试又会静默跑在失能态
+    d.stop()
+    d.enapol(1)
+    d.ena(0)
+    time.sleep(0.2)
+    s = d.st()
+    print()
+    print("  [收尾] 脉冲=0, enapol=%d(已置工作配置, 免下次静默失能), PE9=%d(0=失能=安全态)"
+          % (s["enapol"], s["pe9"]))
+    d.ser.close()
+
+
+def cmd_devcfg():
+    """★★★ 装置/使能状态只读面（`0x39 op=19 sub=11`，32 B）—— P0 档的判据入口。
+
+    它回答三个**以前读不出来**的问题：
+      ① 极性**声明了没有**（`pol_set`）—— 未声明时 `ena(1)` 必须被拒（fail-closed）；
+      ② 停止/上电**该不该保力矩**（`stop_hold`）—— 按轴策略，与极性正交；
+      ③ **指令和引脚实读对不对得上**（`pe9_intent` vs `pe9_actual`，`mismatch_n`）。
+
+    ★ 判据（都能失败）:
+      A. 极性未声明 ⇒ `ena(1)` **必须 NAK** 且落回"光耦导通=失能"
+         —— 需要 `-DDCL_STEP_ENA_POL=-1` 的**对照构建**（见 PLAN-device-config-v1 §2.3 J1）；
+      B. 已声明 ⇒ `ena(1)` 必须 ACK，且 `pe9_intent == pe9_actual`（J4 的常态判据）；
+      C. **全轮测试期间 `mismatch_n` 必须为 0** —— 它是"本该永远不涨"的指示器。
+    """
+    d, s0 = head("装置/使能状态 (0x39 op=19 sub=11) —— 极性声明 / 保力矩 / 指令 vs 实读")
+    s, p = d.xchg(fr(0x39, bytes([19, 11])), timeout=0.6)
+    if s is None or len(p) < 32:
+        print("  ✗ 无应答或应答过短 (len=%s)" % (len(p) if p else 0))
+        print("    ⇒ 固件不是本版（PLAN-device-config-v1 的 P0 档）⇒ 本判据**无效**，不是通过")
+        d.ser.close()
+        return
+    u = struct.unpack("<8I", p[:32])
+    rc, polset, pol, hold, rej, mism, intent, actual = u
+    print("  ena rc_last = %d %s   pol_set = %d   pol = %d   stop_hold = %d"
+          % (rc, "(OK)" if rc == 0 else "(★ ENAPOL_UNSET = fail-closed 拒绝)",
+             polset, pol, hold))
+    print("  计数器:  rej_n = %d   mismatch_n = %d" % (rej, mism))
+    print("  指令 vs 实读:  pe9_intent = %d   pe9_actual = %d   ⇒ %s"
+          % (intent, actual, "✓ 一致" if intent == actual else "★★ 不一致!"))
+    print()
+    if polset == 0:
+        print("  ★ 极性**未声明** ⇒ 任何 ena(1) 都必须被拒（看上面 rc_last / rej_n）")
+        print("    ⇒ fail-closed 生效; 声明方式: op=19 sub=5 arg=<0|1> 或 -DDCL_STEP_ENA_POL")
+    else:
+        print("  ✓ 极性已声明 = %d   （本接线: 1 = 高 = 光耦不导通 = 使能）" % pol)
+    print("  ✓ 保力矩策略 stop_hold = %d  （1 = 停止/上电保持力矩; 垂直轴必须为 1）" % hold)
+    bad = 0
+    if intent != actual:
+        print("  ★★ 指令与引脚实读不一致 ⇒ DO 面没有把这个脚驱动成我们意图的电平")
+        bad += 1
+    if mism != 0:
+        print("  ★★ mismatch_n = %d ≠ 0 ⇒ 历史上出现过『指令≠实读』" % mism)
+        bad += 1
+    print()
+    print("★ 判读: `mismatch_n` 是『本该永远为 0』的指示器；非 0 必须先解释，再谈任何运动结论。")
+    if bad:
+        print("  ⇒ ★ 本次判据 **FAIL**（%d 项）" % bad)
+    d.ser.close()
+
+
 def main():
     a = sys.argv
     cmd = a[1] if len(a) > 1 else "ena"
@@ -725,7 +928,8 @@ def main():
               units=cmd_units, bias=cmd_bias, repro=cmd_repro,
               startup=cmd_startup, fields=cmd_fields, bench=cmd_bench,
               liveness=cmd_liveness, asdiag=cmd_asdiag,
-              pulcheck=cmd_pulcheck).get(cmd)
+              pulcheck=cmd_pulcheck, enapol=cmd_enapol,
+              devcfg=cmd_devcfg).get(cmd)
     if fn is None:
         print(__doc__)
         return 2

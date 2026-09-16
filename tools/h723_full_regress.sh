@@ -35,29 +35,74 @@ say "════════ 全量回归 $(date '+%F %T') ══════�
 # ── 0. 板子回 bench 态 ──
 say "── 0. bench 态准备（seq --wipe + ERASE + 复位）──"
 timeout 180 python tools/h723_seq.py --wipe 2>&1 | tail -1 | tee -a "$LOG"
-python - <<'PY' 2>&1 | tail -2 | tee -a "$LOG"
-import sys, os, struct, time
+# ★★★ 2026-09-17 重写: 原 step 0 只是"试着做"，失败也往下跑 ⇒ 25 套件整片红，
+#   而那些红**不是回归**（是 bench 态没建立）。实测两条原因:
+#     ① `pyocd reset` 之后有一段**已知的"偶发停答、会自愈"**窗口
+#        (SUPPORTED-SCOPE §4 就写着"静置 ~60 s 历史上会自愈"; 本次 3/3 复现)
+#     ② SD 卡未被识别（`g_sd_part_ok=0` / `g_sd_rca=0` / `g_sd_init_stage=5`）⇒ `0x49` NAK "erase failed"
+#   ⇒ 现在把"前置条件"做成**会响的闸门**（本项目最忌**静默降级**）。
+python - <<'PY' 2>&1 | tail -6 | tee -a "$LOG"
+import os, struct, subprocess, sys, time
 sys.path.insert(0, "tools")
 from h723_client import Dcl
-d = Dcl(os.environ.get("DCL_PORT","COM21"))
-sts, p = d.send(0x49)                       # PROG_ERASE: 清掉 SD 上的程序 ⇒ 上电走 bench profile
-print("0x49 PROG_ERASE ->", sts)
-d.send(0x13); time.sleep(0.5)               # 运行态复位
+PORT = os.environ.get("DCL_PORT", "COM21")
+
+d = Dcl(PORT)
+# ★ 也重试: 命令通路 p99=56.8/max=63.6ms, 且 SD 路径可能阻塞主循环 ⇒ 一次超时不算数。
+sts, p = None, b""
+for k in range(3):
+    sts, p = d.send(0x49)                  # PROG_ERASE: 清掉 SD 上的程序 ⇒ 上电走 bench profile
+    if sts == "ACK":
+        break
+    time.sleep(1.5)
+print("0x49 PROG_ERASE ->", sts, repr(p[:32]))
+if sts != "ACK":
+    print("!! SD 程序区擦不掉 ⇒ bench 态**建不起来**（下面直接判无效, 不再跑套件）")
+    print("   查法: pyocd commander -t stm32h723xx --connect halt -c \"read32 <g_sd_*> 0x30\" -c go")
+    print("   只看 g_sd_part_ok(应为 1); g_sd_rca / g_sd_init_stage 停在早期 ⇒ **卡没插好/没被识别**")
+    d.close(); sys.exit(2)
+d.send(0x13); d.close(); time.sleep(0.6)   # 运行态复位
+
+# 全复位（让板子重新读 SD / 装载）。★ 此后**全程只走协议**（本项目工具链纪律）。
+subprocess.run(["pyocd", "reset", "-t", "stm32h723xx"], capture_output=True, text=True)
+
+# ★★ 耐心轮询: 上面那次 reset 之后有一条已知的**偶发停答、会自愈**窗口
+#    ⇒ "一次读失败 ≠ 链路异常"（本项目铁律）⇒ 必须重试到 ~70 s, 不能一次就判死。
+d = Dcl(PORT)
+run, nr, last, t0 = 0, -1, "", time.time()
+while time.time() - t0 < 70.0:
+    sts, p = d.send(0x38)
+    if sts == "ACK" and len(p) >= 23:
+        run = p[22]                        # ★ r[22] = run（代码里唯一权威处）
+        s2, p2 = d.send(0x20, struct.pack("<HB", 0x0E, 2))   # SHM OFF_CTRL_N_ROUTES (u16)
+        if s2 == "ACK" and len(p2) >= 2:
+            nr = struct.unpack("<H", p2[:2])[0]
+        if run == 1:
+            break
+    last = sts
+    time.sleep(2.0)
 d.close()
+print("bench 回读: run=%d ; SHM n_routes=%d  (期望 run=1 / n_routes=128)  用时 %.1fs"
+      % (run, nr, time.time() - t0))
+if run != 1:
+    print("!! 链路/bench 仍未就绪（最后一次 0x38 = %s）" % last)
+    sys.exit(3)
 PY
-pyocd reset -t stm32h723xx 2>&1 | tail -1 | tee -a "$LOG"
-sleep 2
-python - <<'PY' 2>&1 | tail -1 | tee -a "$LOG"
-import sys, os, struct
-sys.path.insert(0, "tools")
-from h723_client import Dcl
-d = Dcl(os.environ.get("DCL_PORT","COM21"))
-sts, p = d.send(0x38)
-nr = struct.unpack("<H", p[20:22])[0] if sts == "ACK" and len(p) >= 22 else -1
-cap = struct.unpack("<H", p[2:4])[0] if sts == "ACK" and len(p) >= 4 else 0
-print("bench 回读: 0x38 len=%d n_routes=%d cap=0x%04X" % (len(p), nr, cap))
-d.close()
-PY
+RC=${PIPESTATUS[0]}
+if [ "$RC" = "2" ]; then
+  say ""
+  say "★★★ 闸门: **SD 程序区不可用** ⇒ 本轮回归判 **无效**，不跑套件。"
+  say "    ★ **不许**把『前置没满足』当成『回归失败』 —— 那些红不是回归。"
+  exit 1
+fi
+if [ "$RC" != "0" ]; then
+  say ""
+  say "★★★ 闸门: **bench 态未建立**（run != 1，已耐心重试 70 s）⇒ 本轮回归判 **无效**。"
+  say "    ① 查 SD 卡是否插好  ② SWD 读 g_sd_part_ok(期望 1)  ③ 修好后重跑"
+  say "    ★ **不许**把『前置没满足』当成『回归失败』。"
+  exit 1
+fi
+say "   ✓ bench 态已建立（run=1）"
 
 # ── 1. 逐套跑（串行 + 独占串口）──
 run() {   # run <名字> <命令行…>

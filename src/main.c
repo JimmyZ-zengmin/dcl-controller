@@ -1689,6 +1689,9 @@ static void ack(const uint8_t *p, uint32_t n) { send_response(STS_ACK, p, n); }
 #define NAKRH_FMODE    8u   /* force: mode 不是 0/1 */
 #define NAKRH_FFIN     9u   /* force: 强制值为 NaN/Inf */
 #define NAKRH_PMODE   10u   /* persist: mode 不是 0/1 */
+#define NAKRH_STEPPOL 11u   /* ★ 2026-09-17 step: ENA 极性**未声明** ⇒ fail-closed 拒绝使能
+                             *   (见 docs/PLAN-device-config-v1.md 的 P0-b; 现场事故见
+                             *    docs/audit/H723-MOTION-QUALITY-AUDIT.md §16) */
 
 static void nak(const char *m)
 {
@@ -2430,7 +2433,13 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
          *     实际是**查询自己把脉冲关了**。★ 教训: **"读取"必须是零副作用的**, 否则它就是陷阱。
          *   sub=1 arg=频率Hz(0=停)  sub=2 arg=方向0/1  sub=3 arg=使能0/1
          *   sub=4 arg=限时毫秒(0=不限)  sub=5 arg=ENA极性  sub=6 = 停止+失能(安全态)
+         *   sub=11 = ★ 只读: 装置/使能状态 (极性是否声明 / 指令 vs 引脚实读 / 计数器) 32B
+         *   sub=12 arg=停止/上电是否**保力矩** (按轴; 1=保持=垂直轴必须 / 0=去使能)
          * ★ 判据: 返回的是**实际**频率(由 ARR 反算), 不是请求值。
+         * ★★★ 2026-09-17: sub=3 的 `ena(1)` 现在是 **fail-closed** —— ENA 极性未声明时
+         *   **NAK(NAKRH_STEPPOL) 明确拒绝**, 而不是"ACK 但保持失能"(后者正是本次事故的形态:
+         *   "看起来接受了, 其实跑错")。`ena(0)` 永远允许。声明方式是 sub=5 或编译期
+         *   `-DDCL_STEP_ENA_POL`。详见 src/step.h 顶部长注释。
          * ★ 安全: 脉冲只由 CC1E 决定; 有了限时, 到点自动 step_stop_safe()。 */
         uint32_t sub = (n >= 2u) ? p[1] : 0u;
         uint32_t arg = (uint32_t)((n >= 6u)
@@ -2440,10 +2449,25 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         case 0u: break;                            /* ★ 只查询, 零副作用 */
         case 1u: step_set_rate(arg); break;
         case 2u: step_set_dir(arg); break;
-        case 3u: step_set_ena(arg); break;
+        case 3u: {
+            /* ★★★ 2026-09-17 fail-closed: ENA 极性**未声明** ⇒ `ena(1)` **明确拒绝**。
+             *   ★ 为什么是 NAK 而不是"ACK 但什么都没做": 本项目的 B 类纪律 = **拒绝必须可读**。
+             *     返回 ACK 却保持失能, 正是本次事故的形态("看起来接受了, 其实跑错"),
+             *     而且它与"驱动器坏了"完全同形 ⇒ 必须让它**响**。
+             *   ★ `ena(0)`(去使能) **永远允许**: 拒绝一个停机请求没有任何安全收益。 */
+            uint32_t rc3 = step_set_ena(arg);
+            if (rc3 != STEP_RC_OK) {
+                g_nak_last = NAKRH_STEPPOL;
+                nak("step: ENA polar not declared (op=19 sub=5, or -DDCL_STEP_ENA_POL)");
+                return;
+            }
+            break;
+        }
         case 4u: step_set_deadline_ms(arg); break;
         case 5u: step_set_ena_pol(arg); break;     /* ENA 极性: 0=拉低使能 1=拉高使能 */
-        case 6u: step_stop_safe(); break;          /* ★ 停止+失能 (安全态) */
+        case 6u: step_stop_safe(); break;          /* ★ 停脉冲 + 按 stop_hold 决定静止态
+                                                    *   (旧注释写"停止+失能"—— 那是 D1 那个缺陷的
+                                                    *    表述: "停止就失能"在垂直轴上=掉力滑车) */
         /* ★★★ 2026-09-15 新增 sub=7/8/9/10: **PA6 静态电平探针** —— 为"万用表判接线"而设。
          *   动机: 500Hz 方波在万用表 DC 档上读的是**平均值**(50% 占空 ⇒ 约 1.65V), 于是
          *   "接通"与"断路"被平均值糊成一团; 而且"脉冲还在不在跑"本身也是个变量
@@ -2477,6 +2501,40 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
             else     { GPIO_OTYPER(0) &= ~(1u << b2); }
             break;
         }
+        case 11u: {
+            /* ★★★ 2026-09-17 新增: **装置/使能状态只读**（零副作用, 与 sub=0 同族）。
+             *   动机（现场事故）: "极性有没有声明" 与 "指令和引脚实读对不对得上" **都读不出来**
+             *   ⇒ 只能靠人记得设过什么, 而本次事故恰恰是"没人记得/没人知道要设"。
+             *   应答 32 B:
+             *     +0  rc_last(最近一次 ena 的返回码)      +4  pol_set(0 = 极性未声明)
+             *     +8  pol(0/1, **仅在 pol_set=1 时有意义**) +12 stop_hold(按轴的保力矩策略)
+             *     +16 rej_n(被 fail-closed 拒绝的次数)    +20 mismatch_n("指令 != 实读" 次数)
+             *     +24 pe9_intent(我们**意图**的引脚电平)   +28 pe9_actual(IDR 里的**真实**电平)
+             *   ★★ +24/+28 **必须成对给出**: 只给一个就说不清"是谁不对",
+             *      而"指令 vs 实读"正是成熟运动控制里 `SVON` + `RDY` 那一对。
+             *   ★ 与 sub=0 的区别: sub=0 给的是**控制/寄存器**面(r+48 = 逻辑位 ena),
+             *     本子命令给的是**装置配置与一致性**面。两者都不改任何状态。 */
+            uint8_t r11[32];
+            put32(r11 +  0, g_step_ena_rc);
+            put32(r11 +  4, g_step_ena_pol_set);
+            put32(r11 +  8, g_step_ena_pol);
+            put32(r11 + 12, g_step_stop_hold);
+            put32(r11 + 16, g_step_ena_rej_n);
+            put32(r11 + 20, g_step_ena_mismatch_n);
+            put32(r11 + 24, g_step_ena_pin_intent);
+            put32(r11 + 28, (GPIO_IDR(DO_GPIO_PORT) >> 9) & 1u);
+            ack(r11, 32u);
+            return;
+        }
+        case 12u: {
+            /* ★ 2026-09-17: 设置"**停止/上电是否保力矩**"（按轴策略；垂直轴必须为 1）。
+             *   与 sub=5(极性) 并列 —— 极性决定"**怎么通电**"，本项决定"**停不停电**"，
+             *   两者**正交**（这正是本次修复的核心：把上电/停止态从"极性顺带决定"里解耦）。
+             *   ★ 判据(能失败): stop_hold=1 ⇒ `sub=6`(停止) 后 PE9 仍是"使能"电平;
+             *     stop_hold=0 ⇒ `sub=6` 后 PE9 变成"光耦导通"(失能)。 */
+            step_set_stop_hold(arg);
+            break;
+        }
         default: break;
         }
         /* ★★★ 修 (2026-09-15): 原为 `uint8_t r[40]` 而本块写了 **68 字节** (r+0..r+67)
@@ -2495,11 +2553,15 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         put32(r + 28, SHM_U32(g_shm, OFF_CTRL_GPIO_MASK));
         put32(r + 32, g_as_raw_v);
         put32(r + 36, g_step_stop_n);
-        /* ★ 上电安全态的直接证据: **引脚的实际电平**。r+40 的低半字节 = PE0..PE15。
-         *   PE8..PE11 应为 1 (共阳接法下 = 光耦不导通 = ENA 失效 / 继电器不吸合)。 */
+        /* ★ 上电/静止态的引脚**输出**电平。r+40 的低半字节 = PE0..PE15。
+         *   ★★ 2026-09-17 更正: 原文写"PE8..PE11 应为 1 (共阳接法下 = 光耦不导通
+         *      = ENA 失效 / 继电器不吸合)" —— **"ENA 失效"这个说法是错的**:
+         *      本接线(pol=1)下"不导通"恰恰是**使能**(见 src/step.h 顶部)。
+         *      ⇒ 单独看 PE9 电平**判断不了**"使没使能", 必须结合 pol 与 stop_hold 才解释得了
+         *        ⇒ 判"使能/一致"请用 **sub=11** 的 intent/actual 那一对(+24/+28)。 */
         put32(r + 40, GPIO_ODR(DO_GPIO_PORT));
         put32(r + 44, GPIO_MODER(DO_GPIO_PORT));
-        put32(r + 48, g_step_ena_pol);      /* ENA 极性 (0=拉低使能) */
+        put32(r + 48, g_step_ena_pol);      /* ENA 极性 (含义仅在 sub=11 报 pol_set=1 时成立) */
         /* ★ 诊断: PA6(TIM3_CH1) 到底有没有在动。
          *   判据三件套: TIM3_CNT 在变(计数器在跑) + PA6 MODER=10(AF) + AFRL=2(TIM3)。
          *   ★★★ 2026-09-15 更正: 上面那句"三者都对 ⇒ 引脚必然在翻转"**是错的**,

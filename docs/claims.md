@@ -56,6 +56,10 @@ B | DB_RC_LEN   | src/dev_bind.h | tools/h723_dev_bind_test.py | len=0
 B | DB_RC_SEQ   | src/dev_bind.h | tools/h723_dev_bind_test.py   | --allow-uncovered 契约 §3.8.8-3 声称的判据**尚未落地**（见该表 E 类同行）；回退提交会让 done_seq 停低位、rej_n 每圈涨 ⇒ 需要专门设计判据
 B | DB_RC_DST   | src/dev_bind.h | tools/h723_dev_bind_test.py   | --allow-uncovered 编码层不可达：dst 仅占 4 bit，掩码后恒 <=15（契约 §3.8.4 末段已如实标注为死码）
 B | DB_RC_NOSEQ | src/dev_bind.h | tools/h723_dev_bind_test.py   | --allow-uncovered req_seq==0 在函数入口即 return ⇒ **该常量在 src/*.c 里从未被赋值**，永不出现（契约 §3.8.4 末段）
+# ★★ 2026-09-17 新增：步进 ENA 极性的 fail-closed 拒因（PLAN-device-config-v1 的 P0-b）
+#   血证 = 现场"电机响但轴不动"：隐藏默认极性把「使能/失能/上电安全态」三处同时弄反。
+#   判据入口需要 `-DDCL_STEP_ENA_POL=-1` 的**对照档**（交付档上该路径不可达 ⇒ 判 SKIP，不是 PASS）。
+B | NAKRH_STEPPOL | src/main.c | tools/h723_step_failclosed_test.py | ENA polar not declared
 
 # ══ C 类：能力位（定义 + 并入 IMPL + 不在 NOTYET）══
 C | DCL_CAP_MULTICYCLE | src/transport.h
@@ -97,6 +101,19 @@ E | 3.8.5-4 ★ 老包不凭空多 48 B            | tools/h723_devbind_persist_
 E | 3.8.5-5 ★ 段坏但程序照常装载           | tools/h723_devbind_persist_test.py | 段坏但**程序照常装载
 E | 3.8.5-6 拒绝可观测（load_bad+1/reject）| tools/h723_devbind_persist_test.py | 拒绝可观测
 E | 3.8.5-7 重装载幂等（不叠加副作用）      | tools/h723_devbind_persist_test.py | 不叠加副作用
+
+# ══ E 类：PLAN-device-config-v1 的 **P0「装置属性显式化」**（2026-09-17）══
+# ★ 每条都**能失败**。★ 前 5 条在**交付档**(`-DDCL_STEP_ENA_POL=1`)上**不可达**
+#   （极性已声明 ⇒ 拒绝路径走不到）⇒ 脚本自己判 **SKIP**（覆盖不到 ≠ 通过），
+#   要覆盖必须烧 `-DDCL_STEP_ENA_POL=-1` 的对照档跑一次（两档都已实机跑过，见 AUDIT §17）。
+E | P0-b 未声明极性 ⇒ ena(1) 必须 NAK       | tools/h723_step_failclosed_test.py | STEP-RC-2 未声明极性
+E | P0-b 拒因必须可读（NAK 带原因）         | tools/h723_step_failclosed_test.py | ENA polar not declared
+E | P0-b 被拒后必须落回物理失能             | tools/h723_step_failclosed_test.py | STEP-RC-3 被拒后必须落回
+E | P0-b 拒绝次数 rej_n 必须递增             | tools/h723_step_failclosed_test.py | STEP-RC-4 拒绝次数 rej_n
+E | P0-a/b 已声明 ⇒ ena(1) 必须 ACK 且真使能 | tools/h723_step_failclosed_test.py | STEP-RC-5 [交付档]
+E | P0-e 指令 vs 引脚实读必须一致            | tools/h723_step_failclosed_test.py | STEP-RC-9 指令 vs 引脚实读一致
+E | P0-e mismatch_n 必须为 0（本该永不涨）   | tools/h723_step_failclosed_test.py | STEP-RC-10 mismatch_n 为 0
+E | P0-d 按轴保力矩策略（**D1 修复**）       | docs/audit/h723_stepper_motion.py | 两臂相反
 
 # ══ E 类：GAP-12「帧归属 v2」——“应答里带 CMD+SEQ”这件事必须真被验到 ══
 E | 9.4-1 ★ 未协商 ⇒ v1 帧逐字节不变         | tools/h723_frame_attrib_test.py | 逐字节相同

@@ -123,9 +123,20 @@ def main():
     r_sm2 = sm(d, SUB_SM_QUERY)
     blk2 = as5600(d)
     sm_raw = ((r_sm2["data"] & 0xFF) << 8) | ((r_sm2["data"] >> 8) & 0xFF)
-    ok_g3 = (r_sm2["status"] == 2 and r_sm2["ln"] == 2 and sm_raw == blk2["raw"])
+    # ★★★ 2026-09-17 修正（判据缺陷，不是固件缺陷）: 原来要求 `sm_raw == blk2["raw"]` **逐位相等**，
+    #   而两次读是**不同时刻**（`sm()` 与 `as5600()` 相隔约 ms）读同一颗 AS5600
+    #   ⇒ 在**编码器噪声底（±0.5 LSB，1 LSB = 0.0879°）**上做等值比较 ⇒ **间歇性误报**。
+    #   实测: 回归里 `[FAIL] G3 ... 读数=937 vs 阻塞=936` —— **差恰好 1 LSB**。
+    #   ★ 与 `h723_i2c_sm_test.py` 的 J1 **同一族**（那条已先修）；本处是它的副本。
+    #   ★ 不放过真缺陷的理由同 J1: 这条要抓的是"**状态机读错了寄存器/搬错了数据**"，
+    #     那会给出**远大于 1** 的差；而"误报会被自己人关掉"是本项目铁律。
+    d_lsb = (sm_raw - blk2["raw"]) & 0xFFF
+    if d_lsb > 2048:
+        d_lsb -= 4096
+    ok_g3 = (r_sm2["status"] == 2 and r_sm2["ln"] == 2 and abs(d_lsb) <= 1)
     print(f"[{'PASS' if ok_g3 else 'FAIL'}] G3 释放后 SM 恢复: status={r_sm2['status']}(应 2) "
-          f"len={r_sm2['ln']} 读数={sm_raw} vs 阻塞={blk2['raw']}")
+          f"len={r_sm2['ln']} 读数={sm_raw} vs 阻塞={blk2['raw']}"
+          + ("" if d_lsb == 0 else f" Δ{d_lsb:+d}LSB(≤±1 噪声底)"))
     if not ok_g3:
         fails.append("G3 放门没生效")
 
