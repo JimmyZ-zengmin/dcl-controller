@@ -45,6 +45,15 @@
 - 只读观测面用 **`connect_mode=halt`**（挂核不复位）；`attach` 在某些 CMSIS-DAP 上初始化不了 AP。**收尾必须 `-c go`**。
 - ★★ **`pyocd reset` 不足以恢复 DWT**（2026-09-16 实测）：`pyocd flash` 或会话退出会让调试域断电清掉
   `CYCCNTENA`，之后**再 `pyocd reset` 也救不回来** ⇒ 只有**断电重上电**能恢复。
+  ★ **根因（权威）**：pyOCD 维护者在 issue #1540 明说 —— **会话 disconnect 时主动写 `DEMCR.TRCENA=0`**，
+  且"**只在你调用 `pyocd reset` 之类**做完整 connect/disconnect 时才发生"。SEGGER KB 说明 J-Link **同款**
+  （理由：免得 WFI/WFE 省电时留下时钟）。⇒ **不是 pyocd 的 bug，是所有主流调试器的设计选择。**
+  ★★ **实测否定**：`-Oresume_on_disconnect=false`（pyocd 0.45.1）**照样弄死时基** ⇒ 没有"翻开关"这条捷径。
+  ⇒ 工具链纪律：**把 `pyocd reset` 从收尾步骤拿掉** —— 改为 `构建 → pyocd flash → 让板子自己重启
+  （断电或按 RESET）→ 之后全程只走协议`，**不再开任何会话**。
+  ⇒ ★★★ **真正的根子在固件**：**别拿调试单元当生产时基**。正解 = 用自由运行的 32 位硬件定时器
+  （H723 上 **TIM5 空闲**；TIM2=拍、TIM3=步进）替代 `DWT_CYCCNT`，并把 DWT 留作**第二条独立路径**。
+  评估全文：`docs/ASSESS-toolchain-2026-09-16.md`。
 - ★★ 更阴的一点：**`g_per_cyc_*` 住 DTCM、跨复位不丢**（只有 `0x13` 冷启动才清）
   ⇒ 复位后读 `0x38` 会看到**上一纪元的残留值**，看起来"时基活着"（我本人就这样被骗过一次）。
   ⇒ **时基活性判据必须走：`0x13 RESET` → `0x11 START` → 等 ~1s → 看 `pmin` 是否非 0。**
