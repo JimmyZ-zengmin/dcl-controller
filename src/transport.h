@@ -146,6 +146,9 @@
                                       *   (S3 把 macro 当"永远可用"、不单独声明)。本平台按
                                       *   "宣称 = 实现"补一位 —— 实现了就该报 (A4 事故教训)。
                                       *   旧上位机忽略未知位, 不受影响。 */
+#define DCL_CAP_DEVBIND_PERSIST 0x2000   /* ★ GAP-11: 绑定表**随程序包持久化**（契约 §3.8.5）。
+                                      *   实现 = 载荷尾部 48B 段（`dev_bind_pack/unpack`）+ 开机恢复 + `0x39 op=23` 重装载。
+                                      *   证据: `tools/h723_devbind_persist_test.py`。★ H723 扩展位，S3 无对应位。 */
 #define DCL_CAP_DEVBIND     0x1000   /* ★ G6-4: 具名设备绑定表 (SHM 0x7300, 上位机可写)
                                       *   = "接一个新器件 = 上传一段配置"（契约 §3.8）。
                                       *   证据: SHM 区 `DB_MAGIC 'DBND'` + `tools/h723_dev_bind_test.py`。
@@ -225,7 +228,8 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
                              DCL_CAP_PERSISTENT | DCL_CAP_WIRE2_FLAG | \
                              DCL_CAP_VERINFO | DCL_CAP_FORCE | \
                              DCL_CAP_SEQ | DCL_CAP_COMM | DCL_CAP_MACRO | \
-                             DCL_CAP_AI | DCL_CAP_DEVBIND)                /* = 0x1DF7 */
+                             DCL_CAP_AI | DCL_CAP_DEVBIND | \
+                             DCL_CAP_DEVBIND_PERSIST)                      /* = 0x3DF7 */
 
 /* ★ 上线的各项说明 (写清楚"为什么现在可以报"):
  *   DCL_CAP_HOTRELOAD (0x0002) — 阶段 3.2: engine_reload_active() 在 ITCM 内

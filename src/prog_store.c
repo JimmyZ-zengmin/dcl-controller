@@ -18,6 +18,7 @@
 
 volatile uint32_t g_prog_ok_n = 0, g_prog_fail_n = 0, g_prog_reject_n = 0;
 volatile uint32_t g_prog_last_rc = PROG_RC_OK, g_prog_loaded_n = 0, g_prog_active_copy = 0xFFFFFFFFu;
+volatile uint32_t g_prog_payload_len = 0u;   /* ★ GAP-11: 卡上那份的**实际**载荷长度 */
 volatile uint32_t g_prog_boot_reject = 0;
 const char *volatile g_prog_reject_str = 0;
 
@@ -221,6 +222,7 @@ int prog_store_load(uint8_t *out, uint32_t cap, ProgManifest_t *mf_out)
         mf_out->req_caps = h->req_caps;
     }
     g_prog_active_copy = (uint32_t)pick;
+    g_prog_payload_len = (uint32_t)((pick ? &hb : &ha)->len);   /* ★ GAP-11: 实际存储长度(含可选段) */
     g_prog_last_rc = PROG_RC_OK;
     return PROG_RC_OK;
 }

@@ -179,11 +179,14 @@ static const ManifestEnt_t g_manifest[] = {
      *   [10..15]计数器: req / ok / nak / stuck / gate(门拒) / busy
      *   ★★ 判据: 一次 n 字节读的 `[5]` 必须 == `6+n`（证明"每拍只推进一步"）,
      *     若它远小于 6+n ⇒ 一拍跑完整个事务（"每拍有界"没实现）。 */
-    MF_ENTRY("DEV_BIND",  OFF_DEV_BIND, 20u, MF_K_U32, MF_F_SHM),
+    MF_ENTRY("DEV_BIND",  OFF_DEV_BIND, 24u, MF_K_U32, MF_F_SHM),
     /*   [0]"DBND" [1]n_valid(**当前生效**的槽数) [2]crc(FNV-1a over 8 条目) [3]req_seq
      *   [4]done_seq(==req 才表示**已生效**) [5]reject(DB_RC_*) [6]period(拍) [7]ok_n
      *   [8..15]条目 u32×8: dev<<28 | dst<<24 | len<<16 | reg<<8 | addr7
      *   [16]err_n(轮询失败) [17]last_err(I2C_SM_ST_*) [18]skip_n(轮空) [19]rej_n(表被拒次数)
+     *   [20]load_ok_n(从程序包**恢复成功**次数) [21]load_bad_n(段在但**校验不过**的次数)
+     *      ★ GAP-11（2026-09-16）: 绑定表随程序包持久化的结果 —— 必须可观测,
+     *        否则"段坏了被拒绝"与"根本没有段"在外部看起来一样（本项目最恨的那种形态）。
      *   ★★ 三个计数必须分开看（"一个计数只回答一个问题"）:
      *     ok_n = 真的执行成功 / err_n = **器件或通信**故障 / skip_n = **调度**现象(总线忙、被抢)
      *     / rej_n = **上传面**被拒。混在一起时"err 在涨"无法解释 ⇒ 判据作废。

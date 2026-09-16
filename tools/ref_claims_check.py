@@ -50,6 +50,7 @@ sys.stdout.reconfigure(errors="replace")   # ★ GBK 控制台上 print 一个 �
 MIN_A = 8      # 结构类：SHM 域至少有这些
 MIN_B = 4      # 拒绝码
 MIN_C = 5      # 能力位
+MIN_N = 2      # 留位能力位（`DCL_CAP_STATE_COLD` / `DCL_CAP_HMI`）
 MIN_D = 20     # 文档里的 文件:行号 引用
 MIN_E = 6      # 判据存在性
 # ── D 类行号漂移阈值（超过则告警；符号消失才是 FAIL）──────────────────────
@@ -210,15 +211,38 @@ def chk_C(root, c):
         return "FAIL", "被指头文件不存在: %s" % rel
     if not re.search(r"#\s*define\s+%s\b" % re.escape(name), txt):
         return "FAIL", "%s 未定义" % name
-    m = re.search(r"#\s*define\s+DCL_CAP_H723_IMPL\b(.*?)\n\n", txt, re.S)
+    m = re.search(r"#\s*define\s+DCL_CAP_H723_IMPL\b(.*?)(?:\n\n|\Z)", txt, re.S)
     impl = m.group(1) if m else ""
     if not re.search(r"\b%s\b" % re.escape(name), impl):
         return "FAIL", "%s 定义了但**没并入 DCL_CAP_H723_IMPL** ⇒ 报了但不生效" % name
-    m2 = re.search(r"#\s*define\s+DCL_CAP_H723_NOTYET\b(.*?)\n", txt, re.S)
+    m2 = re.search(r"#\s*define\s+DCL_CAP_H723_NOTYET\b(.*?)(?:\n\n|\Z)", txt, re.S)
     notyet = m2.group(1) if m2 else ""
     if re.search(r"\b%s\b" % re.escape(name), notyet):
         return "FAIL", "%s 同时在 NOTYET 清单里 ⇒ 自相矛盾" % name
     return "PASS", "定义 + 并入 IMPL + 不在 NOTYET"
+
+
+def chk_N(root, c):
+    """N <能力位> <头文件> —— **留位**：断言该位在 `DCL_CAP_H723_NOTYET` 里。
+    ★ 为什么需要它: C2 完整性要求"定义了的位都必须被显式分类"。若只有 C 类,
+      那 `DCL_CAP_STATE_COLD` / `DCL_CAP_HMI`（**故意留位**的两位）就只能被被迫声明成"已实现"
+      —— 那是**让契据说谎**。⇒ 给出第二个分类: N = "留位, 未实现"。"""
+    if len(c["args"]) < 2:
+        return "FAIL", "N 类参数不足（需要 <能力位> <头文件>）"
+    name, rel = c["args"][0], c["args"][1]
+    txt = read_text(os.path.join(root, rel)) or ""
+    if not re.search(r"#\s*define\s+%s\b" % re.escape(name), txt):
+        return "FAIL", "%s 未定义" % name
+    m2 = re.search(r"#\s*define\s+DCL_CAP_H723_NOTYET\b(.*?)(?:\n\n|\Z)", txt, re.S)
+    notyet = m2.group(1) if m2 else ""
+    if not re.search(r"\b%s\b" % re.escape(name), notyet):
+        return "FAIL", ("%s 被登记为**留位**, 但它**不在** NOTYET 清单里 ⇒ 要么补进 NOTYET, "
+                        "要么改成 C 类（已实现）" % name)
+    m = re.search(r"#\s*define\s+DCL_CAP_H723_IMPL\b(.*?)(?:\n\n|\Z)", txt, re.S)
+    impl = m.group(1) if m else ""
+    if re.search(r"\b%s\b" % re.escape(name), impl):
+        return "FAIL", "%s 同时在 IMPL 里 ⇒ 自相矛盾（既说留位又说实现了）" % name
+    return "PASS", "留位（在 NOTYET 里且不在 IMPL 里）"
 
 
 def chk_E(root, c):
@@ -335,6 +359,7 @@ def run(root, verbose=False):
             ("A", chk_A, MIN_A, "结构（契据声称的符号必须存在；OFF_* 须被 _Static_assert 守住）"),
             ("B", chk_B, MIN_B, "拒绝码（定义 + 被赋值 + 有判据读到 / 或显式声明未覆盖）"),
             ("C", chk_C, MIN_C, "能力位（定义 + 并入 IMPL + 不在 NOTYET）"),
+            ("N", chk_N, MIN_N, "留位能力位（定义 + 在 NOTYET 里 + 不在 IMPL 里）"),
             ("E", chk_E, MIN_E, "判据存在性（契据的判据表 ⇄ 脚本里的 record()）")):
         items = by_kind.get(kind, [])
         npass = nfail = 0
@@ -350,6 +375,35 @@ def run(root, verbose=False):
                 fails.append("  [%s类] L%d %s\n        → %s" % (kind, c["line"], c["raw"][:90], why))
                 print("  [FAIL] L%-4d %-28s %s" % (c["line"], c["args"][0][:28], why))
         per[kind] = (len(items), npass, nfail, minn)
+
+    # ★★★ C2 类：**完整性** —— "定义了却没登记"的洞（2026-09-16 我自己踩的）
+    #   起因：本次新增了 `DCL_CAP_DEVBIND_PERSIST`，而闸门**没红** —— 因为它只查"登记了的"，
+    #   不查"代码里新增了却没登记"。那正是本项目最恨的"闸门有洞"（它会被当成'干净'）。
+    #   ⇒ 对**能力位**这类封闭小集合做反向核对：`transport.h` 里每个 `DCL_CAP_<名>`
+    #     都必须在 claims 里有一条 C 登记。★ 为什么只对能力位做：集合小、语义清晰、
+    #     且"宣称=实现"本来就是硬要求；`OFF_*` 数量大且部分是本文件内部的宏，反向核对会噪声化。
+    print("\n── C2 类：能力位完整性（transport.h 里定义了的**都必须登记**）──")
+    thr_rel = "src/transport.h"
+    thr = read_text(os.path.join(root, thr_rel)) or ""
+    defined_caps, registered = [], set()
+    for m in re.finditer(r"#\s*define\s+(DCL_CAP_[A-Z0-9_]+)\b", thr):
+        nm = m.group(1)
+        if nm in ("DCL_CAP_H723_IMPL", "DCL_CAP_H723_NOTYET"):
+            continue
+        defined_caps.append(nm)
+    # ★ "已分类"= C（已实现）∪ N（留位）—— **每个定义了的位都必须被显式分类**,
+    #   既不登记又不分类 = 闸门看不见它 = 有洞。
+    for c in by_kind.get("C", []) + by_kind.get("N", []):
+        if c["args"]:
+            registered.add(c["args"][0])
+    missing = [n for n in defined_caps if n not in registered]
+    print("   代码里定义 %d 个能力位, claims 登记 %d 个" % (len(defined_caps), len(registered)))
+    for n in missing:
+        msg = ("  [C2类] %s **在 %s 里定义了, 但 docs/claims.md 没有登记它** ⇒ "
+               "闸门看不见它（= 闸门有洞）⇒ 请补一条 `C | %s | %s`" % (n, thr_rel, n, thr_rel))
+        fails.append(msg)
+        print(msg)
+    per["C2"] = (len(defined_caps), len(defined_caps) - len(missing), len(missing), 1)
 
     print("\n── D 类：文档 file:line 引用（被引符号是否还在该文件 + 行号漂移）──")
     rows, dstat = chk_D(root)
@@ -369,7 +423,7 @@ def run(root, verbose=False):
 
     print("\n--- 覆盖度（★ 覆盖不足 ⇒ 判据**无效**，不是'干净'）---")
     invalid = False
-    for k in ("A", "B", "C", "D", "E"):
+    for k in ("A", "B", "C", "N", "C2", "D", "E"):
         n, np_, nf, mn = per.get(k, (0, 0, 0, 0))
         ok = n >= mn
         invalid = invalid or not ok
@@ -402,13 +456,15 @@ N_A, N_B, N_C, N_E = 8, 4, 5, 6
 def _clean_claims():
     L = []
     for i in range(N_A):
-        L.append("A OFF_GOOD%s   src/engine.h" % chr(ord('A') + i))
+        L.append("A | OFF_GOOD%s | src/engine.h" % chr(ord('A') + i))
     for i in range(N_B):
-        L.append("B RC_OK%d src/x.h tools/t.py" % (i + 1))
+        L.append("B | RC_OK%d | src/x.h | tools/t.py" % (i + 1))
     for i in range(N_C):
-        L.append("C DCL_CAP_A%d src/transport.h" % (i + 1))
+        L.append("C | DCL_CAP_A%d | src/transport.h" % (i + 1))
+    for i in range(2):
+        L.append("N | DCL_CAP_N%d | src/transport.h" % (i + 1))
     for i in range(N_E):
-        L.append("E 1.%d tools/t.py 判据%s" % (i + 1, "甲乙丙丁戊己"[i]))
+        L.append("E | 1.%d | tools/t.py | 判据%s" % (i + 1, "甲乙丙丁戊己"[i]))
     return "# t\n```claims\n" + "\n".join(L) + "\n```\n"
 
 
@@ -433,12 +489,17 @@ def _mk_fixture(root, claims=None, corrupt=None):
 
     # ── src/transport.h: 能力位全部并入 IMPL、且不在 NOTYET ──
     thr = "".join("#define DCL_CAP_A%d 0x%04Xu\n" % (i + 1, (i + 1) * 0x10) for i in range(N_C))
+    # ★ 夹具也要有**留位**位：C2 完整性要求"定义了的位都被显式分类",
+    #   而没有留位位时 N 类会覆盖不足 ⇒ 干净夹具自己就返回 1（这也是自测抓到的）。
+    thr += "#define DCL_CAP_N1 0x9000u\n#define DCL_CAP_N2 0x9001u\n"
     thr += "#define DCL_CAP_H723_IMPL   (" + " | ".join(
         "DCL_CAP_A%d" % (i + 1) for i in range(N_C)) + ")\n\n"
-    thr += "#define DCL_CAP_H723_NOTYET (0u)\n"
+    # ★ 故意写成**跨两行**（与真实 transport.h 同形）—— 单行夹具会让"截断在第一个换行"的
+    #   正则 bug 检不出来（本判据第一次就是因为这个 bug 漏判了 HMI）。
+    thr += "#define DCL_CAP_H723_NOTYET (DCL_CAP_N1 | \\\n                             DCL_CAP_N2)\n"
     if corrupt == "cap_notyet":     # 把 A5 同时列进 NOTYET ⇒ C 类必须红
-        thr = thr.replace("#define DCL_CAP_H723_NOTYET (0u)",
-                          "#define DCL_CAP_H723_NOTYET (DCL_CAP_A5)")
+        thr = thr.replace("(DCL_CAP_N1 | \\\n                             DCL_CAP_N2)",
+                          "(DCL_CAP_N1 | \\\n                             DCL_CAP_N2 | DCL_CAP_A5)")
     if corrupt == "cap_notimpl":    # 从 IMPL 里剔除 A5 ⇒ C 类必须红
         thr = thr.replace(" | DCL_CAP_A5", "")
     w("src/transport.h", thr)
@@ -479,9 +540,12 @@ def selftest():
         # E: 契据的判据表 ⊃ 脚本实际有的判据（把最后一条判据名改成不存在的）
         ("E: 契据判据在脚本里不存在", _clean_claims().replace("判据己", "判据不存在XYZ"), None, 2),
         # 覆盖不足: 只留 2 条 A ⇒ 必须判"无效"(rc=1), 而不是"有 FAIL"(2) 或"通过"(0)
+        # C2: 代码里新增了能力位但 claims 没登记 ⇒ 必须红（本判据存在的原因: 我自己踩过）
+        ("C2: 能力位定义了却没登记", _clean_claims().replace(
+            "C | DCL_CAP_A1 | src/transport.h\n", ""), None, 2),
         ("覆盖不足（A 类只剩 2 条）",
-         "\n".join([l for l in _clean_claims().splitlines() if not l.startswith("A OFF_GOOD")
-                    or l.startswith("A OFF_GOODA") or l.startswith("A OFF_GOODB")]) + "\n",
+         "\n".join([l for l in _clean_claims().splitlines() if not l.startswith("A | OFF_GOOD")
+                    or l.startswith("A | OFF_GOODA") or l.startswith("A | OFF_GOODB")]) + "\n",
          None, 1),
     ]
     try:

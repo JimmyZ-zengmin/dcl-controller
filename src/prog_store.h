@@ -105,6 +105,10 @@ uint32_t prog_store_buf_sz(void);
 
 extern volatile uint32_t g_prog_ok_n, g_prog_fail_n, g_prog_reject_n;
 extern volatile uint32_t g_prog_last_rc, g_prog_loaded_n, g_prog_active_copy;
+/* ★ GAP-11: **卡上那份副本的载荷长度**（可能比"由 counts 推出来的长度"多 48B —— 那是绑定表段）。
+ *   为什么单独一个量: `g_prog_loaded_n` 是"由 counts 推出"的长度（= 校验用的形状）,
+ *   而定位载荷**尾部**那一段必须用**实际存储长度**。两者混用就会读错位置（同族: 一个值两个语义）。*/
+extern volatile uint32_t g_prog_payload_len;
 extern volatile uint32_t g_prog_boot_reject;
 extern const char *volatile g_prog_reject_str;   /* 最近一次拒绝串 (调试读, 不保证跨语义稳定) */
 

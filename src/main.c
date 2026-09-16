@@ -167,6 +167,9 @@ static volatile uint32_t g_i2c_hold_until = 0u;
 OBS int      g_boot_status = 0;    /* clock_init 返回值, 0=OK */
 OBS uint32_t g_stage       = 0;    /* 执行进度 / 运行证据 (7 = ISR 在跑) */
 OBS uint32_t g_tick_count  = 0;
+/* ★ GAP-11: 开机装载时"绑定表段"的处理结果（DB_SEG_NONE/OK/BAD）—— 必须可观测,
+ *   否则"段坏了被拒绝"与"根本没有段"在外部看起来一样（本项目最恨的那种形态）。*/
+OBS uint32_t g_db_boot_seg  = 0;
 OBS uint32_t g_clock_hclk  = 0;
 OBS uint32_t g_isr_itcm    = ISR_ITCM;
 
@@ -2223,6 +2226,14 @@ static void h_adc_scan(const uint8_t *p, uint32_t n)
  * ★ 口径提醒(op=2): min/max 是**相邻两次"写 BSRR 之后读 DWT"的差值** —— 量的是
  *   "软件写引脚的时刻"间隔；与 LA 测到的**引脚真实边沿**是两回事, 两者之差
  *   = 从寄存器写入到引脚翻转的延迟。 */
+/* ★★★ 前向声明（GAP-11，2026-09-16）—— `0x39 op=23`（重装载）要用"开机装载的**唯一实现**"
+ *   与装载结果量, 而它们定义在本文件**后面**的程序持久化区。
+ *   ★ 为什么不把函数挪上来: 那会把"程序持久化"那一区的可读性打散; 前向声明是标准做法。
+ *   ★ 为什么不在这里再写一份装载逻辑: 那就变成"一个语义两处存放" —— 而 op=23 存在的
+ *     **全部意义**就是验"开机那条路径", 自写一份就等于没验。 */
+static uint32_t prog_boot_load_apply(void);
+extern volatile uint32_t g_prog_boot_loaded;
+
 static void h_pin_pattern(const uint8_t *p, uint32_t n)
 {
     uint32_t op = (n >= 1u) ? p[0] : 0u;
@@ -2490,6 +2501,21 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         ack(rx, 36u);
         return;
     }
+    if (op == 23u) {
+        /* ★★★ 重新执行**开机装载**（程序 + 绑定表）—— GAP-11 的验收口。
+         * 应答 8 B: [rc:u32 = PROG_RC_*][loaded:u32]
+         * ★ 它存在的理由: **让"开机装载"这条路径可自动化验收**（真断电需要人拔插）。
+         *   正因为它调的是 `prog_boot_load_apply()` —— **与开机同一条代码路径** ——
+         *   它所验证的才是开机行为, 而不是"另一份长得像的实现"。
+         * ★ 幂等: 连发两次结果一致（装载是"读→校验→stage→切", 不叠加状态）。
+         * ★ 会读 SD ⇒ 必须开阻塞窗口（否则可能被判主循环停滞）。 */
+        uint8_t rx[8];
+        uint32_t rc = prog_boot_load_apply();
+        put32(rx + 0, rc);
+        put32(rx + 4, g_prog_boot_loaded);
+        ack(rx, 8u);
+        return;
+    }
     if (op == 21u) {
         /* ★★★ 时基健康度（2026-09-16）—— 交付固件此前**没有**"时基在走"的可读量:
          *   `0x39 op=7`(重新校时)只活在实验补丁里 ⇒ 时基死了在协议面上**无法自证**
@@ -2659,6 +2685,15 @@ static void h_prog_commit(void)
     {   const char *err = prog_validate(prog_store_buf(), s_txn_total, &budget);
         if (err) { s_txn_busy = 0u; g_prog_txn_abort++;
                    g_prog_reject_why = PROG_RC_VALIDATE; nak(err); return; } }
+    /* ★★★ GAP-11 / 契约 §3.8.5: 把**绑定表**作为载荷尾部一段附加进去（2026-09-16）。
+     * ★ **顺序是关键**（三步不能换位）:
+     *   ① 闸2 已按客户端申报的 `total` 校验过 CRC32；
+     *   ② 闸5 已用 `prog_validate` 校验过**原始载荷**；
+     *   ③ **现在**才附加段 —— 于是 `prog_validate` 看到的是它认识的那个形状，
+     *      而落盘时 `prog_store_save` 会按**附加后的长度**重算 CRC32 存进副本头。
+     * ★ 无绑定 ⇒ 原样返回（**不附加空段**）⇒ 老包语义与从前**逐字节相同**。 */
+    s_txn_total = dev_bind_pack(prog_store_buf(), s_txn_total, prog_store_buf_sz());
+
     /* 落盘 (内部含闸3 回读比对 + 闸4 A/B+seq, 头最后写)
      * ★★ 必须开**阻塞窗口**: 这里是"写 1 块 + 读回 1 块", SD 侧一旦超时就会超过
      *    1.2 s 的停滞阈值 ⇒ 被判主循环死了 ⇒ 复位(实测事故)。窗口让停滞判据在这段时间不判。 */
@@ -2672,6 +2707,43 @@ static void h_prog_commit(void)
         put32(r, (uint32_t)rc); put32(r + 4, budget);
         g_prog_txn_commit++;
         ack(r, 8); }
+}
+
+/* ★★★ 开机装载的**唯一实现**（GAP-11，2026-09-16）—— `main()` 的启动序列与 `0x39 op=23`
+ * 都调**这一个函数**。★ 为什么必须抽出来: "重装载"这条诊断口存在的**全部意义**就是
+ * 让"开机装载"这条路径**可自动化验收**（真断电要人拔插）；若它与开机各写一份，
+ * 那验的就不是开机路径了 —— 这正是本项目反复吃亏的"一个语义两处存放"。
+ *
+ * 返回 `prog_store` 的返回码（`PROG_RC_*`）。副作用与开机时**逐条相同**：
+ *   ① `g_prog_boot_rc` / `g_prog_reject_why` 记结果；② 成功则 `eng_apply_program`（stage→下一拍原子切）
+ *   ③ 成功则 `dev_bind_unpack` 恢复绑定表段（老包无段 ⇒ `DB_SEG_NONE`，什么都不做）。
+ * ★ 步进/输出**不在本函数里启动**：是否上电即 RUN 是策略问题（上电即动机械），留给上位机 `0x11`。 */
+static uint32_t prog_boot_load_apply(void)
+{
+    int prc;
+    uint32_t _w = block_window_begin(PROG_BLOCK_TICKS);  /* ★ SD 读: 见 PROG_BLOCK_TICKS */
+    prc = prog_store_boot_load(prog_store_buf(), prog_store_buf_sz(), prog_validate);
+    block_window_end(_w);
+    g_prog_boot_rc = (uint32_t)prc;
+    g_prog_reject_why = (uint32_t)prc;
+    if (prc == PROG_RC_OK) {
+        const uint8_t *pl = prog_store_buf();
+        uint16_t nr = (uint16_t)(pl[0] | ((uint16_t)pl[1] << 8));
+        uint16_t np = (uint16_t)(pl[2] | ((uint16_t)pl[3] << 8));
+        uint16_t ns = (uint16_t)(pl[4] | ((uint16_t)pl[5] << 8));
+        uint16_t nw = eng_apply_program(pl + 6u, nr, np, ns);
+        (void)nw;
+        g_prog_boot_loaded = 1u;
+        __asm__ volatile("dsb" ::: "memory");
+        /* ★★★ GAP-11: 绑定表**随程序包恢复**（契约 §3.8.5）。
+         *   ★ 放在 `eng_apply_program` **之后**：绑定表的轮询要打到真正的引擎上，
+         *     先部署程序、再恢复绑定，顺序与"上位机先 deploy 再写绑定表"一致。
+         *   ★ 老包（无这一段）⇒ 返回 `DB_SEG_NONE`，**什么都不做** ⇒ 行为与从前逐字节相同。
+         *   ★ 段坏 ⇒ `DB_SEG_BAD`：**拒绝该段但不影响程序**（绑定表不是程序正确性的必要条件），
+         *     且它可观测（`DB_LOAD_BAD_N` / `DB_REJECT`）。 */
+        g_db_boot_seg = dev_bind_unpack(pl, g_prog_payload_len);
+    }
+    return (uint32_t)prc;
 }
 
 static void h_prog_status(void)
@@ -3549,6 +3621,8 @@ static void obs_anchor(void)
     sink ^= g_db_ok_n;                    sink ^= g_db_err_n;
     sink ^= g_db_last_err;                sink ^= g_db_skip_n;
     sink ^= g_db_rej_n;                   /* ★ 第二轮审计指出漏登记（dev_bind.h 自述要求）→ 已补 */
+    sink ^= g_db_load_ok_n;               sink ^= g_db_load_bad_n;   /* ★ GAP-11 装载结果 */
+    sink ^= g_db_boot_seg;
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
     sink ^= g_engine_gate;                sink ^= g_engine_sel;
     sink ^= g_n_routes;                   sink ^= g_table_profile;
@@ -4059,24 +4133,7 @@ int main(void)
          *   ★ 闸5 在这里生效: `prog_store_boot_load` 会调 `prog_validate`
          *     —— 与上传路径**同一个函数**, 不是第二份实现。不过就**不装载**,
          *     保持旧程序运行, 并把原因留在 g_prog_boot_rc / g_prog_reject_str。 */
-        {
-            int prc;
-            uint32_t _w = block_window_begin(PROG_BLOCK_TICKS);  /* ★ SD 读: 见 PROG_BLOCK_TICKS */
-            prc = prog_store_boot_load(prog_store_buf(), prog_store_buf_sz(), prog_validate);
-            block_window_end(_w);
-            g_prog_boot_rc = (uint32_t)prc;
-            g_prog_reject_why = (uint32_t)prc;
-            if (prc == PROG_RC_OK) {
-                const uint8_t *pl = prog_store_buf();
-                uint16_t nr = (uint16_t)(pl[0] | ((uint16_t)pl[1] << 8));
-                uint16_t np = (uint16_t)(pl[2] | ((uint16_t)pl[3] << 8));
-                uint16_t ns = (uint16_t)(pl[4] | ((uint16_t)pl[5] << 8));
-                uint16_t nw = eng_apply_program(pl + 6u, nr, np, ns);
-                (void)nw;
-                g_prog_boot_loaded = 1u;
-                __asm__ volatile("dsb" ::: "memory");
-            }
-        }
+        (void)prog_boot_load_apply();   /* ★ 见该函数注释: 与 `0x39 op=23` 走**同一条路径** */
     }
 #if HIL_SAFE
     eng_register_output_surface(do_outputs_safe);

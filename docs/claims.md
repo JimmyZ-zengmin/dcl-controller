@@ -66,6 +66,13 @@ C | DCL_CAP_COMM       | src/transport.h
 C | DCL_CAP_MACRO      | src/transport.h
 C | DCL_CAP_AI         | src/transport.h
 C | DCL_CAP_DEVBIND    | src/transport.h
+C | DCL_CAP_DEVBIND_PERSIST | src/transport.h
+
+# ══ N 类：**留位**能力位（定义了但**故意不实现**）—— 必须显式分类, 否则闸门看不见它 ══
+# ★ C2 完整性判据要求"每个定义了的位都被显式分类为 已实现(C) 或 留位(N)"。
+#   没有 N 类, 这两位就只能被被迫声明成"已实现" —— 那是**让契据说谎**。
+N | DCL_CAP_STATE_COLD | src/transport.h
+N | DCL_CAP_HMI        | src/transport.h
 
 # ══ E 类：契据 §3.8.8「八条能失败的判据」⇒ 脚本里必须真有 ══
 E | 3.8.8-1 magic 在任何清零路径之后仍在    | tools/h723_dev_bind_test.py | RESET 后 IX_MAGIC

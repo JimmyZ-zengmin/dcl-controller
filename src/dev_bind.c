@@ -40,7 +40,8 @@ static uint32_t  s_pend_seq   = 0u;    /* 已暂存的那一号 */
 static uint32_t  s_pend_valid = 0u;
 
 volatile uint32_t g_db_ok_n = 0u, g_db_err_n = 0u, g_db_last_err = 0u,
-                  g_db_skip_n = 0u, g_db_rej_n = 0u;
+                  g_db_skip_n = 0u, g_db_rej_n = 0u,
+                  g_db_load_ok_n = 0u, g_db_load_bad_n = 0u;
 
 /* FNV-1a —— **与上位机同算法**（照 bb_map_sum 的用途: 判"表与固件是不是同一份映射"）*/
 static uint32_t db_crc(const uint8_t *shm)
@@ -79,6 +80,7 @@ void dev_bind_reset(uint8_t *shm)
     db_local_clear();
     g_db_ok_n = 0u; g_db_err_n = 0u; g_db_last_err = 0u;
     g_db_skip_n = 0u; g_db_rej_n = 0u;
+    g_db_load_ok_n = 0u; g_db_load_bad_n = 0u;
 }
 
 void dev_bind_init(uint8_t *shm) { s_shm = shm; }
@@ -311,3 +313,86 @@ uint32_t dev_bind_ok_count(void)    { return g_db_ok_n; }
 uint32_t dev_bind_err_count(void)   { return g_db_err_n; }
 uint32_t dev_bind_skip_count(void)  { return g_db_skip_n; }
 uint32_t dev_bind_rej_count(void)   { return g_db_rej_n; }
+uint32_t dev_bind_load_ok(void)     { return g_db_load_ok_n; }
+uint32_t dev_bind_load_bad(void)    { return g_db_load_bad_n; }
+
+/* ══════════ 随程序包持久化（GAP-11 / 契约 §3.8.5）══════════
+ * 格式与"为什么放载荷尾部"的完整推导见 `dev_bind.h` 的同名小节。这里只写实现要点：
+ *   `dev_bind_pack`   —— 只在**确有绑定**时附加（否则原样返回 ⇒ 老包语义不变）
+ *   `dev_bind_unpack` —— **不自己校验条目**, 写回 SHM 后调 `db_submit()`（= 上传路径同一个函数）
+ */
+static void put32le(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu); p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu); p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+static uint32_t get32le(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+uint32_t dev_bind_pack(uint8_t *payload, uint32_t len, uint32_t cap)
+{
+    if (s_shm == NULL || payload == NULL) { return len; }
+    /* ★★ 只在**确有绑定**时附加。若恒定附加一个空段, 就会破坏"老包行为逐字节相同"
+     *   这条兼容性承诺（载荷长度会凭空多 48 字节, 上位机对账会发现"我没发这么多"）。 */
+    if (s_n == 0u) { return len; }
+    if (len + DB_SEG_LEN > cap) { return len; }        /* 放不下 ⇒ 宁可不带, 也不截断 */
+
+    uint8_t *seg = payload + len;
+    put32le(seg +  0, DB_MAGIC_VAL);                   /* 'DBND'（与运行时的区自证同值）*/
+    put32le(seg +  4, DB_SEG_LEN);
+    put32le(seg +  8, SHM_U32(s_shm, DB_PERIOD));
+    put32le(seg + 12, db_crc(s_shm));                  /* 与运行时**同一算法** ⇒ 装载时可独立复核 */
+    for (uint32_t i = 0u; i < DB_SLOTS; i++) {
+        put32le(seg + 16u + i * 4u, SHM_U32(s_shm, DB_ENTRIES + i * 4u));
+    }
+    return len + DB_SEG_LEN;
+}
+
+uint32_t dev_bind_unpack(const uint8_t *payload, uint32_t len)
+{
+    if (s_shm == NULL || payload == NULL) { return DB_SEG_NONE; }
+    if (len < DB_SEG_LEN) { return DB_SEG_NONE; }      /* 老包（没有这一段）—— 正常, 不是错误 */
+    /* ★ 段的位置：载荷**尾部**最后 48 字节。先按"尾部"取, 再看 magic —— 这样即使
+     *   将来载荷前面又加了别的东西, 判据也不变（只依赖"段在最后"这一条约定）。 */
+    const uint8_t *seg = payload + len - DB_SEG_LEN;
+    if (get32le(seg + 0) != DB_MAGIC_VAL) { return DB_SEG_NONE; }   /* 没有段 */
+
+    /* 段在 ⇒ 从这里开始, 任何不符都必须**明确拒绝且不半装载**（可观测：DB_LOAD_BAD_N + DB_REJECT）*/
+    uint32_t bad = 0u;
+    if (get32le(seg + 4) != DB_SEG_LEN) { bad = 1u; }
+    if (bad == 0u) {
+        for (uint32_t i = 0u; i < DB_SLOTS; i++) {
+            SHM_U32(s_shm, DB_ENTRIES + i * 4u) = get32le(seg + 16u + i * 4u);
+        }
+        /* ★ 现场重算 fnv（**不是**采信段里那个值）—— 采信它等于没校验。 */
+        if (db_crc(s_shm) != get32le(seg + 12)) { bad = 1u; }
+    }
+    if (bad != 0u) {
+        /* 段坏了 ⇒ 把条目**清回原样**（不留半张表）+ 明确拒绝 + 计数 */
+        for (uint32_t i = 0u; i < DB_SLOTS; i++) { SHM_U32(s_shm, DB_ENTRIES + i * 4u) = 0u; }
+        SHM_U32(s_shm, DB_CRC)    = db_crc(s_shm);
+        SHM_U32(s_shm, DB_REJECT) = DB_RC_CRC;
+        g_db_load_bad_n++;
+        SHM_U32(s_shm, DB_LOAD_BAD_N) = g_db_load_bad_n;
+        return DB_SEG_BAD;
+    }
+
+    uint32_t period = get32le(seg + 8);
+    SHM_U32(s_shm, DB_PERIOD) = period;
+    SHM_U32(s_shm, DB_CRC)    = db_crc(s_shm);
+    /* ★★ 关键：**不自己判合法性**, 而是把"提交"这件事交给**上传路径用的同一个函数**。
+     *   于是段里的非法条目会以 `DB_REJECT` 如实报出来（闸5 的同一条纪律：装载与上传共用一份校验）。*/
+    SHM_U32(s_shm, DB_REQ_SEQ) = SHM_U32(s_shm, DB_REQ_SEQ) + 1u;
+    dev_bind_submit();
+    if (SHM_U32(s_shm, DB_REJECT) != DB_RC_OK) {
+        g_db_load_bad_n++;
+        SHM_U32(s_shm, DB_LOAD_BAD_N) = g_db_load_bad_n;
+        return DB_SEG_BAD;
+    }
+    g_db_load_ok_n++;
+    SHM_U32(s_shm, DB_LOAD_OK_N) = g_db_load_ok_n;
+    return DB_SEG_OK;
+}

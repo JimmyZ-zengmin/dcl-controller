@@ -670,7 +670,9 @@ _Static_assert(OFF_I2C_XACT >= OFF_PERSIST_STAT + 32u,
                                               *     拒绝码是 `DB_RC_*`(0..8)，轮询状态是 `I2C_SM_ST_*`(0..7)，
                                               *     两个码空间**数值重叠** ⇒ 混在一个槽里，"last_err=2" 到底是
                                               *     "序号非单调" 还是 "事务成功" 分不出来。 */
-#define OFF_DEV_BIND_SZ         0x50u        /* 80 B */
+#define DB_LOAD_OK_N  (OFF_DEV_BIND + 80u)   /* u32 服务方写: **从程序包恢复成功**的次数（GAP-11）*/
+#define DB_LOAD_BAD_N (OFF_DEV_BIND + 84u)   /* u32 服务方写: 段在但**校验不过**的次数（明确拒绝, 不半装载）*/
+#define OFF_DEV_BIND_SZ         0x60u        /* 96 B（原 80 B: +8B 装载计数）*/
 #define DB_SLOTS                8u
 #define DB_MAGIC_VAL  0x444E4244u            /* 'DBND'（LE 字节序 D,B,N,D）*/
 #define DB_PERIOD_DEF   10u                  /* 默认 10 拍 = 1 ms */
@@ -683,8 +685,8 @@ _Static_assert(OFF_DEV_BIND >= OFF_I2C_XACT + OFF_I2C_XACT_SZ,
 /* ★ 本项目的"容量类注释活不过两周"处置: 表内**最后一个字段**也必须被断言守住 ——
  *   否则将来往表尾加字段时, 只有"越出 SHM 末尾"那一层保险, 而它管不到"越出本区"。 */
 _Static_assert(OFF_DEV_BIND + OFF_DEV_BIND_SZ <= SHM_SIZE &&
-               DB_REJ_N + 4u <= OFF_DEV_BIND + OFF_DEV_BIND_SZ,
-               "SHM: 设备绑定表尾字段 (DB_REJ_N) 越出本区");
+               DB_LOAD_BAD_N + 4u <= OFF_DEV_BIND + OFF_DEV_BIND_SZ,
+               "SHM: 设备绑定表尾字段 (DB_LOAD_BAD_N) 越出本区");
 
 
 #define OFF_PERSIST_STAT_SZ     32u      /* 8 字: 见 manifest.h 的字段说明 */

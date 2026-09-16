@@ -48,17 +48,54 @@ void dev_bind_init(uint8_t *shm);      /* 开机一次: 记下 shm 指针 */
 void dev_bind_submit(void);
 void dev_bind_service(uint32_t tick);   /* ★ 形参与 .c 必须一致（拍号：速率闸用） */
 
-/* ── 观测面（照输出面注册表的既有理由：要能区分"没登记"与"登记了没跑"）── */
-uint32_t dev_bind_valid_count(void);   /* 登记数（= SHM 的 DB_N_VALID）*/
+/* ══════════ 随程序包持久化（GAP-11 / 契约 §3.8.5，2026-09-16）══════════
+ *
+ * ## 为什么是"载荷尾部一段"而不是"扩副本头"
+ * 副本头 `ProgCopyHdr_t` 有一个 `hdr_sum` **覆盖 hdr_sum 之前的全部字**，且 `hdr_valid()`
+ * 按 `offsetof(ProgCopyHdr_t, hdr_sum)` 算长度 ⇒ **扩结构体会让老副本的校验和全部失配**
+ * （老包会被判无效）。而**载荷**这一侧 `prog_validate()` 用的是 `n < need`（不是等号），
+ * **允许尾部有多余字节** ⇒ 追加一段是**天然向后兼容**的：老包没有这一段 ⇒ 按"无绑定"处理。
+ * ★ 附加收益：这一段**白拿"不能漏错"五道闸的保护**（帧 CRC16 / 清单 CRC32 / 写后回读 /
+ *   A/B+seq / 装载前重跑同一套校验），不必为它新发明一套。
+ *
+ * ## 段格式（48 B，仅当设备侧确有绑定表时才附加）
+ * | 偏移 | 字段 |
+ * |---|---|
+ * | 0..3  | magic `'DBND'` = `0x444E4244`（与 `DB_MAGIC_VAL` 同值，便于人眼对照）|
+ * | 4..7  | `seg_len` = 48 |
+ * | 8..11 | `period`（1..`DB_PERIOD_MAX`）|
+ * | 12..15| `fnv` = **按 32 位字**的 FNV-1a over `entries[8]`（与运行时 `db_crc()` 同算法）|
+ * | 16..47| `entries[8]` |
+ * ⇒ 载荷 = `[6B counts][routes][params][states][48B 段(可选)]`
+ *
+ * ## ★★ 恢复走"与上传同一套校验"（闸5 同款纪律）
+ * `dev_bind_unpack()` **不自己校验条目**，而是把段内容写进 SHM 后调 **`dev_bind_submit()`** ——
+ * 也就是**上传路径用的同一个函数**。于是"装载恢复的表"与"上位机上传的表"过的是同一道关，
+ * 段内若有不合法条目，会以 `DB_REJECT` 如实报出来（而不是被悄悄接受）。
+ */
+#define DB_SEG_LEN     48u
+#define DB_SEG_NONE    0u   /* 载荷里没有这一段（老包）⇒ 不恢复, 行为与从前逐字节相同 */
+#define DB_SEG_OK      1u   /* 段有效且已恢复 */
+#define DB_SEG_BAD     2u   /* 段在但校验不过 ⇒ **明确拒绝该段**（不半装载；程序本身照常装载）*/
+
+/* 把**当前**绑定表作为一段附加到载荷尾部。返回附加后的总长度。
+ * ★ 无线索/无绑定 ⇒ 原样返回 `len`（**不附加空段**，否则老包语义被破坏）。*/
+uint32_t dev_bind_pack(uint8_t *payload, uint32_t len, uint32_t cap);
+/* 从载荷里恢复绑定表。返回 `DB_SEG_*`。★ 只在"开机/重装载"路径调用。 */
+uint32_t dev_bind_unpack(const uint8_t *payload, uint32_t len);
+
+/* ── 观测面（照输出面注册表的既有理由：要能区分"没登记"与"登记了没跑"）── */uint32_t dev_bind_valid_count(void);   /* 登记数（= SHM 的 DB_N_VALID）*/
 uint32_t dev_bind_ok_count(void);      /* 执行数（成功轮询次数）*/
 uint32_t dev_bind_err_count(void);     /* 失败轮询次数（**器件/通信**故障）*/
-uint32_t dev_bind_skip_count(void);    /* ★ 轮空次数（总线门忙 / 事务被别的使用者取走）
+uint32_t dev_bind_skip_count(void);  /* ★ 轮空次数（总线门忙 / 事务被别的使用者取走）
                                         *   ★ 与 err 分开是刻意的：err 必须只回答"器件/通信出了什么事"，
                                         *     把调度现象混进去，"err 在涨"这条判据就无法解释 ⇒ 判据作废。 */
 uint32_t dev_bind_rej_count(void);     /* ★ 表被拒次数（**上传面**）—— 同一条理由：与"轮询失败"是两个问题 */
+uint32_t dev_bind_load_ok(void);       /* ★ 从程序包恢复成功的次数（GAP-11）*/
+uint32_t dev_bind_load_bad(void);      /* ★ 段在但校验不过的次数（明确拒绝，不半装载）*/
 
 /* ── 计数器本体（`obs_anchor()` 必须读一遍, 否则被 --gc-sections 回收 —— 本项目已踩三次）── */
 extern volatile uint32_t g_db_ok_n, g_db_err_n, g_db_last_err,
-                         g_db_skip_n, g_db_rej_n;
+                         g_db_skip_n, g_db_rej_n, g_db_load_ok_n, g_db_load_bad_n;
 
 #endif /* DEV_BIND_H */
