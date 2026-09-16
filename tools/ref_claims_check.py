@@ -53,6 +53,7 @@ MIN_C = 5      # 能力位
 MIN_N = 2      # 留位能力位（`DCL_CAP_STATE_COLD` / `DCL_CAP_HMI`）
 MIN_D = 20     # 文档里的 文件:行号 引用
 MIN_E = 6      # 判据存在性
+MIN_F = 2      # 门面一致性（真实仓库是几百行；下限只防"空的"，不防"少"）
 # ── D 类行号漂移阈值（超过则告警；符号消失才是 FAIL）──────────────────────
 D_LINE_TOL = 40
 
@@ -262,6 +263,75 @@ def chk_E(root, c):
                     "要么补判据, 要么 --allow-uncovered" % (clause, frag))
 
 
+# ══════════════════════ F 类：门面/状态一致性（2026-09-16 补）══════════════════════
+# ★ 为什么要有它（**真实的 6 处过期状态**逼出来的）：`claims` 闸门只管"**契据 ⇄ 代码**"，
+#   管不到"**发布说明 / GAP 表 / README**"。于是同一天里真的出现了：GAP 表某行**现状列写
+#   "已落地"、状态列却写 `open`**（同一行自相矛盾）；附录写"GAP-6 是唯一的 open"而它早已 closed；
+#   RELEASE 把三条**已修好**的问题还列在"已知问题"里。
+#   ⇒ 门面写错**比没写更坏**：下一个人会照着错的做。
+#
+# 两条判据（都是"能失败"的）：
+#   F1 **行内不得自相矛盾**：表格行里"已完成"标记与"未完成"标记不得同时出现在**状态列**
+#      （状态列 = 最后一个非空单元格）。★ 这精准命中 GAP-12 那次的错法。
+#   F2 **实现字必须与代码一致**：门面文档里提到"实现字/能力字"的行，**最后一个 `0xXXXX`**
+#      必须等于 `src/transport.h` 的 `DCL_CAP_H723_IMPL`（允许写历史演进链，但**末值必须是当前值**）。
+DONE_RE  = re.compile(r"(✅|closed|已落地|已解决|已修)")
+UNDONE_RE = re.compile(r"(⬜|\bopen\b|未落地|未解决)")
+CAP_RE   = re.compile(r"\b0x([0-9A-Fa-f]{4})\b")
+FACADE_DOCS = ["README.md", "docs/RELEASE-v2.1.0.md", "docs/REF-program-contract.md",
+               "docs/GETTING-STARTED.md", "docs/SUPPORTED-SCOPE.md"]
+
+
+def chk_F(root):
+    """→ (rows, stats)。F1 行内矛盾 + F2 实现字一致。"""
+    rows = []
+    n_tables = n_cap = 0
+    # F2 先取"当前实现字"
+    thr = read_text(os.path.join(root, "src", "transport.h")) or ""
+    m = re.search(r"#\s*define\s+DCL_CAP_H723_IMPL\b(.*?)(?:\n\n|\Z)", thr, re.S)
+    impl = None
+    if m:
+        vals = CAP_RE.findall(m.group(1))
+        if vals:
+            impl = "0x" + vals[-1].upper()
+    for rel in FACADE_DOCS:
+        txt = read_text(os.path.join(root, rel))
+        if txt is None:
+            continue
+        raw = txt.splitlines()
+        head = "\n".join(raw[:40])
+        if any(k in head for k in ("过时", "已作废", "HISTORICAL", "归档")):
+            continue
+        for i, line in enumerate(raw, 1):
+            ls = line.strip()
+            # F1: 表格行（至少 3 个 |）且最后一个非空单元格含"未完成"标记
+            if ls.startswith("|") and ls.count("|") >= 3:
+                cells = [c.strip() for c in ls.strip("|").split("|")]
+                cells = [c for c in cells if c]
+                if cells:
+                    last = cells[-1]
+                    body = " ".join(cells[:-1])
+                    if UNDONE_RE.search(last) and DONE_RE.search(body):
+                        rows.append(("FAIL", "%s:%d  **状态列自相矛盾**：现状说'已完成'、状态列写'未完成'"
+                                     "\n         → %s" % (rel, i, ls[:120])))
+                    n_tables += 1
+            # F2: 提到"实现字/能力字"的行，末值必须是当前实现字
+            # ★ 合法例外：该行若在讲"**剩余/空闲/未用**的位"，那个十六进制值不是"实现字"。
+            #   实例：`能力位 u16 只剩 1 位空闲（当前 0x7DF7，只剩 0x8000）` —— 末值是"还能用的位"。
+            #   （这条限定词是 F2 首跑时被这一行打红后加的：**判据要能把"真过期"与"合法例外"分开**，
+            #     否则它会变成误报机器，而误报会被自己人关掉。）
+            _exc = any(k in line for k in ("只剩", "空闲", "未用", "保留位"))
+            if impl and ("实现字" in line or "能力字" in line) and not _exc:
+                vals = ["0x" + v.upper() for v in CAP_RE.findall(line)]
+                if vals:
+                    n_cap += 1
+                    if vals[-1] != impl:
+                        rows.append(("FAIL", "%s:%d  **实现字与代码不一致**：文中末值 %s，"
+                                     "而 `transport.h` 的 IMPL = %s"
+                                     % (rel, i, vals[-1], impl)))
+    return rows, {"tables": n_tables, "cap": n_cap, "impl": impl}
+
+
 REF_RE = re.compile(r"\b((?:src|tools|docs)/[\w./\-]+\.(?:c|h|py|md)):(\d+)\b")
 TOKEN_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]{2,})`")
 # ★ 裸符号（没加反引号）也要查 —— 否则"文档里写了个已经删掉的宏名"这类漂移检不出来。
@@ -421,9 +491,18 @@ def run(root, verbose=False):
         print("  …（另有 %d 条同类告警已折叠）" % (len(rows) - shown))
     per["D"] = (dstat["refs"], dstat["refs"] - dstat["gone"], dstat["gone"], MIN_D)
 
+    print("\n── F 类：门面/状态一致性（行内不得自相矛盾 + 实现字必须与代码一致）──")
+    frows, fstat = chk_F(root)
+    for st, why in frows:
+        fails.append("  [F类] " + why)
+        print("  [FAIL] " + why)
+    print("   表格行 %d 行 · 提到实现字/能力字的行 %d 行 · 当前 IMPL=%s" %
+          (fstat["tables"], fstat["cap"], fstat["impl"]))
+    per["F"] = (max(fstat["tables"], fstat["cap"]), 0, len(frows), MIN_F)
+
     print("\n--- 覆盖度（★ 覆盖不足 ⇒ 判据**无效**，不是'干净'）---")
     invalid = False
-    for k in ("A", "B", "C", "N", "C2", "D", "E"):
+    for k in ("A", "B", "C", "N", "C2", "D", "E", "F"):
         n, np_, nf, mn = per.get(k, (0, 0, 0, 0))
         ok = n >= mn
         invalid = invalid or not ok
@@ -492,8 +571,10 @@ def _mk_fixture(root, claims=None, corrupt=None):
     # ★ 夹具也要有**留位**位：C2 完整性要求"定义了的位都被显式分类",
     #   而没有留位位时 N 类会覆盖不足 ⇒ 干净夹具自己就返回 1（这也是自测抓到的）。
     thr += "#define DCL_CAP_N1 0x9000u\n#define DCL_CAP_N2 0x9001u\n"
+    # ★ 行尾必须带十六进制（真实 transport.h 就是靠这种注释被 F2 提取的）——
+    #   夹具首版只写符号名 ⇒ F2 提不到 impl ⇒ 那条自测用例**静默没用**（测了个寂寞）。
     thr += "#define DCL_CAP_H723_IMPL   (" + " | ".join(
-        "DCL_CAP_A%d" % (i + 1) for i in range(N_C)) + ")\n\n"
+        "DCL_CAP_A%d" % (i + 1) for i in range(N_C)) + ")  /* = 0x0050 */\n\n"
     # ★ 故意写成**跨两行**（与真实 transport.h 同形）—— 单行夹具会让"截断在第一个换行"的
     #   正则 bug 检不出来（本判据第一次就是因为这个 bug 漏判了 HMI）。
     thr += "#define DCL_CAP_H723_NOTYET (DCL_CAP_N1 | \\\n                             DCL_CAP_N2)\n"
@@ -523,6 +604,16 @@ def _mk_fixture(root, claims=None, corrupt=None):
         doc += "见 src/x.c:3 的 NO_SUCH_SYMBOL_HERE\n"
     w("docs/t.md", doc)
 
+    # ★ F 类夹具：门面文档。F1 = 表格行自相矛盾；F2 = 实现字过期
+    facedoc = "| 项 | 现状 | 状态 |\n|---|---|---|\n"
+    if corrupt == "f1_contradiction":
+        facedoc += "| X | ✅ **已落地** | ⬜ open |\n"
+    elif corrupt == "f2_stale_cap":
+        facedoc += "| 能力位 | 实现字 `0x1234` | ✅ closed |\n"
+    else:
+        facedoc += "| X | ✅ **已落地** | ✅ closed |\n"
+    w("README.md", "# t\n\n" + facedoc)
+    w("src/transport.h", thr)            # F2 要读 IMPL（夹具的 IMPL = A1|..|A5，末值 0x0050）
     w(CLAIMS_REL, claims if claims is not None else _clean_claims())
     return root
 
@@ -540,6 +631,10 @@ def selftest():
         # E: 契据的判据表 ⊃ 脚本实际有的判据（把最后一条判据名改成不存在的）
         ("E: 契据判据在脚本里不存在", _clean_claims().replace("判据己", "判据不存在XYZ"), None, 2),
         # 覆盖不足: 只留 2 条 A ⇒ 必须判"无效"(rc=1), 而不是"有 FAIL"(2) 或"通过"(0)
+        # F1: 门面表格"行内自相矛盾"（现状说已完成、状态列写 open）⇒ 必须红
+        ("F1: 门面行内矛盾", _clean_claims(), "f1_contradiction", 2),
+        # F2: 门面写的实现字与代码不一致 ⇒ 必须红
+        ("F2: 门面实现字过期", _clean_claims(), "f2_stale_cap", 2),
         # C2: 代码里新增了能力位但 claims 没登记 ⇒ 必须红（本判据存在的原因: 我自己踩过）
         ("C2: 能力位定义了却没登记", _clean_claims().replace(
             "C | DCL_CAP_A1 | src/transport.h\n", ""), None, 2),
