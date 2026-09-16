@@ -59,6 +59,7 @@
 | 0x5DE0 | MACRO_CTRL/CODE | 0x1010 | macro 控制块 + 字节码 (4KB) |
 | 0x6E00 | HIL_DUTY / HIL_FB_RAW | 0x8 | W5 观测面 |
 | **0x6E08** | **DO_SHADOW / RTC / EVT / BB_SNAP / FAULT_LOG / WDT_STAT / PERSIST_STAT** | 已占满 | ★★ **不是空闲**：`OFF_DO_SHADOW`=0x6E08、`OFF_RTC_SSR/TR/DR`=0x6E10/14/18、`OFF_EVT_HEAD/BUF`=0x6E1C/0x6E20、`OFF_BB_SNAP`=0x6F20、`OFF_FAULT_LOG`=0x7020、`OFF_WDT_STAT`=0x70B8、`OFF_PERSIST_STAT`=0x7180（`engine.h:525-577`）。★ 原写"空闲 0x11F8"是**中旬以前的快照** —— 照它去放东西会**直接踩在 WDT / 黑匣子 / 事件环**上（本项目已因此踩过一次：程序载荷缓冲撞进黑匣子环，读回魔术字是 `DLBK`）|
+| 0x7200 | **I2C_XACT（G6-3，2026-09-16 新增）** | 0x40 (64B) | I2C 通用事务区：**请求-完成握手**（`MAGIC`='IXAC' / `REQ_SEQ` / `DONE_SEQ` / `STATUS` / `TICKS` / `REQ`打包 / `DATA[8]` / 6 个计数器）。写者：使用者写请求、主循环 `i2c_shm_service()` 回完成。★ 判据 `tools/h723_i2c_shm_test.py`（6/6）。本区之前 `0x71A0`–`0x7200` 是尾巴上唯一的空档 |
 
 ---
 

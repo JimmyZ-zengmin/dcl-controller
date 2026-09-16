@@ -3403,6 +3403,68 @@ static void proto_selftest(void)
     g_selftest_state = g_selftest_frames ? 1u : 2u;
 }
 
+/* ══════════ ★★★ I2C 事务区的服务函数（GAP-6 / G6-3, 2026-09-16）══════════
+ * 把 SHM 里的"请求-完成"握手接到拍内状态机上。**主循环每次循环调用**。
+ *
+ * 为什么要有这一层（契约 §3.6 约束④「就绪门」）:
+ *   事务**跨拍**（一次 2 字节读 ≈8 拍 ≈800µs）⇒ 使用者不能"写完就取结果"。
+ *   握手把这件事变成**可判**的: `IX_DONE_SEQ == 你写的序号` 才代表结果有效。
+ *
+ * ★ 为什么服务放在主循环而不是 ISR: 状态机在 ISR 里推进没问题, 但"发起"要碰 flash
+ *   （`i2c_sm_request` → 门的 acquire）, 且 800µs ≫ 拍长, 主循环一圈 ~1.3ms 足够。
+ * ★ 计数器每圈镜像一次（6 次 SHM 写 ≈ 可忽略）, 这样使用者**不发起事务也能看到计数**。 */
+static volatile uint8_t s_ix_busy = 0u;
+static uint32_t s_ix_seq = 0u;
+
+static void i2c_shm_service(void)
+{
+    /* ── 计数器镜像（无条件, 让 SHM 区自足）── */
+    SHM_U32(g_shm, IX_REQ_N)  = g_i2c_sm_req_n;
+    SHM_U32(g_shm, IX_OK_N)   = g_i2c_sm_ok_n;
+    SHM_U32(g_shm, IX_NAK_N)  = g_i2c_sm_nak_n;
+    SHM_U32(g_shm, IX_STUCK_N)= g_i2c_sm_stuck_n;
+    SHM_U32(g_shm, IX_GATE_N) = g_i2c_sm_gate_n;
+    SHM_U32(g_shm, IX_BUSY_N) = g_i2c_bus_busy_n;
+
+    /* ── 握手 ── */
+    uint32_t rq = SHM_U32(g_shm, IX_REQ_SEQ);
+    uint32_t dn = SHM_U32(g_shm, IX_DONE_SEQ);
+    if (rq == 0u || rq == dn) { return; }              /* 无待办（seq 相同 = 空闲）*/
+
+    if (s_ix_busy == 0u) {
+        uint32_t p    = SHM_U32(g_shm, IX_REQ);
+        uint8_t addr  = (uint8_t)(p & 0xFFu);
+        uint8_t op    = (uint8_t)((p >> 8) & 0xFFu);
+        uint8_t reg   = (uint8_t)((p >> 16) & 0xFFu);
+        uint8_t len   = (uint8_t)((p >> 24) & 0xFFu);
+        uint8_t tx[I2C_SM_MAX_DATA];
+        for (uint32_t i = 0u; i < (uint32_t)I2C_SM_MAX_DATA; i++) { tx[i] = 0u; }
+        if (op == I2C_SM_OP_WRITE) {
+            for (uint32_t i = 0u; (i < len) && (i < (uint32_t)I2C_SM_MAX_DATA); i++) {
+                tx[i] = SHM_U8(g_shm, IX_DATA + i);
+            }
+        }
+        s_ix_seq  = rq;
+        s_ix_busy = (uint8_t)(i2c_sm_request(addr, op, reg,
+                                             (op == I2C_SM_OP_WRITE) ? tx : NULL, len) != 0u);
+        if (s_ix_busy != 0u) { return; }               /* 已发起 ⇒ 等它跨拍跑完 */
+        /* 被拒（门忙 / 参数非法）⇒ 立刻收尾, 把拒绝原因交回使用者 */
+    } else if (i2c_sm_status() == I2C_SM_ST_BUSY) {
+        return;                                        /* 还在飞 ⇒ 继续等（这就是"就绪门"）*/
+    }
+
+    /* ── 收尾: 回写结果, **最后**写 done_seq（顺序很重要: 先数据后完成号）── */
+    SHM_U32(g_shm, IX_STATUS) = i2c_sm_status();
+    SHM_U32(g_shm, IX_PHASE)  = i2c_sm_phase();
+    SHM_U32(g_shm, IX_TICKS)  = i2c_sm_tick_cnt();
+    uint8_t d[I2C_SM_MAX_DATA];
+    uint32_t got = i2c_sm_result(d, (uint32_t)I2C_SM_MAX_DATA);
+    for (uint32_t i = 0u; i < got; i++) { SHM_U8(g_shm, IX_DATA + i) = d[i]; }
+    if (i2c_sm_status() == I2C_SM_ST_OK) { SHM_U32(g_shm, IX_LAST_OK_SEQ) = s_ix_seq; }
+    SHM_U32(g_shm, IX_DONE_SEQ) = s_ix_seq;            /* ★ 最后一步: 使用者据此判"有效" */
+    s_ix_busy = 0u;
+}
+
 /* ══════════ 观测变量锚定 —— 结构性防"被回收" ══════════
  * ★ 已踩过**三次**的同一个坑: 只被静态初始化、代码里无人读也无人写的全局,
  *   会被 -fdata-sections + --gc-sections 整段回收 → 从符号表消失 → 外部读不到。
@@ -3424,6 +3486,14 @@ static void obs_anchor(void)
     sink ^= g_table_ck;                   sink ^= g_active_routes;
     sink ^= g_guard_ok;                   sink ^= g_guard_bad_off;
     sink ^= g_timebase_dead;              sink ^= g_opt_sr;              /* ★ 时基活性标志 (防 --gc-sections 回收) */
+    /* ★ G6-1/G6-2/G6-3 新增观测量 —— 不加这几行它们可能悄悄从符号表消失 */
+    sink ^= g_tb_dead_n;                  sink ^= g_dwt_dead_n;
+    sink ^= g_tb_cyc_last;                sink ^= g_i2c_sm_req_n;
+    sink ^= g_i2c_sm_ok_n;                sink ^= g_i2c_sm_nak_n;
+    sink ^= g_i2c_sm_stuck_n;             sink ^= g_i2c_sm_gate_n;
+    sink ^= g_i2c_sm_ticks_n;             sink ^= g_i2c_bus_busy_n;
+    sink ^= (uint32_t)g_i2c_sm_active;    sink ^= (uint32_t)g_i2c_sm_release_pending;
+    sink ^= (uint32_t)s_ix_busy;          sink ^= s_ix_seq;
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
     sink ^= g_engine_gate;                sink ^= g_engine_sel;
     sink ^= g_n_routes;                   sink ^= g_table_profile;
@@ -3961,6 +4031,16 @@ int main(void)
     g_stage = 12;
 
     /* ⑧ 统一锚定全部观测变量 (防 --gc-sections 回收; 见 obs_anchor 注释) */
+    /* ★★★ G6-3: I2C 事务区初始化 —— 放在开机序列**末尾**（此刻 SHM 已就绪、g_shm 有效）。
+     *   `magic` 是"区存在"的自证: 上位机读不到它就不该按本布局解析（防"布局假设"变成静默错）。 */
+    SHM_U32(g_shm, IX_MAGIC)       = IX_MAGIC_VAL;
+    SHM_U32(g_shm, IX_REQ_SEQ)     = 0u;
+    SHM_U32(g_shm, IX_DONE_SEQ)    = 0u;
+    SHM_U32(g_shm, IX_STATUS)      = I2C_SM_ST_IDLE;
+    SHM_U32(g_shm, IX_PHASE)       = 0u;
+    SHM_U32(g_shm, IX_TICKS)       = 0u;
+    SHM_U32(g_shm, IX_LAST_OK_SEQ) = 0u;
+
     obs_anchor();
 
     for (;;) {
@@ -3969,6 +4049,20 @@ int main(void)
         g_loop_entered = 1u;
 
         step_tick(g_tick_count);        /* 限时截止 (只做一次比较, 极短) */
+
+        /* ══════════ ★★ I2C 的三件服务性工作 —— **必须在循环顶层**（每圈都跑）══════════
+         * ★ 教训（本回合刚踩）: 这三句最初被我写在下面 as5600 的那个 `每 100 拍` 分支里
+         *   ⇒ 延迟放门最长拖 **10ms**（而不是 ~1.3ms）、SHM 握手也只有 10ms 分辨率 ——
+         *   与注释里写的完全不符。**又是"守卫放错层"**：功能对、位置错、于是行为被悄悄改变。
+         * ★ 为什么都在主循环而不是 ISR: 它们都会碰 flash（门在 i2c_bb.c）⇒ 进 ISR 会违反
+         *   ISR 调用树不变量（闸门当场拦过 `i2c_bus_release@0x08008BDC`）,
+         *   而 ITCM 已 100% 占满, 没有"搬进 ITCM"这条退路。 */
+        i2c_sm_service();               /* G6-2: 延迟放门 */
+        i2c_shm_service();              /* G6-3: SHM 事务区握手 */
+        if (g_i2c_hold_until != 0u && (int32_t)(g_tick_count - g_i2c_hold_until) >= 0) {
+            g_i2c_hold_until = 0u;      /* G6-2: 诊断占用有界自动释放 */
+            i2c_bus_release(I2C_OWNER_BLOCKING);
+        }
 
         /* ★ AS5600: 每 10ms 读一次。单次 ≈250µs ⇒ 占主循环 ~2.5%, 远低于停滞阈值。
          * ★★ 必须用**边沿触发**, 不能用 `g_tick_count % 100 == 0`:
@@ -3979,18 +4073,6 @@ int main(void)
             static uint32_t s_as_next = 0u;
             if ((int32_t)(g_tick_count - s_as_next) >= 0) {
                 s_as_next = g_tick_count + 100u;
-                /* ★ G6-2: 延迟放门（状态机在 ISR 里收尾, 放门必须由主循环做 —— 见 i2c_sm.h）*/
-                i2c_sm_service();
-                /* ★★ G6-2 诊断占用的**有界**释放（`0x39 op=22 sub=0`）——
-                 *   占用到 tick 到期就自动放门, 不依赖"上位机记得来释放"。
-                 *   ★ 为什么放在**主循环**而不是 ISR 尾部: `i2c_bus_release()` 在 flash 里,
-                 *     放进 ISR 就违反 ISR 调用树不变量（擦 flash 期间取指被 stall ⇒ 喂狗停）。
-                 *     —— 这是**闸门当场拦下来**的（`gate_isr_itcm.py` 点了 `i2c_bus_release@0x08008BDC`）。
-                 *     而 ≤200ms 的诊断占用本来也不需要拍级精度, 主循环(~1.3ms 一圈)足够。 */
-                if (g_i2c_hold_until != 0u && (int32_t)(g_tick_count - g_i2c_hold_until) >= 0) {
-                    g_i2c_hold_until = 0u;
-                    i2c_bus_release(I2C_OWNER_BLOCKING);
-                }
                 /* ★★ G6-2: 状态机持有总线时**连调用都不发起** —— 门本身已经能拒绝
                  *   （`i2c_bb_*` 内部 acquire），这里只是省掉一次必然失败的 250µs 往返,
                  *   并避免污染 AS5600 的错误计数（那是判据, err 必须保持 0）。 */

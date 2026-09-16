@@ -574,6 +574,57 @@ _Static_assert(OFF_WDT_STAT + OFF_WDT_STAT_SZ <= SHM_SIZE,
  * 为什么单独一个区: 擦除是**唯一能合法阻塞主循环 ~1.5s** 的路径, 而停滞判据的窗口
  *   正是为它留的 ⇒ "擦了没 / 擦了几次 / 跳过了几次"必须可读回, 否则**窗口大小无从验证**。 */
 #define OFF_PERSIST_STAT        0x7180
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ I2C 事务区（GAP-6 / G6-3, 2026-09-16）—— **程序面与驱动面的"请求-完成"握手**
+ *
+ * ## 为什么需要它
+ * G6-1/G6-2 之后，I2C 事务只能靠 `0x39 op=20/22` 这对**诊断命令**触发与读取。
+ * 而契约 §3.6 约束④要求给使用者一个**就绪门**，§3.7 要求事务的请求/结果住在 SHM 里。
+ * ⇒ 有了本区，"要用 I2C 的驱动/外设能力"不必再依赖诊断脚手架，走**数据总线**即可。
+ *
+ * ## 握手语义（★ 这就是"就绪门"）
+ *   使用者: 写 `IX_REQ`/`IX_DATA`，然后 `IX_REQ_SEQ = <新序号>`（单调、非 0）
+ *   服务方: 主循环看到 `IX_REQ_SEQ != IX_DONE_SEQ` ⇒ 发起一次状态机事务
+ *   完成时: 回写 `IX_STATUS`/`IX_DATA`，最后 `IX_DONE_SEQ = 该序号`
+ *   ⇒ **使用者等 `IX_DONE_SEQ == 自己写的序号` 才算拿到结果**；
+ *     禁止假设"写完就有值"（事务跨 ~8 拍 ≈800µs）。
+ *   ★ 序号必须单调递增：同一个序号不会被处理两次（`IX_DONE_SEQ == IX_REQ_SEQ` 即空闲）。
+ *
+ * ## 唯一写者（公理②）
+ *   `IX_REQ_SEQ`/`IX_REQ`/`IX_DATA`(写出)  ← 使用者（当前只有协议/主循环）
+ *   `IX_DONE_SEQ`/`IX_STATUS`/`IX_DATA`(读回) ← 主循环的服务函数
+ *   ⇒ 两边写的是**不同字段**（`IX_DATA` 是"发出方向"与"读回方向"分时复用，
+ *     由 seq 握手保证不同时）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define OFF_I2C_XACT            0x7200
+#define IX_MAGIC       (OFF_I2C_XACT +  0u)   /* u32 'IXAC' —— 区存在性自证 */
+#define IX_REQ_SEQ     (OFF_I2C_XACT +  4u)   /* u32 使用者写（单调非 0）*/
+#define IX_DONE_SEQ    (OFF_I2C_XACT +  8u)   /* u32 服务方写（==REQ_SEQ 即空闲）*/
+#define IX_STATUS      (OFF_I2C_XACT + 12u)   /* u32 i2c_sm 的 I2C_SM_ST_* */
+#define IX_PHASE       (OFF_I2C_XACT + 16u)   /* u32 完成时的相位（诊断）*/
+#define IX_TICKS       (OFF_I2C_XACT + 20u)   /* u32 本次事务耗拍（就绪门的直接证据）*/
+#define IX_LAST_OK_SEQ (OFF_I2C_XACT + 24u)   /* u32 最近一次 status==OK 的序号 */
+#define IX_REQ         (OFF_I2C_XACT + 28u)   /* u32 打包: addr7 | op<<8 | reg<<16 | len<<24 */
+#define IX_DATA        (OFF_I2C_XACT + 32u)   /* u8[8] 读回/送出数据（由 seq 分时复用）*/
+#define IX_REQ_N       (OFF_I2C_XACT + 40u)   /* u32 计数器们（每个都能失败 ⇒ 都是判据）*/
+#define IX_OK_N        (OFF_I2C_XACT + 44u)
+#define IX_NAK_N       (OFF_I2C_XACT + 48u)
+#define IX_STUCK_N     (OFF_I2C_XACT + 52u)
+#define IX_GATE_N      (OFF_I2C_XACT + 56u)   /* 状态机被总线门拒的次数 */
+#define IX_BUSY_N      (OFF_I2C_XACT + 60u)   /* 任何人被总线门拒的次数 */
+#define OFF_I2C_XACT_SZ         64u
+#define IX_MAGIC_VAL   0x43415849u            /* 'IXAC' */
+
+/* ★ 构建期守卫：本区必须落在 SHM 内、且不越界。
+ *   （本项目对"容量类注释活不过两周"的处置：要么 _Static_assert, 要么唯一地图。） */
+_Static_assert(OFF_I2C_XACT + OFF_I2C_XACT_SZ <= SHM_SIZE,
+               "SHM: I2C 事务区越出 SHM 末尾 (见 OFF_I2C_XACT)");
+_Static_assert(OFF_I2C_XACT < OFF_I2C_XACT + OFF_I2C_XACT_SZ,
+               "SHM: I2C 事务区尺寸非法");
+_Static_assert(OFF_I2C_XACT >= OFF_PERSIST_STAT + 32u,
+               "SHM: I2C 事务区与 PERSIST_STAT 重叠 (PERSIST_STAT 占 32B)");
+
 #define OFF_PERSIST_STAT_SZ     32u      /* 8 字: 见 manifest.h 的字段说明 */
 _Static_assert(OFF_WDT_STAT + OFF_WDT_STAT_SZ <= OFF_PERSIST_STAT,
                "SHM: PERSIST_STAT 与 WDT 状态区重叠");
