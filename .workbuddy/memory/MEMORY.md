@@ -147,6 +147,21 @@ pyocd reset                       # 之后串口 0x39 op=7 重新校时(DWT)
 export PATH="/usr/bin:/bin:/mingw64/bin:/c/Windows/System32:$PATH"   # shell 初始化脚本坏了, 必须显式 export
 ```
 - ★ 串口**按能力字认**（两个 CH340，认能力字 **0x0DF7**，别取"第一个 CH340"）；历史上 COM18，步进台架那次 COM21。
-- **`0x39 PIN_PATTERN` op 族**：`1` 开诊断/`2` 64B 快照/`3` 让路/`4` 黑匣子/`5` 触发源/`6` 触发链自证/`7` 重新校时/`8` 原始注入/`9` 桥寄存器透视/`10` 原始写 LIFCR·CCR·CTBR·CTCR/`11` 双写/`13` TC 速率/`16` 抖动累積/`19 sub=1,7,8,9,10` 步进静态探针（应答 **96 B**，偏移 76/80/84/88/92 = `GPIOA_IDR`/`GPIOE_IDR`/`CCMR1`/`CCR1`/`ARR`）
+- **`0x39 PIN_PATTERN` op 族（★ 已核实：**交付固件只有 8 个**）**：`0` 关 / `1` 开+清统计 / `2` 引脚快照(64B) / `3` ISR 让路延时 / `4` 黑匣子开关 / `17` AS5600 上电诊断(64B) / `18` AS5600 运行态(40B) / `19 sub=0..10` 步进+静态探针+寄存器透视（应答 **96 B**，偏移 76/80/84/88/92 = `GPIOA_IDR`/`GPIOE_IDR`/`CCMR1`/`CCR1`/`ARR`）
+  ★ **`op=5..13` 只活在实验补丁**（`docs/exp-2026-09-14-mdma-trigger`，README 明确"不提交"）；**`op=12/14/15/16` 全仓查无** ⇒ 本行原写的 "`1/2/3/4/5/6/7/8/9/10/11/13/16/19`" **是错的**（2026-09-16 更正）。
+  ★ 定位 = **临时脚手架，不是架构的一部分**：未进 SHM、无 `obs_anchor()` 登记、不占能力位、**③层程序不得依赖它**。
 - **工具**：`tools/` 有 `h723_trig_verify.py`、`h723_stepper_test.py`、`dclc.py`、`h723_audit_m234.py`；`docs/audit/` 有 `h723_prog_store_test.py`、`h723_limit_tick_probe.py`，该目录沿用 AUDIT/RESPONSE 配对惯例
 - **协议**：帧 `[SYNC 0xC0/0xC1][CMD][LEN:2][PAYLOAD][CRC16-CCITT]`，`FRAME_PAYLOAD_MAX=6150`。`0x38` 已 39 → **51 B**（尾部追加 `uart_ore/uart_drop/frame_bad`，前 31 B 布局未动 ⇒ `len>=39` 读法兼容）。
+- **发布基线**：**`v2.0.0`**（2026-09-16）—— 说明 `docs/RELEASE-v2.0.0.md`，契约 v1 `docs/REF-program-contract.md`。
+- **构建闸门现在有三道**：ISR 调用树 / 应答缓冲区越界（`tools/h723_ackbuf_check.py`）/ ③层静态判据（`tools/dcl_static_check.py`）。★ 两个工具都**自带 `--selftest` 与覆盖度自报**（覆盖不足 ⇒ 判据判为**无效**，不是"干净"）。
+
+## 九、回归跑测规程（2026-09-16 立，踩过才写的）
+1. ★★ **先让板子回 bench 态**：`0x49 PROG_ERASE` + 复位。空卡时上电填 bench profile =
+   **`n_routes=128 run=1`**。SD 上留着程序（如 `hiloop.dcl` ⇒ 7 路由）会让 `h723_w2_probe`
+   **FAIL 3 项** —— 那是**板态不是回归**（实测：擦掉即回到 14 PASS / 0 FAIL）。
+2. ★★ **判据用"有没有出现新的失败模式"，不要用"PASS 数不低于某值"**：
+   `h723_w2_probe` **同固件连跑三次 = 13/1、11/3、13/1**（**自身非确定**）。
+   `h723_persist` 基线是 **7/19**（记录的 9/17 来自另一个板态）。
+3. ★ 做 A/B 必须**先固定板态**（同板 / 同判据 / 同 prep），否则差异分不清是代码还是状态。
+4. ★ 用 `git show <rev>:file > file` 取旧文件做对照前，**先确认工作区没有未提交编辑**
+   —— 它会把它们**静默覆盖**（本轮已踩一次，re-apply 才补回）。
