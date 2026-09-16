@@ -56,6 +56,7 @@
 #include "faultlog.h"   /* 统一故障台账: 主循环/ISR/协议层的异常都留案底 */
 #include "manifest.h"   /* 诊断资源目录: 0x64 让板子自报"哪里出问题读什么" */
 #include "i2c_sm.h"     /* ★ G6-1: 拍内 I2C 事务状态机 (契约 §3.6 四条约束 / §3.7 实施) */
+#include "timebase.h"   /* ★ 生产时基 = TIM5 (不再押在调试单元 DWT 上) —— 见该头文件的说明 */
 
 /* ★ 总线独占门（契约 §3.6 约束③「总线独占门」）——
  *   = "阻塞路径正在用总线"。**唯一写者**是主循环里包住 `as5600_poll` 的那一段（公理②）。
@@ -923,7 +924,14 @@ ISR_PLACE void TIM2_IRQHandler(void)
      *   用来区分"所有总线都停"与"只有 APB 停下来"。读法: 复位后看 BOOT_REC[41] 的段号。 */
     ISR_CKPT(9);
 
-    uint32_t t0 = DWT_CYCCNT;
+    /* ★★★ 生产时基 (2026-09-16): **不再用 DWT_CYCCNT** —— 它是调试单元, 调试器会话收尾会
+     *   主动清 `DEMCR.TRCENA` 把它关掉 (pyOCD #1540 / SEGGER KB 明文的**设计行为**)。
+     *   改用 TIM5 自由运行 32 位计数器（5ns @200MHz）。DWT 降级为**第二条独立路径**:
+     *   扫描段会同时读它并在那里比对（`g_dwt_dead_n` / `g_tb_dead_n`），
+     *   于是"DWT 死了"是一个**可计数、可读走**的量。本处只读时基。
+     *   ★ 必要性不止"量准": `flash.c` 拿 DWT 当**超时判据**, DWT 一冻 ⇒ 超时永不触发
+     *     ⇒ 有界喂狗退化成无限喂狗 ⇒ **卡死且看门狗失效**。见 docs/ASSESS-toolchain-2026-09-16.md */
+    uint32_t t0 = tb_cyc();
 
     /* ★★ 时基活性 —— **检测必须与"使用"同源** (2026-09-13 修, 回应审计的口径不一致):
      *   原先 `g_timebase_dead` 只由**主循环**("连续 100 轮 CYCCNT 不推进")置位, 而
@@ -1211,7 +1219,8 @@ ISR_PLACE void TIM2_IRQHandler(void)
 
         g_engine_run_seen = SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN);
         if (g_engine_gate && g_engine_run_seen) {
-            uint32_t ta = DWT_CYCCNT;
+            uint32_t ta = tb_cyc();          /* ★ 生产时基（TIM5）：不受调试器影响 */
+            uint32_t wa = DWT_CYCCNT;        /* 对照路径（可能被调试器冻住）*/
             uint32_t sel = g_engine_sel;
             uint32_t ck;
             uint32_t nrun = 0;
@@ -1235,7 +1244,21 @@ ISR_PLACE void TIM2_IRQHandler(void)
                          : engine_scan_flash(g_shm, 0, n);
                 nrun = n;
             }
-            uint32_t tb = DWT_CYCCNT;
+            uint32_t tz = tb_cyc();
+            uint32_t wz = DWT_CYCCNT;
+
+            /* ★★ 两条路径**互相监看** —— "时基在走"从此是一个**可读走的量**, 不再靠约定:
+             *   时基动/DWT 不动 ⇒ DWT 被调试器关了（`g_dwt_dead_n`）
+             *   时基不动/DWT 动 ⇒ 我们的 TIM5 出问题（`g_tb_dead_n`）
+             * 成本 ≈ 两次减法 + 两次比较, 每拍一次。★ 判据必须能失败: 跑一次 `pyocd reset`
+             * 就能让 `g_dwt_dead_n` 从 0 涨起来（而 1 档的统计**照常工作**）。 */
+            {
+                uint32_t d_tb  = tz - ta;
+                uint32_t d_dwt = wz - wa;
+                if (d_tb  == 0u && d_dwt != 0u) { g_tb_dead_n++; }
+                if (d_dwt == 0u && d_tb  != 0u) { g_dwt_dead_n++; }
+                g_tb_cyc_last = d_tb;
+            }
 
             g_eng_sel_used = sel;
             g_eng_n_used   = g_n_routes;
@@ -1244,7 +1267,7 @@ ISR_PLACE void TIM2_IRQHandler(void)
             g_eng_routes_total += nrun;
             g_eng_ticks++;
 
-            uint32_t d = tb - ta;
+            uint32_t d = tz - ta;
             g_eng_cyc_last = d;
             if (!g_eng_cyc_first) g_eng_cyc_first = d;     /* ★ 首样本留痕 (H5) */
             if (d < g_eng_cyc_min) g_eng_cyc_min = d;
@@ -1380,7 +1403,12 @@ ISR_PLACE void TIM2_IRQHandler(void)
         }
 #endif
 
-        uint32_t t1 = DWT_CYCCNT;
+        /* ★★★ 2026-09-16: 这里的尾读**必须与头部的 t0 同源** —— 头部已改成 `tb_cyc()`(TIM5)。
+         *   第一版漏了这一处 ⇒ `di = DWT_CYCCNT - TIM5_CNT` **把两个不同计数器相减**,
+         *   实测表现: `emax = 3.7e9`(垃圾) 且 `ov` **每拍都判超预算**（15050/15050）。
+         *   ★ 这正是"半个对齐比不对齐更坏"的又一次: 改了一半、看起来能编译、数值全是垃圾。
+         *   ★ 而且 `ov` 不是纯观测 —— 它喂给动态预算门, 所以 DWT 一死会让引擎**自认为每拍超支**。 */
+        uint32_t t1 = tb_cyc();
         uint32_t di = t1 - t0;
         g_isr_cyc_last = di;
         if (!g_isr_cyc_first) g_isr_cyc_first = di;    /* ★ 首样本留痕 (H5) */
@@ -1403,10 +1431,14 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *     它与 EXEC_DEPLOY_BUDGET(26000, 下载期静态门) 是**两个语义不同的量**,
          *     刻意分开命名 —— 见 engine.h 里那段"一常量两用"的说明。
          *   ★ 成本: 一次比较 + 极少发生的自增 ⇒ 热路径可忽略。 */
-        if (di > EXEC_BUDGET_CYCLES) {
+        /* ★ 预算按**时间**表达（80 µs），不写死频率 —— 见 timebase.h 的 EXEC_BUDGET_TB。
+         *   这条断言是"两档表达同一个物理预算"的**机器判据**（0 档 32000 cyc / 1 档 16000 tick）。 */
+        _Static_assert(TB_US(80u) == EXEC_BUDGET_CYCLES || (TB_HZ != CLK_SYSCLK_HZ),
+                       "TB 档的预算必须与 EXEC_BUDGET_CYCLES 表达同一个物理量 (80µs)");
+        if (di > EXEC_BUDGET_TB) {
             g_isr_overrun++;
             /* ★ 台账: 上下文 = (实测周期, 预算上限) —— 超了多少一眼可见 */
-            fault_record(g_shm, FAULT_ISR_OVER, g_tick_count, di, EXEC_BUDGET_CYCLES);
+            fault_record(g_shm, FAULT_ISR_OVER, g_tick_count, di, EXEC_BUDGET_TB);
         }
         /* ★★ #2 修复: samples (g_isr_n) = **仅 RUN 拍** (范本语义)。
          *   范本 `core0_isr.c:358` 的 `SAMPLES += 1` 写在 `if (!run) return` **之后**
@@ -2412,6 +2444,38 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         put32(r + 88, TIM_CCR1(TIM3_BASE_ADDR));   /* ★ **实时** CCR1 (与 r+24 的缓存对比) */
         put32(r + 92, TIM_ARR(TIM3_BASE_ADDR));    /* ★ **实时** ARR  (与 r+20 的缓存对比) */
         ack(r, 96u);
+        return;
+    }
+    if (op == 21u) {
+        /* ★★★ 时基健康度（2026-09-16）—— 交付固件此前**没有**"时基在走"的可读量:
+         *   `0x39 op=7`(重新校时)只活在实验补丁里 ⇒ 时基死了在协议面上**无法自证**
+         *   ⇒ 死时基会让所有统计**看起来完美稳定**（本项目铁律第 1 条要防的空判据）。
+         * 应答 40B（每项都能失败）:
+         *   +0 时基档 (1=TIM5 交付 / 0=DWT 改前对照)   +4 时基频率 Hz
+         *   +8 **自检探针 Δ**（=0 即时基是死的）        +12 时基不动而 DWT 在动 的次数
+         *   +16 **DWT 不动而时基在动 的次数**（调试器停的——跑一次 pyocd 就该涨）
+         *   +20 最近每拍时基增量                       +24 pmin(哨兵→0)  +28 pmax
+         *   +32 ISR 执行最大周期                       +36 超预算次数
+         * ★ 判据: 若 DWT 被杀, `+16` 应从 0 涨起来, 而 `+24/+28` **照常正常** —— 这就是"换了
+         *   时基之后调试器再也弄不坏我们"的正证据。 */
+        uint8_t rx[40];
+        put32(rx +  0, (uint32_t)DCL_TIMEBASE);
+        put32(rx +  4, (uint32_t)TB_HZ);
+        /* ★ 探针必须有**间距**：连读两次同一寄存器恒为 0 ⇒ 那会是一条**空判据**
+         *   （本项目最常见的假判据形态）。这里夹一段 nop 循环，Δ=0 才真的意味着"时基死了"。 */
+        {
+            uint32_t a = tb_cyc();
+            for (volatile uint32_t i = 0u; i < 400u; i++) { __asm__ volatile("nop"); }
+            put32(rx + 8, tb_cyc() - a);
+        }
+        put32(rx + 12, g_tb_dead_n);
+        put32(rx + 16, g_dwt_dead_n);
+        put32(rx + 20, g_tb_cyc_last);
+        put32(rx + 24, (g_per_cyc_min == 0xFFFFFFFFu) ? 0u : g_per_cyc_min);
+        put32(rx + 28, g_per_cyc_max);
+        put32(rx + 32, g_isr_cyc_max);
+        put32(rx + 36, g_isr_overrun);
+        ack(rx, 40u);
         return;
     }
     if (op == 20u) {
@@ -3672,6 +3736,11 @@ int main(void)
 
     /* ④ DWT 标定 */
     dwt_enable();
+    /* ★★★ 生产时基（TIM5）—— 必须紧跟 dwt_enable() 之后:
+     *   `dwt_enable()` 现在只负责"打开对照路径(DWT)"; **生产统计全部走 TIM5**。
+     *   ★ 顺带解惑: 上述"时钟不连续保护"是因为 `dwt_enable()` 清 CYCCNT;
+     *     换成 TIM5 之后 TIM5 没人清 ⇒ 该保护不会再触发（保留它无害, 且对 0 档仍必要）。 */
+    tb_init();
     calibrate();
     /* ★★★ 计时统计的**冷启动初始化** (2026-09-11 实测缺陷修复):
      *   这批量 (`g_isr_n` / `g_isr_cyc_*` / `g_per_cyc_*` / `g_per_prev`) 住在 **DTCM**,

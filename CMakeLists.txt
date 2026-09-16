@@ -152,6 +152,17 @@ set(DCL_IO_IN_ISR "1" CACHE STRING "I/O 驱动位置 (1 ISR 拍内 / 0 主循环
 #     ⇒ **PE0~PE7 被静默清零, DO 0..7 永不可用**（观测面看不出来, 寄存器读回全对）。
 set(DCL_DO_LATCH "0" CACHE STRING "DO 输出路径 (0 CPU直写=交付 / 1 影子+MDMA锁存=对照)")
 
+# ---- ★★★ 生产时基 A/B 对照开关 (2026-09-16) ----
+#   1 = **交付**: 生产时基 = **TIM5**（普通 32 位定时器, 200MHz ⇒ 5ns）—— **不受调试器影响**
+#   0 = **改前行为对照**: 生产时基 = **DWT_CYCCNT**（400MHz ⇒ 2.5ns）—— 调试器会话收尾会清
+#       `DEMCR.TRCENA` 把它关掉, 而 `flash.c` 拿它当**超时判据** ⇒ DWT 一死, 超时永不触发
+#       ⇒ "有界喂狗"退化成**无限喂狗** ⇒ **卡死且看门狗失效**。
+#   依据（三个独立来源）: pyOCD issue #1540 / SEGGER KB(J-Link 同款) / ARMv7-M ARM("Debug state 时暂停")。
+#   评估全文: docs/ASSESS-toolchain-2026-09-16.md
+#   ★ 判据（能失败的）: 跑一次 `pyocd reset`（把 DWT 弄死）之后, 0 档的 `h723_jitter` 必须红,
+#     而 1 档必须仍然绿 —— 这就是这个开关存在的全部意义。
+set(DCL_TIMEBASE "1" CACHE STRING "生产时基 (1=TIM5 抗调试器=交付 / 0=DWT 改前行为对照)")
+
 # Cortex-M7 + 双精度 FPU + 硬浮点 (与老项目 build.bat 一致)
 set(MCU_FLAGS -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb)
 
@@ -201,6 +212,7 @@ add_compile_options(
     -DHIL_SAFE=${DCL_HIL_SAFE}
     -DIO_IN_ISR=${DCL_IO_IN_ISR}
     -DDCL_DO_LATCH=${DCL_DO_LATCH}
+    -DDCL_TIMEBASE=${DCL_TIMEBASE}
 )
 
 # syscalls.c 是 newlib 桩: 函数签名由 newlib 规定, 参数天然用不上。
@@ -254,6 +266,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/hil.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/i2c_bb.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/i2c_sm.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/timebase.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/as5600.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/step.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/prog_store.c

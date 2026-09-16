@@ -235,6 +235,14 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
  *     TIM1=0x40010000 TIM8=+400 TIM6=0x40001000 TIM7=+400
  * TIMxCLK = 2×PCLK = 200MHz (DxPPRE ≤ 4; 权威定义在 clock.h 的 CLK_TIMXCLK_HZ) */
 #define TIM2_BASE       0x40000000UL
+/* ★ 生产时基 (src/timebase.*): TIM5 自由运行 32 位计数器。
+ *   为什么不用 TIM2/3/4 —— TIM2=100µs 拍、TIM3=步进脉冲 (TIM4 未被占用但留作备用)。
+ *   为什么不用 DWT_CYCCNT —— 它是**调试单元**, 调试器会话收尾时会主动清 `DEMCR.TRCENA`
+ *   把它关掉 (pyOCD #1540 / SEGGER KB 均有明文), 而 `flash.c` 拿它当**超时判据** ⇒
+ *   DWT 一死, 超时永不触发 + 有界喂狗退化成无限喂狗 ⇒ **卡死且看门狗失效**。
+ *   详见 docs/ASSESS-toolchain-2026-09-16.md。TIM5 = APB1 上的 32 位定时器, 不受调试器影响。 */
+#define TIM5_BASE       0x40000C00UL
+#define RCC_APB1LENR_TIM5EN  (1u << 3)
 #define TIM_CR1(t)      REG32((t) + 0x00)
 #define TIM_DIER(t)     REG32((t) + 0x0C)
 #define TIM_SR(t)       REG32((t) + 0x10)

@@ -11,12 +11,22 @@
 #include "regs.h"
 /* ★★ 有界喂狗需要 wdt_feed() (2026-09-13, 实测缺陷修复 —— 见 fl_wait_qw 内注释) */
 #include "wdt.h"
+#include "timebase.h"   /* ★★ 2026-09-16: 超时判据改用**生产时基**(TIM5), 不再用 DWT —— 见下 */
 
 /* 超时阈值 (DWT 周期数; 400MHz 下 1 秒 = 4e8)。
  * 擦除上限给 8 秒, 编程一个字给 1 秒 —— 都不可能在正常硬件上触发,
  * 只在"控制器真的卡住"时兜底 (此时 SWD 仍可读, 便于定位)。 */
-#define FL_ERASE_TIMEOUT_CYC   (8u * 400000000u)
-#define FL_WRITE_TIMEOUT_CYC   (1u * 400000000u)
+/* 超时阈值 —— ★★ 2026-09-16 口径变更: 单位从"DWT 周期(@400MHz)"改成"**时基计数**",
+ *   并且**不再把 400000000 写死在常量里**（那是"一个常量两个语义"族:
+ *   换时基时这一处必被漏掉）。现在唯一来源是 `timebase.h` 的 `TB_HZ` ⇒ 换档自动跟随。
+ *   ★★ 更要紧的是**为什么必须换**: 本函数用超时判据兜"控制器卡住", 而紧跟其后的
+ *     "有界喂狗"只在**预算内**喂。若时基被冻住, `(now - t0) > timeout` **永不成立**
+ *     ⇒ 超时永不触发 ⇒ **无限喂狗** ⇒ 卡死时主循环永不返回、看门狗也失效。
+ *     调试器会话收尾恰好会把 DWT 关掉（pyOCD #1540 / SEGGER KB）⇒ 这是**可达**的故障。
+ *     依据与实测: docs/ASSESS-toolchain-2026-09-16.md
+ *   8s @200MHz = 1.6e9; 1s @200MHz = 2e8 —— 都在 u32 内。 */
+#define FL_ERASE_TIMEOUT_CYC   TB_MS(8000u)
+#define FL_WRITE_TIMEOUT_CYC   TB_MS(1000u)
 
 /* ★★ 必须进 ITCM 的属性 (2026-09-13, 一次实测缺陷的直接产物) —— 见 fl_wait_qw 的注释。
  *   本项目对"向量表 + ISR 进 ITCM"早有定案, 这里是同一条纪律的**遗漏面**:
@@ -26,7 +36,7 @@
 
 FL_ITCM static uint32_t fl_cyccnt(void)
 {
-    return DWT_CYCCNT;
+    return tb_cyc();      /* ★ 生产时基(TIM5): 不受调试器影响 —— 这就是"不再挂死"的那一步 */
 }
 
 /* ★ 诊断面: 记录最近一次"检测到错误标志"时的原始 SR1 / CCR1 以及出错阶段。

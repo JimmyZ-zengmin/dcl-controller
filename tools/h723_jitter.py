@@ -93,7 +93,41 @@ ROUTE_FLAG_ACTIVE = 0x01
 PERIOD_PHASE_SHIFT = 2
 DIV_FAST, DIV_MID, DIV_SLOW = 0, 1, 2
 
-TICK_CYC = 40000          # 100us @ 400MHz (clock.h 的假定值)
+TICK_CYC = 40000          # 默认按 400MHz(DWT 档) 假定; ★ 运行时由 tb_resolve() 覆盖
+
+# ══════════ ★★★ 判据的"单位随档而变"（2026-09-16）══════════
+# 本套件的阈值原本写死在 **DWT 周期(@400MHz)** 上: 拍 40000 cyc、稳定带 ±1000 cyc、
+# 负载无关 ≤ 基线+16 cyc、T1 ±32 cyc。
+# 而交付固件现在用 **生产时基 = TIM5(@200MHz, 5ns)** ⇒ 同一物理量的**计数减半**
+# （拍 = 20000 tick）。照抄旧数字会得到**假红**。
+# ⇒ 正确做法: 判据要表达**物理量**(时间)，计数按当前时基换算。
+#   官方频率由 `0x39 op=21` 给出（约定: 该 op 的应答 +4 = 时基频率 Hz；旧固件 NAK ⇒ 退回 400MHz）。
+TB_HZ = 400000000
+TICK_CYC = 40000
+STABLE_TOL = 1000         # 原 ±1000 cyc @400MHz = ±2.5µs
+LOAD_TOL = 16             # 原 +16 cyc = 40ns
+T1_TOL = 32               # 原 ±32 cyc = 80ns
+
+
+def tb_resolve(L):
+    """读 `0x39 op=21` 拿时基频率, 并把全部阈值按**时间**换回计数。
+    ★ 参数是 `h723_modbus.Link`（本套件走的是 Link, 不是 h723_client.Dcl）。"""
+    global TB_HZ, TICK_CYC, STABLE_TOL, LOAD_TOL, T1_TOL
+    try:
+        sts, p = L.xact(0x39, struct.pack("<BBI", 21, 0, 0))
+        if sts == 0 and len(p) >= 8:
+            hz = struct.unpack_from("<I", p, 4)[0]
+            if hz >= 1000000:
+                TB_HZ = hz
+    except Exception:                                          # noqa: BLE001
+        pass        # 旧固件没有 op=21 ⇒ 退回 400MHz 假定（并在下面打印出来）
+    us = TB_HZ / 1000000.0
+    TICK_CYC   = int(TB_HZ // 10000)      # 100 µs
+    STABLE_TOL = int(us * 2.5)            # ±2.5 µs（= 原 1000 cyc @400MHz）
+    LOAD_TOL   = max(1, int(us * 0.04))   # 40 ns（= 原 16 cyc @400MHz）
+    T1_TOL     = max(1, int(us * 0.08))   # 80 ns（= 原 32 cyc @400MHz）
+    print(f"时基: {TB_HZ/1e6:.0f} MHz ⇒ 拍标称 {TICK_CYC} 计数 (100µs); "
+          f"稳定带 ±{STABLE_TOL}; 负载容差 +{LOAD_TOL}; T1 ±{T1_TOL}")
 
 RESULTS = []
 
@@ -226,12 +260,12 @@ def main():
         s0["spread"] = spread          # ★ 必须无条件挂上: 调用方要读它取基线,
         if spread is None:             #   之前只在成功路径上赋值 ⇒ 失败时调用方 KeyError 崩掉
             record(name, False, "pmin/pmax 为空 (统计刚复位或 CYCCNT 未计数?)"); return s0
-        ok_stable = (TICK_CYC - 1000 < s0["pmin"]) and (s0["pmax"] < TICK_CYC + 1000)
-        ok_load = True if baseline is None else (spread <= baseline + 16)
+        ok_stable = (TICK_CYC - STABLE_TOL < s0["pmin"]) and (s0["pmax"] < TICK_CYC + STABLE_TOL)
+        ok_load = True if baseline is None else (spread <= baseline + LOAD_TOL)
         ok = (ok_stable and ok_load) if not a.expect_fail else (spread != 0)
         detail = ("pmin=%u pmax=%u 入口间隔极差=%d cyc emax=%u samples=%u%s"
                   % (s0["pmin"], s0["pmax"], spread, s0["emax"], s0["samples"],
-                     "" if baseline is None else " (基线+16=%d)" % (baseline + 16)))
+                     "" if baseline is None else " (基线+%d=%d)" % (LOAD_TOL, baseline + LOAD_TOL)))
         record(name, ok, detail)
         s0["spread"] = spread
         return s0
@@ -245,10 +279,11 @@ def main():
            "samples %s→%s" % (sa["samples"] if sa else None, sb["samples"] if sb else None))
 
     # T1 骨架拍 (STOP 态, 只跑骨架)
+    tb_resolve(L)          # ★ 先把阈值按时基频率换算（交付档 TIM5=200MHz ⇒ 拍 20000 计数, 不是 40000）
     L.xact(CMD_RESET); time.sleep(0.15)
     L.xact(CMD_STOP); time.sleep(a.settle)
     st1 = status()
-    ok1 = st1 is not None and abs(st1["pmax"] - TICK_CYC) <= 32
+    ok1 = st1 is not None and abs(st1["pmax"] - TICK_CYC) <= T1_TOL
     record("T1 骨架拍 pmax ≈ %d (测量通道真的在报数)" % TICK_CYC, ok1,
            "pmax=%s (差 %s cyc)" % (st1["pmax"] if st1 else None,
                                     (st1["pmax"] - TICK_CYC) if st1 else "?"))
