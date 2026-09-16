@@ -34,6 +34,10 @@ class Fake:
         self.flaws = set(flaws)
         self.present = present
         self.nodevbind = nodevbind
+        # ★ 先于 reset_state 初始化: B10 变异让 reset_state **不**清门, 若这里不先建
+        #   属性, 第一次 reset_state 之后就会 AttributeError（自测会崩而不是判红）。
+        self.refs = 0
+        self.owner = 0
         self.reset_state()
 
     # ---- SHM 访问 ----
@@ -210,6 +214,8 @@ class Fake:
         self.last_start = self.tick
         self.busy = 1
         self.inflight_left = 8
+        self.refs += 1                     # acquire（正常实现会在收尾配对归还）
+        self.owner = 2                     # I2C_OWNER_SM
 
     def loop(self):
         self.tick += 1
@@ -248,7 +254,9 @@ class Fake:
             sub = payload[1] if len(payload) >= 2 else 0
             if op == 22 and sub == 2:
                 st = 1 if self.busy else 2           # 1=BUSY(在飞) 2=OK
-                return 0x00, struct.pack("<9I", 0, 0, 0, 0, st, 0, 0, 0, 0)
+                # +4 owner / +32 refs —— T9 就是靠这两个量判"门干不干净"
+                return 0x00, struct.pack("<9I", 0, self.owner, 0, 0, st, 0, 0, 0,
+                                         self.refs)
             return 0xFF, b"bad sub"
         if cmd == T.CMD_READ_BURST:
             a, c = struct.unpack("<IH", payload[:6])
@@ -291,7 +299,8 @@ def make_board(f):
     return b
 
 
-def run(flaws=(), present=False, nodevbind=False, mode="words", rounds=4, observe=0.03):
+def run(flaws=(), present=False, nodevbind=False, mode="words", rounds=4, observe=0.03,
+        reset_at_end=True):
     T._N_PASS = T._N_FAIL = T._N_SKIP = 0
     f = Fake(flaws, present=present, nodevbind=nodevbind)
     b = make_board(f)
@@ -310,7 +319,12 @@ def run(flaws=(), present=False, nodevbind=False, mode="words", rounds=4, observ
         # ★ 必须接住 t7_cleanup 返回的 seq —— 丢了它 T8 就会用**已生效的旧序号**提交,
         #   固件按"幂等"直接忽略 ⇒ T8 整段变成假判据（本次自测抓到过）。
         seq = T.t7_cleanup(b, seq, used, T.DB_PERIOD_DEF)
-        T.t8_inflight_swap(b, seq, used, 7, T.DB_PERIOD_DEF, rounds, observe)
+        # ★ 同样必须接住 T8 的返回值: T8 内部会提交表 A / 表 B 共 rounds+2 次,
+        #   req_seq 已经往前走了很多; 丢掉它就等于用**早已过期的 seq** 去提交收尾空表
+        #   ⇒ 固件判"回退"⇒ reject=2(SEQ) ⇒ T7.1 假红（本次自测又抓到一次同款）。
+        seq = T.t8_inflight_swap(b, seq, used, 7, T.DB_PERIOD_DEF, rounds, observe)
+        seq = T.t7_cleanup(b, seq, used, T.DB_PERIOD_DEF)   # ★ 与 main 一致: T8 后又立了表
+        T.t9_teardown(b, want_reset=reset_at_end)
     return T._N_PASS, T._N_FAIL, T._N_SKIP, buf.getvalue(), True
 
 
@@ -323,6 +337,13 @@ CASES = [
     ("B4 拒绝不回 done_seq(done_seq_off)", ("done_seq_off",), False, False, ">0"),
     ("B5 submit 未被主循环调用(nosubmit)", ("nosubmit",), False, False, ">0"),
     ("B8 立即换表(swap_now) ★T8 专测", ("swap_now",), True, False, ">0"),
+    # B9: 收尾不归还总线门 ⇒ refs 只增不减 ⇒ T9.1 必须红（下一个套件会假失败的那个缺陷）
+    ("B9 收尾不还总线门(leak_refs) ★T9.1 专测", ("leak_refs",), True, False, ">0"),
+    # B10: 组合变异 —— T9.2 是"清场手段有效性"判据, 它**只在**前置违约存在时才有意义
+    #      （refs 本就是 0 时, RESET 后当然还是 0 ⇒ 无从失败）。所以必须"泄漏 + RESET 不清门"
+    #      一起给, 才能证明 T9.2 有失败路径。
+    ("B10 泄漏+RESET 不清门 ★T9.2 专测",
+     ("leak_refs", "reset_keeps_refs"), True, False, ">0"),
 ]
 
 if __name__ == "__main__":

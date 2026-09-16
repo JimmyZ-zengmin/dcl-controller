@@ -110,7 +110,17 @@ CMD_RESET      = 0x13
 CMD_SEQ_DEPLOY = 0x44
 
 # 程序常量
-SRC_W  = 0       # 条件源 wire (测试摇杆, 由测试写)
+# ★★ SRC_W = 17, **不是 0** (2026-09-16 修判据前提缺陷)。
+#   原因: bench profile (`engine_fill_tables`, src/engine.c:684-688) 的路由
+#   `i%3==0 → src=SENSOR[i%64]`, `dst_channel = i%128` 恰好**写满全部 128 个 WIRE 槽**
+#   ⇒ 上电后没有任何"空闲 WIRE 槽"可言。其中 i=0 把 **SENSOR[0] (= AS5600 RAW angle,
+#   实测 3347.0)** 映进 WIRE[0] ⇒ T28 用 WIRE[0] 当"摇杆"时, START 那一刻条件
+#   `> 0.5` 就已经成立, 序贯器直接推 2 步 ⇒ T28.B1 恒 FAIL (现象 cur=2 / W5=3.00 / W6=1.00)。
+#   17 的取值理由: `17%3==2 → src=SRC_CONST` ⇒ 上电值恒 `0.002+(17%7)*0.001 = 0.005`,
+#   **不依赖任何传感器槽** (槽的归属会变, 正是上一轮 T8 踩的同一个陷阱), 远低于 `>0.5`。
+#   ★ 设值仍走 `_w32(...)` (pyocd 直写): T28 链里 `0x10 deploy` 会把表**换成 1 条**,
+#     此后没有路由再写这个槽 ⇒ 直写真能站住 (段1~4 一直如此, 由 C1/C2/C3/D1 自证)。
+SRC_W  = 17      # 条件源 wire (测试摇杆, 由测试写)
 MIRROR = 5       # seq 步号镜像 wire
 DECODE = 6       # 译码输出 wire
 TMO_S  = 0.05    # 超时 0.05 秒 (= 500 拍 @ div0 100μs)
@@ -457,8 +467,8 @@ def t28(syms, A, observe_ms=40, timeout_ms=900, BOOT_MS=250):
     deploy_payload = struct.pack("<HHH", 1, 3, 0) + RT + P0 + P1 + P2
 
     # seq 程序: 3 步 (step0 用 param0, step1 用 param2, step2 超时用 param0.b)
-    steps_bytes = (seq_step(1, SRC_W, 0x00, 0) +      # step0: WIRE[0] > 0.5
-                   seq_step(1, SRC_W, 0x00, 2) +      # step1: WIRE[0] > 3.0
+    steps_bytes = (seq_step(1, SRC_W, 0x00, 0) +      # step0: WIRE[SRC_W] > 0.5
+                   seq_step(1, SRC_W, 0x00, 2) +      # step1: WIRE[SRC_W] > 3.0
                    seq_step(2, 0,     0x03, 0))       # step2: 纯超时 + loop
     seq_payload = seq_frame([(3, MIRROR, 0, steps_bytes)])
     assert len(steps_bytes) == 48

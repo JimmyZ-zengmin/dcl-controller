@@ -39,8 +39,26 @@ h723_dev_bind_test.py — G6-4 **具名设备绑定表**的上机验收
                           ★ 构造: `DB_PERIOD=1`（合法值）+ 事务跨 8 拍 ⇒ 几乎总有事务在飞;
                             表 B 指向**不存在**的从机 ⇒ 它生效后永不写 `SENSOR[15]`,
                             于是 `SENSOR[15] != 哨兵` 就只可能是"用错 lane"。
-                          ★ 本轮判据正方向也必须能失败: 每轮都要求 `err_n` 在涨
+                          ★ 正方向也必须能失败: 本轮期间 `err_n` **必须**有增长
                             （证明 B 真的在执行, 而不是"B 没生效所以没写"）。
+                            ★ 判据形式是**聚合**（N 轮里 ≥1 轮增长），不是"每轮都必须涨":
+                              `dev_bind` 与 AS5600 的**阻塞轮询**共用同一条总线（契约
+                              §3.6 约束③）, 某一轮 0.6s 内一次都没抢到门是**合法竞争**
+                              —— 逐轮判会把"环境"读成"固件缺陷"（2026-09-16 上机实测
+                              遇到过: 某轮 `err_n +0` 而同轮 `skip_n` 在涨）。
+                              聚合**不损失**捕捉力: B 压根没执行 ⇒ 总增量 0 ⇒ 照样红。
+                              每轮的 `err_n`/`skip_n` 增量都会打出来（skip 涨 = 该轮只是
+                              没抢到总线, 不是"服务方没跑"）。
+                          ★ **命中必须复读确认**（否则会把主机侧串帧读成固件缺陷）:
+                            实测抓到过一次 `SENSOR[15]` 的位模式 = `0x1DF70200`
+                            = `fw_ver(0x0200) | cap(0x1DF7)<<16` —— 那是 **0x01
+                            GET_VERSION 的应答载荷**, 一次 0x22 读回的槽值**不可能**
+                            长成这个形状 ⇒ 主机侧**串帧**（根因: `h723_w1.Link.xact()`
+                            只校验 SYNC/长度/CRC16、**不校验命令码**, 而所有 ACK 帧的
+                            cmd 都是 0x00; 本机**两个 CH340 通到同一块板子**是已知条件）。
+                            真缺陷的错值是**粘住**的 ⇒ 复读仍是同值 ⇒ 照样判红;
+                            串帧则复读即恢复哨兵值。命中时另读一次 `DB_MAGIC` 做旁证
+                            （magic 也错 = 铁证协议层）。噪声次数会打在本轮 detail 里。
   T9 收尾副作用可观测    —— 失败路径: 任何 `acquire` 后不配对 `release` ⇒ 总线门
                           `refs != 0` / `owner != NONE`（由 B9 变异证明能红）。
                           ★ 为什么必须有它（**判据缺口, 由 regress-verify 实测暴露**）:
@@ -788,6 +806,47 @@ def sm_gate_query(b):
                 sm_status=f[4], sm_phase=f[5], bb_tx=f[6], bb_nak=f[7], refs=f[8])
 
 
+def _same_f32(a, c):
+    """按位比较两个 float32（避免 NaN / 极小值的数值比较陷阱）。"""
+    if a is None or c is None:
+        return False
+    return struct.pack("<f", a) == struct.pack("<f", c)
+
+
+def _confirm_hit(b, sentinel, first, tries=3, gap=0.03):
+    """T8 命中后的**复读确认** —— 把「固件真的写错了槽」与「主机读到了别的帧」分开。
+
+    ## 为什么必须有（2026-09-16 上机被抓出来的，不是理论风险）
+    T8 的密轮询跑到 ~230 次/秒。真板上实测抓到过一次:
+        `SENSOR[15] = 6.538242356772269e-21`
+    而它的**位模式是 `0x1DF70200`** = `fw_ver(0x0200) | cap(0x1DF7) << 16`
+    —— 那是 **`0x01 GET_VERSION` 的应答载荷**，而一次 0x22 读回的 SENSOR 槽
+    **不可能**长成这个形状（它要么是哨兵 `0x45870800`，要么是被写坏的别的数据）。
+    ⇒ 那一次是**主机侧串帧**，不是固件缺陷。
+
+    ## 根因在主机侧（工具链问题，不是本脚本的判据问题）
+    `tools/h723_w1.py:120 Link.xact()` 只校验 **SYNC / 长度 / CRC16**，**不校验命令码**
+    —— 而所有 ACK 帧的 cmd 都是 `0x00`，本来就分不出是谁的应答。于是只要
+      · 有第二个串口同时在跑（本机**两个 CH340 通到同一块板子**，见任务书的"按能力字认口"），或
+      · 某次应答迟到 / 某次 `xact` 超时后那条应答仍然到达
+    就会**串帧**：一次 0x22 的"应答"实际是别人的 payload。`reset_input_buffer()`
+    只能清驱动缓冲，挡不住已经在路上的字节。
+
+    ## 为什么这**不降低**判据的捕捉力
+    判据原文的论断是"错值是**粘住**的（表 B 生效后无人写 `SENSOR[15]`）⇒ 一次读就能判"。
+    那个前提是"读到的必定是 SHM 里的真值" —— 串帧打破了它。所以复读确认是**把前提补回来**:
+      · 真缺陷 ⇒ 错值粘住 ⇒ 复读**仍然**是同一个非哨兵值 ⇒ **照样判红**;
+      · 串帧 ⇒ 复读立刻回到哨兵 ⇒ **不误判**。
+    ★ 另外同时读一次 `DB_MAGIC`（一个不变量）作为**旁证**: magic 若也错 ⇒ 铁证是协议层。
+    """
+    for _ in range(tries):
+        time.sleep(gap)
+        if not _same_f32(b.rd_f(OFF_SENSOR_MAP + 15 * 4), first):
+            return False, None
+    m = b.rd(DB_MAGIC, 1)
+    return True, (m[0] if m else None)
+
+
 def t8_inflight_swap(b, seq, mode, dst, period_restore, rounds, observe):
     """T8 ★ 有事务在飞时换表 ⇒ 新表必须**暂存待生效**（不得用新表的 lane 解释旧事务的数据）。
 
@@ -882,6 +941,8 @@ def _t8_body(b, seq, mode, dst, A, Bt, SENT2, SLOT15, rounds, observe):
     hit = None
     n_rounds_ok = 0
     n_busy_rounds = 0
+    err_deltas = []          # 每轮 err_n 增量（T8.5 的**聚合**判据用它, 理由见循环后）
+    sk_deltas = []           # 每轮 DB_SKIP_N 增量（诊断: 本轮的"没跑"是不是被门挡了）
     for r in range(1, rounds + 1):
         # ① 重新武装哨兵，然后**立刻**提交 B（中间不 sleep —— 要的就是落在在飞窗口里）
         if not b.wr_f(SLOT15, SENT2):
@@ -899,10 +960,11 @@ def _t8_body(b, seq, mode, dst, A, Bt, SENT2, SLOT15, rounds, observe):
             break
         ok, sb = wait_done(b, seq, timeout=2.0)
         base_err = sb["err_n"] if sb else 0
+        base_skip = sb["skip_n"] if sb else 0
 
         # ② 密轮询：哨兵必须**始终**不被改动（错值是粘的，但窗口给足"坏事发生"的机会）
         t0 = time.time()
-        n_rd = n_err = 0
+        n_rd = n_err = n_noise = 0
         while True:
             v = b.rd_f(SLOT15)
             n_rd += 1
@@ -911,22 +973,30 @@ def _t8_body(b, seq, mode, dst, A, Bt, SENT2, SLOT15, rounds, observe):
                 if n_err > 20:
                     break
             elif abs(v - SENT2) > 1e-6:
-                hit = (r, v)
-                break
+                # ★ 命中 **不等于**缺陷 —— 必须复读确认（串帧与真缺陷的区分见
+                #   `_confirm_hit` 的 docstring）。噪声不计入判定, 但要报出来。
+                confirmed, magic_seen = _confirm_hit(b, SENT2, v)
+                if confirmed:
+                    hit = (r, v, magic_seen)
+                    break
+                n_noise += 1
+                continue
             if time.time() - t0 >= observe:
                 break
         if hit:
             break
         sm = snap(b)
         er_delta = (sm["err_n"] - base_err) if sm else 0
+        sk_delta = (sm["skip_n"] - base_skip) if sm else 0
+        err_deltas.append(er_delta)
+        sk_deltas.append(sk_delta)
         record("T8.4 第 %d 轮: SENSOR[15] 仍 == 哨兵 %s（换表落在在飞窗口）" % (r, SENT2),
                back is not None and abs(back - SENT2) < 1e-6,
-               "提交前 SM status=%s%s; 轮询 %d 次/%.2fs（读错 %d）; err_n +%d; done_seq %s" % (
+               "提交前 SM status=%s%s; 轮询 %d 次/%.2fs（读错 %d, 串帧噪声 %d）; "
+               "err_n +%d; skip_n +%d; done_seq %s" % (
                    q["sm_status"] if q else "?", "(BUSY=在飞)" if busy_now else "",
-                   n_rd, observe, n_err, er_delta,
+                   n_rd, observe, n_err, n_noise, er_delta, sk_delta,
                    ("跟上 %d" % seq) if ok else "未跟上"))
-        record("T8.5 第 %d 轮: err_n 在涨（B 真的在执行 ⇒ 上一行不是空判据）" % r,
-               er_delta > 0, "err_n +%d" % er_delta)
         if not ok:
             record("T8.6 第 %d 轮: 表 B 的 done_seq 在 2s 内跟上（暂存后必须补回执）" % r,
                    False, "req=%d done=%s" % (seq, sm["done_seq"] if sm else "?"))
@@ -936,13 +1006,34 @@ def _t8_body(b, seq, mode, dst, A, Bt, SENT2, SLOT15, rounds, observe):
         submit(b, A, seq, mode=mode, period=None)
         wait_done(b, seq, timeout=1.0)
 
+    # ★ T8.5 为什么是**聚合**判据, 不是逐轮判（2026-09-16 上机改的, 附理由）
+    #   `dev_bind` 与 AS5600 的**阻塞轮询**共用同一条总线（契约 §3.6 约束③）。
+    #   某一轮的 0.6s 窗口内服务方一次都没抢到门 —— 这是**合法的调度竞争**（实测存在:
+    #   6 轮里有一轮 err_n +0, 同轮 skip_n 在涨; 另有套件在跑时更容易发生）。
+    #   逐轮判会把"环境"读成"固件缺陷" ⇒ 违反"判据不得依赖被测环境"。
+    #   ★ 而 T8.5 的**目的**只有一个: 证明 T8.4 不是空判据（B 真的被执行过）。
+    #     聚合形式完全达到, 且**不损失任何缺陷捕捉能力**:
+    #     B 压根没执行（服务方没跑）⇒ 总增量 0 ⇒ 照样红。
+    n_err_grew = sum(1 for d in err_deltas if d > 0)
+    record("T8.5 ★ err_n 在涨（B 真的在执行 ⇒ 上面几行不是空判据）",
+           n_err_grew > 0,
+           "%d/%d 轮有增长, 逐轮 err_n 增量=%s（逐轮 skip_n 增量=%s; skip 在涨 = "
+           "该轮只是没抢到总线, 不是固件没跑）" % (
+               n_err_grew, len(err_deltas), err_deltas, sk_deltas))
+
     if hit:
+        r_, v_, m_ = hit
         record("T8.6 ★ 在飞换表时 SENSOR[15] 被改动 ⇒ **用错 lane**"
                "（新表的 dst/len 被用于旧事务的数据）",
-               False, "第 %d 轮读到 SENSOR[15]=%s（哨兵 %s, 而表 B 指向**不存在**的 0x50）"
-               % (hit[0], hit[1], SENT2))
+               False,
+               "第 %d 轮读到 SENSOR[15]=%s（位模式 0x%08X; 哨兵 %s, 而表 B 指向**不存在**"
+               "的 0x50）。★ 已复读确认（连读 3 次同值 ⇒ 排除串帧）; 同期 DB_MAGIC=0x%08X"
+               "（应 0x%08X%s）" % (
+                   r_, v_, struct.unpack("<I", struct.pack("<f", v_))[0], SENT2,
+                   m_ if m_ is not None else 0, DB_MAGIC_VAL,
+                   "" if m_ == DB_MAGIC_VAL else " ← magic 也错 ⇒ 更像协议层串帧"))
         record("T8.7 全部 %d 轮哨兵均未被改动" % rounds, False,
-               "第 %d 轮即失败" % hit[0])
+               "第 %d 轮即失败" % r_)
     elif n_busy_rounds == 0:
         # ★ 构造没成立就不算 PASS —— 否则"没抓到窗口"会被读成"固件没问题"。
         skip("T8.6 哨兵未被动过", "★ 构造未成立: %d/%d 轮的提交时刻 SM 都不是 BUSY ⇒ "
@@ -1022,9 +1113,10 @@ def t9_teardown(b, want_reset=True):
     if q0 is None:
         record("T9.1 收尾读 0x39 op=22 sub=2", False, "无应答")
         return
-    refs0, owner0 = q0["refs"], q0["owner"]
+    refs_first, owner_first = q0["refs"], q0["owner"]
+    refs0, owner0 = refs_first, owner_first
     print("        收尾瞬间: owner=%d(%s) refs=%d sm_status=%d busy_n=%d"
-          % (owner0, I2C_OWNER_NAME.get(owner0, "?"), refs0,
+          % (owner_first, I2C_OWNER_NAME.get(owner_first, "?"), refs_first,
              q0["sm_status"], q0["busy_n"]))
 
     deadline = time.time() + 1.0
@@ -1038,8 +1130,10 @@ def t9_teardown(b, want_reset=True):
     record("T9.1 ★ 收尾时总线门 refs==0 且 owner==NONE"
            "（固件自述的空闲判据: src/i2c_bb.h:51 / src/i2c_sm.h:124）",
            clean,
-           "owner=%d(%s) refs=%d%s" % (
-               owner0, I2C_OWNER_NAME.get(owner0, "?"), refs0,
+           "owner %d(%s)→%d(%s), refs %d→%d%s" % (
+               owner_first, I2C_OWNER_NAME.get(owner_first, "?"),
+               owner0, I2C_OWNER_NAME.get(owner0, "?"),
+               refs_first, refs0,
                "" if clean else
                "  ← **违约**: 门被占着 ⇒ 下一个用这条总线的套件会**假失败**"
                "（实测 h723_i2c_gate_test 4/5 FAIL）。本判据只报『门不干净』, "
