@@ -162,6 +162,8 @@ class Link:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default=None)
+    ap.add_argument("--reset-mode", action="store_true",
+                    help="只把设备的帧模式复位成 v1（别的工具报'0x38 无有效应答'时用它救场）")
     a = ap.parse_args()
 
     # ★ 判据发射器**命名为 `record`** —— 与仓库其它验收脚本**同一约定**。
@@ -179,6 +181,19 @@ def main():
             print("  [FAIL] %s  %s" % (name, detail))
 
     d = Dcl(a.port)
+    if a.reset_mode:
+        # ★ 救场入口：设备可能被上一次"切到 v2 后异常退出"留在 v2，此时所有 v1 工具都读到 TIMEOUT。
+        #   本命令**用 v1 发** `0x05 mode=0` —— 按契约它的**应答强制 v1** ⇒ 一定收得到回执。
+        try:
+            sts1, p1 = d.send(C_FRAME_MODE, bytes([0]))
+            print("0x05 mode=0 → %s %s" % (sts1, p1.hex() if p1 else ""))
+            sts2, p2 = d.send(0x01)
+            print("复检 0x01 → %s len=%d" % (sts2, len(p2)))
+            okk = (sts1 == "ACK" and sts2 == "ACK")
+            print("[%s] 帧模式已复位到 v1" % ("PASS" if okk else "FAIL"))
+            return 0 if okk else 2
+        finally:
+            d.close()
     L = Link(d.ser)
     print("端口: %s" % d.port)
     try:
@@ -238,7 +253,7 @@ def main():
            % (r["cmd"] or 0, r["seq"] or 0, C_PIN_PATTERN, seq))
         if r and len(r["payload"]) >= 8:
             mode1 = struct.unpack("<2I", r["payload"][:8])[0]
-            ok("T2.5 设备侧确认 mode=1（『我切了』≠『它记住了』⇒ 分开判）", mode1 == 1,
+            record("T2.5 设备侧确认 mode=1（『我切了』≠『它记住了』⇒ 分开判）", mode1 == 1,
                "mode=%d" % mode1)
 
         # ── T3 ★★ 陈旧应答可辨识（决定性）──
@@ -314,6 +329,16 @@ def main():
         print("[PASS] GAP-12：v2 帧归属可用，且 v1 一字未变（老上位机零改动）")
         return 0
     finally:
+        # ★★★ 帧模式必须复位，而且**必须放 finally**（我的 memory §九.5：状态复原放 finally，
+        #   判据 FAIL 时也要还原 —— 这里更狠：**脚本崩溃时**也要还原）。
+        #   不还原的后果（实测踩到过）：设备留在 v2 ⇒ 之后**所有用 v1 的工具全部 TIMEOUT**，
+        #   症状是"板子没响应"，会把人引向接线/驱动方向。
+        #   ★ 能救回来的原因正是契约那条"**0x05 的应答永远用 v1**" ⇒ **用 v1 发就能收到可解析的回执**。
+        try:
+            sts_rec, _ = d.send(C_FRAME_MODE, bytes([0]))
+            print("[复原] 帧模式回 v1: %s" % sts_rec)
+        except Exception as e:                                  # noqa: BLE001
+            print("[复原] ★ 失败(%s) ⇒ 手工救场: python tools/h723_frame_attrib_test.py --reset-mode" % e)
         d.close()
 
 

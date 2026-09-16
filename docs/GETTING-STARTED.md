@@ -105,6 +105,31 @@ python tools/h723_proto.py --port COMxx      # COM 口按实际填
 - ② 必须出现 `programmed N bytes`（**N>0**）—— 见 §7 坑 #1
 - ④ `12 PASS / 0 FAIL / 0 SKIP`
 
+### 4.1 再跑三套功能验收（v2.1.0 起；**建议每次改完都跑**）
+
+```bash
+python tools/h723_dev_bind_test.py       --port COMxx   # 具名设备绑定表     预期 52 PASS / 0 FAIL / 1 SKIP
+python tools/h723_devbind_persist_test.py --port COMxx  # 绑定表随程序包持久化 预期 32 PASS / 0 FAIL
+python tools/h723_frame_attrib_test.py   --port COMxx   # 帧归属 v2           预期 18 PASS / 0 FAIL
+```
+
+★ **串口是独占资源**：同一时刻只允许**一个**进程用它（并发会让两边都读到串帧，
+而症状是"读到不可能的值"—— 本项目真踩过）。跑之前确认没有别的脚本/工具占着口。
+★ 三套都**只走协议**（不需要 pyocd、不需要调试器）。
+★ 每套的判据都**能失败**，见 `docs/RELEASE-v2.1.0.md` §8（含"怎么让它红"与变异体自测命令）。
+
+#### 如果某个工具报 `0x38 无有效应答` / 一直 `TIMEOUT`
+
+大概率是**设备被留在 v2 帧模式**（v2 的应答是 `0xC3` 帧，v1 的工具解析不了）。
+用这条**救场**（它是 v1 请求，而 `0x05` 的应答按契约**强制 v1** ⇒ 一定能收回来）：
+
+```bash
+python tools/h723_frame_attrib_test.py --reset-mode      # → [PASS] 帧模式已复位到 v1
+```
+
+★ 注意 `0x13 RESET` **不解决**这个问题吗？——**它能解决**（复位会把帧模式回 v1），
+但它同时清掉运行态（绑定表、程序 staging）。所以**先用 `--reset-mode`**，它只动帧模式。
+
 ---
 
 ## 5. 跑通第一个程序（部署 + 启动）
