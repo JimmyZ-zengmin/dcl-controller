@@ -1522,7 +1522,11 @@ ISR_PLACE void TIM2_IRQHandler(void)
  * 这样 ISR 时长与"帧有多长"无关, 拍周期不受 PC 通信影响。
  */
 static FrameParser_t  s_parser;
-static uint8_t        s_txbuf[FRAME_TOTAL_MAX];
+/* ★★★ 2026-09-16 起按 **v2 尺寸**声明（GAP-12 帧归属）: v1 帧 = payload+6，
+ *   而 v2 应答 = payload+8 —— 原声明**正好等于 v1 帧长** ⇒ 发 v2 应答会**越界写 2 字节**。
+ *   （同族教训："固定缓冲 + 更大的帧"；本项目在这一族上已栽过两次。） */
+static uint8_t        s_txbuf[FRAME_TOTAL_MAX_V2];
+_Static_assert(FRAME_TOTAL_MAX_V2 >= FRAME_TOTAL_MAX, "v2 帧长必须 >= v1");
 static volatile uint32_t s_selftest_active = 0;
 
 OBS uint32_t g_uart_brr      = 0;    /* BRR 实测值 (100MHz/115200 → 0x3641) */
@@ -1548,6 +1552,9 @@ OBS uint32_t g_frame_bad     = 0;    /* 超长 / CRC 不符 */
 OBS uint32_t g_cmd_count     = 0;
 OBS uint32_t g_cmd_last      = 0xFFFFFFFFu;
 OBS uint32_t g_nak_count     = 0;
+/* ★ GAP-12: 收到的 v2 帧数（`0x39 op=24` 可读当前模式；这个计数证明"确实在用 v2"）
+ *   ★ 必须登记进 `obs_anchor()`，否则被 --gc-sections 回收（本项目已踩三次）。 */
+OBS uint32_t g_frame_v2_n    = 0;
 OBS uint32_t g_banner_count  = 0;
 /* ★ 组帧自检结果 (1=通过): 用独立实现算出的期望值校验 CRC 覆盖范围。
  *   "覆盖长度写错"这类 bug 不会崩、不会报警, 只会让**每一帧都被对端判为 CRC 错**
@@ -1588,6 +1595,32 @@ static uint32_t build_frame_into(uint8_t *out, uint8_t sts, const uint8_t *p, ui
     return pos;
 }
 
+/* ★★★ v2 应答组帧（GAP-12，2026-09-16）: `[C3][CMD][SEQ][STS][LEN:2][payload][CRC:2]`
+ *   ★ **归属写进帧里**: `CMD` = 该请求的命令码回显, `SEQ` = 该请求携带的序号原样回显
+ *     ⇒ 客户端能判"这条应答是不是我那次请求的"。
+ *   ★ 与 v1 的关键差别: v1 应答**根本没有命令字段**（只有 `STS`）⇒ 客户端只能
+ *     "收到任何合法帧就当应答"，一条杂帧（开机 banner / 迟到应答 / 别的进程的应答）
+ *     会被当成自己的答案 —— 本轮实测到过一次（`SENSOR[15]` 读回值位型 = `0x01` 的应答载荷）。
+ *   ★ CRC 覆盖 `[CMD][SEQ][STS][LEN:2][payload]`，**分段链式**按实际发送顺序喂
+ *     （与 v1 的 `FRAME_CRC_COVER(n)` 同理；"覆盖长度写错"这一族本项目踩过）。 */
+static uint32_t build_frame_v2_into(uint8_t *out, uint8_t cmd, uint8_t seq,
+                                    uint8_t sts, const uint8_t *p, uint32_t n)
+{
+    if (n > FRAME_PAYLOAD_MAX) n = FRAME_PAYLOAD_MAX;
+    uint32_t pos = 0;
+    out[pos++] = FRAME_SYNC_MCU2PC_V2;
+    out[pos++] = cmd;
+    out[pos++] = seq;
+    out[pos++] = sts;
+    out[pos++] = (uint8_t)(n & 0xFFu);
+    out[pos++] = (uint8_t)((n >> 8) & 0xFFu);
+    for (uint32_t i = 0; i < n; i++) out[pos++] = p[i];
+    uint16_t crc = crc16_ccitt(out + 1, FRAME_CRC_COVER_V2A(n));   /* ★ 不含 SYNC */
+    out[pos++] = (uint8_t)(crc & 0xFFu);
+    out[pos++] = (uint8_t)(crc >> 8);
+    return pos;
+}
+
 /**
  * @brief 组帧自检: 用**独立实现**(PC 侧 Python CRC16-CCITT)算出的期望值校验组帧。
  *
@@ -1612,12 +1645,29 @@ static uint32_t frame_build_selftest(void)
     return (f[8] == 0xC9u && f[9] == 0xC9u) ? 1u : 0u;
 }
 
+/* ★ 帧归属 v2 的**链路状态**（GAP-12）。★ 它是"逐链路"状态、不是 SHM 域 ⇒
+ *   `0x13 RESET` 与上电都必须显式回 v1（否则设备还在等 v2 帧、而客户端已退回 v1 ⇒ 链路失联）。*/
+static uint8_t s_frame_v2    = 0u;
+static uint8_t s_ack_v1_once = 0u;
+static uint8_t s_req_cmd     = 0u, s_req_seq = 0u;   /* 当前请求的 CMD/SEQ（应答回显用）*/
+
 static void send_response(uint8_t sts, const uint8_t *p, uint32_t n)
 {
-    uint32_t pos = build_frame_into(s_txbuf, sts, p, n);
+    uint32_t pos;
+    /* ★ `s_ack_v1_once` = "这一条应答强行用 v1" —— 只给 `0x05 FRAME_MODE` 用：
+     *   客户端必须能用**它已知的格式**解析"切换成功"那一条，之后才切到 v2。
+     *   否则握手无解（它还不知道该按哪种格式读回执）。 */
+    if (s_frame_v2 && !s_ack_v1_once) {
+        pos = build_frame_v2_into(s_txbuf, s_req_cmd, s_req_seq, sts, p, n);
+    } else {
+        pos = build_frame_into(s_txbuf, sts, p, n);
+    }
+    s_ack_v1_once = 0u;
     uart1_write(s_txbuf, pos);
     g_uart_tx_bytes += pos;
 }
+
+/* ★ `0x05 FRAME_MODE` 的处理函数定义在 `nak()` 之后（它要用 ack/nak）。 */
 
 static void ack(const uint8_t *p, uint32_t n) { send_response(STS_ACK, p, n); }
 
@@ -1649,6 +1699,24 @@ static void nak(const char *m)
     fault_record(g_shm, (g_nak_last == NAKRH_BUDGET) ? FAULT_DEPLOY_REJ : FAULT_PROTO_NAK,
                  g_tick_count, (uint32_t)g_nak_last, n);
     send_response(STS_NAK, (const uint8_t *)m, n);
+}
+
+/* ★★★ 0x05 FRAME_MODE —— 帧归属 v2 的协商入口（GAP-12，2026-09-16）
+ * 载荷 `[mode:u8]`：1 = 进入 v2（应答带 CMD+SEQ），0 = 回到 v1。
+ * ★★ **本命令的应答永远用 v1 帧**（`s_ack_v1_once`），理由见 `send_response` 里的注释。
+ * ★ 应答 `[mode:u8][caps_hi:u8]`：让客户端确认"设备确实记住了"，并复核能力位。
+ * ★ 老上位机不知道 `0x05` ⇒ 收到 NAK ⇒ **行为一字不变**（这就是"零改动兼容"的实现）。 */
+static void h_frame_mode(void)
+{
+    if (s_parser.payload_len < 1u) { s_ack_v1_once = 1u; nak("frame mode: need 1B"); return; }
+    uint8_t m = s_parser.payload[0];
+    if (m > 1u) { s_ack_v1_once = 1u; g_nak_last = NAKRH_FMODE; nak("frame mode: 0 or 1"); return; }
+    uint8_t r[2];
+    r[0] = m;
+    r[1] = (uint8_t)((uint32_t)DCL_CAP_H723_IMPL >> 8);
+    s_ack_v1_once = 1u;                /* ★ 这一条用 v1 发（必须在改模式**之前**置位）*/
+    ack(r, 2u);
+    s_frame_v2 = m;                    /* ★ 从**下一帧**起生效 */
 }
 
 /* 版本/能力协商: 载荷 [fw:u16 LE][cap:u16 LE] —— 与 S3 逐字节同构 */
@@ -2501,6 +2569,17 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
         ack(rx, 36u);
         return;
     }
+    if (op == 24u) {
+        /* ★ GAP-12: 读**设备侧**的帧模式与 v2 帧计数。
+         *   ★ 为什么要这条: 客户端"以为切过去了"**不构成证据** —— 有可能请求压根没被受理。
+         *     这条让"设备的看法"直接可读，于是"我切了"与"它记住了"能被分开判。
+         *   应答 8 B: [mode:u32][v2_frames:u32] */
+        uint8_t rx[8];
+        put32(rx + 0, (uint32_t)s_frame_v2);
+        put32(rx + 4, g_frame_v2_n);
+        ack(rx, 8u);
+        return;
+    }
     if (op == 23u) {
         /* ★★★ 重新执行**开机装载**（程序 + 绑定表）—— GAP-11 的验收口。
          * 应答 8 B: [rc:u32 = PROG_RC_*][loaded:u32]
@@ -3095,6 +3174,12 @@ static void h_stop_w1(void)
 static void h_reset_w1(void)
 {
     cold_start_reset();          /* 整段 memset, 天然覆盖 FORCE_MASK/VAL (W2.1) */
+    /* ★ 2026-09-16（GAP-12）: **帧模式回 v1**。它是"逐链路"状态、不是 SHM 域，
+     *   所以整段 memset 覆盖不到它 —— 必须在这里显式复位。
+     *   ★ 不复位的后果：设备还在等 v2 帧，而客户端可能已退回 v1 ⇒ **整条链路失联**，
+     *     且症状是"板子不响应"（会把人引向接线/驱动方向）。 */
+    s_frame_v2    = 0u;
+    s_ack_v1_once = 0u;
     g_force_clears++;            /* ★ 用同一计数证明 RESET 真的清过 force */
     /* ★ W3: RESET 清空了 N_SEQ 与整张 ctrl 块 → "已 arm"标记必须一起失效,
      *   否则下一次 START 会走"已 RUN 分支"(不清步号)—— 而步号此刻已经不存在了。
@@ -3392,6 +3477,7 @@ static void proto_dispatch(uint8_t cmd, const uint8_t *p, uint32_t n)
     g_cmd_last = cmd;
     switch (cmd) {
         case CMD_GET_VERSION:   h_get_version(); break;
+        case CMD_FRAME_MODE:    h_frame_mode();  break;   /* ★ GAP-12 帧归属 v2 协商 */
         case CMD_DEPLOY:        h_deploy(p, n); break;
         case CMD_ENGINE_STATUS: h_engine_status(); break;
         case CMD_PIN_PATTERN:   h_pin_pattern(p, n); break;
@@ -3450,6 +3536,11 @@ static void proto_poll(void)
             /* 自检期只计数**不分发** —— 否则回环收到的请求会被再次应答,
              * TX→RX 再 TX… 变成回声风暴 */
             if (s_selftest_active) { g_selftest_frames++; continue; }
+            /* ★ 记下本帧的 CMD/SEQ ⇒ 应答时回显（v2 帧归属）。必须在分发**之前**，
+             *   因为分发内部会调 ack()/nak()。 */
+            s_req_cmd = s_parser.cmd;
+            s_req_seq = s_parser.seq;
+            if (s_parser.v2) { g_frame_v2_n++; }
             proto_dispatch(s_parser.cmd, s_parser.payload, s_parser.payload_len);
         } else if (r < 0) {
             g_frame_bad++;
@@ -3630,6 +3721,7 @@ static void obs_anchor(void)
     sink ^= g_db_rej_n;                   /* ★ 第二轮审计指出漏登记（dev_bind.h 自述要求）→ 已补 */
     sink ^= g_db_load_ok_n;               sink ^= g_db_load_bad_n;   /* ★ GAP-11 装载结果 */
     sink ^= g_db_boot_seg;               sink ^= g_db_seg_len;
+    sink ^= g_frame_v2_n;                sink ^= (uint32_t)s_frame_v2;   /* ★ GAP-12 帧归属 */
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
     sink ^= g_engine_gate;                sink ^= g_engine_sel;
     sink ^= g_n_routes;                   sink ^= g_table_profile;

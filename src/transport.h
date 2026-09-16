@@ -146,6 +146,8 @@
                                       *   (S3 把 macro 当"永远可用"、不单独声明)。本平台按
                                       *   "宣称 = 实现"补一位 —— 实现了就该报 (A4 事故教训)。
                                       *   旧上位机忽略未知位, 不受影响。 */
+#define DCL_CAP_FRAME_V2    0x4000   /* ★ GAP-12: 帧归属 v2（应答回显 CMD+SEQ）—— 见 FRAME_SYNC_*_V2 的说明。
+                                      *   证据: `tools/h723_frame_attrib_test.py`。★ H723 扩展位。 */
 #define DCL_CAP_DEVBIND_PERSIST 0x2000   /* ★ GAP-11: 绑定表**随程序包持久化**（契约 §3.8.5）。
                                       *   实现 = 载荷尾部 48B 段（`dev_bind_pack/unpack`）+ 开机恢复 + `0x39 op=23` 重装载。
                                       *   证据: `tools/h723_devbind_persist_test.py`。★ H723 扩展位，S3 无对应位。 */
@@ -168,12 +170,30 @@
  * N7 历史注: 原 3078 = 6 + 192×16 (64+64+64) 的设计容量单帧下发修复. */
 #define FRAME_PAYLOAD_MAX   6150
 #define FRAME_TOTAL_MAX     (FRAME_PAYLOAD_MAX + 6)
+/* ★★★ 帧归属 v2（GAP-12，2026-09-16）：**协商后才用**，v1 一字不改。
+ *   动机（有解码过的现场实例）: v1 应答是 `[C1][STS][LEN:2][payload][CRC:2]` —— **没有命令字段**,
+ *   客户端只能"收到任何合法帧就当应答" ⇒ 一条杂帧（开机 banner / 迟到应答 / 别的进程的应答）
+ *   会被当成自己的答案。实测: `SENSOR[15]` 读回值位型 `0x1DF70200` = **`0x01` 的应答载荷**。
+ *   ⇒ v2 把**归属**写进帧里: 请求带 `SEQ`、应答**回显 `CMD` 与 `SEQ`** ⇒ 客户端能判"这条是不是我的"。
+ *   v2 请求 `[C2][CMD][SEQ][LEN:2][payload][CRC:2]`  CRC 覆盖 `[CMD][SEQ][LEN:2][payload]`
+ *   v2 应答 `[C3][CMD][SEQ][STS][LEN:2][payload][CRC:2]` CRC 覆盖 `[CMD][SEQ][STS][LEN:2][payload]`
+ *   ★ `0x05 FRAME_MODE` 的应答**永远用 v1**（客户端用已知格式解析那一条，之后才切）。
+ *   ★ 序号只**回显**、**不强制顺序**（不做重传窗口）—— 归属是 GAP-12 要的，顺序是下一版的事。
+ *   ★ 缓冲区: v2 应答最长 = payload + 8 ⇒ `s_txbuf` 必须按 V2 尺寸声明（否则溢出 2 字节）。 */
+#define FRAME_SYNC_PC2MCU_V2  0xC2
+#define FRAME_SYNC_MCU2PC_V2  0xC3
+#define CMD_FRAME_MODE        0x05   /* [mode:u8] 1=进入 v2, 0=回到 v1 */
+#define FRAME_TOTAL_MAX_V2    (FRAME_PAYLOAD_MAX + 8)
+#define FRAME_CRC_COVER_V2Q(n)  (4u + (n))   /* 请求: [CMD][SEQ][LEN:2][payload] */
+#define FRAME_CRC_COVER_V2A(n)  (5u + (n))   /* 应答: [CMD][SEQ][STS][LEN:2][payload] */
 
 uint16_t crc16_ccitt(const uint8_t *data, size_t len);
 uint16_t crc16_ccitt_seg(uint16_t crc, const uint8_t *data, size_t len);
 
 typedef struct {
-    uint8_t  state;     /* 0=WAIT_SYNC 1=CMD 2=LEN_LO 3=LEN_HI 4=PAYLOAD 5=CRC_LO 6=CRC_HI */
+    uint8_t  state;     /* 0=WAIT_SYNC 1=CMD 2=LEN_LO 3=LEN_HI 4=PAYLOAD 5=CRC_LO 6=CRC_HI 7=V2_SEQ */
+    uint8_t  v2;        /* ★ 本帧是不是 v2（由 SYNC 决定: 0xC0=v1, 0xC2=v2）*/
+    uint8_t  seq;       /* ★ v2 请求携带的序号（应答要**原样回显**）*/
     uint8_t  cmd;
     uint16_t payload_len;
     uint16_t payload_idx;
@@ -229,7 +249,8 @@ int  fp_feed(FrameParser_t *fp, uint8_t byte); /* 0=waiting 1=ok -1=bad */
                              DCL_CAP_VERINFO | DCL_CAP_FORCE | \
                              DCL_CAP_SEQ | DCL_CAP_COMM | DCL_CAP_MACRO | \
                              DCL_CAP_AI | DCL_CAP_DEVBIND | \
-                             DCL_CAP_DEVBIND_PERSIST)                      /* = 0x3DF7 */
+                             DCL_CAP_DEVBIND_PERSIST | \
+                             DCL_CAP_FRAME_V2)                             /* = 0x7DF7 */
 
 /* ★ 上线的各项说明 (写清楚"为什么现在可以报"):
  *   DCL_CAP_HOTRELOAD (0x0002) — 阶段 3.2: engine_reload_active() 在 ITCM 内

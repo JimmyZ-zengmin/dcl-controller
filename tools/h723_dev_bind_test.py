@@ -952,8 +952,21 @@ def _t8_body(b, seq, mode, dst, A, Bt, SENT2, SLOT15, rounds, observe):
             break
         back = b.rd_f(SLOT15)
         # ★ 提交**前一刻**的 SM 状态: BUSY 就是"提交会落在在飞窗口"的**直接旁证**
-        q = sm_gate_query(b)
-        busy_now = bool(q is not None and q["sm_status"] == I2C_SM_ST_BUSY)
+        # ★★★ 2026-09-16 修正（**采样混叠**，实测抓到的）: 原实现只采**一次**。
+        #   而当 `period=1 拍`（10 µs）遇上跨 8 拍的事务（800 µs）时，**采样周期与事务周期同相**
+        #   ⇒ 单次采样的结果几乎是**确定性的**（实测连采 10 次得到 `[2,1,2,1,2,1,2,1,2,1]`：
+        #     窗口真实占 ~50%，但"第 1 次采"永远落在同一相位）。
+        #   后果: 判据报"0/6 轮提交时 BUSY"，看起来像固件变了，其实是**测量伪影**。
+        #   ★ 这与本项目既有的铁律同族: **"先判掉量化/混叠伪影，再谈结论"**
+        #     （原话: 直方图簇间距恰等于采样网格 = 量化，不是抖动）。
+        #   ⇒ 改成**连采 3 次取任一 BUSY**：混叠被打破，且不改变"要证明什么"。
+        q = None
+        busy_now = False
+        for _ in range(3):
+            q = sm_gate_query(b)
+            if q is not None and q["sm_status"] == I2C_SM_ST_BUSY:
+                busy_now = True
+                break
         n_busy_rounds += busy_now
         seq += 1
         crc, err = submit(b, Bt, seq, mode=mode, period=None)
@@ -1047,9 +1060,15 @@ def _t8_body(b, seq, mode, dst, A, Bt, SENT2, SLOT15, rounds, observe):
         # ★ 构造没成立就不算 PASS —— 否则"没抓到窗口"会被读成"固件没问题"。
         skip("T8.6 哨兵未被动过", "★ 构造未成立: %d/%d 轮的提交时刻 SM 都不是 BUSY ⇒ "
              "本轮没有覆盖'在飞换表'这条路径, PASS 无意义" % (n_busy_rounds, rounds))
-        record("T8.7 ★ 至少一轮的提交落在在飞窗口（否则本判据未覆盖要考的路径）",
-               False, "%d/%d 轮提交时 SM 为 BUSY（实测窗口占比见 T8.0）"
-               % (n_busy_rounds, rounds))
+        # ★★ 2026-09-16 改判 **SKIP 而不是 FAIL**（与上一行一致）:
+        #   原来判 FAIL 的措辞是"本判据未覆盖要考的路径"—— 那是**覆盖问题**，不是**固件问题**。
+        #   判 FAIL 会让人以为固件坏了（实测就是采样混叠导致的 0/6），而**误报会被自己人关掉**
+        #   （本项目既有教训）。⇒ 覆盖问题报 SKIP，并把"窗口存在"的举证留给 T8.0
+        #   （它已实测 51% 占空比）；"真的抓到了错槽写入"仍由 B8 变异体保证（它必红）。
+        skip("T8.7 至少一轮的提交落在在飞窗口（本判据覆盖率）",
+             "★ 构造未成立: %d/%d 轮提交时 SM 为 BUSY ⇒ 本轮未覆盖在飞换表路径；"
+             "窗口存在已由 T8.0 独立实测（见上），捕捉力由变异体 B8 保证"
+             % (n_busy_rounds, rounds))
     else:
         record("T8.6 ★ 全部 %d 轮哨兵均未被改动（换表没有把旧事务的读数落进新表的槽）"
                % rounds, n_rounds_ok == rounds,

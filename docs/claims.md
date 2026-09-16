@@ -69,6 +69,7 @@ C | DCL_CAP_MACRO      | src/transport.h
 C | DCL_CAP_AI         | src/transport.h
 C | DCL_CAP_DEVBIND    | src/transport.h
 C | DCL_CAP_DEVBIND_PERSIST | src/transport.h
+C | DCL_CAP_FRAME_V2   | src/transport.h
 
 # ══ N 类：**留位**能力位（定义了但**故意不实现**）—— 必须显式分类, 否则闸门看不见它 ══
 # ★ C2 完整性判据要求"每个定义了的位都被显式分类为 已实现(C) 或 留位(N)"。
@@ -95,6 +96,14 @@ E | 3.8.5-4 ★ 老包不凭空多 48 B            | tools/h723_devbind_persist_
 E | 3.8.5-5 ★ 段坏但程序照常装载           | tools/h723_devbind_persist_test.py | 段坏但**程序照常装载
 E | 3.8.5-6 拒绝可观测（load_bad+1/reject）| tools/h723_devbind_persist_test.py | 拒绝可观测
 E | 3.8.5-7 重装载幂等（不叠加副作用）      | tools/h723_devbind_persist_test.py | 不叠加副作用
+
+# ══ E 类：GAP-12「帧归属 v2」——“应答里带 CMD+SEQ”这件事必须真被验到 ══
+E | 9.4-1 ★ 未协商 ⇒ v1 帧逐字节不变         | tools/h723_frame_attrib_test.py | 逐字节相同
+E | 9.4-2 ★ 0x05 的应答必须是 v1（握手可解） | tools/h723_frame_attrib_test.py | 用已知格式解析回执
+E | 9.4-3 ★★ 陈旧应答可辨识（反向断言不匹配）| tools/h723_frame_attrib_test.py | 必须不匹配
+E | 9.4-4 协商可逆（回到 v1 后逐字节相同）   | tools/h723_frame_attrib_test.py | 回到 v1 之后
+E | 9.4-5 序号只回显、不强制顺序             | tools/h723_frame_attrib_test.py | 同一 SEQ
+E | 9.4-6 ★ RESET 后模式回 v1（否则链路失联）| tools/h723_frame_attrib_test.py | 用 v1 请求能通
 # ★ 以下两条是**契据 §3.8.8 里明确写着、但判据尚未落地**的行。
 #   按本项目 DoD（"挂账必须明确写'不做'并给理由，不允许沉默地留着"）**显式登记**，
 #   并已在 `docs/REF-program-contract.md` §3.8.8 的同名表里标注"判据未落地"。

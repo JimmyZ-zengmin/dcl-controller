@@ -89,7 +89,8 @@ EXPECT_CAP = (0x0001    # MULTICYCLE
               | 0x0800  # MACRO      (W5 落地 — 字节码 VM 0x40/0x41/0x42, 2026-09-11)
               | 0x0400  # AI         (W5 落地 — ADC1 16bit + AI 3 通道 SENSOR[8..10])
               | 0x1000  # DEVBIND    (G6-4 具名设备绑定表, 2026-09-16)
-              | 0x2000) # DEVBIND_PERSIST (GAP-11 绑定表随程序包持久化, 2026-09-16 — 宏=0x3DF7)
+              | 0x2000  # DEVBIND_PERSIST (GAP-11 绑定表随程序包持久化, 2026-09-16)
+              | 0x4000) # FRAME_V2 (GAP-12 帧归属: 应答回显 CMD+SEQ, 2026-09-16 — 宏=0x7DF7)
 #         ★ G6-4 注意 (2026-09-16): 本镜像已跟到 transport.h 的 0x1DF7, 但截至核对时
 #           `dev_bind_submit()` / `dev_bind_service()` 在 `src/main.c` 主循环里**没有调用点**
 #           ⇒ 本判据(T1.4)现在证明的是"**声明**与源码宏一致", 不证明"位背后的功能真的在跑"。

@@ -30,10 +30,14 @@ void fp_init(FrameParser_t *fp) { memset(fp, 0, sizeof(*fp)); }
 int fp_feed(FrameParser_t *fp, uint8_t byte) {
     switch (fp->state) {
         case 0: /* WAIT_SYNC */
-            if (byte == FRAME_SYNC_PC2MCU) { fp->state = 1; fp->payload_idx = 0; }
+            /* ★ v2 由 SYNC 字节区分（老上位机永远发 0xC0 ⇒ 行为一字不变）*/
+            if (byte == FRAME_SYNC_PC2MCU)    { fp->v2 = 0; fp->state = 1; fp->payload_idx = 0; }
+            else if (byte == FRAME_SYNC_PC2MCU_V2) { fp->v2 = 1; fp->state = 1; fp->payload_idx = 0; }
             return 0;
         case 1: /* CMD */
-            fp->cmd = byte; fp->state = 2; return 0;
+            fp->cmd = byte; fp->state = fp->v2 ? 7 : 2; return 0;
+        case 7: /* ★ V2_SEQ: v2 请求的序号（应答原样回显）*/
+            fp->seq = byte; fp->state = 2; return 0;
         case 2: /* LEN_LO */
             fp->payload_len = byte; fp->state = 3; return 0;
         case 3: /* LEN_HI */
@@ -53,6 +57,14 @@ int fp_feed(FrameParser_t *fp, uint8_t byte) {
             uint16_t ex = crc16_ccitt_seg(0xFFFF, (const uint8_t[]){fp->cmd,
                         (uint8_t)(fp->payload_len & 0xFF), (uint8_t)((fp->payload_len >> 8) & 0xFF)}, 3);
             if (fp->payload_len) ex = crc16_ccitt_seg(ex, fp->payload, fp->payload_len);
+            /* ★ v2: CRC 还要覆盖 SEQ（它是帧的一部分, 不覆盖就等于给了篡改的余地）
+             *   —— 用**独立重算**而不是"改上面那 3 字节数组", 因为 CRC 是**分段链式**的:
+             *      必须按实际发送顺序 [CMD][SEQ][LEN][payload] 喂进去。 */
+            if (fp->v2) {
+                ex = crc16_ccitt_seg(0xFFFF, (const uint8_t[]){fp->cmd, fp->seq,
+                            (uint8_t)(fp->payload_len & 0xFF), (uint8_t)((fp->payload_len >> 8) & 0xFF)}, 4);
+                if (fp->payload_len) ex = crc16_ccitt_seg(ex, fp->payload, fp->payload_len);
+            }
             fp->state = 0;
             return (rx == ex) ? 1 : -1;
         }
