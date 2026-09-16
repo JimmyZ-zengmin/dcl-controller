@@ -137,6 +137,21 @@ set(DCL_HIL_SAFE "1" CACHE STRING "停机安全态覆盖 HIL 输出 (1 交付 / 
 #     (ADC 单次转换 259µs > 拍长 100µs) —— 这本身就是"非阻塞化是必需, 不是优化"的实证。
 set(DCL_IO_IN_ISR "1" CACHE STRING "I/O 驱动位置 (1 ISR 拍内 / 0 主循环对照)")
 
+# ---- ★★ DO 输出路径 A/B 对照开关 (2026-09-16 **补接线**) ----
+#   0 = **交付档**: CPU 一次 32 位 `GPIO_BSRR` 直写（那次写就是写引脚）
+#   1 = **对照档**: 影子 + MDMA 定时锁存（那次写只写影子，引脚由 MDMA 在拍上溢锁存）
+#   ★★ 为什么是"补接线": `src/do.h` 的注释**早就宣称**"可被 CMake `-DDCL_DO_LATCH=0`
+#     覆盖", 但 CMakeLists **从来没有** `set(... CACHE ...)` 也没有传 `-D`
+#     ⇒ 那是个**假开关**: 你用 `-D` 传它，CMake 连缓存项都不建，构建脚本那节
+#     "生效开关(读自 CMakeCache)"里**根本不会出现 DCL_DO_LATCH** ⇒ 你以为切了, 其实没切。
+#     （本项目第 2 次栽在"声称可覆盖但没接线": 第 1 次是 ISR 调用树闸门。）
+#   ★ 判据/量化: 0 档引脚抖动 ≈3.6 ns, 1 档 ≈54~60 ns（LA 实测 PE0 σ≈60 ns）。
+#     但**必须有 1 档**才能跑 A/B —— 没有对照档 = 这个差异无法自证。
+#   ★★ 切到 0 档的**必要补丁**在 src/do.c `do_latch_init()`: 0 档必须**完全不启动**
+#     MDMA 锁存链, 否则它每 100 µs 把影子(0 档没人写它 ⇒ 恒 0)锁进 GPIOE_ODR 低字节
+#     ⇒ **PE0~PE7 被静默清零, DO 0..7 永不可用**（观测面看不出来, 寄存器读回全对）。
+set(DCL_DO_LATCH "0" CACHE STRING "DO 输出路径 (0 CPU直写=交付 / 1 影子+MDMA锁存=对照)")
+
 # Cortex-M7 + 双精度 FPU + 硬浮点 (与老项目 build.bat 一致)
 set(MCU_FLAGS -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb)
 
@@ -185,6 +200,7 @@ add_compile_options(
     -DMIN_TX_STRESS=${DCL_MIN_STRESS}
     -DHIL_SAFE=${DCL_HIL_SAFE}
     -DIO_IN_ISR=${DCL_IO_IN_ISR}
+    -DDCL_DO_LATCH=${DCL_DO_LATCH}
 )
 
 # syscalls.c 是 newlib 桩: 函数签名由 newlib 规定, 参数天然用不上。

@@ -76,6 +76,7 @@ DEFAULTS=(
     -DDCL_MIN_UART2=0
     -DDCL_HIL_SAFE=1
     -DDCL_IO_IN_ISR=1
+    -DDCL_DO_LATCH=0          # DO 输出路径: 0=CPU 直写(交付) 1=影子+MDMA锁存(对照)
 )
 
 "$CMAKE" -S "$WIN_HERE" -B "$BUILD" -G Ninja \
@@ -145,6 +146,27 @@ else
         echo "★★ ISR 调用树闸门失败 ⇒ 拒绝通过。"
         echo "   上表列出的函数**擦 flash 时会让拍 ISR 卡死**(取指/读常量被 stall)。"
         echo "   修法: 给它们加 DCL_ITCM (见 src/itcm.h); 只读常量表用 .itcm_rodata 段。"
+        exit 1
+    fi
+fi
+
+# ── ★★ 应答缓冲区越界闸门 (2026-09-16 正式接入) ──────────────────────────────
+# ★ 为什么必须有这一步: 同一族缺陷**已犯两次**, 而且两次都"运行期完全看不出来" ——
+#   ① `h_pin_pattern()` : `uint8_t r[40]` 却 `ack(r, 68)` ⇒ 写坏调用者栈 28 字节
+#   ② `h_engine_status()`: `uint8_t r[40]` 却 `ack(r, 51)` ⇒ 越界 11 字节
+#      （把 `0x38` 从 39 扩到 51 字节时**只改了写的偏移, 没同步改缓冲声明**）
+#   共同点: **不报错、不崩溃**, 读回来的字段**全是合理值** ⇒ **动态判据永远发现不了**。
+#   ⇒ 只能是**静态**判据, 且必须进构建闸门（同 ISR 闸门的理由: 光有工具不进闸门 = 没做）。
+#   ★ 判据本身也踩过"空判据"坑（第一版一个函数都没解析到却打印 OK）——
+#     故本闸门要求工具**自报覆盖度**, 覆盖不足即判无效。见 tools/h723_ackbuf_check.py。
+if [ -n "$PY_BIN" ]; then
+    echo
+    echo "── 应答缓冲区越界闸门 (静态: ack/put32 写入长度 vs 局部缓冲声明) ──"
+    if ! "$PY_BIN" "$WIN_HERE/tools/h723_ackbuf_check.py" "$WIN_HERE/src"; then
+        echo
+        echo "★★ 应答缓冲区越界闸门失败 ⇒ 拒绝通过。"
+        echo "   修法: 用**同一个常量**同时定缓冲大小与发送长度, 不要在两处各写一遍字面量"
+        echo "         （这是本项目'一个语义两处存放 ⇒ 静默失效'族的根因）。"
         exit 1
     fi
 fi

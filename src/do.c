@@ -97,6 +97,27 @@ void do_init(uint8_t *base)
 
 void do_latch_init(void)
 {
+#if !DCL_DO_LATCH
+    /* ★★★ A 档（交付档）必须**完全不启动**这条锁存链 —— 否则它会**把 DO 0..7 弄死**。
+     * 机理（2026-09-16 读码取证，见 docs/PLAN-dcl-standardization.md §6.5-4）：
+     *   ① 节点 CTCR=0x00020000（**byte 尺寸 + 地址固定**）+ CBNDTR=4
+     *      ⇒ 4 次字节搬运**全落在 `GPIOE_ODR + 0`** ⇒ **只覆盖 PE0~PE7**；
+     *   ② 源 = `OFF_DO_SHADOW`，而 A 档的 `do_poll()` 走 `#else` 分支，**只写 BSRR、
+     *      从不写影子** ⇒ **影子恒为 0**（冷启 memset 之后没有任何写者）；
+     *   ③ ⇒ 每 100 µs（TIM2_UP）MDMA 把 **0** 锁进 ODR 低字节
+     *      ⇒ **CPU 用 BSRR 置起来的 PE0~PE7 会在下一拍被静默清掉** ⇒ DO 0..7 永不可用。
+     * ★ 这条是"DCL_DO_LATCH 切到 0 档"的**必要补丁**：当初只算了抖动
+     *   （3.6 ns vs 54~60 ns），**没算到"锁存链还在跑、而影子已经没人写"** ——
+     *   于是切档顺手把 DO 0..7 弄死了，而且**观测面上完全看不出来**
+     *   （寄存器读回全对、`g_do_write_n` 照涨，只是引脚不动）。
+     *   ★ 同族：`h_engine_status` 的 `r[40]` / 影子没人写 —— 都是"改了一半"。
+     * ⇒ A 档 = 纯 CPU 直写：**不启用 DMA2 / DMAMUX1 / MDMA，也不置 TIM2.DIER.UDE**。
+     *   顺带消掉 ~350 万次/秒的 AXI 链表搬运与 AHB4 写。
+     * ★ 判据（能失败的）：A 档下写 `GPIO_MASK` 含 PE0~PE7 的位并置 ACTUATOR>0.5，
+     *   `GPIOE_IDR` 对应位必须**保持**为 1（配对照：本补丁前它会在 ≤100 µs 内变 0）。 */
+    (void)0;
+    return;
+#else
     /* ── 时钟: MDMA 在 AHB3, DMA2/DMAMUX1 在 AHB1 ── */
     *(volatile uint32_t *)0x580244D4u |= 1u;            /* RCC_AHB3ENR(@0x580244D4).MDMAEN ——
                                           * 地址经 h723-core0 实测代码核实 (0x1C 是 D2CFGR, 首版写错) */
@@ -175,6 +196,7 @@ void do_latch_init(void)
     /* ── TIM2 DIER |= UDE: 拍上溢发 DMA 请求 (|= 保护已有 UIE) ── */
     TIM_DIER(TIM2_BASE) |= (1u << 8);
     __asm__ volatile("dsb" ::: "memory");
+#endif /* DCL_DO_LATCH —— A 档在函数开头就 return 了, 绝不碰上面这些寄存器 */
 }
 
 DCL_ITCM void do_poll(uint8_t *base, uint32_t tick_now)

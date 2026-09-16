@@ -2587,9 +2587,18 @@ static void h_device_desc(void)
     ack(r, k);
 }
 
+/* ★★★ 0x38 应答契约长度 —— **一个常量同时定"缓冲大小"与"发送长度"**。
+ * 2026-09-16 发现真缺陷: 原来缓冲区写死 `uint8_t r[40]`, 而 `ack(r, 51)`
+ *   ⇒ **越界 11 字节**, 写坏调用者的栈。它是本项目"**一个语义两处存放 ⇒ 静默失效**"
+ *   族的再现（把 `0x38` 从 39 扩到 51 时，只改了写的偏移，没同步改缓冲声明）。
+ * ★ 这类缺陷**运行期完全看不出来**（不报错、不崩，读回的字段全是合理值）
+ *   ⇒ 只能靠**静态**判据: `tools/h723_ackbuf_check.py`（已纳入构建闸门）。
+ * ⇒ 变更契约长度时**只改这一个数**，不要在两处各写一遍字面量。 */
+#define ENG_STATUS_LEN 51u
+
 static void h_engine_status(void)
 {
-    uint8_t r[40];
+    uint8_t r[ENG_STATUS_LEN];
     uint32_t pn = (g_per_cyc_min == 0xFFFFFFFFu) ? 0u : g_per_cyc_min;
     uint32_t en = (g_isr_cyc_min == 0xFFFFFFFFu) ? 0u : g_isr_cyc_min;
     /* ★★ 审计发现 D 修复: 原来读的是 C 全局 `g_active_routes`, 而它只在启动/reinit
@@ -2645,7 +2654,7 @@ static void h_engine_status(void)
     put32(r + 39, g_uart_ore);    /* 硬件溢出次数 (ORE) —— 非 0 = 排空太慢 */
     put32(r + 43, g_uart_drop);   /* 软件满丢弃次数 —— 非 0 = 环写满 */
     put32(r + 47, g_frame_bad);   /* 坏帧数 (CRC/长度不符; 含"数据没到全"造成的坏帧) */
-    ack(r, 51);
+    ack(r, ENG_STATUS_LEN);   /* 长度与缓冲区同源 —— 见 ENG_STATUS_LEN 的说明 */
 }
 
 /* ══════════ W1: 运行控制 + SHM 读写 (0x11/0x12/0x13 + 0x20-0x23) ══════════
