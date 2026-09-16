@@ -285,7 +285,7 @@ FACADE_DOCS = ["README.md", "docs/RELEASE-v2.1.0.md", "docs/REF-program-contract
 def chk_F(root):
     """→ (rows, stats)。F1 行内矛盾 + F2 实现字一致。"""
     rows = []
-    n_tables = n_cap = 0
+    n_tables = n_cap = n_links = 0
     # F2 先取"当前实现字"
     thr = read_text(os.path.join(root, "src", "transport.h")) or ""
     m = re.search(r"#\s*define\s+DCL_CAP_H723_IMPL\b(.*?)(?:\n\n|\Z)", thr, re.S)
@@ -294,10 +294,22 @@ def chk_F(root):
         vals = CAP_RE.findall(m.group(1))
         if vals:
             impl = "0x" + vals[-1].upper()
+    LINK_RE = re.compile(r"\]\(([^)#\s]+)\)")
     for rel in FACADE_DOCS:
         txt = read_text(os.path.join(root, rel))
         if txt is None:
             continue
+        # F3：门面里的**本地链接必须指向真实文件**（"README 指向不存在的文件"是交付最常见的尴尬）。
+        basedir = os.path.dirname(os.path.join(root, rel))
+        for i, line in enumerate(txt.splitlines(), 1):
+            for tgt in LINK_RE.findall(line):
+                if tgt.startswith(("http://", "https://", "mailto:")):
+                    continue
+                cand = os.path.normpath(os.path.join(basedir, tgt))
+                if not os.path.exists(cand):
+                    rows.append(("FAIL", "%s:%d  **链接指向不存在的文件**：%s"
+                                 % (rel, i, tgt)))
+                n_links += 1
         raw = txt.splitlines()
         head = "\n".join(raw[:40])
         if any(k in head for k in ("过时", "已作废", "HISTORICAL", "归档")):
@@ -332,7 +344,7 @@ def chk_F(root):
                         rows.append(("FAIL", "%s:%d  **实现字与代码不一致**：文中末值 %s，"
                                      "而 `transport.h` 的 IMPL = %s"
                                      % (rel, i, vals[-1], impl)))
-    return rows, {"tables": n_tables, "cap": n_cap, "impl": impl}
+    return rows, {"tables": n_tables, "cap": n_cap, "links": n_links, "impl": impl}
 
 
 REF_RE = re.compile(r"\b((?:src|tools|docs)/[\w./\-]+\.(?:c|h|py|md)):(\d+)\b")
@@ -499,9 +511,9 @@ def run(root, verbose=False):
     for st, why in frows:
         fails.append("  [F类] " + why)
         print("  [FAIL] " + why)
-    print("   表格行 %d 行 · 提到实现字/能力字的行 %d 行 · 当前 IMPL=%s" %
-          (fstat["tables"], fstat["cap"], fstat["impl"]))
-    per["F"] = (max(fstat["tables"], fstat["cap"]), 0, len(frows), MIN_F)
+    print("   表格行 %d 行 · 提实现字/能力字的行 %d 行 · 本地链接 %d 个 · 当前 IMPL=%s" %
+          (fstat["tables"], fstat["cap"], fstat["links"], fstat["impl"]))
+    per["F"] = (max(fstat["tables"], fstat["cap"], fstat["links"]), 0, len(frows), MIN_F)
 
     print("\n--- 覆盖度（★ 覆盖不足 ⇒ 判据**无效**，不是'干净'）---")
     invalid = False
