@@ -74,7 +74,7 @@ extern volatile uint8_t g_i2c_sm_active;   /* **只作观测**: 1 = 状态机事
  *   ⇒ 放进 ISR 就违反 ISR 调用树不变量（擦 flash 期间取指被 stall ⇒ 喂狗停 ⇒ 复位）。
  *   ★ 而"给它加 DCL_ITCM"这条路**走不通**: 实测 **ITCM 已 100% 占满**（64KB/64KB）。
  *   ⇒ 于是改成**延迟释放**: ISR 只置 `g_i2c_sm_release_pending`, 主循环调 `i2c_sm_service()` 放门。
- *   ★ 代价（已权衡并接受）: 事务结束后总线最多再被持 ~1 圈主循环（~1.3ms）。
+ *   ★ 代价（已权衡并接受）: 事务结束后总线最多再被持 ~1 圈主循环（**~0.37ms**）。
  *     影响面很小 —— 同 owner 再申请**照样成功**(acquire 允许同 owner 重入),
  *     只有阻塞路径会被多跳一次（而它本来 10ms 才轮一次）。 */
 extern volatile uint8_t g_i2c_sm_release_pending;
