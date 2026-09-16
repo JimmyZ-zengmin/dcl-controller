@@ -171,6 +171,25 @@ if [ -n "$PY_BIN" ]; then
     fi
 fi
 
+# ── ★★ ③层静态判据闸门 (2026-09-16 接入): 程序面不得出现引脚号/地址/寄存器名 ──
+# ★ 契约 §3.1 自评"最重要的一条", GAP-10 原为 open; 三边权威独立确认:
+#   IEC 61131-3 / CODESYS("application POUs never reference physical I/O addresses") / Zephyr。
+# ★ 这里扫的是 **examples/ 的示例程序** —— 因为示例是"③层该怎么写"的**事实标准**,
+#   它们一旦漂移, 后来的人就会照着错的学。真正的强制点在 `tools/dclc.py`(拒绝编译)。
+# ★ 该判据自带 `--selftest`(造好的红必红/绿必绿) 与**覆盖度自报**(0 文件即判无效) ——
+#   原因见 tools/dcl_static_check.py 的说明: 它第一版就因为"引脚名只在注释里"的标定问题
+#   差点变成误报机器, 而误报会被自己人关掉。
+if [ -n "$PY_BIN" ]; then
+    echo
+    echo "── ③层静态判据闸门 (契约 §3.1: 程序不得出现引脚号/总线地址/寄存器名) ──"
+    if ! "$PY_BIN" "$WIN_HERE/tools/dcl_static_check.py" "$WIN_HERE/examples"; then
+        echo
+        echo "★★ ③层静态判据闸门失败 ⇒ 拒绝通过。"
+        echo "   修法: 用符号槽表达(sensor[i]/wire[j]); 引脚/地址属于②层外设能力, 不进程序。"
+        exit 1
+    fi
+fi
+
 # ── 打印**实际生效**的开关 (不是"我以为传了什么") ──
 echo
 echo "── 生效开关 (读自 CMakeCache) ──"

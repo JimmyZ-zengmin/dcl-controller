@@ -719,6 +719,35 @@ def main():
     port = next((a for a in sys.argv[2:] if not a.startswith('-')), None)
 
     text = open(path, encoding='utf-8').read()
+
+    # ══════════ ★★★ 契约 §3.1 红线 1 / GAP-10: ③层不得出现物理引脚号/总线地址/寄存器名 ══════════
+    # ★ 为什么放在"编译之前"这个位置: 契约 §4.5 的失效语义 ——
+    #   **任何"不满足"必须在上传期或装载期失败; 禁止在运行期静默给一个合法值。**
+    #   ③层出现引脚号 = 这份程序**绑死在这块板子上**, 换板/换脚就得改程序 ——
+    #   而那正是分层要消除的成本(本项目 I2C 那次就是走了"改固件"的弯路, 见契约 GAP-6)。
+    # ★ 三边权威独立确认这条边界: IEC 61131-3(逻辑/硬件两分) ·
+    #   CODESYS(*"application POUs never reference physical I/O addresses"*) ·
+    #   Zephyr(*"驱动代码不应该包含任何具体的引脚号、地址"*)。
+    # ★★ 判据**先剥注释**(与下面的 strip_comment 同规则): 标定时发现
+    #   `examples/h723_di_demo.dcl` 的 `PC0..PC3` **全在注释里**(真实代码是 `sensor[3]`)
+    #   —— 不剥注释就会把**合法的接线文档**打成违规, 误报会让人关掉这条判据。
+    try:
+        from dcl_static_check import check_text          # 同目录(tools/)
+        bad, _st = check_text(text, path)
+    except ImportError as e:
+        print(f"⚠️ 未能加载静态判据 (tools/dcl_static_check.py): {e}")
+        print("   ⇒ 契约 §3.1 红线 1 **本次未被校验**(显式告警, 不静默跳过)。")
+        bad = []
+    if bad:
+        print(f"=== dclc: {path} —— **拒绝编译**(契约 §3.1 红线 1) ===")
+        for ln, kind, tok, code in bad:
+            print(f"  [X] 第 {ln} 行  {kind} 命中 `{tok}`")
+            print(f"        {code}")
+        print("  ③层程序必须**只引用符号槽**: 输入 sensor[i]/wire[j], 输出 wire[j]。")
+        print("  要接一个新器件 ⇒ 走②层外设能力(契约 §3.2-C), **不是**在程序里写引脚。")
+        print("  ★ 引脚号/地址写在注释里是允许的(接线文档) —— 判据已先剥注释。")
+        sys.exit(2)
+
     stmts = parse(text)
     S = compile_stmts(stmts)
 
