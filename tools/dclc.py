@@ -755,10 +755,19 @@ def main():
     if '--nostart' in sys.argv:
         # 只部署不启动: 供验收脚本精确控制 START 时刻 (计时基准), 也符合
         # "上电不自动运行" 的安全语义 (引擎保持 STOP, 由上位机显式启动)
-        print(f"[OK] deploy 完成 ({port}) — 引擎 STOP (--nostart)")
+        print(f"[OK] deploy 完成 ({dcl.port}) — 引擎 STOP (--nostart)")
         return
-    dcl.send(0x11)
-    print(f"[OK] deploy+START 完成 ({port}) — 引擎 RUN")
+    sts, msg = dcl.send(0x11)
+    if sts != 'ACK':
+        # ★ 2026-09-16 修: 原来**只发不判**。而 deploy 成功、START 被拒 是一个真实的可能状态
+        #   (例如 F11 毒药表兜底: 历史持久化的超预算表会被 START 拒绝) —— 那时脚本照样打
+        #   "[OK] ... 引擎 RUN", **而引擎其实没跑** ⇒ 正是本项目"宣称 > 实现"那一族。
+        reason = msg.decode('utf-8', 'replace').strip() if isinstance(msg, (bytes, bytearray)) else ''
+        print(f"START 被拒: {sts} — {reason}")
+        print("  (deploy 已成功; 引擎仍在 STOP —— 常见原因: F11 预算门拦下了历史毒药表)")
+        sys.exit(1)
+    # ★ 另外修: 原来印的是**请求**端口 (自动找板时它是 None, 于是打出 "(None)") —— 印解析后的。
+    print(f"[OK] deploy+START 完成 ({dcl.port}) — 引擎 RUN")
 
 
 if __name__ == '__main__':

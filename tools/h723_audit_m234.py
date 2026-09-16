@@ -143,6 +143,17 @@ def main():
             tl = r[1]
             return r[0], (bytes(r[2:2 + tl]) if tl else b"")
 
+        # ★★★ 2026-09-16 修 (M2 一直"全红"的真因): **必须先切成"缓冲模式"。**
+        #   实测根因: `c->tx_uart` **默认 = 1 = 响应从物理口发**（`modbus.c:798`），
+        #   而物理口模式下发完就把 TX 缓冲清掉（`modbus.c:560/569`）⇒ `0x61` 的 `tx_len` 恒 0
+        #   ⇒ 本测试拿到的 `resp` 永远是空 ⇒ 判 BAD。
+        #   ⇒ 它验的其实是"0x61 在默认配置下读不到"，**不是** Modbus 的 qty 边界。
+        #   ★ 切成缓冲模式后实测: qty=10/59/60/64 都得 8B 正常响应（`0110 9c81 00xx …`）、
+        #     qty=65 得 5B 异常 02（`0190 02 …`）—— **`MB_MAX_FRAME=255` 的修复完全成立**。
+        #   ⇒ 这是**测试缺陷**，固件正确。
+        L.xact(0x62, bytes([0, 0]))        # src=0, tx_uart=0 → 响应留缓冲供 0x61 读回
+        time.sleep(0.1)
+
         # qty 59 (len 127) / 60 (129, M2 边界) / 64 (137, 地址空间允许的上限)
         m2_ok, det = True, []
         for q in (59, 60, 64):
@@ -161,6 +172,7 @@ def main():
         record("M2-2 ★qty=65: 帧被正常接收 → 异常 02 (地址越界, 而非长度拒绝)",
                resp is not None and len(resp) == 5 and resp[1] == 0x90 and resp[2] == 0x02
                and mb_check(resp), "resp=%s" % (resp.hex() if resp else None))
+        L.xact(0x62, bytes([0, 1]))       # ★ 用完恢复默认 (tx_uart=1 = 物理口发) —— 好公民
 
         # ══════════ M3: 0x43 报最新副本的条数 ══════════
         print("\n── M3: 0x43 持久化条数必须取[最新副本] ──")
