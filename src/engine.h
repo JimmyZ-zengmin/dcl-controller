@@ -524,7 +524,7 @@ _Static_assert(sizeof(MacroCtrl_t) == 16, "MacroCtrl_t must be 16 bytes");
  * 位置: SHM 尾部空闲区, 与 WIRE/ACTUATOR 物理分离 (覆盖分析见 MEMORY-LAYOUT.md §4)。 */
 #define OFF_DO_SHADOW       0x6E08   /* u32: DO 打包位图 (MDMA 锁存源) */
 #define OFF_DO_SHADOW_SEQ   0x6E0C   /* u32: shadow 写序号 (诊断"电平对应哪一拍") */
-#define OFF_RTC_SSR         0x6E10   /* u32: RTC 亚秒计数器 (1024Hz, 分辨率 ~1ms) */
+#define OFF_RTC_SSR         0x6E10   /* u32: RTC 亚秒计数器 (**256Hz, 分辨率 ≈3.9ms** —— 见 rtc.h 的频率更正; 原写 1024Hz/~1ms 与 PRER 不符) */
 #define OFF_RTC_TR          0x6E14   /* u32: RTC 时间寄存器 (BCD: 时分秒) */
 #define OFF_RTC_DR          0x6E18   /* u32: RTC 日期寄存器 (BCD: 年月日) */
 #define OFF_EVT_HEAD        0x6E1C   /* u32: 事件环形缓冲写指针 (单调递增) */

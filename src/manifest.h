@@ -86,7 +86,8 @@ static const ManifestEnt_t g_manifest[] = {
     MF_ENTRY("RTC_DIAG",  0x4A00u,   4u, MF_K_U32,    MF_F_SHM),
     /*   [0]RCC_BDCR [1]RTC_ISR [2]TR 启动时 [3]状态判定 (1=日历已可信) */
     MF_ENTRY("EVT_BUF",   0x6E20u,  64u, MF_K_STRUCT, MF_F_SHM),
-    /*   32 条 × [亚秒, 事件码] 环形缓冲 (RTC 1024Hz ⇒ ~1ms 分辨率) */
+    /*   32 条 × [亚秒, 事件码] 环形缓冲 (RTC **256Hz** ⇒ ≈3.9ms 分辨率; ★ 原写 1024Hz/~1ms
+     *   与 rtc.c:105 的 PRER 不符 —— 见 rtc.h 的频率更正) */
 
     /* ── ⑤ 存储 / 黑匣子 (AXI —— 走只读窗才读得到) ── */
     MF_ENTRY("SD_DIAG",   0x24000200u, 64u, MF_K_U32, 0u),

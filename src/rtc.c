@@ -11,7 +11,7 @@
  *   ④ WPR 写保护解锁 (0xCA→0x53) 后才能写 ISR/PRER/TR/DR
  *
  * ★ 观测面: SSR/TR/DR 三个寄存器的**值**拷进 SHM (pyocd 直接读)。
- *   SSR 是 16 位向下计数器 (1024Hz), 差值 = 事件间精确时间。 */
+ *   SSR 是 16 位向下计数器 (**256Hz** —— 见 rtc.h 的频率更正), 差值 = 事件间精确时间。 */
 #include "rtc.h"
 #include "itcm.h"   /* ★ ISR 调用树必须住 ITCM —— 见该头文件 */
 #include "engine.h"

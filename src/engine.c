@@ -480,7 +480,7 @@ ATTR_ITCM uint32_t engine_seq_tick(uint8_t *base, uint32_t tick)
     volatile SeqCtrl_t *scw = (volatile SeqCtrl_t *)(void *)(base + OFF_SEQ_CTRL);
 
     uint32_t ph1 = tick % (uint32_t)BUCKET_DIV1_PHASES;      /* 10 */
-    uint32_t ph2 = tick % (uint32_t)BUCKET_DIV2_PHASES;      /* 64 */
+    uint32_t ph2 = tick % (uint32_t)BUCKET_DIV2_PHASES;      /* 100 —— 原注写 64 是过期值, 见 engine.h:191 */
     uint32_t wrote = 0u;
 
     for (uint32_t i = 0; i < n_seq; i++) {
@@ -659,7 +659,7 @@ void engine_fill_tables(uint8_t *base, int profile)
         /* ---- 档位/相位分配 (★ 必须与工具里的 Python 预测逐字对应) ----
          * profile 3/4 = 三档混合: div = i % 3, 约 1/3 落在 div0/1/2;
          *   div1 phase = (i/3) % BUCKET_DIV1_PHASES
-         *   div2 phase = (i/3) % BUCKET_DIV2_PHASES   (64, 不是 100 —— 见 engine.h 的 H9)
+         *   div2 phase = (i/3) % BUCKET_DIV2_PHASES   (**100**, 见 engine.h:191) 
          * 其它 profile = 全 div0 (与阶段 2 的表保持一致, 便于对照)。 */
         uint8_t dv = PERIOD_DIV_IDX_FAST, ph = 0;
         if (profile == 3 || profile == 4) {
@@ -1137,8 +1137,11 @@ ATTR_ITCM void eng_outputs_safe(void)
      *        2 个可寻址引脚" —— 对不上。
      *     ② 根因是 **u32 装不下**: 掩码需要覆盖 GPIOA..GPIOK 共 11 port × 16 pin
      *        = **176 位**。S3 是单端口 u32 (位=引脚), 直搬到 H723 就不成立了。
-     *   ★ 当前**不可达**: 没有任何代码写 OFF_CTRL_GPIO_MASK (恒 0), `if (mask)`
-     *     直接短路 ⇒ 这段循环从来没执行过一次。
+     *   ★★ 2026-09-16 更正: **已经不再"不可达"** —— `src/step.c:46` 会写
+     *      `OFF_CTRL_GPIO_MASK = STEP_DO_MASK (0x0F00)`（步进初始化时登记 PE8~PE11）。
+     *      原写"没有任何代码写它(恒 0)"在写下时是实情, 现已过期。
+     *      ⇒ 本段循环在步进启用后**会**执行; 要判"它到底跑没跑过"必须看实测计数,
+     *        不能沿用这句旧注释（否则又是一个"空判据"式的假结论）。
      *   ★ 处置原则 (本项目"宣称必须等于实现"): **宁可不做, 不做错的**。
      *     保留一个已知错误的位映射, 比什么都不做更危险 —— 一旦将来有人往
      *     GPIO_MASK 写值, 它会**去清错误的引脚** (而 P1-2 的本意恰恰是"停机时

@@ -25,7 +25,7 @@
 |---|---|---|---|
 | .data | 0x20000000 ~ 0x2000002C | 44 B | 已初始化全局 |
 | .bss | 0x20000040 ~ 0x20008218 | 32.8 KB | 零初始化全局（含引擎观测面）|
-| **SHM** | **0x20008220 ~ 0x20010220** | **32 KB** | 数据总线（见 §2）|
+| **SHM** | **DTCM 里 32 KB（基址由链接器分配，★ 不要写死）** | **32 KB** | 数据总线（见 §2）|
 | **空闲** | 0x20010220 ~ 0x20020000 | **63.5 KB** | 未用（栈从顶向下，当前仅占 ~160B）|
 
 **结论：DTCM 余量 63.5KB —— "浪费内存"在本平台不成立，真正的约束是 §2 的分区边界。**
@@ -43,9 +43,11 @@
 | 0x0440 | LUT_DATA | 0x400 (256×f32) | LUT 原语数据 |
 | 0x0840 | ROUTE_TABLE (active) | 0x800 (128×16B) | 路由表（引擎执行的"程序"）|
 | 0x1040 | ROUTE_STAGING | 0x800 | 路由表 staging（部署写这里，RELOAD 后换）|
-| 0x1840 | PARAM_TABLE | 0x1000 (128×16B) | 参数槽（4×f32/条）|
-| 0x2840 | STATE_TABLE | 0x1000 (128×16B) | 状态槽（PID 积分/TIMER 累计等跨拍状态）|
-| 0x3840 | RSVD_DSL_DOMAIN | 0x7C0 | DSL 预留（内含 TICK_STATS 0x3854）|
+| 0x1840 | PARAM_TABLE | 0x800 (128×16B) | 参数槽（4×f32/条）★ 原表写 0x1000 **尺寸错** |
+| 0x2040 | PARAM_STAGING | 0x800 (128×16B) | 参数暂存（部署写这里，RELOAD 后换）★ **原表整行漏了** |
+| 0x2840 | STATE_TABLE | 0x800 (128×16B) | 状态槽（PID 积分/TIMER 累计等跨拍状态）★ 原表写 0x1000 **尺寸错** |
+| 0x3040 | STATE_STAGING | 0x800 (128×16B) | 状态暂存（热重载用）★ **原表整行漏了** |
+| 0x3840 | RSVD_DSL_DOMAIN | **0xC40** | DSL 预留洞。权威 = `engine.h:211` `OFF_ROUTE_BUCKETS - OFF_RSVD_DSL_DOMAIN`（`:898` 有断言）。★ 原写 0x7C0 只是"洞内 SEQ 之前那一段"(0x3840→0x4000)，**口径不同**，照它算少 0x480 |
 | 0x4000 | SEQ_TABLE | 0x400 (64×16B) | 顺序步条目 |
 | 0x4400 | SEQ_CTRL | 0x80 (8×16B) | 顺序实例控制块 |
 | 0x4480 | ROUTE_BUCKETS (active) | 0x1B8 | 分档桶表 |
@@ -56,7 +58,7 @@
 | 0x4DE0 | CMD_REQ | 0x1000 | 免串口命令请求区 |
 | 0x5DE0 | MACRO_CTRL/CODE | 0x1010 | macro 控制块 + 字节码 (4KB) |
 | 0x6E00 | HIL_DUTY / HIL_FB_RAW | 0x8 | W5 观测面 |
-| **0x6E08** | **空闲** | **0x11F8 (4.6KB)** | **← shadow 的家（§4）** |
+| **0x6E08** | **DO_SHADOW / RTC / EVT / BB_SNAP / FAULT_LOG / WDT_STAT / PERSIST_STAT** | 已占满 | ★★ **不是空闲**：`OFF_DO_SHADOW`=0x6E08、`OFF_RTC_SSR/TR/DR`=0x6E10/14/18、`OFF_EVT_HEAD/BUF`=0x6E1C/0x6E20、`OFF_BB_SNAP`=0x6F20、`OFF_FAULT_LOG`=0x7020、`OFF_WDT_STAT`=0x70B8、`OFF_PERSIST_STAT`=0x7180（`engine.h:525-577`）。★ 原写"空闲 0x11F8"是**中旬以前的快照** —— 照它去放东西会**直接踩在 WDT / 黑匣子 / 事件环**上（本项目已因此踩过一次：程序载荷缓冲撞进黑匣子环，读回魔术字是 `DLBK`）|
 
 ---
 
@@ -87,10 +89,15 @@
 引入 shadow 后的数据流（单缓冲）：
 
 ```
-拍 N:   输入段 → 计算段 → do_pack → 写 shadow(值A)
-t=拍N边界: TIM1 上溢 ⇒ MDMA 读 shadow(值A) → GPIOE_ODR  ┐ 与拍中断 N+1 入口
-拍 N+1: 输入段 → 计算段 → do_pack → 写 shadow(值B)       ┘ 同时发生(总线仲裁)
-t=拍N+1边界: MDMA 读 shadow(值B) → GPIOE_ODR
+★★★ **2026-09-16 更正：下面这段数据流建立在"已被实测推翻"的前提上，仅作历史留档。**
+实测结论（`docs/ARCH-TIMELINE-CPU-MDMA.md:11-14 / :44 / :61-62`，`docs/exp-2026-09-14-mdma-trigger/`）：
+- "TIM2_UP → DMAMUX1 → DMA2_S0 → TC → MDMAMUX → MDMA → ODR" 这条**七级触发链不成立**：
+  `DMAMUX1_C8=0`、`DMA2_S0_CR.EN=0`、`CTBR.TSEL` 扫 0..15 —— 锁存**全部照常工作**；
+  **只有 `MDMA_CH0_CCR.EN=0` 才会停** ⇒ **MDMA 通道在自循环，不消费任何请求源**。
+- ⇒ **输出引脚时刻 = CPU 最后一次写影子 + 0.12 µs**，**不是"拍边界由硬件锚定"**。
+- ⇒ 触发源是 **TIM2_UP（DMAMUX 请求 22）**，不是 TIM1（`src/do.c:64/107/176`；
+  TIM1 是照抄参考工程 h723-core0 的笔误 —— 那边节拍才是 TIM1）。
+- ⇒ 本章"单缓冲数据流 / 触发 / 频率"三处**不要用于时序判断**；DO 路径的交付形态见 §4.1。
 ```
 
 逐个场景：
@@ -135,8 +142,8 @@ t=拍N+1边界: MDMA 读 shadow(值B) → GPIOE_ODR
 
 | 项 | 值 |
 |---|---|
-| 源 | `SHM + OFF_DO_SHADOW` = `0x20008220 + 0x6E08` = `0x2000F028`（DTCM，MDMA 经 AHBS 可达）|
+| 源 | `SHM + OFF_DO_SHADOW`（DTCM，MDMA 经 AHBS 可达）★ **不要写死基址**：本文原写 `0x20008220`，2026-09-16 实测已是 `0x20003EA0` —— 加/删一个全局就会挪（`manifest.h:8` 记着这条教训）|
 | 目的 | `GPIOE_ODR = 0x58021014` |
 | 宽度/长度 | 8 字节（shadow + seq）/ 单块 |
-| 触发 | TIM1 上溢 → DMAMUX → DMA2 哑传输(1字) → TC → MDMA（硬件链）|
+| 触发 | ★ **实测：没有有效触发源** —— MDMA 通道在**自循环**（见上方更正）。"TIM2_UP→DMAMUX→DMA2_TC" 这条链看上去成立，但把它逐段拆掉，锁存**照样工作**；只有 `MDMA_CH0_CCR.EN=0` 才会停 |
 | 频率 | 每拍 1 次 = 10 kHz ⇒ MDMA 占用率可忽略（余量 >1000 倍）|
