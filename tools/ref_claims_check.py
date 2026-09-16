@@ -320,7 +320,10 @@ def chk_F(root):
             #   实例：`能力位 u16 只剩 1 位空闲（当前 0x7DF7，只剩 0x8000）` —— 末值是"还能用的位"。
             #   （这条限定词是 F2 首跑时被这一行打红后加的：**判据要能把"真过期"与"合法例外"分开**，
             #     否则它会变成误报机器，而误报会被自己人关掉。）
-            _exc = any(k in line for k in ("只剩", "空闲", "未用", "保留位"))
+            #   ★ 第二类合法例外：**"必备位掩码"** 里的十六进制**不是实现字**，而是"程序要求哪些必备位"
+            #     （`(cap & 0x0DF7) == 0x0DF7` 里那个 `0x0DF7` 是**设计常量**，永远不变）。
+            #     实例：README 的认口那一行同时出现掩码 `0x0DF7` 与演进链 `… → 0x7DF7`。
+            _exc = any(k in line for k in ("只剩", "空闲", "未用", "保留位", "掩码", "cap &"))
             if impl and ("实现字" in line or "能力字" in line) and not _exc:
                 vals = ["0x" + v.upper() for v in CAP_RE.findall(line)]
                 if vals:
