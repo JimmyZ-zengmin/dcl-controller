@@ -258,7 +258,8 @@ deploy_routes=4  0x38 n_routes=4 applied=1` ✓
 - 新命令：`0x45` BEGIN / `0x46` DATA / `0x47` COMMIT / `0x48` STATUS(96B) / `0x49` ERASE / `0x4A` DEVICE_DESC
 - ★ **`0x48` 的 96B 里 +52/+56/+60 = `txn_begin/commit/abort`，+64/+68/+72/+76 = 开机装载结果，
   +80..92 = 从卡上读回的载荷头** ⇒ **验收全部走协议，不需要 SWD。**
-- 验收脚本：`docs/audit/h723_prog_store_test.py`（用 `h723_motion_probe.Dut`，**别用 `h723_client.Dcl`**）
+- 验收脚本：`docs/audit/h723_prog_store_test.py`（`Dut` 或 `h723_client.Dcl` **都自带 CRC 校验**，
+  两者皆可；见 §10.5 关于"应答归属"的更正）
 - 契约：`docs/REF-program-contract.md`（§9 GAP 表已按实施更新）；状态：`docs/STATUS-2026-09-16.md`
 
 ### 10.2 ★★★ AXI 真实地图（320KB **已用满**）—— 加任何缓冲前先看这张表
