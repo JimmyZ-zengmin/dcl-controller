@@ -110,9 +110,12 @@ void dev_bind_submit(void)
      *   ⇒ 会被无条件接受并整表替换, **把现场打回旧配置**。而且任何观测量都不会说
      *   "这是一张旧表"（`REJECT=0`、`N_VALID` 合法、`DONE_SEQ` 跟上了）。
      *   ⇒ 判据: 用**有符号差**判回退（`(int32_t)(rq - dn) < 0`）, 天然处理 u32 回绕。
+     *   ★ `dn == 0` 是**新纪元**（刚冷启动/从未生效过）⇒ 任何非 0 序号都算"新的", 不判回退。
+     *     没有这个例外就有个不必要的约束: 首张表若用 `req_seq >= 2^31`, 会被误判成回退
+     *     （审计指出的边界）。有了它, "序号只要单调递增即可", 与起始值无关。
      *   ★ 回退被拒时**不回 `done_seq`**: 它代表"当前已生效的最新号", 回退它会破坏单调性。
      *     上位机只须看 `reject != 0 && done_seq != rq` 即可判定并**终止等待**（判据能终止）。 */
-    if ((int32_t)(rq - dn) < 0) {
+    if (dn != 0u && (int32_t)(rq - dn) < 0) {
         SHM_U32(s_shm, DB_REJECT) = DB_RC_SEQ;
         g_db_rej_n++;
         SHM_U32(s_shm, DB_REJ_N)  = g_db_rej_n;
@@ -198,15 +201,17 @@ void dev_bind_service(uint32_t tick)
     /* ② 有一个在飞 ⇒ 只做收尾 */
     if (s_busy != 0u) {
         if (i2c_sm_status() == I2C_SM_ST_BUSY) { return; }      /* 还在跨拍推进 */
-        /* ★★★ 归属判据 —— **本模块最容易悄悄出错的一处**。
-         *   只看 `status == OK` 不够: 它只能证明"有人跑完了一次全 ACK 的事务",
+        /* ★★★ 收尾必须走**完成记录**（2026-09-16 第二轮审计后修正）。
+         *   只看 `status == OK` 不够: 那只能证明"**有人**跑完了一次全 ACK 的事务",
          *   证明不了"那一次**是我发的**"。本状态机只有一个 `s_rbuf`, 另一个使用者
-         *   （`i2c_shm_service`, G6-3）**可以在我收尾之前插入并完成**, 把他的读数留在
-         *   `s_rbuf` 里 ⇒ 只按 status 收尾就会把**别人的数据**写进我的 `SENSOR[dst]`。
-         *   全程无报错、计数器全绿、寄存器全对 —— 只有值悄悄是错的（本项目最怕的一类）。
-         *   ⇒ 必须用归属令牌核对序号（令牌住在 `i2c_sm` = 资源处, 见 i2c_sm.h）。 */
+         *   （`i2c_shm_service`）**可以在我收尾之前插入并完成**, 把他的读数留在 `s_rbuf` 里。
+         *   ★★ 而且**只加令牌也不够**（这是第二轮的发现）: `s_status` 是**实时态**,
+         *     一个**被拒**的请求（门忙 / BADARG）会覆写它 ⇒ 会出现"令牌匹配但状态已被改"，
+         *     于是收尾方**丢弃自己的好数据并计一次 err**。
+         *   ⇒ 正解 = 完成记录 `{done_req, done_status, done_len}`（完成那刻快照、
+         *     受理新请求即失效），并用 `take_result(my, …)` 取数 —— 全程不碰实时字段。 */
         if (i2c_sm_done_req() != s_my_req) {
-            /* 我那一次的结果已被后来的事务覆盖 ⇒ **丢弃并重发**（绝不当成功用）。
+            /* 结果被后来者覆盖 / 记录已失效 ⇒ **丢弃并重发**（绝不当成功用）。
              * ★ 计入 skip 而非 err: 这是**调度现象**（被别人抢先收尾）, 不是器件/通信故障。
              *   混进 err 会让"err 在涨"这条判据无法解释 ⇒ 判据作废（一个计数只回答一个问题）。 */
             s_busy = 0u;
@@ -216,8 +221,8 @@ void dev_bind_service(uint32_t tick)
         }
         s_busy = 0u;
         uint8_t d[I2C_SM_MAX_DATA];
-        uint32_t got = i2c_sm_result(d, (uint32_t)I2C_SM_MAX_DATA);
-        if ((i2c_sm_status() == I2C_SM_ST_OK) && (got >= s_lane[s_idx].len)) {
+        uint32_t got = i2c_sm_take_result(s_my_req, d, (uint32_t)I2C_SM_MAX_DATA);
+        if (got >= s_lane[s_idx].len) {          /* take_result 只在**完成状态为 OK** 时给数据 */
             float fv = (s_lane[s_idx].len == 1u)
                      ? (float)d[0]
                      : (float)(((uint32_t)d[0] << 8) | (uint32_t)d[1]);   /* 大端, 与 AS5600 一致 */
@@ -228,7 +233,9 @@ void dev_bind_service(uint32_t tick)
             /* ★ 失败**保留上一次的值**（不写 0）—— 把"没读到"伪装成"值=0"会让闭环跑飞 */
             g_db_err_n++;
             SHM_U32(s_shm, DB_ERR_N)   = g_db_err_n;
-            SHM_U32(s_shm, DB_LAST_ERR)= i2c_sm_status();
+            /* ★ 记**完成时**的状态（`done_status`），不是实时 `status` —— 后者可能已被
+             *   别人的被拒请求改掉, 那样记下来的"原因"就是错的。 */
+            SHM_U32(s_shm, DB_LAST_ERR)= i2c_sm_done_status();
         }
         return;
     }
@@ -277,8 +284,15 @@ void dev_bind_service(uint32_t tick)
             s_busy = 1u;
         } else {
             uint32_t st = i2c_sm_status();
-            if (st == I2C_SM_ST_GATE_BUSY) {
-                /* 在我检查之后、发起之前总线被别人拿走了（窗口极小但存在）⇒ 同 skip 处理 */
+            /* ★★ 两种"没轮到我"都必须算 **skip 而不是 err**（第二轮审计挖出的第二条漏洞）:
+             *   · `GATE_BUSY` = 阻塞路径占着总线（上面 ⑤ 已提前挡掉，这里是收窄后的窗口）
+             *   · `BUSY`      = **别人的事务正在飞**（`i2c_sm_request` 因 `s_phase` 非空闲而返回 0，
+             *                   **且它不改 `s_status`** ⇒ 状态仍是 BUSY）
+             *     后者在**同一圈里就稳定复现**：`i2c_shm_service()` 排在 `dev_bind_service()`
+             *     **之前**（main.c），它一旦发起，本函数这一圈的请求必然撞上 BUSY。
+             *   ⇒ 若把 BUSY 计成 err, 那么"err 只回答器件/通信问题"这条判据**当场失效**
+             *     （err 会因为另一个使用者的正常活动而涨）。 */
+            if (st == I2C_SM_ST_GATE_BUSY || st == I2C_SM_ST_BUSY) {
                 g_db_skip_n++;
                 SHM_U32(s_shm, DB_SKIP_N) = g_db_skip_n;
             } else {

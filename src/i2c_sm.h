@@ -61,25 +61,40 @@ uint32_t i2c_sm_request(uint8_t addr7, uint8_t op, uint8_t reg,
 /* ── ★ 每拍调用一次（拍 ISR 内）。推进**一个相位**，开销有界。── */
 void     i2c_sm_tick(void);
 
-/* ── 观测面 ── */
-uint32_t i2c_sm_status(void);
+/* ── 观测面 ──
+ * ★★ 2026-09-16 修正（第二轮审计挖出的第二条漏洞）: `s_status` 是**实时态** ——
+ *   一个**被拒**的请求（门忙 / BADARG）会**覆写**它。于是"令牌匹配"仍可能配上
+ *   一个**被别人改过的状态** ⇒ 收尾方会**丢弃自己的好数据并计错**。
+ *   ⇒ 引入 **完成记录** `{req, status, len}`：完成的一刻快照，**受理新请求时立即失效**
+ *     （`done_req = I2C_SM_DONE_NONE`）。
+ *   **取结果必须走完成记录**（`take_result` / `result`），**不要**再看 `i2c_sm_status()`。
+ *   ★ 判据一般化: **"完成态"与"实时态"是两件事** —— 共用一份状态，就会被后续动作改掉。 */
+#define I2C_SM_DONE_NONE  0xFFFFFFFFu   /* 完成记录为空（无结果可取）*/
+
+uint32_t i2c_sm_status(void);              /* **实时态**（诊断用；**不要**用它判"我的结果好了没"）*/
 uint32_t i2c_sm_phase(void);       /* 当前相位号（诊断）*/
 uint32_t i2c_sm_phase_cnt(void);   /* 本次事务已推进的相位数 */
 uint32_t i2c_sm_tick_cnt(void);    /* 本次事务已耗的拍数 */
-uint32_t i2c_sm_result(uint8_t *buf, uint32_t n);   /* 拷回接收数据, 返回实际字节数 */
+/* 取"最近一次完成"的数据（要求完成记录存在且其状态为 OK）。返回实际字节数。
+ * ★ 注意它不是"我的结果" —— 要判归属必须用下面的 take_result。 */
+uint32_t i2c_sm_result(uint8_t *buf, uint32_t n);
 
-/* ★★★ 事务归属令牌（2026-09-16）。**每个使用者都必须用它收尾**，不能只看 status。
+/* ★★★ 事务归属令牌 + 完成记录（2026-09-16）。**每个使用者都必须用它收尾**。
  *
  * 反例（真缺陷，不是理论风险）：本状态机只有一个 `s_rbuf`/`s_status`/`s_len`，而使用者有
- * **两个**（`i2c_shm_service` 与 `dev_bind_service`）。只查 `status == I2C_SM_ST_OK` 时：
- *   我发起 → 完成(OK, 数据是我的) → **别人发起并完成**(数据被换成他的) → 我按 OK 收尾
- *   ⇒ 把**他的**读数写进我的目标槽。全程无错、计数器全绿，只有值是错的。
- * 用法：
- *   ① `i2c_sm_request()` 返回 1 之后立刻记下 `my = g_i2c_sm_req_n`;
- *   ② 收尾时要求 `i2c_sm_done_req() == my`，否则**丢弃结果并重发**（不得当成功）。
+ * **两个**（`i2c_shm_service` 与 `dev_bind_service`）。两类静默错数据：
+ *   ① 只查 `status == OK` ⇒ 别人的完成被当成自己的（数据串台）；
+ *   ② 只查令牌 ⇒ 令牌匹配但**状态已被别人后来的被拒请求改掉** ⇒ 丢自己的好数据、还计错。
+ * 处方（两者都要）:
+ *   ③ `i2c_sm_request()` 返回 1 之后立刻记下 `my = g_i2c_sm_req_n`;
+ *   ④ 收尾时 **①** 实时态非 BUSY、**②** `i2c_sm_done_req() == my`（否则结果已被覆盖 / 失效）;
+ *   ⑤ 用 `i2c_sm_take_result(my, …)` 取数据（它同时校验完成记录的状态与长度）。
  * ★ 放在资源处（而不是在每个调用点各判一次）是本项目 §4.5 铁律：
  *   "守卫必须住在资源的定义处" —— 否则多一个调用者就静默穿透。 */
-uint32_t i2c_sm_done_req(void);    /* 刚完成的事务的受理序号（= g_i2c_sm_req_n 的快照）*/
+uint32_t i2c_sm_done_req(void);    /* 刚完成的事务的受理序号；无记录时 = I2C_SM_DONE_NONE */
+uint32_t i2c_sm_done_status(void); /* **完成时**的状态快照（OK/NAK/STUCK），不受后续动作影响 */
+uint32_t i2c_sm_take_result(uint32_t my_req, uint8_t *buf, uint32_t n);
+                                   /* 仅当 `done_req == my_req` 且完成状态为 OK 时拷回数据 */
 
 /* ★★ 总线独占门住在 **`i2c_bb`**（= 资源的定义处），本模块只是它的**使用者** —— 见 `i2c_bb.h` 的门 API。
  *   ★ 为什么改到这里: 早先那版把"阻塞路径在忙"的标志放在**主循环**、把判断放在**状态机**

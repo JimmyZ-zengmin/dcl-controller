@@ -3448,6 +3448,13 @@ static void i2c_shm_service(void)
     uint32_t dn = SHM_U32(g_shm, IX_DONE_SEQ);
     if (rq == 0u || rq == dn) { return; }              /* 无待办（seq 相同 = 空闲）*/
 
+    /* ★★ "被拒"与"完成"是**两条不同的收尾路径**（2026-09-16 修）:
+     *   · 被拒（门忙 / 参数非法）⇒ **没有完成记录**, 原因在**实时** `i2c_sm_status()` 里;
+     *   · 完成 ⇒ 原因与数据都在**完成记录**里（实时 `status` 可能已被别人的动作改掉）。
+     *   ★ 踩过: 引入完成记录后, 被拒路径一度也去读 `done_status()` ⇒ 报回 `IDLE(0)`,
+     *     **拒绝理由丢失**, 上位机分不清"没做事"与"被拒了"。
+     *     抓到它的是我那条判据里的断言: "**没跑到该分支 ⇒ 本判据无效, 不是通过**"。 */
+    uint32_t refused = 0u;
     if (s_ix_busy == 0u) {
         uint32_t p    = SHM_U32(g_shm, IX_REQ);
         uint8_t addr  = (uint8_t)(p & 0xFFu);
@@ -3468,7 +3475,7 @@ static void i2c_shm_service(void)
             s_ix_my_req = g_i2c_sm_req_n;      /* ★ 受理序号 = 归属令牌（收尾时核对）*/
             return;                            /* 已发起 ⇒ 等它跨拍跑完 */
         }
-        /* 被拒（门忙 / 参数非法）⇒ 立刻收尾, 把拒绝原因交回使用者 */
+        refused = 1u;                          /* 被拒（门忙 / 参数非法）⇒ 立刻收尾, 原因在实时状态里 */
     } else if (i2c_sm_status() == I2C_SM_ST_BUSY) {
         return;                                        /* 还在飞 ⇒ 继续等（这就是"就绪门"）*/
     } else if (i2c_sm_done_req() != s_ix_my_req) {
@@ -3485,13 +3492,25 @@ static void i2c_shm_service(void)
     }
 
     /* ── 收尾: 回写结果, **最后**写 done_seq（顺序很重要: 先数据后完成号）── */
-    SHM_U32(g_shm, IX_STATUS) = i2c_sm_status();
+    if (refused != 0u) {
+        /* 被拒: 没有数据可给, 只把**原因**交回（实时状态 = 拒绝码 GATE_BUSY / BADARG）。 */
+        SHM_U32(g_shm, IX_STATUS)   = i2c_sm_status();
+        SHM_U32(g_shm, IX_PHASE)    = i2c_sm_phase();
+        SHM_U32(g_shm, IX_TICKS)    = i2c_sm_tick_cnt();
+        SHM_U32(g_shm, IX_DONE_SEQ) = s_ix_seq;
+        s_ix_busy = 0u;
+        return;
+    }
+    SHM_U32(g_shm, IX_STATUS) = i2c_sm_done_status();   /* ★ 用**完成时**的状态快照 */
     SHM_U32(g_shm, IX_PHASE)  = i2c_sm_phase();
     SHM_U32(g_shm, IX_TICKS)  = i2c_sm_tick_cnt();
     uint8_t d[I2C_SM_MAX_DATA];
-    uint32_t got = i2c_sm_result(d, (uint32_t)I2C_SM_MAX_DATA);
+    /* ★★ 取数走 `take_result(我的号, …)`：它同时校验**归属**与**完成状态**。
+     *   ★ 不能只看实时 `i2c_sm_status()` —— 别人后来的**被拒**请求会覆写它，
+     *     于是"我的成功"会被读成失败（第二轮审计挖出的漏洞；见 i2c_sm.h 的完成记录）。 */
+    uint32_t got = i2c_sm_take_result(s_ix_my_req, d, (uint32_t)I2C_SM_MAX_DATA);
     for (uint32_t i = 0u; i < got; i++) { SHM_U8(g_shm, IX_DATA + i) = d[i]; }
-    if (i2c_sm_status() == I2C_SM_ST_OK) { SHM_U32(g_shm, IX_LAST_OK_SEQ) = s_ix_seq; }
+    if (got != 0u) { SHM_U32(g_shm, IX_LAST_OK_SEQ) = s_ix_seq; }
     SHM_U32(g_shm, IX_DONE_SEQ) = s_ix_seq;            /* ★ 最后一步: 使用者据此判"有效" */
     s_ix_busy = 0u;
 }
@@ -3528,6 +3547,7 @@ static void obs_anchor(void)
     /* ★ G6-4 新增观测量 —— 同样不加这几行它们可能悄悄从符号表消失 */
     sink ^= g_db_ok_n;                    sink ^= g_db_err_n;
     sink ^= g_db_last_err;                sink ^= g_db_skip_n;
+    sink ^= g_db_rej_n;                   /* ★ 第二轮审计指出漏登记（dev_bind.h 自述要求）→ 已补 */
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
     sink ^= g_engine_gate;                sink ^= g_engine_sel;
     sink ^= g_n_routes;                   sink ^= g_table_profile;

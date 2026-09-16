@@ -77,7 +77,18 @@ volatile uint32_t g_i2c_sm_req_n = 0u, g_i2c_sm_ok_n = 0u, g_i2c_sm_nak_n = 0u,
  *   **绝不会把别人的值当成自己的**。
  * ★ 为什么放这里而不是在调用点各加一个判断: 调用点会越加越多（现在就两个, 将来三个）,
  *   而"守卫必须住在资源的定义处"正是为了"多一个调用者不会静默穿透"。 */
-volatile uint32_t g_i2c_sm_done_req = 0u;
+volatile uint32_t g_i2c_sm_done_req = I2C_SM_DONE_NONE;   /* 初始"无完成记录" */
+/* ★★★ 完成记录（2026-09-16 第二轮审计后补）—— `{req, status, len}` 三者必须**同一刻快照**。
+ *
+ * 为什么单有 `done_req` 不够（真漏洞）:
+ *   `s_status` 是**实时态** —— 一个**被拒**的请求（门忙 / BADARG）会覆写它。
+ *   时序: 我的事务完成(OK) → 别人发请求被门拒(`s_status=GATE_BUSY`) → 我收尾
+ *   ⇒ 令牌匹配、而 `s_status` 已不是 OK ⇒ 我**丢弃自己的好数据并计一次 err**。
+ *   `s_len` 同理（下一个事务会覆写它）⇒ 取结果可能拷回**张冠李戴的长度**。
+ * ⇒ 处方: **完成的一刻**把三元组拷进完成记录；**受理新请求时立刻失效**（`done_req=NONE`）。
+ *   于是"取结果"不再依赖任何实时字段 —— 这叫**完成态与实时态分开**。 */
+volatile uint32_t g_i2c_sm_done_status = I2C_SM_ST_IDLE;
+static uint8_t    s_done_len = 0u;
 
 static inline uint32_t bit1_m(void) { return (1u << s_scl) | (1u << s_sda); }
 static inline uint32_t bit2_m(void) { return (3u << (s_scl * 2u)) | (3u << (s_sda * 2u)); }
@@ -149,6 +160,25 @@ uint32_t i2c_sm_request(uint8_t addr7, uint8_t op, uint8_t reg, const uint8_t *t
 {
     if (!s_run) { return 0u; }
     if (s_phase != PH_IDLE && s_phase != PH_DONE) { return 0u; }   /* 上一个还在飞 */
+    /* ★★★ 参数校验必须在**拿门之前**（2026-09-16 上机实测抓到的真缺陷）。
+     *   原实现是"先 `i2c_bus_acquire()`、再校验参数"，而三条"参数非法"分支
+     *   `s_status = BADARG; s_phase = PH_DONE; return 0u;` —— **直接返回、不放门**
+     *   ⇒ **引用计数泄漏**：owner 永久卡在 `I2C_OWNER_SM`，阻塞路径再也拿不到总线。
+     *   症状（实测）: `0x39 op=22` 读回 `owner=2` **冻结不变**、`refs != 0`、
+     *     而状态机早已 idle（`status=OK`、`phase=DONE`）——
+     *     ⇒ 之后**所有**依赖阻塞路径的判据（AS5600 轮询、G6-2 的 G1/G4/G5、G6-3 的 S6）
+     *       **一起变红**，而错误方向指向"总线被谁占了"，与真因（一次参数非法的请求）相隔很远。
+     *   ★ 抓到它的是**专为这类泄漏准备的 `refs` 计数**（G6-2 的 `i2c_bus_refs()`，
+     *     `0x39 op=22 +32`）—— 又一个"为可解释性加的观测，顺手抓住静默故障"的实例。
+     *   ★ 一般化: **不要为一个你准备拒绝的请求去占用资源**；真要占，就必须保证每条
+     *     出口都成对释放（"成对"这种事靠人记，迟早漏 —— 所以用结构性写法：先验后占）。 */
+    if (addr7 > 0x7Fu || op > I2C_SM_OP_WRITE) {
+        s_status = I2C_SM_ST_BADARG; s_phase = PH_DONE; return 0u;
+    }
+    if (n > I2C_SM_MAX_DATA) { s_status = I2C_SM_ST_BADARG; s_phase = PH_DONE; return 0u; }
+    if (op == I2C_SM_OP_WRITE && n > 0u && tx == NULL) {
+        s_status = I2C_SM_ST_BADARG; s_phase = PH_DONE; return 0u;
+    }
     /* ★★★ 总线独占门（契约 §3.6 约束③ / §3.7 G6-2）——
      *   与阻塞路径(i2c_bb_*)走**同一道门**。占用中 ⇒ 明确拒绝 + 计数(能失败的判据)。
      *   ★ 判据怎么跑: `0x39 op=22 sub=0` 人工占住总线, 再发 `op=20 sub=0` ⇒
@@ -159,13 +189,6 @@ uint32_t i2c_sm_request(uint8_t addr7, uint8_t op, uint8_t reg, const uint8_t *t
         s_phase  = PH_DONE;
         return 0u;
     }
-    if (addr7 > 0x7Fu || op > I2C_SM_OP_WRITE) {
-        s_status = I2C_SM_ST_BADARG; s_phase = PH_DONE; return 0u;
-    }
-    if (n > I2C_SM_MAX_DATA) { s_status = I2C_SM_ST_BADARG; s_phase = PH_DONE; return 0u; }
-    if (op == I2C_SM_OP_WRITE && n > 0u && tx == NULL) {
-        s_status = I2C_SM_ST_BADARG; s_phase = PH_DONE; return 0u;
-    }
 
     s_addr = addr7; s_op = op; s_reg = reg; s_len = n; s_idx = 0u; s_seq = 0u;
     s_rxpend = 0u; s_byte = 0u; s_rx = 0u; s_bit = 8u;
@@ -175,6 +198,11 @@ uint32_t i2c_sm_request(uint8_t addr7, uint8_t op, uint8_t reg, const uint8_t *t
     if (op == I2C_SM_OP_WRITE) { for (uint32_t i = 0u; i < n; i++) { s_tbuf[i] = tx[i]; } }
     s_pcnt = 0u; s_tcnt = 0u;
     s_status = I2C_SM_ST_BUSY;
+    /* ★★ 受理即**失效完成记录** —— 从这一刻起"没有结果可取"，
+     *   直到本次事务真的完成。这一条同时堵住"新事务读了一半数据就把 s_rbuf 改掉"的窗口。 */
+    g_i2c_sm_done_req    = I2C_SM_DONE_NONE;
+    g_i2c_sm_done_status = I2C_SM_ST_BUSY;
+    s_done_len           = 0u;
     g_i2c_sm_req_n++;
     g_i2c_sm_active = 1u;
     sm_od_init();                        /* 阻塞路径可能改过引脚形态 ⇒ 每次重设 */
@@ -254,8 +282,12 @@ DCL_ITCM void i2c_sm_tick(void)
         sda_hi(); ndly(I2C_SM_HI_ITERS);
         if (s_status == I2C_SM_ST_BUSY) { s_status = I2C_SM_ST_OK; g_i2c_sm_ok_n++; }
         g_i2c_sm_active = 0u;
-        /* ★ 归属令牌: 完成的一刻宣告"是我这一号跑完了" —— 收尾方据此确认结果归属。 */
-        g_i2c_sm_done_req = g_i2c_sm_req_n;
+        /* ★ 完成的一刻**同时**快照三元组 {序号, 状态, 长度} —— 收尾方据此判断
+         *   "有没有结果 / 是不是我的 / 多长"。此后即使别人发起并被拒（覆写 `s_status`），
+         *   这份记录也不受影响。 */
+        g_i2c_sm_done_req    = g_i2c_sm_req_n;
+        g_i2c_sm_done_status = s_status;
+        s_done_len           = s_len;
         /* ★ 放门**不在这里做** —— `i2c_bus_release()` 在 flash 里, 而本函数跑在拍 ISR:
          *   直接调它会违反 ISR 调用树不变量（闸门已当场拦下 `i2c_bus_release@0x08008C04`）;
          *   而"加 DCL_ITCM"走不通（**ITCM 已 100% 占满**）⇒ 改成置标志, 由主循环放门。 */
@@ -265,7 +297,10 @@ DCL_ITCM void i2c_sm_tick(void)
 
     default:
         g_i2c_sm_active = 0u;
-        g_i2c_sm_done_req = g_i2c_sm_req_n;   /* ★ 归属令牌（见 g_i2c_sm_done_req 的说明）*/
+        /* ★ 完成记录（同上）—— default 也是"事务结束"的一条出口，必须同样快照。 */
+        g_i2c_sm_done_req    = g_i2c_sm_req_n;
+        g_i2c_sm_done_status = s_status;
+        s_done_len           = s_len;
         /* ★ 放门**不在这里做** —— `i2c_bus_release()` 在 flash 里, 而本函数跑在拍 ISR:
          *   直接调它会违反 ISR 调用树不变量（闸门已当场拦下 `i2c_bus_release@0x08008C04`）;
          *   而"加 DCL_ITCM"走不通（**ITCM 已 100% 占满**）⇒ 改成置标志, 由主循环放门。 */
@@ -277,13 +312,34 @@ DCL_ITCM void i2c_sm_tick(void)
 
 uint32_t i2c_sm_status(void)    { return s_status; }
 
-/* ★★★ 归属令牌读取口（2026-09-16）。语义: **刚完成的那个事务的受理序号**。
- * 用法（收尾方必须两步都做）:
- *   ① 发起成功后记下 `my = g_i2c_sm_req_n`（= 自己那一号）;
- *   ② 收尾时要求 `i2c_sm_done_req() == my`, 否则**不得**用 `i2c_sm_result()` 的值。
- * ★ 只查 `status == I2C_SM_ST_OK` 是不够的 —— 那只能证明"有人成功了", 不能证明"是你要的那次"
- *   （见 i2c_sm.c 里 `g_i2c_sm_done_req` 的完整反例）。缺少第 ② 步 = **静默错数据**。 */
-uint32_t i2c_sm_done_req(void)  { return g_i2c_sm_done_req; }
+/* ★★★ 归属令牌 + 完成记录读取口（2026-09-16）。语义与用法见 `i2c_sm.h`。
+ * 收尾方三步：① 实时态非 BUSY ② `done_req == my` ③ `take_result(my, …)`。 */
+uint32_t i2c_sm_done_req(void)    { return g_i2c_sm_done_req; }
+uint32_t i2c_sm_done_status(void) { return g_i2c_sm_done_status; }
+
+/* 取**最近一次完成**的数据。★ 它不再看实时 `s_status`/`s_len` —— 那两样会被后续动作改掉
+ *   （这正是第二轮审计挖出的漏洞：被拒的请求会覆写 `s_status`）。改用完成记录。 */
+static uint32_t sm_copy_done(uint8_t *buf, uint32_t n)
+{
+    if (buf == NULL) { return 0u; }
+    if (g_i2c_sm_done_req == I2C_SM_DONE_NONE) { return 0u; }      /* 无完成记录 */
+    if (g_i2c_sm_done_status != I2C_SM_ST_OK) { return 0u; }       /* 完成了但没成功 */
+    uint32_t c = (n < (uint32_t)s_done_len) ? n : (uint32_t)s_done_len;
+    for (uint32_t i = 0u; i < c; i++) { buf[i] = s_rbuf[i]; }
+    return c;
+}
+
+uint32_t i2c_sm_result(uint8_t *buf, uint32_t n)
+{
+    return sm_copy_done(buf, n);
+}
+
+uint32_t i2c_sm_take_result(uint32_t my_req, uint8_t *buf, uint32_t n)
+{
+    /* ★ 归属核对放在**资源处**（不是在各调用点）—— 多一个使用者也不会静默穿透。 */
+    if (g_i2c_sm_done_req != my_req) { return 0u; }
+    return sm_copy_done(buf, n);
+}
 
 /* ★★ I2C 事务区的冷启动登记（由 cold_start_reset 调用）—— 见 i2c_sm.h 的说明。
  *   ★ 只碰 SHM，不碰硬件：`cold_start_reset()` 在启动序列的**阶段③**（早于 `i2c_sm_init()`），
@@ -294,6 +350,12 @@ void i2c_xact_reset(uint8_t *shm)
     SHM_U32(shm, IX_MAGIC)  = IX_MAGIC_VAL;
     SHM_U32(shm, IX_STATUS) = I2C_SM_ST_IDLE;
     g_i2c_sm_release_pending = 0u;
+    /* ★ 完成记录也要**作废**（新纪元: 上一轮的完成号/状态不该被当成"刚发生的事"）。
+     *   `g_i2c_sm_req_n` 本身**不清**（它是累计量, 与 DTCM 统计同族: 清它反而会造出
+     *   "序号回绕"的假象）；真正要紧的是把**完成记录**置空, 让所有收尾方判为"无结果"。 */
+    g_i2c_sm_done_req    = I2C_SM_DONE_NONE;
+    g_i2c_sm_done_status = I2C_SM_ST_IDLE;
+    s_done_len           = 0u;
 }
 
 /* ★ G6-2: 延迟放门 —— **只能在主循环调用**（本函数会碰 flash 里的门, 不能进 ISR）。 */
@@ -307,10 +369,6 @@ void i2c_sm_service(void)
 uint32_t i2c_sm_phase_cnt(void) { return s_pcnt; }
 uint32_t i2c_sm_tick_cnt(void)  { return s_tcnt; }
 
-uint32_t i2c_sm_result(uint8_t *buf, uint32_t n)
-{
-    if (buf == NULL || s_status != I2C_SM_ST_OK) { return 0u; }
-    uint32_t c = (n < s_len) ? n : s_len;
-    for (uint32_t i = 0u; i < c; i++) { buf[i] = s_rbuf[i]; }
-    return c;
-}
+/* ★ 旧的 `i2c_sm_result()` 实现（按实时 `s_status`/`s_len` 取数）已**删除**，不要恢复：
+ *   它会在"我的事务完成后、别人被拒"这类时序下返回**错误的长度或直接返回 0**。
+ *   现在 `i2c_sm_result()` 是完成记录的薄封装（见上方 `sm_copy_done`）。 */
