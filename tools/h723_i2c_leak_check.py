@@ -60,7 +60,9 @@ def main():
         print("SHM = 0x%08X" % shm)
 
         def rd(off, w):
-            sts, r = d.send(0x22, struct.pack("<IH", shm + off, w))
+            # ★ 用 `expect_len` 防串帧：应答**没有命令码回显**（GAP-12），
+            #   长度不符即判"这条不属于本次请求"（本仓 2026-09-16 真的被吃过一次 0x01 的应答）。
+            sts, r = d.send(0x22, struct.pack("<IH", shm + off, w), expect_len=w * 4)
             if sts != "ACK" or len(r) < w * 4:
                 raise IOError("0x22 应答异常: %s len=%d" % (sts, len(r)))
             return list(struct.unpack("<%dI" % w, r[:w * 4]))

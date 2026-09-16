@@ -838,13 +838,15 @@ def _confirm_hit(b, sentinel, first, tries=3, gap=0.03):
       · 真缺陷 ⇒ 错值粘住 ⇒ 复读**仍然**是同一个非哨兵值 ⇒ **照样判红**;
       · 串帧 ⇒ 复读立刻回到哨兵 ⇒ **不误判**。
     ★ 另外同时读一次 `DB_MAGIC`（一个不变量）作为**旁证**: magic 若也错 ⇒ 铁证是协议层。
+    ★ 命中时还抓一份**当时的表状态**（`snap()`）—— 因为曾出现过**一次偶发命中**而当场
+      信息不足以定案（见下），下一次再遇到就能直接看出"当时表是什么、服务方跑了没"。
     """
     for _ in range(tries):
         time.sleep(gap)
         if not _same_f32(b.rd_f(OFF_SENSOR_MAP + 15 * 4), first):
-            return False, None
+            return None
     m = b.rd(DB_MAGIC, 1)
-    return True, (m[0] if m else None)
+    return dict(magic=(m[0] if m else None), snap=snap(b))
 
 
 def t8_inflight_swap(b, seq, mode, dst, period_restore, rounds, observe):
@@ -975,9 +977,9 @@ def _t8_body(b, seq, mode, dst, A, Bt, SENT2, SLOT15, rounds, observe):
             elif abs(v - SENT2) > 1e-6:
                 # ★ 命中 **不等于**缺陷 —— 必须复读确认（串帧与真缺陷的区分见
                 #   `_confirm_hit` 的 docstring）。噪声不计入判定, 但要报出来。
-                confirmed, magic_seen = _confirm_hit(b, SENT2, v)
-                if confirmed:
-                    hit = (r, v, magic_seen)
+                ctx = _confirm_hit(b, SENT2, v)
+                if ctx is not None:
+                    hit = (r, v, ctx)
                     break
                 n_noise += 1
                 continue
@@ -1022,16 +1024,23 @@ def _t8_body(b, seq, mode, dst, A, Bt, SENT2, SLOT15, rounds, observe):
                n_err_grew, len(err_deltas), err_deltas, sk_deltas))
 
     if hit:
-        r_, v_, m_ = hit
+        r_, v_, ctx = hit
+        m_ = (ctx or {}).get("magic")
+        s_ = (ctx or {}).get("snap")
         record("T8.6 ★ 在飞换表时 SENSOR[15] 被改动 ⇒ **用错 lane**"
                "（新表的 dst/len 被用于旧事务的数据）",
                False,
                "第 %d 轮读到 SENSOR[15]=%s（位模式 0x%08X; 哨兵 %s, 而表 B 指向**不存在**"
                "的 0x50）。★ 已复读确认（连读 3 次同值 ⇒ 排除串帧）; 同期 DB_MAGIC=0x%08X"
-               "（应 0x%08X%s）" % (
+               "（应 0x%08X%s）; 当时表态: n_valid=%s reject=%s done_seq=%s ok_n=%s "
+               "err_n=%s skip_n=%s last_err=%s" % (
                    r_, v_, struct.unpack("<I", struct.pack("<f", v_))[0], SENT2,
                    m_ if m_ is not None else 0, DB_MAGIC_VAL,
-                   "" if m_ == DB_MAGIC_VAL else " ← magic 也错 ⇒ 更像协议层串帧"))
+                   "" if m_ == DB_MAGIC_VAL else " ← magic 也错 ⇒ 更像协议层串帧",
+                   s_["n_valid"] if s_ else "?", s_["reject"] if s_ else "?",
+                   s_["done_seq"] if s_ else "?", s_["ok_n"] if s_ else "?",
+                   s_["err_n"] if s_ else "?", s_["skip_n"] if s_ else "?",
+                   I2C_SM_ST.get(s_["last_err"], s_["last_err"]) if s_ else "?"))
         record("T8.7 全部 %d 轮哨兵均未被改动" % rounds, False,
                "第 %d 轮即失败" % r_)
     elif n_busy_rounds == 0:
@@ -1147,14 +1156,19 @@ def t9_teardown(b, want_reset=True):
         record("T9.2 0x13 RESET 被受理（清场手段）", False, "sts=%s" % sts)
         return
     q1 = None
-    deadline = time.time() + 1.0
+    n_try = 0
+    deadline = time.time() + 2.0          # ★ 留足: RESET 后固件要重跑 cold_start_reset
     while time.time() < deadline:
         q1 = sm_gate_query(b)
+        n_try += 1
         if q1 is not None and q1["refs"] == 0 and q1["owner"] == 0:
             break
         time.sleep(0.05)
     if q1 is None:
-        record("T9.2 0x13 RESET 后门归零", False, "RESET 后无应答")
+        record("T9.2 0x13 RESET 后门归零", False,
+               "RESET 后 2.0s 内 %d 次查询**全部无应答** —— 注意 T2 阶段的 0x13 是"
+               "**正常恢复**的, 所以这不是『RESET 慢』, 更像链路/并发异常"
+               "（本机两个 CH340 通到同一块板子）" % n_try)
         return
     record("T9.2 ★ 0x13 RESET 后门归零（⇒ 『跑前先复位』是可行约定, 下一个套件可自救）",
            q1["refs"] == 0 and q1["owner"] == 0,

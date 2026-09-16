@@ -71,12 +71,37 @@ class Dcl:
         if wait:
             time.sleep(wait)      # 打开串口常触发 DTR/RTS 复位 —— 等设备启动
 
-    def send(self, cmd, payload=b""):
-        """→ ('ACK'|'NAK'|'TIMEOUT', payload_bytes) —— 与 S3 同形状"""
-        sts, p = self.L.xact(cmd, payload, timeout=self.timeout)
-        if sts is None:
-            return ("TIMEOUT", b"")
-        return ("ACK" if sts == STS_ACK else "NAK", bytes(p))
+    def send(self, cmd, payload=b"", expect_len=None):
+        """→ ('ACK'|'NAK'|'TIMEOUT', payload_bytes) —— 与 S3 同形状
+
+        ★★★ `expect_len`（2026-09-16 新增，**现场教训**）：给定时校验**应答载荷长度**，
+        不符直接返回 `("TIMEOUT", b"")`（调用方按现有语义重试/判失败）。
+
+        **它挡的是什么**：协议应答里**没有命令码回显、也没有序号**（契约 GAP-12），
+        所有 ACK 帧的 cmd 都是 `0x00` ⇒ 客户端**无法判断这条应答是不是自己刚发出的请求**。
+        于是任何杂帧（开机 banner、上一条的迟到应答、**另一个进程的应答**）都会被当成本次应答。
+        **实测现场（不容置疑）**：密轮询 `0x22 READ_BURST` 读 1 个字时，读回值位型
+        `0x1DF70200` = **低16位 `fw_ver 0x0200` + 高16位 `cap 0x1DF7`** ——
+        那是一次 **`0x01 GET_VERSION` 的应答**被吃掉了。★ 最坏巧合：`0x22` 读 **1 个字**
+        的应答**也是 4 字节**，与 `0x01` 的**完全相同** ⇒ 在那一档上**长度判据也救不了**。
+        ⇒ 实践建议（三层，按代价从低到高）：
+          ① 能读**两个字**就别读一个字（帧长 8 即挡掉 4 字节杂帧）—— `expect_len=8`；
+          ② 关键观测**连续两次读到同值**才算命中；
+          ③ 命中时**打印原始 u32**（不要只打解码后的 float —— 定性靠位型）。
+        ★ 根治在协议层（应答带命令码回显或序号），属 v1 首选。
+        ★ 说明：**旧调用点仍是弱判据**（不传 `expect_len` 时行为与从前逐字节相同），
+          这里只提供能力，不在全仓库强行改造（那是 v1 量级的线上格式变更）。
+        """
+        # ★ 重试的意义：串帧是**瞬时**现象（杂帧被吃掉一次），重发通常就能拿对。
+        #   与"连续两次同值"配合，才能把"偶然串帧"与"真实数值变化"分开。
+        for _ in range(3 if expect_len is not None else 1):
+            sts, p = self.L.xact(cmd, payload, timeout=self.timeout)
+            if sts is None:
+                return ("TIMEOUT", b"")
+            if expect_len is not None and len(p) != expect_len:
+                continue          # ★ 长度不符 ⇒ **这条应答不属于本次请求**，丢掉重发
+            return ("ACK" if sts == STS_ACK else "NAK", bytes(p))
+        return ("TIMEOUT", b"")   # 重试后仍拿不到长度正确的应答
 
     def close(self):
         try:
