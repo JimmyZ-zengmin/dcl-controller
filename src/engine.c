@@ -24,6 +24,7 @@
 #include <string.h>
 #include "regs.h"
 #include "engine.h"
+#include "step.h"
 #include "modbus.h"
 #include "macro.h"
 #include "lsym.h"
@@ -107,6 +108,10 @@ void cold_start_reset(void)
      *     (上电 / 0x13 RESET / deploy 装载) 都会清掉已上传的程序** —— 这是
      *     macro.h 声明的 v0 边界 (RAM-only, 掉电/RESET 丢失), 不是缺陷。 */
     macro_reset(g_shm);
+    /* ★★★ 2026-09-17: **步进模块的 DO 面管辖掩码**（见 src/step.h 的 `step_cold_reset`）。
+     *   修前症状：`0x13 RESET` 的 memset 把 `GPIO_MASK` 清 0 后**永不恢复**
+     *   （`step_init` 不在本入口里）⇒ DO 面不驱动 PE9 ⇒ **驱动器失能 ⇒ 运动全废**。 */
+    step_cold_reset(g_shm);
     /* ★ 统一故障台账登记 (2026-09-13)。
      *   memset 已把台账清 0, 这里显式写 magic —— 目的是让"漏登记"从
      *   "读出来是 0 分不清'干净'还是'没登记'" 变成 `fault_sane()==1` 的**可判**状态。

@@ -101,6 +101,16 @@ void     step_stop_safe(void);
 
 /* 运动服务 —— **主循环**调用（与 `step_tick` 同处）。只在槽值变化时动作。 */
 void     step_service_motion(void);
+/* ★★★ 2026-09-17: **冷启动登记**（`cold_start_reset()` 里调用）。
+ *   本函数负责把"DO 面管辖掩码"(`OFF_CTRL_GPIO_MASK = STEP_DO_MASK`) 重新登记 ——
+ *   它是"引擎管哪些引脚"的登记，而 `step_init()`（唯一设它的地方）**不在冷启动入口里**。
+ *   ⇒ 修前：`0x13 RESET` 的 memset 把它清 0 ⇒ **DO 面不再驱动 PE8~PE11** ⇒
+ *     `PE9` 恒 0 = 光耦导通 = **驱动器失能** ⇒ **所有运动都不工作**（实测症状：
+ *     `ena=1/intent=1` 而 `PE9=0/IACT=0`，`GPIO_MASK=0x0000`）。
+ *   ★ 这条纪律本项目写过："新增域必须登记到单一冷启动入口"（本函数里 mb/macro 都登记了，
+ *     而 `GPIO_MASK` 是 step 模块设的 ⇒ **必须由 step 自己登记**）。 */
+void     step_cold_reset(uint8_t *shm);   /* ★ 与 macro_reset(g_shm) 同范式：带 base */
+
 void     step_set_motion_src(uint32_t src);
 uint32_t step_motion_src(void);
 

@@ -510,6 +510,20 @@ static void motion_cache_invalidate(void)
     s_mot_en = 0xFFFFFFFFu; s_mot_lim = 0xFFFFFFFFu;
 }
 
+/* ★★★ 见 step.h：冷启动登记 DO 面管辖掩码（否则 `0x13 RESET` 后运动全废）。*/
+void step_cold_reset(uint8_t *shm)
+{
+    /* ★★★ 语义: "上电/任何清零路径之后, DO 面管辖掩码应回到 STEP_DO_MASK"。
+     *   为什么必须由 step 自己登记: 该掩码**只有 step 模块设**（`step_init`），
+     *   而 `step_init` **不在冷启动入口里** ⇒ `0x13 RESET` 的 memset 清 0 后永不恢复。
+     *   修前实测: `0x13 RESET` ⇒ `GPIO_MASK=0x0000` ⇒ DO 面不驱动 PE8~PE11 ⇒
+     *   `PE9` 恒 0 = 光耦导通 = **驱动器失能** ⇒ **所有运动都不工作**。
+     *   ★ 用 `shm` 入参而不是隐藏的 `g_shm`（engine.h 的范式：所有引擎函数带 base）。 */
+    if (shm == NULL) { return; }
+    *(volatile uint32_t *)(shm + OFF_CTRL_GPIO_MASK) = STEP_DO_MASK;
+    __asm__ volatile("dsb" ::: "memory");
+}
+
 void     step_set_motion_src(uint32_t src)
 {
     uint32_t want = (src != 0u) ? STEP_MOT_SRC_PROGRAM : STEP_MOT_SRC_SCAFFOLD;
