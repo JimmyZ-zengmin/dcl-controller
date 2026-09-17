@@ -131,9 +131,16 @@ def main():
         time.sleep(N / float(FREQ) + 0.6)                        # 走完 + 留主循环停脉冲的时间
         e1 = pc()
         raw1 = st0()[8]
+        # ★★★ 解卷绕必须**按预期值**做，不能用固定的 >2048 阈值 ——
+        #   本判据的预期是"走 ≈N 步"⇒ N=1000 时对应 **2560 counts > 2048**，
+        #   固定阈值会把"正转 225°"误判成"反转 135°"（实测踩到：编码器算出 558.6 步，
+        #   而硬件计数是 1000 步 ⇒ 看起来像"丢步 44%"，其实是**判据自己算错**）。
+        exp_counts = N * DEG_PER_STEP / 360.0 * 4096.0
         dr = (raw1 - raw0) & 0xFFF
-        if dr > 2048:
+        while dr - exp_counts > 2048.0:
             dr -= 4096
+        while exp_counts - dr > 2048.0:
+            dr += 4096
         deg = dr * 360.0 / 4096.0
         steps_enc = abs(deg) / DEG_PER_STEP
 

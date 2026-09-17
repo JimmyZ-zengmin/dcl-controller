@@ -74,26 +74,34 @@ def main():
         print("提交后: N_VALID=%d  REJECT=%d" % (n1, b.rd(D.DB_REJECT, 1)[0]))
         print("  [%s] N_VALID 从 0 变为非 0（表被受理）" % ("PASS" if n1 > 0 else "FAIL"))
 
-        # ★★ 判据：状态机必须在 ~1.5 s 内开始成功（每 N 拍一次）
-        t = s18()
-        time.sleep(1.5)
-        u = s18()
-        grew = u[4] > t[4]
-        print("  [%s] AS5600 状态机复活: ok_n %d → %d (err_n %d → %d)"
-              % ("PASS" if grew else "FAIL", t[4], u[4], t[5], u[5]))
+        # ★★★ 判据用**绑定服务的计数** `DB_OK_N` 和**权威槽** `SENSOR[0]`，不是 `op=19 sub=18`。
+        #   原因（2026-09-17 实测）：`sub=18` 报的是 `as5600.c` **自己那套**的计数，
+        #   与"绑定表每 N 拍回填"根本不是同一个东西 —— 曾经因此误报 FAIL
+        #   （`DB_OK_N` 在涨、`sensor[0]` 也对，而 `sub=18` 的 `ok_n` 恒 0）。
+        def dbok():
+            v = b.rd(D.DB_OK_N, 1)
+            return None if v is None else v[0]
+        def sens0():
+            v = b.rd(0x0040, 1)          # OFF_SENSOR_MAP + 0
+            return None if v is None else struct.unpack("<f", struct.pack("<I", v[0]))[0]
+
+        ok0 = dbok(); s10 = sens0()
+        time.sleep(1.0)
+        ok1 = dbok(); s11 = sens0()
+        grew = (ok0 is not None and ok1 is not None and ok1 > ok0)
+        print("  [%s] 绑定服务在跑: DB_OK_N %s → %s" % ("PASS" if grew else "FAIL", ok0, ok1))
+
         # ★ 与阻塞路径交叉核对（两条独立路径）
         blk = struct.unpack("<24I", b.send(0x39, bytes([19, 0]) + struct.pack("<I", 0))[1][:96])[8]
-        smraw = (u[1] & 0xFFF)
-        dd = (smraw - blk) & 0xFFF
-        if dd > 2048:
-            dd -= 4096
-        print("  [%s] 两条路径一致: 状态机 raw=%d vs 阻塞 raw=%d (Δ%+d, 允许 ±1 LSB 噪声底)"
-              % ("PASS" if abs(dd) <= 1 else "FAIL", smraw, blk, dd))
+        sm = int(round(s11)) if s11 is not None else -999
+        dd = abs(sm - blk) if sm > -999 else 999
+        print("  [%s] 两条路径一致: SENSOR[0]=%s vs 阻塞 raw=%d (Δ%d, 允许 ±1 LSB)"
+              % ("PASS" if dd <= 1 else "FAIL", s11, blk, dd))
         print()
         print("★ 现在 `sensor[0]`（raw）/`sensor[1]`（角度）**每 N 拍自动回填** ⇒ "
               "DCL 程序的 `SENSOR name FROM sensor[1]` 才有活的反馈。")
         print("★★ 记住：**新程序包必须自带这条绑定**（否则部署动作会把反馈源删掉）。")
-        return 0 if (n1 > 0 and grew and abs(dd) <= 1) else 1
+        return 0 if (n1 > 0 and grew and dd <= 1) else 1
     finally:
         b.close()
 

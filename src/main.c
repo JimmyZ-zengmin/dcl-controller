@@ -2571,6 +2571,39 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
             ack(r14, 32u);
             return;
         }
+        case 15u: {
+            /* ★★★ 2026-09-17: **"走 N 个脉冲自停"**（硬件计数，见 src/step.h）。
+             *   arg = 目标步数（0 = 取消）。★ 前置：**当前必须有脉冲在跑**，否则 NAK 并给原因
+             *   （`NAKRH_STEPNCNT`）—— 不能"接受了却什么也没发生"。
+             *   ★ 到点由 `step_tick`（主循环）停脉冲 ⇒ 会多走 ≤1 圈的几步；
+             *     但 `g_step_pulses`（= `TIM4_CNT`）**精确记录实际步数**，可读回（sub=16）。
+             *   ★ 16 位上限 65535 步，超出**钳位**（在 `step_set_remaining` 里）。 */
+            uint32_t rc15 = step_set_remaining(arg);
+            if (rc15 != STEP_RC_OK) {
+                g_nak_last = NAKRH_STEPNCNT;
+                nak("step: no pulse running (set rate first)");
+                return;
+            }
+            break;
+        }
+        case 16u: {
+            /* ★ 只读：**脉冲计数状态**（32 B，零副作用，与 sub=11/14 同族）
+             *   +0 count_en  +4 goal      +8 pulses     +12 done_n
+             *   +16 abort_n  +20 rej_n    +24 TIM4_CNT(原始) +28 rate(当前 Hz)
+             *   ★ +12/+16/+20 **三个计数必须分开**：到点自停 / 被限时或停机打断 / 被拒
+             *     是**三件不同的事** —— 合并成一个就回答不了"这次是走到了还是被打断了"。 */
+            uint8_t r16[32];
+            put32(r16 +  0, g_step_count_en);
+            put32(r16 +  4, g_step_goal);
+            put32(r16 +  8, g_step_pulses);
+            put32(r16 + 12, g_step_goal_done_n);
+            put32(r16 + 16, g_step_goal_abort_n);
+            put32(r16 + 20, g_step_goal_rej_n);
+            put32(r16 + 24, step_pulses_now());
+            put32(r16 + 28, g_step_rate_hz);
+            ack(r16, 32u);
+            return;
+        }
         default: break;
         }
         /* ★★★ 修 (2026-09-15): 原为 `uint8_t r[40]` 而本块写了 **68 字节** (r+0..r+67)
