@@ -34,6 +34,10 @@ if [ -z "$PORT" ]; then
 fi
 if [ -z "$PORT" ]; then echo "✗ 找不到 CH340（用 DCL_PORT=COMxx 显式指定）"; exit 1; fi
 echo "端口 = $PORT"
+# ★★★ 2026-09-17: **必须 export** —— 下面的 python 块读的是 `os.environ.get("DCL_PORT","COM21")`，
+#   只设 shell 变量不导出 ⇒ 它们仍在用硬编码的 COM21 ⇒ 换口后**全部失败**，
+#   而现象看起来像"bench 建不起来"（实测：20 s 早退、只输出一行闸门）。
+export DCL_PORT="$PORT"
 LOG=/tmp/full_regress.log
 : > "$LOG"
 
