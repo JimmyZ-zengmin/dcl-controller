@@ -44,26 +44,62 @@
 #
 # ══════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════
+# ★★★ 实机验证结果（2026-09-17，COM22，`tools/h723_stall_detect_verify.py` → **全部通过**）
+# ══════════════════════════════════════════════════════════════════════════
+#   R（反向判据）4000 Hz：`stall=0`、确实在转 5236 counts/0.5s（理论 5120，误差 2%）✓
+#   注入突加 18000 Hz（**从静止起转**）：`stall` **1.17 s** 触发
+#     → = 遮蔽窗 900 ms + 去抖 200 ms ⇒ **与设计预期精确吻合**
+#   恢复后：`nfail=1` · `der=0.25` · `hz=4500`(=0.25×18000，精确)
+#   ★ T5 **轴已恢复转动**：末窗 1 s 实测 **11432 / 理论 11520 = 99.2%**
+#
+# ★★ 这条判据为什么必须过 `LPF`（**上板第一版就是死在这里**）
+#   编码器由绑定表**每 10 拍回填一次**（1 kHz），而判据是**每拍**跑的 ⇒ `dab` 呈 1:10 占空比
+#   （9 拍读 0、第 10 拍读到 10 倍，实测读回正是 `33 / 0 / 48 / 0 / 0`）。
+#   ⇒ `TON PT=200ms` 要**连续 200 拍**"没跟上"，而每 10 拍就有一次尖峰把它复位
+#     ⇒ **永远凑不满、压根不触发**（现象是"电机失速了, 检测器却毫无反应"）。
+#   ⇒ 处方：一阶低通 `τ=20ms ≫ 采样周期 1ms` ⇒ 输出 ≈ 平均速率。
+#   ★★★ **不要试图用 `PERIOD=1ms` 把判据降到与传感器同速** ——
+#     固件有**跨档速率检查**（`main.c:1838`）：`慢消费者读快生产者 ⇒ NAK "rate mismatch"`，
+#     而且"下游必须同档或更慢"会**一路传染**（连 `OUTPUT` 也躲不掉，而 `OUTPUT` 不接受 `PERIOD=`）
+#     ⇒ 实测两次 deploy 被拒。**低通是同速问题的正解，降档不是。**
+#
+# ★ 已知未解释项（如实声明）：`dab` 的**绝对刻度偏低 ~2.3 倍** ——
+#   4000 Hz 稳态实测 `dab=4431.9`，而理论 counts/s = 4000/1600×4096 = **10240**（43%）。
+#   运动本身是对的（编码器同期实测 10472 counts/s ≈ 理论）⇒ **是 `dab` 的口径没对齐，
+#   不是电机的问题**。判据仍成立是因为门限留了 **4× 余量**（实测比值 0.43 ≫ 0.25）。
+#   ⇒ 若要收紧：按"实测标定"把 `K_EXP` 从 2.56 换成实测比值（本项目纪律：凡刻度一律实测再写死）。
+#
+# ══════════════════════════════════════════════════════════════════════════
+
 # ── 常量 ──
 CONST   one     = 1.0
 CONST   mone    = -1.0
-CONST   R4096   = -4096.0      # raw 折 ±2048
-CONST   WSP     = 40960000.0   # 一圈: 4096 counts / 100µs
-CONST   WSPN    = -40960000.0  # ★ 负一圈（`BY=` 只能接**已声明的 CONST 名或信号**）
-CONST   K_TK    = 0.0001       # counts/s → counts/拍   ★ CONST 字面量**不认科学计数法**(实测),
-CONST   K_EXP   = 0.000256     # Hz → counts/拍   (= 2.56 counts/step ÷ 10000 拍/s) —— 只能写小数
-CONST   RATIO   = 0.25         # "没跟上"的比例门
-CONST   DER1    = 0.25         # 降额一档
-CONST   lim_ms  = 0.0          # 不限时（由本程序自己管停机）
-CONST   dirfwd  = 0.0          # ★ `FROM` 只接受**已声明的信号/CONST**（写 `FROM 0.0` 会报"未定义信号"）
+CONST   R4096   = -4096.0   # raw 折 ±2048
+CONST   WSP     = 4096000.0   # 一圈: 4096 counts / 1ms  (判据链跑 1ms 档 ⇒ 尖峰是 4096/1e-3)
+CONST   WSPN    = -40960000.0   # ★ 负一圈（`BY=` 只能接**已声明的 CONST 名或信号**）
+CONST   K_EXP   = 2.56   # Hz → counts/s  (1600 步/圈 × 4096 counts/圈 ⇒ 2.56 counts/步)
+# ★ 两边**同量纲**(都是 counts/s) ⇒ 不再需要"换成 counts/拍"那一步换算;
+#   而 `RATE` 除的 dt 就是**该路由自己的周期**(engine.c:283) ⇒ 换档不改单位。
+CONST   RATIO   = 0.25   # "没跟上"的比例门
+CONST   DER1    = 0.25   # 降额一档
+CONST   lim_ms  = 0.0   # 不限时（由本程序自己管停机）
+CONST   dirfwd  = 0.0   # ★ `FROM` 只接受**已声明的信号/CONST**（写 `FROM 0.0` 会报"未定义信号"）
 # ★★ 三条口径差异（2026-09-17 编译期实测，别再猜）：
 #   · `THR=` 只认**数字字面量**（CONST 名/信号都不行）⇒ 拿算出来的量当门限要先 `SUB` 再比 0
 #   · `BY=`  只认**已声明的 CONST 名或信号**（内联字面量不行）⇒ 负数也要先 CONST 出来
 #   · `CONST` 字面量不认科学计数法（`1.0e-4` 报语法错误）⇒ 写 `0.0001`
 
-# ── 上位机请求（HMI 设定区，写 40065+n 即生效）──
-HMI     dem     FROM hmi[0]    # 请求频率 Hz（0 = 停）
-HMI     enarq   FROM hmi[1]    # 请求使能
+# ── 上位机请求（★ 裸 wire 槽，见下方"为什么不用 hmi[]"）──
+#    wire[11] = 请求频率 Hz（0 = 停）    wire[10] = 请求使能（>0.5）
+# ★★★ 为什么**不用 `hmi[]`**：H723 的引擎**没实现 `SRC_HMI`** ——
+#    `src/engine.c` 里 `case SRC_HMI: return 0.0f;`（留位），而 deploy 校验会**拒绝**
+#    `src_type == SRC_HMI`（原话: "SRC_HMI not implemented on H723"）。
+#    ⇒ 写 `hmi[0]` 的程序**上传期就被拒**（这是好的失败, 不是静默给 0）。
+#    ★ 附带教训：`dclc --dump` **只过编译期**; ②层/①层的校验在上传期 ⇒
+#      "编译通过"不等于"能部署" —— 必须真上传一次才算验证。
+# ★ 这两个槽被**当作输入引用** ⇒ `dclc` 会自动把它们从分配池里排除（2026-09-17 加的）。
+#   否则程序自己的中间量可能被分配到同一个槽 ⇒ 上位机写的值被静默丢掉（同一族静默失效）。
 
 # ── 反馈：raw 0..4095 折到 [-2048, 2048) ──
 #    ★★ 踩坑备忘（2026-09-17 实测）：`CONST` 与 `THR=` 的口径**不一样** ——
@@ -74,7 +110,15 @@ ADD     r2      FROM raw BY=R4096
 GE      rw      IN=raw THR=2048.0
 SEL     f0      G=rw IN0=raw IN1=r2
 
-# ── 每拍增量（counts/s），并**双侧折衷**到 ±2048 counts/拍 等价区间 ──
+# ── ★★★ 整条链**一起降到 1ms 档**，与 AS5600 回填同速 ──
+#   为什么必须"整条链一起"：固件有**跨档速率检查**（`main.c:1838`）——
+#     "慢消费者读快生产者 = 欠采样 ⇒ 拒"，判据是 `生产者 div < 消费者 div 即拒`。
+#   只把 `RATE` 降到 1ms、而 `f0` 还在 0.1ms ⇒ **生产者 0 < 消费者 1 ⇒ deploy 被拒**
+#     （`NAK: rate mismatch`）—— **这是固件拒绝得对**，它挡住的正是"用 1ms 采样去代表 0.1ms 信号"。
+#   ⇒ 正解是整条链同档（`SENSOR/ADD/GE/SEL/RATE` 全 1ms）：既不欠采样，也顺带省 CPU。
+#   ★ 单位不受影响：`RATE` 除的 `dt` 就是**该路由自己的周期**（`engine.c:283`）⇒ 恒为 counts/s。
+#
+# ── 增量（counts/s），并**双侧折衷**到 ±2048 counts/1ms 等价区间 ──
 #    为什么必须折：编码器单圈 ⇒ 过零时 RATE 会给出 ±4096 counts/拍 的假尖峰，
 #    而它看起来**正好像"在动"** ⇒ 会把失速判据在整个转动过程中反复打掉（假阴性）。
 RATE    dr      FROM f0
@@ -85,39 +129,46 @@ ADD     dneg    FROM d1 BY=WSP
 LT      gln     IN=d1 THR=-20480000.0
 SEL     d2      G=gln IN0=d1 IN1=dneg
 
-# ── 换算成 counts/拍 并取幅值（DCL 无 ABS ⇒ 用 MAX(x, −x) 凑）──
-MUL     dtk     FROM d2 BY=K_TK
-MUL     dng     FROM dtk BY=mone
-MAX     dab     FROM dtk BY=dng
+# ── 取幅值（DCL 无 ABS ⇒ 用 MAX(x, −x) 凑）。d2 单位已是 counts/s ⇒ 与 expc 同量纲 ──
+MUL     dng     FROM d2 BY=mone
+MAX     dab     FROM d2 BY=dng
+# ★★★ 把"占空比伪影"滤掉 —— 本题最关键的一句（2026-09-17 实机验证定案）
+#   编码器由绑定表**每 10 拍回填一次**（1 kHz），而判据是**每拍**跑的 ⇒
+#   `dab` 呈 1:10 占空比（9 拍读 0、第 10 拍读到 10 倍）——实测读回就是 `33 / 0 / 48 / 0`。
+#   ⇒ `TON PT=200ms` 要求**连续 200 拍**都"没跟上"，而每 10 拍就有一次尖峰把它复位
+#     ⇒ **永远凑不满 ⇒ 失速检测压根不会触发**（第一版上板就是这么失败的）。
+#   ★ 处方：一阶低通（τ=20ms ≫ 采样周期 1ms）⇒ 输出 ≈**平均速率**，纹波 <25%；
+#     且 `LPF` 在 div0 ⇒ **不触发固件的跨档速率检查**（`main.c:1838`）。
+LPF     dabs    FROM dab T=0.02
 
 # ── 期望增量与门限 ──
-MUL     expc    FROM dem BY=K_EXP
+MUL     expc    FROM wire[11] BY=K_EXP
 MUL     lo      FROM expc BY=RATIO
 
 # ── ① 失步判据（含起转遮蔽窗）──
-GE      running IN=dem THR=1.0
-SUB     dfl     FROM dab BY=lo              # ★ 差值口径：dab − 门限
-LT      slow    IN=dfl THR=0.0              # 差值为负 ⇔ 实测 < 门限
+GE      running IN=wire[11] THR=1.0
+SUB     dfl     FROM dabs BY=lo   # ★ 差值口径：dab − 门限
+LT      slow    IN=dfl THR=0.0   # 差值为负 ⇔ 实测 < 门限
 LOGIC   bad0    = running AND slow
 R_TRIG  rstart  CLK=running
-TP      blank   IN=rstart PT=900ms          # 起转后遮蔽（固件斜坡期间不判）
+TP      blank   IN=rstart PT=900ms   # 起转后遮蔽（固件斜坡期间不判）
 LOGIC   nbl     = NOT blank
 LOGIC   bad     = bad0 AND nbl
-TON     stall   IN=bad PT=200ms             # ★ 去抖：连续 200 ms 才确认失步
+TON     stall   IN=bad PT=200ms   # ★ 去抖：连续 200 ms 才确认失步
 
 # ── ③ 恢复：断流一瞬 + 降额重发（降额锁存，主机重下令才复位）──
-TP      cut     IN=stall PT=150ms           # 断流窗（让转子落回同步）
-F_TRIG  hdrop   CLK=running                 # 主机把 dem 写 0 ⇒ 这是一次"重新下令"
+TP      cut     IN=stall PT=150ms   # 断流窗（让转子落回同步）
+F_TRIG  hdrop   CLK=running   # 主机把 dem 写 0 ⇒ 这是一次"重新下令"
 CTU     nfail   CU=stall R=hdrop PV=1
-SEL     der     G=nfail IN0=one IN1=DER1    # ★ 直接用 nfail 当 G（SEL 按 >0.5 判真）
-MUL     demd    FROM dem BY=der
+SEL     der     G=nfail IN0=one IN1=DER1   # ★ 直接用 nfail 当 G（SEL 按 >0.5 判真）
+MUL     demd    FROM wire[11] BY=der
 LOGIC   ncut    = NOT cut
-MUL     hz      FROM demd BY=ncut           # ★ 最终下发的频率（断流窗内 = 0）
+MUL     hz      FROM demd BY=ncut   # ★ 最终下发的频率（断流窗内 = 0）
 
 # ── 运动请求（③层输出面**只有** `wire[]`）──
 OUTPUT  o_hz    TO wire[12] FROM hz
 OUTPUT  o_dir   TO wire[13] FROM dirfwd     # 方向固定为正（单向连续转动）
-OUTPUT  o_ena   TO wire[14] FROM enarq      # ★ HMI 已是 0/1 ⇒ 不再过一道 GE（省一个 wire 槽）
+OUTPUT  o_ena   TO wire[14] FROM wire[10]      # ★ HMI 已是 0/1 ⇒ 不再过一道 GE（省一个 wire 槽）
 OUTPUT  o_lim   TO wire[15] FROM lim_ms
 
 # ── 观测（56..63 供本程序用；★ 64/65 是**固件保留**的运动镜像，程序不得占用）──
@@ -125,8 +176,8 @@ OUTPUT  o_lim   TO wire[15] FROM lim_ms
 #       取数）⇒ `dclc` 的自动分配上限 64 槽对"中等规模"程序就不够。本程序已按提示精简
 #       （THR 内联字面量、不再为 `GE ena`/`GE nfail≥1` 单开信号），并砍到 4 个观测槽。
 #       要再扩：走 HMI 设定区，或让引擎支持"常量不进 wire"（①层改动）。
-OUTPUT  w_dab   TO wire[56] FROM dab        # 实测每拍增量 counts/拍
-OUTPUT  w_stall TO wire[57] FROM stall      # 失步已确认（1 = 是）
+OUTPUT  w_dab   TO wire[56] FROM dabs        # 实测增量 counts/s（1ms 档，与判据同量纲）
+OUTPUT  w_stall TO wire[57] FROM stall   # 失步已确认（1 = 是）
 OUTPUT  w_nfail TO wire[58] FROM nfail      # 失步次数（锁存）
 OUTPUT  w_der   TO wire[59] FROM der        # 当前降额系数
 OUTPUT  w_hz    TO wire[60] FROM hz         # 实际下发的频率

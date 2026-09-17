@@ -152,6 +152,7 @@ class Sym:
     def __init__(self):
         self.slot = {}       # name -> wire slot
         self.pinned = set()  # 已固定的 wire 槽 (OUTPUT)
+        self.in_wires = set()  # ★ 被**当作输入**引用的裸 wire 槽(如 wire[11]) ⇒ 自动分配避开
         self.auto_next = 1        # wire[0] 是"无第二源"哨兵 (core0_isr: wire2_idx=0 判空)
                                   # 自动分配必须避开, 否则 AND/OR 引用首个信号恒假 (审计 M1)
         self.params = []     # 每项 4 floats
@@ -201,7 +202,8 @@ class Sym:
                 raise SystemExit(f"错误: wire[{pin}] 被多个 OUTPUT 固定")
             self.slot[name] = pin; self.pinned.add(pin)
             return pin
-        while self.auto_next in self.pinned or self.auto_next in FW_RESERVED_WIRES:
+        while (self.auto_next in self.pinned or self.auto_next in FW_RESERVED_WIRES
+               or self.auto_next in self.in_wires):
             self.auto_next += 1
         if self.auto_next >= MAX_WIRES:
             raise SystemExit(
@@ -225,6 +227,12 @@ class Sym:
             n = int(m.group(1))
             if n >= MAX_WIRES:
                 raise SystemExit(f"错误: wire[{n}] 越界")
+            # ★★★ 2026-09-17: 被**当作输入**引用的裸槽, 自动分配必须避开。
+            #   否则分配器可能把某个内部信号放到同一个槽 ⇒ 程序**读的是自己的中间量**,
+            #   而外面写的值被静默丢掉（与"自动分配撞固件保留槽"同一族, 只是方向相反）。
+            #   ★ 不放进 `pinned`: `pinned` 的语义是"被 OUTPUT 固定"（重复即报错）;
+            #     裸槽被读**同时**被 OUTPUT 写, 是有意义的用法(自锁存), 不该报错。
+            self.in_wires.add(n)
             return SRC['WIRE'], n
         m = re.fullmatch(r'hmi\[(\d+)\]', token)    # HMI 设定区 (上位机可写, 程序读)
         if m:
@@ -297,6 +305,16 @@ class Sym:
 
 def compile_stmts(stmts):
     S = Sym()
+    # ★★★ 2026-09-17 预扫: 把**所有被引用的裸 wire 槽**先占住, 再开始分配。
+    #   为什么必须"预扫"而不是"用到时才记账": 各语句处理器都是
+    #   **先 `alloc_wire(输出名)` 再 `ref(源)`** ⇒ 若只在 ref 里记账, 那么"第一次引用
+    #   `wire[11]` 的那条语句自己的输出"仍可能被分配到 11 ⇒ 程序读回自己的中间量。
+    #   ⇒ 预扫一遍语句文本, 把裸槽全部登记进 `in_wires`(自动分配跳过)。
+    #   ★ 把 OUTPUT 的 `TO wire[n]` 也一并登记**无害**: 它本来就在 `pinned` 里既跳过,
+    #     而"读+写同一个槽"(自锁存)是合法用法, 不该被拒。
+    for _kw, _body in stmts:
+        for _m in re.finditer(r'wire\[(\d+)\]', _body):
+            S.in_wires.add(int(_m.group(1)))
     # 第一遍: 先处理 OUTPUT 的固定槽, 避免自动槽占用
     # (M5 审计: set.add 幂等对"两个不同名 OUTPUT 钉同一 wire"静默 — 编译期给清晰错误,
     # 不靠固件 NAK 兜底)
