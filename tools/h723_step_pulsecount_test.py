@@ -101,9 +101,14 @@ def main():
         a = pc()
         sts, pld = step(1000)
         b = pc()
+        txt = (pld or b"").decode("utf-8", errors="replace")
         record("P1 没有脉冲时下 N ⇒ **必须 NAK**（不得静默接受）",
                sts is not None and sts != 0 and b["rej"] > a["rej"],
-               "sts=%s payload=%r rej_n %d→%d" % (sts, pld[:44], a["rej"], b["rej"]))
+               "sts=%s rej_n %d→%d" % (sts, a["rej"], b["rej"]))
+        # ★ 本项目 B 类纪律：**拒绝必须可读** —— NAK 要带原因，且原因要能认出是哪条。
+        #   这个拒因码是 `NAKRH_STEPNCNT`（"当前没有脉冲在跑"），对应的可读载荷如下。
+        record("P1b NAK 必须带可读原因（'no pulse running'）",
+               "no pulse running" in txt, "payload=%r" % txt[:56])
 
         # ── P5 钳位（先测，因为它不需要跑动）──
         d.send(0x39, bytes([19, 1]) + struct.pack("<I", 500))    # 起脉冲

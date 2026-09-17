@@ -50,7 +50,7 @@ CONST   hz_min  = 15.0          # TIM3 物理下界（见边界③）；"可用�
 CONST   hz_max  = 3000.0        # 上限：远低于突加失速点 16650 Hz，先保证能跟随
 CONST   lim_ms  = 4000.0        # 限时（安全网）：到点固件自动停脉冲（step_tick）
 CONST   one     = 1.0           # 使能
-CONST   d       = 0.0           # 方向（★ 必须实测，见边界②）
+CONST   d       = 1.0           # ★★ 方向：**实测** dir=1 ⇒ 编码器 raw 减小 ⇒ err 收敛（原写 0.0 会发散）
 
 # ── 反馈：AS5600 角度（0..360）—— `src/as5600.h` 的 AS5600_SENSOR_DEG = 1 ──
 SENSOR  ang     FROM sensor[1]     # ★ 角度 0..360（`AS5600_SENSOR_DEG=1`）；sensor[0] 是 **raw 0..4095**
