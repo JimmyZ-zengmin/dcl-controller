@@ -60,6 +60,13 @@ volatile uint32_t g_step_goal_done_n = 0u;   /* 到点自停次数 */
 volatile uint32_t g_step_goal_abort_n= 0u;   /* 因限时/停机而未到点的次数 */
 volatile uint32_t g_step_goal_rej_n  = 0u;   /* 被拒（没有脉冲在跑 / 参数非法）*/
 
+/* ★★★ 轨迹规划（斜坡限幅）—— 见 step.h。★ **默认 0 = 关** ⇒ 既有行为逐位不变。 */
+volatile uint32_t g_step_ramp_hz_s     = 0u;
+volatile uint32_t g_step_rate_cmd      = 0u;
+volatile uint32_t g_step_rate_out      = 0u;
+volatile uint32_t g_step_ramp_active   = 0u;
+volatile uint32_t g_step_ramp_done_n   = 0u;
+
 static uint8_t *s_base = NULL;
 static uint32_t s_sync = 1u;   /* ★ 首次/重新武装后先对齐 s_last, 见 step_tick */
 
@@ -225,7 +232,14 @@ void step_init(uint8_t *base)
     __asm__ volatile("dsb" ::: "memory");
 }
 
-void step_set_rate(uint32_t hz)
+/* ══════════════════════════════════════════════════════════════════════════
+ * 频率落地的**两条路径**（分开的原因见 step.h 的"轨迹规划"段）
+ *   ① `step_rate_apply`       —— **完整**：会动 `CC1E`（起/停/换频率时用）
+ *   ② `step_rate_apply_light` —— **轻量**：只写预装载寄存器（斜坡推进用）
+ *      ★ 不关 `CC1E`、不写 `EGR.UG` ⇒ **既不切断脉冲，也不多产生更新事件**
+ *        （后者会污染"走 N 个脉冲"的硬件计数 `TIM4_CNT`）
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void step_rate_apply(uint32_t hz)
 {
     if (hz == 0u) {
         TIM_CCER(TIM3) &= ~TIM_CCER_CC1E;         /* 停脉冲 */
@@ -247,7 +261,52 @@ void step_set_rate(uint32_t hz)
     __asm__ volatile("dsb" ::: "memory");
 }
 
+/** @brief **斜坡专用**：只改预装载寄存器（`ARPE`/`OC1PE` ⇒ 下个更新事件生效）。
+ *  ★★ `hz==0` 时退回完整路径（要真的关掉 `CC1E` 才能停）。 */
+static void step_rate_apply_light(uint32_t hz)
+{
+    if (hz == 0u) { step_rate_apply(0u); return; }
+    uint32_t arr1 = STEP_TIMCLK_HZ / hz;
+    if (arr1 < 2u)      { arr1 = 2u; }
+    if (arr1 > 65536u)  { arr1 = 65536u; }
+    TIM_ARR(TIM3)  = arr1 - 1u;                   /* 预装载 ⇒ 下个更新事件生效 */
+    TIM_CCR1(TIM3) = arr1 / 2u;                   /* 预装载 ⇒ 不会出现半个脉冲 */
+    g_step_arr = TIM_ARR(TIM3); g_step_ccr1 = TIM_CCR1(TIM3);
+    g_step_rate_hz = STEP_TIMCLK_HZ / arr1;
+    __asm__ volatile("dsb" ::: "memory");
+}
+
+/* ★★★ 加减速（斜坡限幅）：**所有**频率写入口都经过这里 ⇒ 两条通路（脚手架 `sub=1` /
+ *   程序面 `wire[12]`）**同时**获得限幅。斜坡**关**（默认 0）或**要求停**（hz==0）
+ *   ⇒ 立即生效 —— 停必须是立即的（安全语义），不能"慢慢降到 0"。 */
+void step_set_rate(uint32_t hz)
+{
+    g_step_rate_cmd = hz;
+    if (g_step_ramp_hz_s == 0u || hz == 0u) {
+        g_step_rate_out    = hz;
+        g_step_ramp_active = 0u;
+        step_rate_apply(hz);
+    }
+    /* 斜坡开且 hz!=0 ⇒ 只记目标，由 `step_tick` 每个主循环推进一步 */
+}
+
 void step_set_dir(uint32_t dir) { g_step_dir = dir ? 1u : 0u; act_bits(STEP_DIR_ACT, g_step_dir); }
+
+/** @brief 设斜坡斜率（Hz/s）。**0 = 关**（立即生效到目标）—— 默认就是 0。
+ *  ★ 打开后**立即把输出对齐到当前硬件频率**，避免"上一段的残留"被当成爬坡起点。 */
+void step_set_ramp(uint32_t hz_per_s)
+{
+    g_step_ramp_hz_s = hz_per_s;
+    if (hz_per_s == 0u) {
+        /* 关斜坡：立刻把输出拉到目标（如果有目标）*/
+        g_step_ramp_active = 0u;
+        g_step_rate_out    = g_step_rate_cmd;
+        step_rate_apply(g_step_rate_cmd);
+    } else {
+        g_step_rate_out    = g_step_rate_hz;   /* ★ 以**当前硬件频率**为起点 */
+        g_step_ramp_active = (g_step_rate_out != g_step_rate_cmd) ? 1u : 0u;
+    }
+}
 
 /* ENA: 参数是"**希望驱动器使能**", 与物理电平之间隔一层极性（翻译只在 `drive_ena()` 里）。
  * ★★★ fail-closed: **极性未声明时拒绝 en=1**，并**保持物理失能**。
@@ -387,6 +446,29 @@ void step_tick(uint32_t tick_now)
      *   ★ 钳到 100ms 是取舍: 宁可让限时**稍微延长**, 也不要让它被瞬间吃光
      *     (前者最多晚停 100ms, 后者等于没有限时保护)。 */
     if (dt > 1000u) { dt = 1000u; }
+
+    /* ═══ ★★★ 加减速：斜坡推进（**必须在下面 `deadline_tick==0 ⇒ return` 之前**：
+     *   "不限时"时也要能爬坡）═══
+     *   · 每圈最多变 `斜率(Hz/s) × dt(ms) / 1000`，至少 1 Hz（否则 dt 小时永远不动）；
+     *   · 输出与目标相等 ⇒ 停（`g_step_ramp_active=0`）并记一次"到目标"；
+     *   · ★ 落地走**轻量路径**（只写预装载寄存器）⇒ 不切断脉冲、不产生额外更新事件
+     *     ⇒ **不污染"走 N 个脉冲"的硬件计数**。 */
+    if (g_step_ramp_hz_s != 0u && g_step_rate_out != g_step_rate_cmd) {
+        uint32_t dt_ms = (dt + 9u) / 10u;              /* 拍→ms，向上取整 */
+        uint32_t dv    = (g_step_ramp_hz_s * dt_ms) / 1000u;
+        if (dv == 0u) { dv = 1u; }
+        if (g_step_rate_out < g_step_rate_cmd) {
+            uint32_t t = g_step_rate_out + dv;
+            g_step_rate_out = (t > g_step_rate_cmd) ? g_step_rate_cmd : t;
+        } else {
+            uint32_t t = (g_step_rate_out > dv) ? (g_step_rate_out - dv) : 0u;
+            g_step_rate_out = (t < g_step_rate_cmd) ? g_step_rate_cmd : t;
+        }
+        step_rate_apply_light(g_step_rate_out);
+        g_step_ramp_active = (g_step_rate_out != g_step_rate_cmd) ? 1u : 0u;
+        if (g_step_ramp_active == 0u) { g_step_ramp_done_n++; }
+    }
+
     if (g_step_deadline_tick == 0u) { return; }
     uint32_t dm = dt / 10u;                 /* 拍 → 毫秒 */
     if (dm == 0u) { return; }

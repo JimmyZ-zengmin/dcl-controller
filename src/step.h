@@ -133,6 +133,36 @@ extern volatile uint32_t g_step_goal_done_n;   /* 到点自停次数 */
 extern volatile uint32_t g_step_goal_abort_n;  /* 未到点（被限时/停机打断）次数 */
 extern volatile uint32_t g_step_goal_rej_n;    /* 被拒次数 */
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 轨迹规划（加减速 / 斜坡限幅）—— README 能力边界 **A 类第一项**
+ *
+ * ## 为什么这一条最值钱
+ * 实测：**突加** 31000 Hz ⇒ 只能用到 **627 rpm**（比值 0.565，**掉步**）；
+ *      **带斜坡** ⇒ **~1100 rpm**。⇒ **缺斜坡 = 可用转速被砍 47%**。
+ *
+ * ## 为什么放固件、而不是 ③ 层"凑"
+ * 斜坡的本质是"**请求频率随时间变化，且变化率有上限**"。
+ * 而**频率的写入口只有一个**（`step_set_rate`，来自脚手架 `sub=1` **和** 程序面 `wire[12]`）
+ * ⇒ **在它里面加限幅，两条通路同时受益**；放 ③ 层则脚手架那条路受益不到。
+ *
+ * ## ★★★ 实现上唯一必须小心的地方：改 `ARR` 的方式
+ * `TIM3` 已配 `ARPE`（ARR 预装载）与 `OC1PE`（CCR1 预装载）⇒ **写它们在下个更新事件才生效**
+ * ⇒ 斜坡推进**只写 `ARR`/`CCR1`** 就够，**既不关 `CC1E`、也不写 `EGR.UG`**：
+ *   · 关 `CC1E` 会**切断脉冲**（每个斜坡步都断一次 ⇒ 丢步）；
+ *   · 写 `EGR.UG` 会**多产生一个更新事件** ⇒ 被 `TIM4` 记成**多一个脉冲**
+ *     ⇒ 会把"走 N 个脉冲"的硬件计数**污染**。
+ * ⇒ 所以斜坡走一条**轻量路径** `step_rate_apply_light()`，与"要停/要起"的完整路径分开。
+ *
+ * ## 默认关闭（`0`）⇒ **既有行为逐位不变**
+ * 与"运动源"同款纪律：**新行为必须显式打开**。`op=19 sub=17 arg=Hz/s`（0 = 关）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+void     step_set_ramp(uint32_t hz_per_s);     /* 0 = 关（立即生效到目标）*/
+extern volatile uint32_t g_step_ramp_hz_s;     /* 斜率上限 Hz/s；0 = 关 */
+extern volatile uint32_t g_step_rate_cmd;      /* 请求的目标频率（斜坡的终点）*/
+extern volatile uint32_t g_step_rate_out;      /* 斜坡输出（已交给硬件的）*/
+extern volatile uint32_t g_step_ramp_active;   /* 1 = 正在爬坡 */
+extern volatile uint32_t g_step_ramp_done_n;   /* 到目标次数 */
+
 extern volatile uint32_t g_step_rate_hz, g_step_dir, g_step_ena, g_step_owns_tim3;
 extern volatile uint32_t g_step_deadline_tick, g_step_stop_n, g_step_arr, g_step_ccr1;
 extern volatile uint32_t g_step_ena_pol;

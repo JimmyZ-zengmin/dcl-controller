@@ -2604,6 +2604,35 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
             ack(r16, 32u);
             return;
         }
+        case 17u: {
+            /* ★★★ 2026-09-17: **轨迹规划 / 加减速**（斜坡限幅）—— README 能力边界 A 类第一项。
+             *   arg = 斜率上限 **Hz/s**（**0 = 关**，立即生效到目标）—— **默认 0**，
+             *   与"运动源"同款纪律：新行为必须显式打开 ⇒ 既有行为逐位不变。
+             *   ★ 为什么放固件：频率的写入口只有一个（`step_set_rate`）⇒ 在这里加限幅，
+             *     **脚手架 `sub=1` 与程序面 `wire[12]` 两条通路同时受益**。
+             *   ★ 收益（实测）：突加 31000 Hz 只能用到 **627 rpm**（掉步）；
+             *     带斜坡 ⇒ **~1100 rpm** ⇒ **可用转速 +75%**。 */
+            step_set_ramp(arg);
+            break;
+        }
+        case 19u: {
+            /* ★ 只读：**斜坡状态**（32 B，零副作用）
+             *   +0 ramp_hz_s  +4 rate_cmd  +8 rate_out  +12 rate_actual(硬件)
+             *   +16 ramp_active +20 ramp_done_n  +24 reserved +28 reserved
+             *   ★ `rate_cmd` 与 `rate_out` 的差就是"还在爬坡"的证据 ——
+             *     只看 `rate_actual` 分不出"已到目标"还是"正在爬"。 */
+            uint8_t r19[32];
+            put32(r19 +  0, g_step_ramp_hz_s);
+            put32(r19 +  4, g_step_rate_cmd);
+            put32(r19 +  8, g_step_rate_out);
+            put32(r19 + 12, g_step_rate_hz);
+            put32(r19 + 16, g_step_ramp_active);
+            put32(r19 + 20, g_step_ramp_done_n);
+            put32(r19 + 24, 0u);
+            put32(r19 + 28, 0u);
+            ack(r19, 32u);
+            return;
+        }
         default: break;
         }
         /* ★★★ 修 (2026-09-15): 原为 `uint8_t r[40]` 而本块写了 **68 字节** (r+0..r+67)
