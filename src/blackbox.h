@@ -68,9 +68,12 @@
                                        *   丢包判据 = "落后量 > 槽数", 而卡顿实测来自
                                        *   **SD 卡自身块编程抖动**([60] 单批最长 68.4ms,
                                        *   30s 内 35 次 >20ms) ⇒ 唯一解法是加大吸收量。
-                                       *   960 槽 = 96ms, 占 AXI 240KB, 冻结区 64KB,
-                                       *   正好把 0x24004000..0x24050000 用满。 */
-#define BB_TOTAL        (BB_SLOT_SZ * BB_SLOTS)  /* 128KB */
+                                       *   960 槽 = 96ms **@逐拍全量**; 交付开的是"变化才记"
+                                       *   (blackbox.c 的 change-triggered) ⇒ **实测跨度 ~380ms**
+                                       *   (变化率 ~25%, 记录率 ~1000/s) ★ 跨度必须按
+                                       *   **记录里的 tick 字段**算, 不能按"槽数×拍长"算。
+                                       *   占 AXI 240KB, 冻结区 64KB, 正好用满。 */
+#define BB_TOTAL        (BB_SLOT_SZ * BB_SLOTS)  /* = 240KB (原注释写 128KB, 已过期) */
 #define BB_MAGIC        0x42424B42u   /* "BBKB" (环首字, 旧) */
 #define BBLOG_REC_MAGIC 0x4B424C44u   /* "DLBK" 每条记录的魔数 */
 #define BB_SEQ_MAGIC    0x51455344u   /* "DSEQ" 序号魔数 */
