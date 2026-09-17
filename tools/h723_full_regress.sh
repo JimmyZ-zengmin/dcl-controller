@@ -24,7 +24,16 @@
 set -u
 cd "$(dirname "$0")/.."
 export PATH="/usr/bin:/bin:/mingw64/bin:/c/Windows/System32:$PATH"
-PORT="${DCL_PORT:-COM21}"
+# ★★★ 2026-09-17: 默认口**自动找 CH340**，而不是硬编码 COM21 ——
+#   USB 重插/换口是常态（今天两次踩到：板子从 COM21 变成 COM22，
+#   于是所有命令发到不存在的口 ⇒ `0x49` 失败 ⇒ 前置闸门判"无效"早退，
+#   而现象看起来像"bench 建不起来"）。显式 `DCL_PORT=COMxx` 仍可覆盖。
+PORT="${DCL_PORT:-}"
+if [ -z "$PORT" ]; then
+  PORT=$(python -c "import sys; sys.path.insert(0,'tools'); from h723_client import find_board; print(find_board())" 2>/dev/null)
+fi
+if [ -z "$PORT" ]; then echo "✗ 找不到 CH340（用 DCL_PORT=COMxx 显式指定）"; exit 1; fi
+echo "端口 = $PORT"
 LOG=/tmp/full_regress.log
 : > "$LOG"
 
