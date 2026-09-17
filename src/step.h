@@ -62,6 +62,53 @@ void     step_set_deadline_ms(uint32_t ms);  /* 0 = 不限时 */
 /* 停脉冲 + 按 `stop_hold` 决定静止态（保力矩 ⇒ 通电 / 否则 ⇒ 物理去使能）。 */
 void     step_stop_safe(void);
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 运动能力面（**程序面**）—— `PLAN-step-motion-v1` Step 1
+ *
+ * ## 为什么需要它
+ * `0x39 op=19` 是**诊断脚手架**（未进 SHM、无 `obs_anchor()`、不占能力位、③层不得依赖）
+ * ⇒ ③层（DCL 程序）**够不到"运动"** ⇒ **"闭环步进的 DCL 程序"在架构上写不出来**。
+ * （核实过的另一条路也不通：HIL 的 PWM 通道**共享同一个 TIM3**，但它只写 `CCR1` 占空比，
+ *   `ARR` 由 `hil_init` 写死 1 kHz ⇒ ③层改不了频率。）
+ *
+ * ## 做法：把运动请求落在 `WIRE[12..15]`（**零语义扩展、零编译器改动**）
+ * ★★★ 为什么**不是** `ACTUATOR[12..15]`（我第一版就是这么设计的，**被编译器推翻**）：
+ *   `tools/dclc.py` 的 `OUTPUT <name> TO <dst> FROM <sig>` **只接受 `wire[<n>]`**
+ *   —— **③层的输出面只有 `wire[]`**。写 `TO actuator[12]` 直接**编译失败**。
+ *   而 `wire[]` 恰好是"引擎内部信号"的槽：**谁读它由服务方决定** ⇒ 正好是本模块要的语义。
+ * - ★ 代价（如实登记）：`WIRE[]` 的作用域是**本程序**，任何把 `wire[12..15]` 当普通信号的
+ *   route 都会与运动请求**抢槽** ⇒ **本程序内这 4 个槽必须只有一个写者**（判据 M7）。
+ * - **单写者干净**：③层写 12..15；`step.c` 是 8/9 的唯一写者 —— 两边不重叠（红线 2）。
+ *
+ * ## ★★★ 运动源必须**显式**（否则会打坏既有的一切）
+ * 如果本服务**无条件**把槽值应用到硬件，那么 `op=19 sub=1`（脚手架／**所有运动回归套件**）
+ * 设的频率会被**每圈覆盖回 0** ⇒ 整个运动验收套件全废。
+ * ⇒ `op=19 sub=13 arg=0` = **脚手架直控【默认，保持现状】**／`1` = **程序面**。
+ * ⇒ 默认 0 ⇒ **既有行为零变化**。
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define STEP_MOT_SLOT_RATE    12u   /* WIRE[12] 请求: 脉冲频率 Hz（0 = 停）*/
+#define STEP_MOT_SLOT_DIR     13u   /* WIRE[13] 请求: 方向（>0.5 ⇒ 1）*/
+#define STEP_MOT_SLOT_ENA     14u   /* WIRE[14] 请求: 使能（>0.5 ⇒ 1；未声明极性 ⇒ 被 fail-closed 拒）*/
+#define STEP_MOT_SLOT_LIMIT   15u   /* WIRE[15] 请求: 限时 ms（0 = 不限）*/
+#define STEP_MOT_SLOT_RATE_AP  64u  /* WIRE[64] 镜像: 已应用的频率（Hz）*/
+#define STEP_MOT_SLOT_LIMIT_AP 65u  /* WIRE[65] 镜像: 已应用的限时余量（ms）*/
+/* ★★★ 镜像为什么必须 >63：`dclc.py` 的**自动分配上限是 64**（wire[0..63]）⇒
+ *   把镜像放在 16/17 会被 FB 自动分配**抢槽**（实测：`LT lo = wire[16]`、`LOGIC drive = wire[17]`）
+ *   ⇒ 引擎每拍覆写 ⇒ 镜像失效。⇒ 约定 **64/65 为"固件保留观测槽"**，程序侧不要钉它们。
+ *   ★ 请求槽 12..15 则**安全**：它们被 `OUTPUT` **显式钉住**，自动分配会跳过（dclc 的先钉后配）。 */
+#define STEP_MOT_SRC_SCAFFOLD  0u
+#define STEP_MOT_SRC_PROGRAM   1u
+
+/* 运动服务 —— **主循环**调用（与 `step_tick` 同处）。只在槽值变化时动作。 */
+void     step_service_motion(void);
+void     step_set_motion_src(uint32_t src);
+uint32_t step_motion_src(void);
+
+extern volatile uint32_t g_motion_src;        /* 0 = 脚手架（默认）/ 1 = 程序面 */
+extern volatile uint32_t g_motion_cmd_n;      /* 槽值**变化**次数（≠"每圈空转"）*/
+extern volatile uint32_t g_motion_applied_n;  /* 真正下给硬件几次 */
+extern volatile uint32_t g_motion_rej_n;      /* 被拒次数（主要是 fail-closed）*/
+
 extern volatile uint32_t g_step_rate_hz, g_step_dir, g_step_ena, g_step_owns_tim3;
 extern volatile uint32_t g_step_deadline_tick, g_step_stop_n, g_step_arr, g_step_ccr1;
 extern volatile uint32_t g_step_ena_pol;

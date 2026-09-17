@@ -45,6 +45,12 @@ volatile uint32_t g_step_ena_mismatch_n  = 0u;
 volatile uint32_t g_step_ena_pin_intent  = 1u;   /* 上电默认意图 = 高(不导通) */
 volatile uint32_t g_step_dt_max = 0u;
 
+/* ★★★ 运动能力面（程序面）—— 见 step.h 的说明。★ **默认脚手架 ⇒ 既有行为零变化**。 */
+volatile uint32_t g_motion_src       = STEP_MOT_SRC_SCAFFOLD;
+volatile uint32_t g_motion_cmd_n     = 0u;
+volatile uint32_t g_motion_applied_n = 0u;
+volatile uint32_t g_motion_rej_n     = 0u;
+
 static uint8_t *s_base = NULL;
 static uint32_t s_sync = 1u;   /* ★ 首次/重新武装后先对齐 s_last, 见 step_tick */
 
@@ -292,4 +298,76 @@ void step_tick(uint32_t tick_now)
     if (dm == 0u) { return; }
     if (g_step_deadline_tick > dm) { g_step_deadline_tick -= dm; }
     else { g_step_deadline_tick = 0u; step_stop_safe(); }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 运动能力面（程序面）—— `PLAN-step-motion-v1` Step 1
+ *   ③层写 `ACTUATOR[12..15]` → 本服务把它落到硬件。见 step.h 顶部的完整理由。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ★ 运动请求住在 **WIRE** 而不是 ACTUATOR —— 理由见 step.h（③层的输出面只有 `wire[]`）。 */
+static float wire_get(uint32_t idx)
+{
+    if (s_base == NULL) { return 0.0f; }
+    return *(volatile float *)(s_base + OFF_WIRE_MAP + idx * 4u);
+}
+static void wire_set(uint32_t idx, float v)
+{
+    if (s_base == NULL) { return; }
+    *(volatile float *)(s_base + OFF_WIRE_MAP + idx * 4u) = v;
+}
+
+/* ★★★ 请求值缓存 + **失效函数** —— 切换运动源时必须失效（见 step_service_motion 的说明）。 */
+static uint32_t s_mot_hz = 0xFFFFFFFFu, s_mot_dir = 0xFFFFFFFFu;
+static uint32_t s_mot_en = 0xFFFFFFFFu, s_mot_lim = 0xFFFFFFFFu;
+static void motion_cache_invalidate(void)
+{
+    s_mot_hz = 0xFFFFFFFFu; s_mot_dir = 0xFFFFFFFFu;
+    s_mot_en = 0xFFFFFFFFu; s_mot_lim = 0xFFFFFFFFu;
+}
+
+void     step_set_motion_src(uint32_t src)
+{
+    uint32_t want = (src != 0u) ? STEP_MOT_SRC_PROGRAM : STEP_MOT_SRC_SCAFFOLD;
+    if (want != g_motion_src) { motion_cache_invalidate(); }
+    g_motion_src = want;
+}
+uint32_t step_motion_src(void) { return g_motion_src; }
+
+/* ★ 主循环调用。语义：
+ *   · **只在槽值变化时动作** —— ★ 判据要能回答"这个计数是不是每圈在空转涨"
+ *     （本项目铁律："为可解释性加的计数会顺手抓住静默故障"）。
+ *   · 镜像槽（16/17）**每次刷新**（不是只在变化时）—— 否则限时到期自动停脉冲后镜像会陈旧。
+ *   · 顺序：**先方向/使能，再频率**（让驱动器先进入确定状态再起脉冲）。 */
+void step_service_motion(void)
+{
+    if (g_motion_src != STEP_MOT_SRC_PROGRAM) { return; }
+
+    float rf = wire_get(STEP_MOT_SLOT_RATE);
+    float df = wire_get(STEP_MOT_SLOT_DIR);
+    float ef = wire_get(STEP_MOT_SLOT_ENA);
+    float lf = wire_get(STEP_MOT_SLOT_LIMIT);
+    uint32_t hz  = (rf <= 0.0f) ? 0u : (uint32_t)rf;   /* ★ NaN 走 <= 分支 ⇒ 视为"停"(安全侧) */
+    uint32_t dir = (df > 0.5f) ? 1u : 0u;
+    uint32_t en  = (ef > 0.5f) ? 1u : 0u;
+    uint32_t lim = (lf <= 0.0f) ? 0u : (uint32_t)lf;
+
+    /* ★ 镜像每次刷新：让程序面能回答"我下的指令，硬件这边已经变成什么"（跨拍就绪门）。 */
+    wire_set(STEP_MOT_SLOT_RATE_AP,  (float)g_step_rate_hz);
+    wire_set(STEP_MOT_SLOT_LIMIT_AP, (float)g_step_deadline_tick);
+
+    /* ★★★ "变化"的判定 = **请求值 vs 上次请求值**（不是" vs 硬件现状"）：
+     *   · 与硬件比会在"限时到期自动停脉冲"之后**立刻把脉冲拉回来** ⇒ 限时（安全网）失效；
+     *   · 而"与上次请求比"必须配 **切换源时失效缓存** —— 否则"上一次留下的请求"会被当成
+     *     "没有变化" ⇒ 程序面第一次下发的值（恰好与上次相同）**不会被应用**。
+     *     实测（2026-09-17）：重新部署同一个程序后 `wire[12]=15 Hz` 而 `rate=0`。
+     *     ★ 与"重放旧表被静默忽略"（req_seq 撞号）是**同一族**：都是"把'值相同'当成'无事发生'"。 */
+    if (hz == s_mot_hz && dir == s_mot_dir && en == s_mot_en && lim == s_mot_lim) { return; }
+    g_motion_cmd_n++;
+    s_mot_hz = hz; s_mot_dir = dir; s_mot_en = en; s_mot_lim = lim;
+    step_set_dir(dir);
+    if (step_set_ena(en) != STEP_RC_OK) { g_motion_rej_n++; }   /* 未声明极性 ⇒ fail-closed */
+    step_set_rate(hz);                    /* 0 = 停脉冲；>0 由 step_set_rate 内部钳位 */
+    step_set_deadline_ms(lim);
+    g_motion_applied_n++;
 }

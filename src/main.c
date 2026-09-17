@@ -2435,6 +2435,9 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
          *   sub=4 arg=限时毫秒(0=不限)  sub=5 arg=ENA极性  sub=6 = 停止+失能(安全态)
          *   sub=11 = ★ 只读: 装置/使能状态 (极性是否声明 / 指令 vs 引脚实读 / 计数器) 32B
          *   sub=12 arg=停止/上电是否**保力矩** (按轴; 1=保持=垂直轴必须 / 0=去使能)
+         *   sub=13 arg=**运动源** (0=脚手架直控【默认】/ 1=程序面: ③层写 actuator[12..15])
+         *            ★ 见 src/step.h 的"运动能力面"与 docs/PLAN-step-motion-v1.md
+         *   sub=14 = ★ 只读: 运动能力面状态 (源 / cmd_n / applied_n / rej_n / 已应用频率) 32B
          * ★ 判据: 返回的是**实际**频率(由 ARR 反算), 不是请求值。
          * ★★★ 2026-09-17: sub=3 的 `ena(1)` 现在是 **fail-closed** —— ENA 极性未声明时
          *   **NAK(NAKRH_STEPPOL) 明确拒绝**, 而不是"ACK 但保持失能"(后者正是本次事故的形态:
@@ -2534,6 +2537,34 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
              *     stop_hold=0 ⇒ `sub=6` 后 PE9 变成"光耦导通"(失能)。 */
             step_set_stop_hold(arg);
             break;
+        }
+        case 13u: {
+            /* ★★★ 2026-09-17 **运动源**（`PLAN-step-motion-v1` Step 1）：
+             *   0 = 脚手架直控（`sub=1..4` 直接写寄存器）—— **默认，保持既有行为**
+             *   1 = 程序面：③层写 `WIRE[12..15]`（③层的输出面只有 `wire[]`），由 `step_service_motion()` 消费
+             *   ★ 为什么必须显式：程序面若**无条件**生效，会把脚手架/所有运动套件设的频率
+             *     **每圈覆盖回 0** ⇒ 整个运动验收套件全废。⇒ 一次只允许一个运动源。 */
+            step_set_motion_src(arg);
+            break;
+        }
+        case 14u: {
+            /* ★ 2026-09-17: **运动能力面只读状态**（零副作用，与 sub=11 同族）。
+             *   应答 32 B:
+             *     +0 src(0=脚手架 1=程序面)  +4 cmd_n(槽值变化次数)  +8 applied_n  +12 rej_n
+             *     +16 已应用频率 Hz          +20 限时余量 ms
+             *   ★ +4 与 +8 的区分就是判据：**无变化时 +4 不得涨**（否则说明服务在空转）。
+             *   ★ +12 是 fail-closed 的可见面（未声明极性时写 `actuator[14]>0.5` 必被拒）。 */
+            uint8_t r14[32];
+            put32(r14 +  0, g_motion_src);
+            put32(r14 +  4, g_motion_cmd_n);
+            put32(r14 +  8, g_motion_applied_n);
+            put32(r14 + 12, g_motion_rej_n);
+            put32(r14 + 16, g_step_rate_hz);
+            put32(r14 + 20, g_step_deadline_tick);
+            put32(r14 + 24, 0u);
+            put32(r14 + 28, 0u);
+            ack(r14, 32u);
+            return;
         }
         default: break;
         }
@@ -2966,7 +2997,11 @@ static void h_prog_erase(void)
  *       而不是跑起来才发现。★ 这是把"未实现的能力必须在上传期失败"做成机器可判的一步。 */
 static void h_device_desc(void)
 {
-    uint8_t r[64];
+    /* ★ 缓冲必须按"最长的尾部扩展链"给足：本函数是**追加式**的（旧上位机读到 `n_dev` 就停）。
+     * ★★ 注意一处**闸门盲区**（已如实记下）：`tools/h723_ackbuf_check.py` 认的是
+     *   `ack(r, <数字>)` 与 `put32(r + <数字>)`；本函数用的是 **变量偏移** `r + k`
+     *   ⇒ 那些写**闸门看不见** ⇒ 缓冲大小只能靠**人**数。当前最大 k = 66（见下），故取 96。 */
+    uint8_t r[96];
     uint32_t k = 0u;
     uint16_t caps = (uint16_t)(DCL_CAP_H723_IMPL & 0xFFFFu);
     put16le(r + k, (uint16_t)DCL_FW_VERSION_H723); k += 2u;   /* fw_ver */
@@ -3001,6 +3036,21 @@ static void h_device_desc(void)
     put16le(r + k, (uint16_t)DB_SLOTS); k += 2u;     /* 槽数 */
     put16le(r + k, 0x0001u); k += 2u;                /* ops 位图: bit0 = 通用 I2C 读 */
     put32(r + k, (uint32_t)OFF_DEV_BIND); k += 4u;   /* SHM 偏移 (0x7300) */
+    /* ★★★ 运动能力面（程序面，`PLAN-step-motion-v1` Step 1）—— **追加式**，同样不改前面任何字节。
+     *   为什么**不占能力位**：`u16` 只剩 0x8000，而契约自己写着"再加一位就必须做 GAP-3(u32)"，
+     *   且改 `IMPL` 会牵动 10+ 处门面文档（F 类闸门会红）。⇒ 用本块声明，把 GAP-3 的紧迫性归零。
+     *   布局（相对本块起点, 全小端）:
+     *     [0:2] n_motion(=1 表示本块存在)  [2:4] 请求槽基号 [4:6] 请求槽数
+     *     [6:8] 只读镜像基号               [8:10] 镜像数     [10:12] 语义版本
+     *   ★ 判据: 旧客户端读到 `n_dev` 就停 ⇒ 行为与之前**逐字节相同**。
+     *   ★ 槽位语义(WIRE): 12=频率Hz 13=方向 14=使能 15=限时ms；16=已应用频率 17=限时余量。
+     *   ★ 用法: `op=19 sub=13 arg=1` 切到程序面（默认 0 = 脚手架直控，保持既有行为）。 */
+    put16le(r + k, 1u); k += 2u;                                       /* n_motion */
+    put16le(r + k, (uint16_t)STEP_MOT_SLOT_RATE); k += 2u;             /* 请求槽基号 = 12 */
+    put16le(r + k, 4u); k += 2u;                                       /* 请求槽数 = 4 */
+    put16le(r + k, (uint16_t)STEP_MOT_SLOT_RATE_AP); k += 2u;          /* 镜像基号 = 16 */
+    put16le(r + k, 2u); k += 2u;                                       /* 镜像数 = 2 */
+    put16le(r + k, 1u); k += 2u;                                       /* 语义版本 = 1 */
     ack(r, k);
 }
 
@@ -4358,6 +4408,7 @@ int main(void)
         g_loop_entered = 1u;
 
         step_tick(g_tick_count);        /* 限时截止 (只做一次比较, 极短) */
+        step_service_motion();          /* ★ 运动能力面(程序面): 只在槽值变化时动作 —— 见 step.h */
 
         /* ══════════ ★★ I2C 的三件服务性工作 —— **必须在循环顶层**（每圈都跑）══════════
          * ★ 教训（本回合刚踩）: 这三句最初被我写在下面 as5600 的那个 `每 100 拍` 分支里
