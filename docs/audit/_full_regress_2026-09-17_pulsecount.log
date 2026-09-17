@@ -1,0 +1,44 @@
+════════ 全量回归 2026-09-17 17:08:37 ════════
+── 0. bench 态准备（seq --wipe + ERASE + 复位）──
+wipe: SEC_A=0xFFFFFFFF SEC_B=0xFFFFFFFF → OK
+0x49 PROG_ERASE -> ACK b'\x00\x00\x00\x00'
+bench 回读: run=1 ; SHM n_routes=-1  (期望 run=1 / n_routes=128)  用时 0.0s
+   ✓ bench 态已建立（run=1）
+
+── 1. 12 套基线 ──
+h723_proto                         结果: 12 PASS / 0 FAIL / 0 SKIP  (共 12 项)  [rc=0]
+h723_w1                            W1 结果: 27 PASS / 1 FAIL  [rc=1]
+h723_w2_probe                      结果: 14 PASS / 0 FAIL / 共 14  [rc=0]
+h723_r1_actuator                   (无摘要行, rc=0)  [rc=0]
+h723_macro                         W5 macro VM 结果: 18 PASS / 0 FAIL  [rc=0]
+h723_jitter                        (无摘要行, rc=0)  [rc=0]
+h723_seq                           结果: 27 PASS / 0 FAIL / 0 SKIP / 共 27  [rc=0]
+h723_audit_m234                    (无摘要行, rc=1)  [rc=1]
+h723_t26                           (无摘要行, rc=1)  [rc=1]
+h723_w5                            (无摘要行, rc=1)  [rc=1]
+h723_persist                       结果: 7 PASS / 19 FAIL / 共 26  [rc=1]
+h723_modbus                        W4 Modbus 结果: 5 PASS / 10 FAIL  [rc=1]
+
+── 2. 本轮新增/改动的套件 ──
+h723_i2c_sm_test                   [PASS] G6-1 通过: 两条独立路径读数一致 + 每拍一步 + 信道干净 + 可重复 + ping 可用  [rc=0]
+h723_i2c_gate_test                 [PASS] G6-2 通过: 占用期状态机被拒 + 阻塞路径不受影响 + 释放即恢复 + 占用有界  [rc=0]
+h723_i2c_shm_test                  [PASS] G6-3 通过: 数据总线路径可用 + 就绪门可判 + 序号幂等 + 阻塞路径无污染  [rc=0]
+h723_i2c_leak_check                [PASS] 参数非法路径不再泄漏总线门（先验参、再拿门）  [rc=0]
+h723_dev_bind_test                   PASS 52 / FAIL 0 / SKIP 1  [rc=0]
+h723_devbind_persist                 摘要:  PASS 32 / FAIL 0 / SKIP 0  [rc=0]
+h723_frame_attrib                    PASS 18 / FAIL 0 / SKIP 0  [rc=0]
+h723_do_hold_test                  (无摘要行, rc=0)  [rc=0]
+
+── 3. 离线自测（不需要板子）──
+selftest_dev_bind                  变异测试: 全部符合预期  [rc=0]
+selftest_persist                   (无摘要行, rc=0)  [rc=0]
+selftest_claims                       F 类: 登记   3（下限   2）OK   PASS 0 / FAIL 0  [rc=0]
+
+── 4. docs/audit 下的（能跑的）──
+audit_probe_w1w2w3                 (无摘要行, rc=0)  [rc=0]
+limit_tick_probe                   (无摘要行, rc=0)  [rc=0]
+
+── 5. 收尾：板子还活着吗（大 deploy 有已知偶发'停答'缺陷，见 STATUS §17）──
+收尾探活: 5 次中应答 5 次
+
+════════ 结束 2026-09-17 17:15:08 ════════
