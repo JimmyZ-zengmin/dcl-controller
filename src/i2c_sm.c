@@ -158,7 +158,7 @@ void i2c_sm_init(void)
     s_run = 1u;
 }
 
-uint32_t i2c_sm_request(uint8_t addr7, uint8_t op, uint8_t reg, const uint8_t *tx, uint8_t n)
+DCL_ITCM uint32_t i2c_sm_request(uint8_t addr7, uint8_t op, uint8_t reg, const uint8_t *tx, uint8_t n)
 {
     if (!s_run) { return 0u; }
     if (s_phase != PH_IDLE && s_phase != PH_DONE) { return 0u; }   /* 上一个还在飞 */
@@ -318,12 +318,12 @@ uint32_t i2c_sm_status(void)    { return s_status; }
 
 /* ★★★ 归属令牌 + 完成记录读取口（2026-09-16）。语义与用法见 `i2c_sm.h`。
  * 收尾方三步：① 实时态非 BUSY ② `done_req == my` ③ `take_result(my, …)`。 */
-uint32_t i2c_sm_done_req(void)    { return g_i2c_sm_done_req; }
-uint32_t i2c_sm_done_status(void) { return g_i2c_sm_done_status; }
+DCL_ITCM uint32_t i2c_sm_done_req(void)    { return g_i2c_sm_done_req; }
+DCL_ITCM uint32_t i2c_sm_done_status(void) { return g_i2c_sm_done_status; }
 
 /* 取**最近一次完成**的数据。★ 它不再看实时 `s_status`/`s_len` —— 那两样会被后续动作改掉
  *   （这正是第二轮审计挖出的漏洞：被拒的请求会覆写 `s_status`）。改用完成记录。 */
-static uint32_t sm_copy_done(uint8_t *buf, uint32_t n)
+DCL_ITCM static uint32_t sm_copy_done(uint8_t *buf, uint32_t n)
 {
     if (buf == NULL) { return 0u; }
     if (g_i2c_sm_done_req == I2C_SM_DONE_NONE) { return 0u; }      /* 无完成记录 */
@@ -338,7 +338,7 @@ uint32_t i2c_sm_result(uint8_t *buf, uint32_t n)
     return sm_copy_done(buf, n);
 }
 
-uint32_t i2c_sm_take_result(uint32_t my_req, uint8_t *buf, uint32_t n)
+DCL_ITCM uint32_t i2c_sm_take_result(uint32_t my_req, uint8_t *buf, uint32_t n)
 {
     /* ★ 归属核对放在**资源处**（不是在各调用点）—— 多一个使用者也不会静默穿透。 */
     if (g_i2c_sm_done_req != my_req) { return 0u; }

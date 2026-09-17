@@ -1481,6 +1481,14 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *     `i2c_sm_status() == OK` 才能取结果, **不能假设"发请求即得值"**。 */
         i2c_sm_tick();
 
+        /* ★★★ 2026-09-17 阶段 0（`docs/PLAN-closedloop-stepper-v2.md`）：
+         *   **AS5600 的"发起"也搬进拍内** —— 因为源码核实的瓶颈就在这里：
+         *     `i2c_sm_tick()` 早已在拍内推进相位，而**发起**在主循环
+         *     ⇒ **反馈率天花板实测 163 Hz**，而**反馈率 = 闭环带宽上限**。
+         *   ★ 必须在 `i2c_sm_tick()` **之后**：本拍若把状态机推到"完成"，这里才收得到结果。
+         *   ★ 默认模式是阻塞路径（`g_as_sm_mode==0`）⇒ 本函数**立即 return** ⇒ 零行为变化。 */
+        as5600_tick(g_tick_count);
+
         if (g_per_prev) {
             uint32_t p = t0 - g_per_prev;
             /* ★★★ 时钟不连续保护 (2026-09-11 实测缺陷修复):
@@ -2659,6 +2667,34 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
             put32(r21 + 24, g_as_status);
             put32(r21 + 28, g_as_mag_ok);
             ack(r21, 32u);
+            return;
+        }
+        case 22u: {
+            /* ★★★ 2026-09-17 阶段 0：**AS5600 的读走哪条路**
+             *   arg=0（**默认**）⇒ 主循环阻塞读（既有行为，逐位不变）
+             *   arg=1           ⇒ **拍内状态机**：由 `as5600_tick()`（拍 ISR）发起 + 收结果
+             *   ★ 为什么这是关键路径：`i2c_sm_tick()` 早已在拍内推进相位，**只有"发起"在主循环**
+             *     ⇒ 反馈率天花板实测 **163 Hz**，而**反馈率 = 闭环带宽上限**（见 PLAN v2 阶段 0）。
+             *   ★ 运行期改动，**复位即回默认**（不污染持久化）。 */
+            as5600_set_sm_mode(arg);
+            break;
+        }
+        case 23u: {
+            /* ★ 只读：**拍内模式的状态与账**（32 B）
+             *   +0 sm_mode  +4 sm_req(在飞号)  +8 sm_busy_n  +12 sm_nobase_n
+             *   +16 ok_n    +20 err_n           +24 skip_bus_n +28 period_ticks
+             *   ★ 判"拍内是否真的跑起来"：`ok_n` 增量应 ≫阻塞模式；
+             *     `sm_busy_n` 涨 ⇒ 与 `dev_bind` 争总线（需统一调度）。 */
+            uint8_t r23[32];
+            put32(r23 +  0, g_as_sm_mode);
+            put32(r23 +  4, g_as_sm_req);
+            put32(r23 +  8, g_as_sm_busy_n);
+            put32(r23 + 12, g_as_sm_nobase_n);
+            put32(r23 + 16, g_as_ok_n);
+            put32(r23 + 20, g_as_err_n);
+            put32(r23 + 24, g_as_skip_bus_n);
+            put32(r23 + 28, g_as_period_ticks);
+            ack(r23, 32u);
             return;
         }
         default: break;
@@ -4562,7 +4598,11 @@ int main(void)
                  * ★★★ 2026-09-17: 这条**以前不可观测** —— 现在记 `g_as_skip_bus_n`，
                  *   因为它直接决定"闭环拿到的是不是新鲜反馈"（反馈率 = 闭环带宽上限）。 */
                 if (i2c_bus_owner() != I2C_OWNER_SM) {
-                    as5600_poll(g_shm);
+                    /* ★★ 阶段 0：**拍内模式时不再走阻塞读**（否则两条路会争总线、且拖慢主循环）。
+                     *   拍内模式由 `as5600_tick()`（拍 ISR）负责发起与收结果。 */
+                    if (as5600_sm_mode() == AS_SM_MODE_BLOCKING) {
+                        as5600_poll(g_shm);
+                    }
                 } else {
                     g_as_skip_bus_n++;
                 }

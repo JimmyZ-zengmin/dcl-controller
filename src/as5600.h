@@ -31,5 +31,33 @@ extern volatile uint32_t g_as_ok_n, g_as_err_n, g_as_last_err;
 extern volatile uint32_t g_as_skip_bus_n, g_as_period_ticks;
 void     as5600_set_period_ticks(uint32_t n);   /* 钳到 [2, 100000]；复位即回默认 100 */
 uint32_t as5600_period_now(void);
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 阶段 0（`docs/PLAN-closedloop-stepper-v2.md`）：**把"发起"搬进拍内**
+ *
+ * ## 为什么只差这一步
+ * 源码已核实（`src/main.c:1482` 的注释）：
+ *   · `i2c_sm_tick()` **已经在拍 ISR 最尾部、每拍推进一个相位** ✓
+ *   · 而**发起**（谁下 `i2c_sm_request`）在**主循环** ⇒ **发起率 ≤ 主循环频率**
+ * ⇒ **实测反馈率天花板 163 Hz**（周期改 100→10→4 拍都停在 163，`err_n=0`、`skip_bus_n=0`）
+ * ⇒ **而反馈率就是闭环带宽的上限**（`~80 Hz`，不是"执行频率 10 kHz"）。
+ *
+ * ## 做法（**默认关** ⇒ 既有行为逐位不变）
+ * `op=19 sub=22 arg=0|1`：0 = 主循环阻塞路径（**默认**）；1 = 拍内状态机。
+ * 开启后由 `as5600_tick()`（**拍 ISR 内、`i2c_sm_tick()` 之后**）做两件事：
+ *   ① **收结果**：`i2c_sm_take_result(my,…)`（归属核对住在资源处）⇒ 写 `SENSOR[0]/[1]`
+ *   ② **到点发起**：每 `period` 拍下一次 `i2c_sm_request`
+ *
+ * ## 边界（都记在计数器里，不静默）
+ * · 发起被拒（**别的请求在飞**——如 `dev_bind`）⇒ `g_as_sm_busy_n++`，下一轮再试
+ * · 完成但状态非 OK / 长度不对 ⇒ `g_as_err_n++` 并**保留上次值**（不写 0）
+ * · 未设 base（还没走过一次阻塞读）⇒ 不发起，记 `g_as_sm_nobase_n`
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define AS_SM_MODE_BLOCKING 0u    /* 默认：主循环阻塞读（既有行为）*/
+#define AS_SM_MODE_TICK     1u    /* 拍内状态机 */
+void     as5600_set_sm_mode(uint32_t mode);
+uint32_t as5600_sm_mode(void);
+void     as5600_tick(uint32_t tick_now);   /* ★ 由**拍 ISR** 调用 */
+extern volatile uint32_t g_as_sm_mode, g_as_sm_busy_n, g_as_sm_nobase_n, g_as_sm_req;
 extern volatile uint32_t g_as_scan_lo, g_as_scan_hi;   /* as5600_scan 的自检两个读回值 */
 #endif

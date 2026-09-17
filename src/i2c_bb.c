@@ -1,4 +1,5 @@
 #include "i2c_bb.h"
+#include "itcm.h"   /* ★ 阶段 0: 拍内 I2C 会用到 ⇒ 必须住 ITCM */
 #include <stddef.h>
 #include "regs.h"
 
@@ -26,7 +27,7 @@ static volatile uint8_t  s_i2c_owner = I2C_OWNER_NONE;
 static volatile uint16_t s_i2c_refs  = 0u;
 volatile uint32_t g_i2c_bus_busy_n = 0u;
 
-uint32_t i2c_bus_acquire(uint8_t owner)
+DCL_ITCM uint32_t i2c_bus_acquire(uint8_t owner)
 {
     if (owner == I2C_OWNER_NONE) { return 0u; }
     uint8_t cur = s_i2c_owner;
