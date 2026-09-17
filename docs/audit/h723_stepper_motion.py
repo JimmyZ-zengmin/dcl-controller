@@ -51,7 +51,23 @@ import os as _os
 sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "tools"))
 from h723_modbus import open_serial as _open_serial   # noqa: E402
 
-PORT = "COM21" if "COM21" in [p.device for p in lp.comports()] else "COM14"
+"""★★ 2026-09-17 更正: 原来这里是
+    `PORT = "COM21" if "COM21" in comports() else "COM14"`
+—— 那是"**按端口号**认板子"。端口号会变（实测 COM21→COM22 换过两次），
+  按号认必然间歇失败，而且**症状像"板子坏了"**（回归里报过一条 rc=1 被当成设备故障）。
+★ 本项目纪律: **串口按能力字认，不取"第一个"**（两个 CH340）。
+  顺序: 显式 port 参数 → 环境变量 `DCL_PORT` → 能力探测 `h723_client.find_board()`。
+"""
+
+PORT = None          # 仅作**默认参数占位**；真正的解析在 _resolve_port()
+
+
+def _resolve_port():
+    p = _os.environ.get("DCL_PORT")
+    if p:
+        return p
+    from h723_client import find_board
+    return find_board()
 
 
 # ★★ 仓库约定（`docs/claims.md` 的 E 类闸门）：**判据发射器必须叫 `record(...)`** ——
@@ -85,12 +101,14 @@ def fr(cmd, pl=b""):
 
 
 class Dut:
-    def __init__(self, port=PORT):
+    def __init__(self, port=None):
         # ★★ 用项目的 `open_serial`（打开后**立刻释放 DTR/RTS**）—— 不是裸 `serial.Serial`。
         #   血证(2026-09-11，2026-09-17 本套件又命中一次): CH340 的 RTS 若接到板子 NRST,
         #   裸开串口会 assert RTS ⇒ **把板子按在复位上** ⇒ 串口 0 字节 + SWD 也失败,
         #   症状像"固件挂了/探针坏了", 排查方向被完全带偏。
-        self.ser = _open_serial(port, 115200, timeout=0.02)
+        #   ★★ 同一次审查还发现端口是"按号认" ⇒ 现在按能力字认（见 _resolve_port 的长注释）。
+        self.port = port or _resolve_port()
+        self.ser = _open_serial(self.port, 115200, timeout=0.02)
 
     def xchg(self, f, timeout=0.15):
         """★ 必须**校验帧**(长度 + CRC16) 并在缓冲里重找, 不能只看 0xC1 头。

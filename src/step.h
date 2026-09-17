@@ -188,4 +188,11 @@ extern volatile uint32_t g_step_ena_rc;          /* 最近一次 step_set_ena �
 extern volatile uint32_t g_step_ena_rej_n;       /* 被 fail-closed 拒绝的次数 */
 extern volatile uint32_t g_step_ena_mismatch_n;  /* "指令 != 引脚实读" 的次数 */
 extern volatile uint32_t g_step_ena_pin_intent;  /* 我们**意图**的 PE9 电平 (0/1) */
+/* ★★★ 归因（2026-09-17）—— `mismatch_n ≡ hi_n + lo_n`；现场快照让"哪一半不对"可读。
+ *   加它的直接原因是 327616 那个数**只说了"不对"，没说"谁把它弄成这样的"**。 */
+extern volatile uint32_t g_step_ena_mismatch_hi_n;  /* 不一致且实读=1 ⇒ 被人拉高 */
+extern volatile uint32_t g_step_ena_mismatch_lo_n;  /* 不一致且实读=0 ⇒ 被人拉低 */
+extern volatile uint32_t g_step_mismatch_lmask;     /* 当刻**生效**掩码 (do 面同一函数) */
+extern volatile uint32_t g_step_mismatch_lidr;      /* 当刻 GPIOE_IDR 低 16 位 */
+extern volatile uint32_t g_step_mismatch_ltick;     /* 当刻拍号 */
 #endif

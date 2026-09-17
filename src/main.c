@@ -2697,6 +2697,37 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
             ack(r23, 32u);
             return;
         }
+        case 24u: {
+            /* ★★★ 2026-09-17 新增: **使能一致性归因 + DO 掩码归属**（32 B，零副作用）
+             *
+             * 动机：`sub=11 +20` 的 `mismatch_n` 曾涨到 **327616 后冻结**，而它只回答
+             *   "不对了多少次"，**不回答"谁把它弄成这样的"** ⇒ 真因（上位机把 GPIO_MASK
+             *   换成 0x00FF / 0x7FC00000 ⇒ DO 面不再驱 PE9 ⇒ 引脚冻结在旧电平）被误读成
+             *   "有野写者"。★ 这就是"一个计数只能回答一个问题"的又一次代价 —— 本子命令拆开它。
+             *
+             * 应答 32 B:
+             *   +0  mismatch_n    不一致总次数（**≡ +4 + +8，这条恒等式本身就是判据**）
+             *   +4  hi_n          不一致且**实读=1** ⇒ 有人把它拉高
+             *   +8  lo_n          不一致且**实读=0** ⇒ 有人把它拉低
+             *   +12 step_drop_n   do 面独有: 上位机把 PE8..PE11 剔出掩码的**次数**(沿计数)
+             *   +16 last_mask     不一致当刻的**生效**掩码（do 面同一函数）
+             *   +20 last_idr      不一致当刻的 GPIOE_IDR 低 16 位
+             *   +24 last_tick     不一致当刻的拍号（配合 0x38 拍号 ⇒ "多久以前"）
+             *   +28 host_mask     上位机**原始**掩码（与 +16 对比 ⇒ 一眼看出保留位有没有被剔）
+             *   ★ +16 与 +28 成对给出，理由同 sub=11 的 intent/actual：
+             *     两者不一致时，必须能一眼看出**差在哪几位**，而不是只知道"不一样"。 */
+            uint8_t r24[32];
+            put32(r24 +  0, g_step_ena_mismatch_n);
+            put32(r24 +  4, g_step_ena_mismatch_hi_n);
+            put32(r24 +  8, g_step_ena_mismatch_lo_n);
+            put32(r24 + 12, g_do_mask_step_drop_n);
+            put32(r24 + 16, do_mask_effective());
+            put32(r24 + 20, g_step_mismatch_lidr);
+            put32(r24 + 24, g_step_mismatch_ltick);
+            put32(r24 + 28, do_mask_host());
+            ack(r24, 32u);
+            return;
+        }
         default: break;
         }
         /* ★★★ 修 (2026-09-15): 原为 `uint8_t r[40]` 而本块写了 **68 字节** (r+0..r+67)

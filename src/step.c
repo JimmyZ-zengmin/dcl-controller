@@ -43,7 +43,26 @@ volatile uint32_t g_step_stop_hold   = (uint32_t)((DCL_STEP_STOP_HOLD) ? 1 : 0);
 volatile uint32_t g_step_ena_rc          = STEP_RC_OK;
 volatile uint32_t g_step_ena_rej_n       = 0u;
 volatile uint32_t g_step_ena_mismatch_n  = 0u;
-volatile uint32_t g_step_ena_pin_intent  = 1u;   /* 上电默认意图 = 高(不导通) */
+volatile uint32_t g_step_ena_pin_intent  = 1u;   /* 上电默认意图 = 高(光耦不导通) */
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 2026-09-17: `mismatch_n` 的**归因**（一个数变成"能指认谁"的一组数）
+ *
+ * 血证：`g_step_ena_mismatch_n` 曾涨到 **327616 后冻结**，当时只能读到这一个数 ⇒
+ *   被解读成"有别的代码在驱 PE9"（听起来像野写者），实际是**上位机把 GPIO_MASK
+ *   换成 0x00FF（`h723_do_hold_test.py`）/ 0x7FC00000（`h723_w1.py` 越界注入）**
+ *   ⇒ DO 面不再驱 PE9 ⇒ 引脚停在旧电平。**真因离读数很远， потому就是读数没说清。**
+ *
+ * ⇒ 拆成三个**互斥**且**穷尽**的类别 + 三件现场快照：
+ *      `mismatch_n ≡ hi_n + lo_n`（按实读电平分方向：是被人拉高还是拉低）
+ *      `do_mask_step_drop_n`（do.c 独有）：上位机是否剔过保留位 —— **另问一个问题**，
+ *        所以**不**并进上面那个和式（"一个计数只能回答一个问题"）。
+ *    ★ 于是"PE9 不对"这句话，以后能直接读出**哪一半不对**、**当刻掩码长什么样**。
+ * ══════════════════════════════════════════════════════════════════════════ */
+volatile uint32_t g_step_ena_mismatch_hi_n = 0u;  /* 不一致且实读=1 ⇒ 有人把它拉**高** */
+volatile uint32_t g_step_ena_mismatch_lo_n = 0u;  /* 不一致且实读=0 ⇒ 有人把它拉**低** */
+volatile uint32_t g_step_mismatch_lmask    = 0u;  /* 不一致当刻的**生效掩码**(do 面同一函数) */
+volatile uint32_t g_step_mismatch_lidr     = 0u;  /* 不一致当刻的 GPIOE_IDR 低 16 位 */
+volatile uint32_t g_step_mismatch_ltick    = 0u;  /* 不一致当刻的拍号 */
 volatile uint32_t g_step_dt_max = 0u;
 
 /* ★★★ 运动能力面（程序面）—— 见 step.h 的说明。★ **默认脚手架 ⇒ 既有行为零变化**。 */
@@ -410,7 +429,18 @@ void step_tick(uint32_t tick_now)
         static uint32_t s_prev_bad = 0u;
         uint32_t actual = (GPIO_IDR(DO_GPIO_PORT) >> 9) & 1u;
         if (actual != g_step_ena_pin_intent) {
-            if (s_prev_bad != 0u) { g_step_ena_mismatch_n++; }
+            if (s_prev_bad != 0u) {
+                g_step_ena_mismatch_n++;
+                /* ★ 归因 + 现场快照：让"PE9 不对"这句话能指认方向与当刻掩码。
+                 *   ★ 掩码取自 `do_mask_effective()`（**与 do_poll 用的同一个函数**）——
+                 *     若这里自己再算一遍 SHM 字段，就会出现"读回来的"与"用上去的"分叉，
+                 *     那正是本项目"一个绑定跨两个寄存器"的老族。 */
+                if (actual != 0u) { g_step_ena_mismatch_hi_n++; }
+                else              { g_step_ena_mismatch_lo_n++; }
+                g_step_mismatch_lmask = do_mask_effective();
+                g_step_mismatch_lidr  = (uint32_t)GPIO_IDR(DO_GPIO_PORT) & 0xFFFFu;
+                g_step_mismatch_ltick = tick_now;
+            }
             s_prev_bad = 1u;
         } else {
             s_prev_bad = 0u;

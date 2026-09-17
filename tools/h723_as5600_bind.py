@@ -43,7 +43,15 @@ def main():
     if "--port" in sys.argv:
         port = sys.argv[sys.argv.index("--port") + 1]
     dry = "--dry" in sys.argv
-    b = D.Board(port or "COM21")
+    # ★★ 2026-09-17: 原来是 `port or "COM21"` —— **按端口号认板子**，而号会变
+    #   （实测 COM21→COM22 换过两次）⇒ 找错口的表现是"读不到 g_shm"，**看起来像固件问题**。
+    #   本项目纪律: **串口按能力字认，不取"第一个"（两个 CH340）**。
+    if not port:
+        port = os.environ.get("DCL_PORT")
+    if not port:
+        from h723_client import find_board
+        port = find_board()
+    b = D.Board(port)
     try:
         if not b.locate_shm():
             print("✗ 读不到 g_shm（0x38 无应答）⇒ 无法定位 SHM")

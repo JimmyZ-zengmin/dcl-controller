@@ -51,7 +51,26 @@ import os as _os
 sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "tools"))
 from h723_modbus import open_serial as _open_serial   # noqa: E402
 
-PORT = "COM21" if "COM21" in [p.device for p in lp.comports()] else "COM14"
+"""★★ 2026-09-17 更正: 原来这里是
+    `PORT = "COM21" if "COM21" in comports() else "COM14"`
+—— 那是"**按端口号**认板子"。端口号会变（实测 COM21→COM22 换过两次），
+  按号认必然间歇失败，而且**症状像"板子坏了"**（回归里就报过一条 rc=1，
+  一度被当成"设备故障"，其实只是它找错了口）。
+★ 本项目纪律: **串口按能力字认，不取"第一个"**（两个 CH340）。
+  顺序: 显式 port 参数 → 环境变量 `DCL_PORT` → 能力探测 `h723_client.find_board()`。
+★ 为什么不在 import 期解析: 本文件被 `h723_limit_tick_probe.py` **import**，
+  import 期就探测会在"没插板子"时直接抛 ⇒ 把一个本来能跑的离线路径也弄死。
+"""
+
+PORT = None          # 仅作**默认参数占位**；真正的解析在 _resolve_port()
+
+
+def _resolve_port():
+    p = _os.environ.get("DCL_PORT")
+    if p:
+        return p
+    from h723_client import find_board
+    return find_board()
 
 SPR = 1600.0                  # 8 细分: 1600 步/圈 (实测确认)
 DEG_PER_STEP = 360.0 / SPR    # 0.225°
@@ -76,12 +95,15 @@ class Dut:
        偏移 0/4/8/12/16/20/24/28 = hz/dir/ena/tleft/ccer/.../raw/.../enapol
        偏移 76/80/84/88/92 = GPIOA_IDR / GPIOE_IDR / TIM3_CCMR1 / TIM3_CCR1 / TIM3_ARR"""
 
-    def __init__(self, port=PORT):
+    def __init__(self, port=None):
         # ★★ 用项目的 `open_serial`（打开后**立刻释放 DTR/RTS**）—— 不是裸 `serial.Serial`。
         #   血证(2026-09-11，2026-09-17 又命中一次): CH340 的 RTS 若接到板子 NRST,
         #   裸开串口会 assert RTS ⇒ **把板子按在复位上** ⇒ 串口 0 字节 + SWD 也失败,
         #   症状像"固件挂了/探针坏了"。本探针此前一直没做这一步。
-        self.ser = _open_serial(port, 115200, timeout=0.02)
+        #   ★★ 同一次审查还发现: 端口是 `if "COM21" in comports() else "COM14"` —— 按**号**认板子。
+        #     号会变(COM21→COM22) ⇒ 找错口 ⇒ **症状同样像"板子坏了"** ⇒ 现在按能力字认。
+        self.port = port or _resolve_port()
+        self.ser = _open_serial(self.port, 115200, timeout=0.02)
 
     def xchg(self, f, timeout=0.15):
         """★ 超时 0.05 → 0.15 (2026-09-16): 命令通路往返实测
@@ -293,7 +315,7 @@ def head(t):
     d = Dut()
     s = d.st()
     if s is None:
-        print("板子无响应 (端口 %s)" % PORT)
+        print("板子无响应 (端口 %s)" % (_os.environ.get("DCL_PORT") or "按能力字自动探测"))
         return None, None
     print("基线: ena=%d 极性=%d PE9=%d raw=%d (%.2f°) 脉冲=%dHz"
           % (s["ena"], s["enapol"], s["pe9"], s["raw"], s["raw"] * 360 / 4096, s["hz"]))

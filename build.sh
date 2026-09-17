@@ -77,6 +77,9 @@ DEFAULTS=(
     -DDCL_HIL_SAFE=1
     -DDCL_IO_IN_ISR=1
     -DDCL_DO_LATCH=0          # DO 输出路径: 0=CPU 直写(交付) 1=影子+MDMA锁存(对照)
+    -DDCL_DO_MASK_UNION=1     # ★ DO 掩码保留位: 1=PE8..PE11 不可被上位机剔出掩码(交付)
+                              #   /0=掩码说了算(对照档)。见 CMakeLists 的长注释:
+                              #   `mismatch_n` 涨到 327616 的真因就是掩码把 PE9 剔掉了。
     -DDCL_STEP_ENA_POL=1      # ★ 步进 ENA 极性: -1=未配置(→fail-closed, 拒绝使能)/0=拉低使能
                               #   /1=拉高使能 ← **本台实机**(光耦正端接 3.3V, 实测)。见 PLAN-device-config-v1
     -DDCL_STEP_STOP_HOLD=0    # ★ 停止/上电是否保力矩。**本台 = 0（休息态断电）**
@@ -103,23 +106,39 @@ DEFAULTS=(
 #              ② 这里再扫一遍完整日志 (含链接器/汇编的警告)
 set -o pipefail
 LOG="$HERE/build/buildlog.txt"
-# ★★ 已知间歇性失败 (2026-09-12 一天踩 3 次, 且**不一定重跑一次就收敛**):
+# ★★ 已知间歇性失败 (2026-09-12 一天踩 3 次, 且**不一定重跑一次就收敛**;
+#    2026-09-17 又踩: 单次重试**也失败**了):
 #     cc1.exe: fatal error: can't open '...\build\tmp\ccXXXXXX.s' for writing: Permission denied
 #   随机文件、随机名、且失败的文件里包含**从未改动过**的 .c ⇒ 与代码无关 (已知族)。
-#   ⇒ 这里加**一次自动重试**; 但**显式打印出来, 不静默** ——
+#   ⇒ 改成**最多 3 轮重试 + 退避**; 每一轮都**显式打印**, 不静默 ——
 #     静默重试会把"真的编译失败"掩盖成"重试后还是失败", 丢掉第一次的错误信息。
-if ! "$CMAKE" --build "$BUILD" 2>&1 | tee "$LOG"; then
-    echo
-    if grep -q "Permission denied" "$LOG" && grep -q "can't open" "$LOG"; then
-        echo "★★ 命中已知症状 (build/tmp Permission denied, 与代码无关) ⇒ 清 tmp 后自动重试一次。"
+# ★★★ 2026-09-17 修掉一处真缺陷: 原写法是
+#       if ! build; then …重试…; "$CMAKE" --build … | tee; else …; exit 1; fi
+#     重试那一句是分支里的**最后一条命令, 退出码没人看** ⇒ 重试也失败时脚本照样往下走,
+#     而后面几道闸门是**读日志/grep**的、不依赖刚刚是否链接成功
+#     ⇒ 结果是 **"构建失败 → 门过 → 烧了旧镜像"**（本项目 2026-09-17 真发生过一次:
+#        `pyocd flash` 报 `programmed 0 bytes, skipped 68608` —— 板子上还是上一版固件,
+#        而后续判据把"旧固件的错误行为"当成新固件的结论）。
+#     ⇒ 现在: **循环 + 每轮都判退出码 + 最终失败 exit 1**。
+ATTEMPT=0
+while true; do
+    if "$CMAKE" --build "$BUILD" 2>&1 | tee "$LOG"; then
+        break
+    fi
+    ATTEMPT=$((ATTEMPT + 1))
+    if grep -q "Permission denied" "$LOG" && grep -q "can't open" "$LOG" && [ "$ATTEMPT" -lt 3 ]; then
+        echo
+        echo "★★ 命中已知症状 (build/tmp Permission denied, 与代码无关) ⇒ 清 tmp 后重试 (第 $ATTEMPT/3 次)。"
         rm -rf "$BUILD/tmp"
         mkdir -p "$BUILD/tmp"
-        "$CMAKE" --build "$BUILD" 2>&1 | tee "$LOG"
-    else
-        echo "★★ 构建失败, 且**不是**已知的 build/tmp 症状 ⇒ 按真实构建失败处理 (见上面的日志)。"
-        exit 1
+        sleep 2
+        continue
     fi
-fi
+    echo
+    echo "★★ 构建失败 (非已知症状, 或已重试 3 次仍失败) ⇒ 中止, **不要烧旧镜像**。"
+    echo "   ⚠ 此时 build/dcl_h723.hex 是**上一次**的产物; 任何 flash/验收都无意义。"
+    exit 1
+done
 
 NW=$(grep -c "warning:" "$LOG" || true)
 if [ "$NW" != "0" ]; then

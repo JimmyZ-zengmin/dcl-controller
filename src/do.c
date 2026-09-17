@@ -199,6 +199,43 @@ void do_latch_init(void)
 #endif /* DCL_DO_LATCH —— A 档在函数开头就 return 了, 绝不碰上面这些寄存器 */
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 掩码"归属"的唯一实现处（见 do.h 的 DO_STEP_RESERVED_MASK 长注释）
+ *
+ * 为什么必须有"生效掩码"这一层：`GPIO_MASK` 的既有语义是
+ *   "bit=0 ⇒ **任何路径都不许碰 PEi**"。这对**普通 DO** 是对的，但对
+ *   **步进脉冲源的 PE8..PE11** 是错的 —— 那几位是**驱动器的接口**，
+ *   "不碰"等于把它停在**非受控电平**（可能使能、可能失能，取决于上一次是谁写的）。
+ *   血证：`g_step_ena_mismatch_n` 涨到 327616 后冻结，真因是上位机把掩码换成 0x00FF。
+ *
+ * ★ 两处必须用**同一个函数**：#define 一个不行 —— `do_poll`（拍内写）与
+ *   `do_outputs_safe`（停机清）以及诊断读回，三处若各算一遍就会分叉
+ *   （本项目老族："一个绑定跨两个寄存器 ⇒ 必须同一个函数改"）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+volatile uint32_t g_do_mask_step_drop_n = 0u;   /* 上位机剔除保留位的**次数**(沿) */
+
+uint32_t do_mask_host(void)
+{
+    if (!s_do_base) return 0u;
+    return SHM_U32(s_do_base, OFF_CTRL_GPIO_MASK) & 0xFFFFu;
+}
+
+uint32_t do_mask_effective(void)
+{
+    uint32_t host = do_mask_host();
+#if DCL_DO_MASK_UNION
+    return host | DO_STEP_RESERVED_MASK;
+#else
+    (void)DO_STEP_RESERVED_MASK;
+    return host;                    /* ★ A/B 对照档: 改前行为（掩码说了算） */
+#endif
+}
+
+/* ★ 沿计数（不是每拍 +1）：每拍 +1 会在 10 kHz 下变成不可解释的大数 ——
+ *   本轮血证（327616）本身就是"计数器口径不可解释"造成的误判，不能再犯。
+ *   ★★ 为什么**内联**在 do_poll 而不单独成一个 DCL_ITCM 函数：**ITCM 已 100% 占满**
+ *     （记忆 §5.4），而 do_poll 是 ISR 可达 ⇒ 它调用的每个函数都必须也在 ITCM。
+ *     为 4 行账目再开一个 ITCM 符号不划算 ⇒ 直接写在同一函数里。 */
 DCL_ITCM void do_poll(uint8_t *base, uint32_t tick_now)
 {
     (void)tick_now;          /* 输出面每拍都做, 不需要相位 */
@@ -207,7 +244,20 @@ DCL_ITCM void do_poll(uint8_t *base, uint32_t tick_now)
                                     第一版放在 mask==0 早退之后 ⇒ 上电 GPIO_MASK=0
                                     时它恒 0, 看起来"DO 没工作"—— 空判据翻车 (项目
                                     已知教训, 自己代码里又踩了一次)。 */
-    uint32_t mask = SHM_U32(base, OFF_CTRL_GPIO_MASK) & 0xFFFFu;
+    uint32_t host = SHM_U32(base, OFF_CTRL_GPIO_MASK) & 0xFFFFu;
+    /* ★ 记账必须在早退之前（否则"mask==0"这条路径又把它变成空判据） */
+    {
+        static uint32_t s_prev_drop = 0u;
+        uint32_t drop = ((host & DO_STEP_RESERVED_MASK) != DO_STEP_RESERVED_MASK) ? 1u : 0u;
+        if (drop != 0u && s_prev_drop == 0u) { g_do_mask_step_drop_n++; }
+        s_prev_drop = drop;
+    }
+    uint32_t mask;
+#if DCL_DO_MASK_UNION
+    mask = do_mask_effective();             /* = host | DO_STEP_RESERVED_MASK */
+#else
+    mask = host;                            /* ★ A/B 对照档: 改前行为（掩码说了算） */
+#endif
     if (mask == 0u) return;      /* 没登记任何管辖位 ⇒ 整口不碰 (且省 40 cyc) */
     uint32_t bits = do_pack(base, mask);
 #if DCL_DO_LATCH
@@ -229,7 +279,7 @@ DCL_ITCM void do_poll(uint8_t *base, uint32_t tick_now)
 void do_outputs_safe(void)
 {
     if (!s_do_ready) return;
-    uint32_t mask = SHM_U32(s_do_base, OFF_CTRL_GPIO_MASK) & 0xFFFFu;
+    uint32_t mask = do_mask_effective();   /* ★ 与 do_poll 同一个函数（不许各算一遍） */
 #if DCL_DO_LATCH
     /* 影子模式: 清 shadow 的管辖位 (MDMA 下个拍边界锁存 0) —— 与 do_poll 同款保持语义 */
     uint32_t odr = GPIO_ODR(DO_GPIO_PORT) & 0xFFFFu;

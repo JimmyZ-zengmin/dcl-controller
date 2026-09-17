@@ -152,6 +152,16 @@ set(DCL_IO_IN_ISR "1" CACHE STRING "I/O 驱动位置 (1 ISR 拍内 / 0 主循环
 #     ⇒ **PE0~PE7 被静默清零, DO 0..7 永不可用**（观测面看不出来, 寄存器读回全对）。
 set(DCL_DO_LATCH "0" CACHE STRING "DO 输出路径 (0 CPU直写=交付 / 1 影子+MDMA锁存=对照)")
 
+# ---- ★★★ DO 掩码"归属"开关 (2026-09-17) —— 步进保留位是否可被上位机掩码剔除 ----
+#   1 = **交付档**: 生效掩码 = host | DO_STEP_RESERVED_MASK(0x0F00) ⇒ **PE8..PE11 永不被丢**
+#   0 = **对照档**: 生效掩码 = host（改前行为）⇒ 上位机换掩码就能让 PE9 停在非受控电平
+#   ★ 起因（一个被单个计数器掩盖了真因的问题）: `g_step_ena_mismatch_n` 涨到 **327616 后冻结**,
+#     当时被解读为"有别的代码在驱 PE9"; 实测真因是 `h723_do_hold_test.py` 把掩码换成 0x00FF、
+#     `h723_w1.py` 注入 0x7FC00000（&0xFFFF = 0）⇒ `do_poll` 不再驱 PE9 ⇒ 引脚冻结在旧电平。
+#   ★ 判据（能失败）: `tools/h723_do_mask_owner_test.py` —— 对照档上 mismatch_n **必须涨**,
+#     交付档上 **必须为 0** 且 `do_mask_step_drop_n` 涨 1（同一套测量方法打两份, 缺一不成证据）。
+set(DCL_DO_MASK_UNION "1" CACHE STRING "DO 掩码保留位 (1 保留位不可剔=交付 / 0 掩码说了算=对照)")
+
 # ---- ★★★ 步进 ENA 极性 + 停止保持力矩 (2026-09-17, PLAN-device-config-v1 P0) ----
 #   起因: 现场"电机响但轴不动" = `g_step_ena_pol` 的**隐藏默认值**与实机接线相反,
 #         把「使能 / 失能 / 上电安全态」**三处同时弄反** (H723-MOTION-QUALITY-AUDIT §16)。
@@ -231,6 +241,7 @@ add_compile_options(
     -DHIL_SAFE=${DCL_HIL_SAFE}
     -DIO_IN_ISR=${DCL_IO_IN_ISR}
     -DDCL_DO_LATCH=${DCL_DO_LATCH}
+    -DDCL_DO_MASK_UNION=${DCL_DO_MASK_UNION}
     -DDCL_TIMEBASE=${DCL_TIMEBASE}
     -DDCL_STEP_ENA_POL=${DCL_STEP_ENA_POL}
     -DDCL_STEP_STOP_HOLD=${DCL_STEP_STOP_HOLD}

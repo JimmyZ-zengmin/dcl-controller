@@ -53,4 +53,44 @@ void do_latch_init(void);
 extern volatile uint32_t g_do_poll_n;    /* 活性计数 (就绪门后每拍+1) */
 extern volatile uint32_t g_do_write_n;   /* 实际写 BSRR 次数 (mask≠0 时) */
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 2026-09-17: **步进脉冲源的固有管辖位**（PE8..PE11）—— 掩码不得剔除
+ *
+ * 起因（一个被计数器掩盖了真因的问题）：`g_step_ena_mismatch_n` 曾涨到 **327616** 后冻结，
+ *   当时被解读为"有别的代码在驱 PE9"。实测真因是**上位机把 GPIO_MASK 换成 0x00FF
+ *   （`h723_do_hold_test.py`）或 0x7FC00000（`h723_w1.py` 的越界注入）** ⇒
+ *   `do_poll` 的 `mask==0` 早退/不含 bit9 ⇒ **PE9 从此没人驱动**，冻结在旧电平 ⇒
+ *   与 `g_step_ena_pin_intent` 永久不一致 ⇒ 主循环每圈 +1。
+ *
+ * ⇒ 结构结论：**PE8..PE11 不是"上位机可以决定要不要管"的位，而是步进脉冲源的固有接口**
+ *   （`STEP_DIR/ENA/PUL` 与预留一位）。它们归 DO 面驱动，但**归谁管不由上位的掩码决定** ——
+ *   否则"一位都不驱"就等于把驱动器停在**非受控电平**上（安全相关，不是显示问题）。
+ *
+ * ★ 为什么把常量放在 do.h 而不是 step.h：**门必须住在资源的定义处**（本项目纪律）——
+ *   真正写 GPIOE 的是 DO 面，所以"哪些位不能被剔"必须由 DO 面定义。
+ *   ★ 而这**不破坏单写者**：PE8..PE11 的**值**仍来自 ACTUATOR[8..11]，DO 面是唯一写者；
+ *     这里只是保证"管辖范围"不被裁剪掉。
+ *
+ * ★ A/B 对照开关 `DCL_DO_MASK_UNION`（默认 1）：置 0 复现**改前行为**（掩码说了算），
+ *   用来证明"这条判据能失败"——见 `tools/h723_do_mask_owner_test.py`。
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define DO_STEP_RESERVED_MASK 0x0F00u   /* PE8..PE11 = 步进 DIR/PUL/ENA + 预留 */
+
+#ifndef DCL_DO_MASK_UNION
+#define DCL_DO_MASK_UNION 1   /* ★ 默认开 = 保留位不可被上位机掩码剔除（交付语义）。
+                               *   =0 ⇒ **改前行为**（掩码说了算）的对照档，唯一目的是让
+                               *   "PE9 被合法丢在半空"这条判据能在同一套测量下量到 FAIL。 */
+#endif
+
+/** @brief 上位机写在 SHM 里的**原始**掩码（低 16 位）。诊断用，**只读**。 */
+uint32_t do_mask_host(void);
+
+/** @brief **实际生效**的掩码 = host | DO_STEP_RESERVED_MASK（`DCL_DO_MASK_UNION=0` 时 = host）。
+ *  ★ 与 `do_poll` 用的是**同一个函数** ⇒ "读回来的"和"用上去的"不可能分叉。 */
+uint32_t do_mask_effective(void);
+
+/** @brief 上位机把保留位剔出掩码的**次数（沿计数，不是每拍 +1）**。
+ *  ★ 沿计数：若按每拍 +1，10 kHz 下这个数会变成不可解释的大数（本轮血证的翻版）。 */
+extern volatile uint32_t g_do_mask_step_drop_n;
+
 #endif /* DCL_DO_H */

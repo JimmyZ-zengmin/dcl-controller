@@ -59,6 +59,57 @@ PERIOD_DIV = {0.0001: 0, 0.001: 1, 0.01: 2}
 SRC = dict(SENSOR=0, WIRE=1, CONST=2, HMI=3)   # HMI=3: 通信域设定区 (40065-40128)
 DST_WIRE = 2
 MAX_WIRES, MAX_ROUTES, MAX_PARAMS, MAX_STATES = 128, 128, 128, 128
+# ══════════════════════════════════════════════════════════════════════════
+# ★★★ 2026-09-17 修一处**静默失效**：自动分配撞上固件保留的镜像槽
+#
+# 血证：写 `examples/h723_step_stall_recover.dcl` 时编译**通过**、看起来一切正常，而
+#   分配器把 `der`（降额系数）放到了 **`wire[65]`** —— 而 `WIRE[65]` 是**固件每拍写入的
+#   运动镜像**（`STEP_MOT_SLOT_LIMIT_AP`）⇒ 程序算出的值**每拍被覆写** ⇒ 现象是
+#   "程序在写槽、硬件一动不动"（`WIRE[16]/[17]` 被引擎覆写那次是同一个病）。
+# ★ 为什么以前没暴露：`OUTPUT TO wire[n]` 的槽是**解析前预登记**的，显式钉住就安全；
+#   而**自动分配**只跳过"已钉住的"，完全不认识固件保留区 ⇒ 槽一紧张就越过 64。
+#   `src/step.h` 写的"dclc 自动分配上限是 64"只是**约定**，**没有代码在守**。
+#
+# ⇒ 处方（两条，都在这里守）：
+#   ① 自动分配**跳过** `FW_RESERVED_WIRES`
+#   ② 显式 `OUTPUT TO wire[n]` 落到保留槽 ⇒ **报错**，不静默接受
+#
+# ★★ 为什么不是"一律不许用 ≥64"：实测**过度保守会让中等程序装不下** ——
+#   本引擎里 `SEL` 每个吃 **4 个** wire 槽（3 个中间量 + 输出）、**`CONST` 也占 1 个**
+#   ⇒ 一个 60 行的运动安全程序在 wire[0..63] 里就溢出了。而固件实际只占 64/65。
+#   ⇒ 约束应该是"**别碰保留集**"，不是"不能用高区"。
+#
+# ★★★ 保留集**从 `src/step.h` 自动读出**（不手抄）：手抄会漂移，而漂移的后果是
+#   "程序写一个被固件每拍覆写的槽，且不报错" —— 正是本文件要防的那件事。
+# ══════════════════════════════════════════════════════════════════════════
+def _load_fw_reserved_wires():
+    """从 src/step.h 的 `#define STEP_MOT_SLOT_<NAME>_AP <n>u` 读出固件保留的 WIRE 槽。
+    ★ 读不到就**显式告警**并退回内置表（不静默）—— 静默会让"两边漂移"重新变成可能。"""
+    import os
+    builtin = {64: "step: 已应用频率镜像 (STEP_MOT_SLOT_RATE_AP)",
+               65: "step: 已应用限时余量镜像 (STEP_MOT_SLOT_LIMIT_AP)"}
+    h = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "step.h")
+    try:
+        txt = open(h, encoding="utf-8").read()
+    except OSError as e:
+        print(f"⚠️ dclc: 读不到 {h} ({e}) ⇒ 保留槽退回内置表 {sorted(builtin)}")
+        print("   ⇒ 若固件改了保留区, 本检查会失准(显式告警, 不静默)。")
+        return builtin
+    out = {}
+    for m in re.finditer(r'#define\s+STEP_MOT_SLOT_([A-Z0-9_]+)_AP\s+(\d+)u', txt):
+        out[int(m.group(2))] = f"step: {m.group(1)} 镜像 (STEP_MOT_SLOT_{m.group(1)}_AP)"
+    if out and set(out) != set(builtin):
+        # ★ 只比**键集合**：第一版比分了完整字典 ⇒ 同一组槽(描述串不同)也报"不一致"
+        #   ⇒ 那是一条**必然误报**的判据，而误报会被使用者关掉(本项目纪律: 误报比没有更坏)。
+        print(f"⚠️ dclc: 固件保留槽与内置表不一致: step.h={sorted(out)} 内置={sorted(builtin)}")
+        print("   ⇒ 以 **step.h 为准**(它是权威); 请顺手更新本文件的内置表。")
+    elif not out:
+        print(f"⚠️ dclc: {h} 里没找到任何 STEP_MOT_SLOT_*_AP ⇒ 保留槽退回内置表 {sorted(builtin)}")
+        return builtin
+    return out
+
+
+FW_RESERVED_WIRES = _load_fw_reserved_wires()
 MB_NREG = 64      # 通信域设定区寄存器数 (shared_mem.h MB_NREG — 改容量须三处同步)
 MAX_SEQ_INST, MAX_SEQ_STEPS = 8, 64      # 与 shared_mem.h 一致 (Sequencer v0)
 
@@ -140,14 +191,23 @@ class Sym:
         if name in self.slot:
             raise SystemExit(f"错误: 信号 '{name}' 重复声明 (B1 唯一写者)")
         if pin is not None:
+            if pin in FW_RESERVED_WIRES:
+                raise SystemExit(
+                    f"错误: OUTPUT {name} TO wire[{pin}] 撞上**固件保留槽** ——\n"
+                    f"        wire[{pin}] = {FW_RESERVED_WIRES[pin]}\n"
+                    f"        ⇒ 固件每拍都会覆写它, 你的值读回来永远不对(而且不报错)。\n"
+                    f"        保留槽: {sorted(FW_RESERVED_WIRES)}; 请换槽, 或改固件的保留区定义。")
             if pin in self.pinned:
                 raise SystemExit(f"错误: wire[{pin}] 被多个 OUTPUT 固定")
             self.slot[name] = pin; self.pinned.add(pin)
             return pin
-        while self.auto_next in self.pinned:
+        while self.auto_next in self.pinned or self.auto_next in FW_RESERVED_WIRES:
             self.auto_next += 1
         if self.auto_next >= MAX_WIRES:
-            raise SystemExit(f"错误: WIRE 槽耗尽 (>{MAX_WIRES})")
+            raise SystemExit(
+                f"错误: 自动分配的 WIRE 槽耗尽 (>{MAX_WIRES})\n"
+                f"        ★ 引擎里 `CONST` 也占 1 个 wire 槽、`SEL` 占 **4 个**\n"
+                f"        ⇒ 少声明 CONST(能内联就内联)、合并中间信号, 或把常量走 HMI 设定区。")
         s = self.auto_next; self.auto_next += 1
         self.slot[name] = s
         return s
