@@ -750,6 +750,45 @@ def compile_stmts(stmts):
         if S.cur_period:
             S.desc[-1] += "   [div%d=%s]" % (
                 S.cur_period, ('100us', '1ms', '10ms')[S.cur_period])
+    # ══════════════════════════════════════════════════════════════════════════
+    # ★★★ 2026-09-17: **跨档速率检查的编译期镜像**（权威仍是固件 `src/main.c:1838`）
+    #
+    # 规则原话（固件注释）："慢消费者读快生产者 = **欠采样** → 混叠/发散。
+    #   判据: 生产者 div_idx < 消费者 div_idx 即拒。" 固件的报错是 `NAK: rate mismatch`。
+    #
+    # ★ 为什么要在工具里再实现一遍：我只在 **deploy 期**被它拒过 **两次**
+    #   （写 `examples/h723_step_stall_recover.dcl` 时把判据链降到 1ms 档），
+    #   每次都要烧写往返才发现；而这条规则是**纯静态**的 ⇒ 搬到编译期，一行报错就够。
+    #
+    # ★ 为什么这不算"两份真值互相漂移"的风险：这里**不新增语义**，只是把固件已有的
+    #   规则**提前**应用一遍；**权威永远是固件** —— 若两边不一致，以固件为准并同步本函数。
+    #
+    # ★ 覆盖面**刻意与固件逐条对齐**：只看**主输入**（`src_t == SRC_WIRE`）。
+    #   第二输入 `wire2` 固件侧也没查（它只读 `rr.src_index`）⇒ 这里同样不查。
+    # ══════════════════════════════════════════════════════════════════════════
+    prod_div = {}
+    for r in S.routes:
+        prod_div[r["ch"]] = r["period"]
+    viol = []
+    for r in S.routes:
+        if r["src_t"] != SRC['WIRE']:
+            continue
+        p = prod_div.get(r["src_i"])
+        if p is not None and p < r["period"]:
+            viol.append((r, p))
+    if viol:
+        lines = ["    src=wire[%d](生产者 div=%d) → dst=wire[%d](消费者 div=%d)"
+                 % (r["src_i"], p, r["ch"], r["period"]) for r, p in viol[:8]]
+        if len(viol) > 8:
+            lines.append("    … 共 %d 处" % len(viol))
+        raise SystemExit(
+            "错误: **跨档速率不合法** —— 慢消费者读快生产者（欠采样）\n"
+            + "\n".join(lines) +
+            "\n  ⇒ 固件会在 deploy 时以 `NAK: rate mismatch` 拒绝（`src/main.c:1838`）。\n"
+            "  ⇒ 修法: 把**下游整条链**都降到同一档（或更慢）—— 用 `PERIOD=<t>` 后缀。\n"
+            "     ★ 注意 `OUTPUT` **不接受 `PERIOD=`** ⇒ 让最后一级留在**快档**通常最省事。\n"
+            "     ★ 若目的是「跟慢采样信号同速」，**优先用 `LPF` 低通**而不是降档\n"
+            "       （降档会一路传染到 OUTPUT，实测撞死；见 MEMORY §5.20）。")
     return S
 
 
