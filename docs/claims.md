@@ -60,6 +60,8 @@ B | DB_RC_NOSEQ | src/dev_bind.h | tools/h723_dev_bind_test.py   | --allow-uncov
 #   血证 = 现场"电机响但轴不动"：隐藏默认极性把「使能/失能/上电安全态」三处同时弄反。
 #   判据入口需要 `-DDCL_STEP_ENA_POL=-1` 的**对照档**（交付档上该路径不可达 ⇒ 判 SKIP，不是 PASS）。
 B | NAKRH_STEPPOL | src/main.c | tools/h723_step_failclosed_test.py | ENA polar not declared
+# ★ 2026-09-17 新增：「走 N 个脉冲」时**当前没有脉冲在跑** ⇒ 明确拒绝（不能"接受了却什么也没发生"）
+B | NAKRH_STEPNCNT | src/main.c | tools/h723_step_pulsecount_test.py | no pulse running
 
 # ══ C 类：能力位（定义 + 并入 IMPL + 不在 NOTYET）══
 C | DCL_CAP_MULTICYCLE | src/transport.h

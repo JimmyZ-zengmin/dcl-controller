@@ -109,6 +109,30 @@ extern volatile uint32_t g_motion_cmd_n;      /* 槽值**变化**次数（≠"�
 extern volatile uint32_t g_motion_applied_n;  /* 真正下给硬件几次 */
 extern volatile uint32_t g_motion_rej_n;      /* 被拒次数（主要是 fail-closed）*/
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ "走 N 个脉冲自停" —— **硬件计数，零中断/零 DMA/零 ITCM**
+ *
+ * 我原先把它列进"做不到"（TIM3 无 RCR + ITCM 已满 ⇒ 加不了"每脉冲一次"的中断）。
+ * ★ 那条**结论错了**：不需要中断 —— 让**另一个定时器去数 TIM3 的更新事件**即可。
+ *   `TIM4` 的 ITR 表含 **ITR2 = TIM3** ⇒ 配"外部时钟模式 1"后 `TIM4_CNT` 就是一个**脉冲计数器**
+ *   （连线全在芯片内部，不占引脚、不用接线）。
+ *
+ * ★ 到点怎么停：**主循环**看 `TIM4_CNT >= goal` ⇒ 停脉冲（延迟 ≤1 圈 ≈0.37 ms）。
+ *   ⇒ 会**多走几步**，但**那不是误差**：`TIM4_CNT` 精确记下"实际走了多少"，可读回、可补偿。
+ *   闭环里"走 N 步"本来就是**粗定位**（精定位由编码器收尾）。★ v2 可做硬件精确停
+ *   （`TIM4` 的 CC 比较事件 → 一次 DMA 把 0 写进 `TIM3_CCR1`），**不需要 MDMA**。
+ * ★ 16 位 ⇒ 单次 ≤ 65535 步；超出**明确钳位**（不是静默）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define STEP_RC_NOCOUNT 2u   /* ★ 当前没有脉冲在跑 ⇒ "走 N 步"无意义（拒绝，且可见） */
+uint32_t step_set_remaining(uint32_t n);   /* 设目标步数并启动计数；0 = 取消 */
+uint32_t step_pulses_now(void);            /* 硬件计数器快照 */
+extern volatile uint32_t g_step_goal;
+extern volatile uint32_t g_step_pulses;
+extern volatile uint32_t g_step_count_en;
+extern volatile uint32_t g_step_goal_done_n;   /* 到点自停次数 */
+extern volatile uint32_t g_step_goal_abort_n;  /* 未到点（被限时/停机打断）次数 */
+extern volatile uint32_t g_step_goal_rej_n;    /* 被拒次数 */
+
 extern volatile uint32_t g_step_rate_hz, g_step_dir, g_step_ena, g_step_owns_tim3;
 extern volatile uint32_t g_step_deadline_tick, g_step_stop_n, g_step_arr, g_step_ccr1;
 extern volatile uint32_t g_step_ena_pol;

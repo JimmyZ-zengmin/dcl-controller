@@ -10,6 +10,7 @@
  * 范围: ARR+1 最小 2 ⇒ 500kHz(远超需要); 最大 65536 ⇒ 15.3Hz。 */
 #define STEP_TIMCLK_HZ  1000000u
 #define TIM3  TIM3_BASE_ADDR      /* 与 hil.c 同一写法 (regs.h 只给了 *_BASE_ADDR) */
+#define TIM4  TIM4_BASE_ADDR      /* ★ 脉冲计数器（从模式）—— 见 step.h 的"走 N 个脉冲"段 */
 
 /* ══════════════════════════════════════════════════════════════════════════
  * ★★★ 出厂声明（PLAN-device-config-v1 的 P0 档）—— 见 step.h 顶部长注释
@@ -51,6 +52,14 @@ volatile uint32_t g_motion_cmd_n     = 0u;
 volatile uint32_t g_motion_applied_n = 0u;
 volatile uint32_t g_motion_rej_n     = 0u;
 
+/* ★★★ "走 N 个脉冲"的账（硬件计数）—— 见 step.h */
+volatile uint32_t g_step_goal        = 0u;   /* 目标步数（钳到 16 位）*/
+volatile uint32_t g_step_pulses      = 0u;   /* 已走步数（TIM4_CNT 快照）*/
+volatile uint32_t g_step_count_en    = 0u;   /* 计数中 */
+volatile uint32_t g_step_goal_done_n = 0u;   /* 到点自停次数 */
+volatile uint32_t g_step_goal_abort_n= 0u;   /* 因限时/停机而未到点的次数 */
+volatile uint32_t g_step_goal_rej_n  = 0u;   /* 被拒（没有脉冲在跑 / 参数非法）*/
+
 static uint8_t *s_base = NULL;
 static uint32_t s_sync = 1u;   /* ★ 首次/重新武装后先对齐 s_last, 见 step_tick */
 
@@ -91,6 +100,66 @@ static void drive_opto(uint32_t conducting)
     g_step_ena_pin_intent = conducting ? 0u : 1u;   /* 导通 ⇒ 拉低 ⇒ PE9=0 */
     act_bits(STEP_ENA_ACT, conducting);
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 脉冲计数器（`TIM4` 从模式）—— "走 N 个脉冲自停"的地基
+ *
+ * 为什么不是"每脉冲一次的中断"：TIM3 没有 RCR，而"每脉冲一次"的中断在 31 kHz 下
+ * 会压垮拍预算；且 `gate_isr_itcm.py` 要求 ISR 住 ITCM 而 **ITCM 已 100% 占满**。
+ * ⇒ 换一条**不需要 CPU 的路**：让**另一个定时器去数 TIM3 的更新事件**。
+ *
+ * 连线是**芯片内部**的（不用接线、不占引脚）：
+ *   `TIM3_CR2.MMS = 010` ⇒ TIM3 的 **TRGO 输出 = 更新事件 UEV**（每个 PWM 周期一次 = 一个脉冲）
+ *   `TIM4_SMCR = SMS(111 外部时钟模式1) | TS(010 = ITR2)` ⇒ **ITR2 = TIM3**（ST 通用 ITR 表）
+ *   ⇒ **`TIM4_CNT` 每来一个 TIM3 更新事件 +1** ⇒ 它就是"已发多少个脉冲"。
+ *
+ * ★ 副作用：MMS 只影响 TRGO 这条内部线 ⇒ **对 TIM3 自身 PWM 输出无影响**。
+ * ★ TIM4 不用任何通道引脚 ⇒ **GPIO 不用配**。
+ * ★ TIM4 是 **16 位** ⇒ 单次目标上限 **65535 步**（40.9 圈 @1600 步/圈），超出**明确钳位**。
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void step_count_init(void)
+{
+    RCC_APB1LENR |= RCC_APB1LENR_TIM4EN;
+
+    TIM_CR1(TIM4)  = 0u;                           /* 先停 */
+    TIM_PSC(TIM4)  = 0u;
+    TIM_ARR(TIM4)  = 0xFFFFu;                      /* 满量程（自由上数，不回绕到 0）*/
+    TIM_CNT(TIM4)  = 0u;
+    TIM_SMCR(TIM4) = (7u << TIM_SMCR_SMS_SHIFT)    /* SMS=111 外部时钟模式 1 */
+                   | (2u << TIM_SMCR_TS_SHIFT);    /* TS=010  ⇒ ITR2 = TIM3 */
+    TIM_EGR(TIM4)  = TIM_EGR_UG;                   /* 立刻装载 PSC/ARR */
+
+    /* TIM3 侧：把"更新事件"送上 TRGO（**只改 MMS 三位，其余位保留**）*/
+    TIM_CR2(TIM3) = (TIM_CR2(TIM3) & ~(7u << TIM_CR2_MMS_SHIFT))
+                  |  (2u << TIM_CR2_MMS_SHIFT);
+
+    g_step_goal = 0u; g_step_pulses = 0u; g_step_count_en = 0u;
+    __asm__ volatile("dsb" ::: "memory");
+}
+
+/** @brief 设目标步数并启动计数。n=0 ⇒ 取消。
+ *  ★★ **要求当前有脉冲在跑**：没有脉冲时"走 N 步"没有意义（且会立刻判到点）⇒ **明确拒绝**，
+ *     而不是"接受了但什么也没发生"（本项目纪律：拒绝必须可读）。 */
+uint32_t step_set_remaining(uint32_t n)
+{
+    if (n == 0u) {                                  /* 取消 */
+        TIM_CR1(TIM4) &= ~TIM_CR1_CEN;
+        g_step_count_en = 0u; g_step_goal = 0u; g_step_pulses = TIM_CNT(TIM4);
+        return STEP_RC_OK;
+    }
+    if (g_step_rate_hz == 0u) { g_step_goal_rej_n++; return STEP_RC_NOCOUNT; }
+
+    TIM_CR1(TIM4) &= ~TIM_CR1_CEN;                  /* ① 停 */
+    TIM_CNT(TIM4)  = 0u;                            /* ② 清零（必须在 CEN=1 之前）*/
+    g_step_goal    = (n > 0xFFFFu) ? 0xFFFFu : n;   /* ★ 16 位上限，**明确钳位** */
+    g_step_pulses  = 0u;
+    g_step_count_en= 1u;
+    __asm__ volatile("dsb" ::: "memory");
+    TIM_CR1(TIM4) |= TIM_CR1_CEN;                   /* ③ 开始数 */
+    return STEP_RC_OK;
+}
+
+uint32_t step_pulses_now(void) { return TIM_CNT(TIM4); }
 
 /* ★ "希望驱动器使能" → 物理电平 的**唯一**翻译点（极性只在这里出现一次）
  *     conducing = (pol==0) ? energized : !energized      （conducing=1 ⇒ 光耦导通 ⇒ PE9=0）
@@ -149,6 +218,10 @@ void step_init(uint8_t *base)
     TIM_EGR(TIM3)   = TIM_EGR_UG;
     g_step_arr = TIM_ARR(TIM3); g_step_ccr1 = TIM_CCR1(TIM3);
     g_step_rate_hz = 0u;
+
+    /* ④ 脉冲计数器（TIM4 从模式）—— 见 step.h 的"走 N 个脉冲"段 */
+    step_count_init();
+
     __asm__ volatile("dsb" ::: "memory");
 }
 
@@ -274,6 +347,27 @@ void step_tick(uint32_t tick_now)
             s_prev_bad = 1u;
         } else {
             s_prev_bad = 0u;
+        }
+    }
+
+    /* ═══ ★★★ "走 N 个脉冲"到点自停 ═══
+     * 判据 = **硬件计数器** `TIM4_CNT`（不是估算）⇒ "实际走了多少"永远可读回。
+     * ★ 停脉冲在主循环 ⇒ 会**多走 ≤1 圈**的几步（≈0.37 ms）。**那不是误差，是已知量**：
+     *   `g_step_pulses` 记下真实步数，闭环的精定位本来就由编码器收尾。
+     * ★ 与"限时"的关系：限时先到会走 `step_stop_safe()` ⇒ 这里把 goal 判为"未到点"（abort）
+     *   ⇒ 两种停法**可区分**（否则"到点"和"被限时打断"会混成一个计数）。 */
+    if (g_step_count_en) {
+        uint32_t p = TIM_CNT(TIM4);
+        g_step_pulses = p;
+        if (p >= g_step_goal) {
+            TIM_CR1(TIM4) &= ~TIM_CR1_CEN;
+            g_step_count_en = 0u;
+            step_set_rate(0u);
+            g_step_goal_done_n++;
+        } else if (g_step_rate_hz == 0u) {          /* 脉冲被别人停了 ⇒ 未到点 */
+            TIM_CR1(TIM4) &= ~TIM_CR1_CEN;
+            g_step_count_en = 0u;
+            g_step_goal_abort_n++;
         }
     }
 

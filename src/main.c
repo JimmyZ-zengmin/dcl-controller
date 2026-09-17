@@ -1689,6 +1689,9 @@ static void ack(const uint8_t *p, uint32_t n) { send_response(STS_ACK, p, n); }
 #define NAKRH_FMODE    8u   /* force: mode 不是 0/1 */
 #define NAKRH_FFIN     9u   /* force: 强制值为 NaN/Inf */
 #define NAKRH_PMODE   10u   /* persist: mode 不是 0/1 */
+#define NAKRH_STEPNCNT 12u  /* ★ 2026-09-17 step: "走 N 个脉冲"时**当前没有脉冲在跑** ⇒ 拒绝
+                             *   （没有脉冲时"走 N 步"没有意义，且会立刻判到点 ⇒ 必须明确拒绝，
+                             *     不能"接受了但什么也没发生" —— 本项目纪律：拒绝必须可读）*/
 #define NAKRH_STEPPOL 11u   /* ★ 2026-09-17 step: ENA 极性**未声明** ⇒ fail-closed 拒绝使能
                              *   (见 docs/PLAN-device-config-v1.md 的 P0-b; 现场事故见
                              *    docs/audit/H723-MOTION-QUALITY-AUDIT.md §16) */
@@ -2438,6 +2441,8 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
          *   sub=13 arg=**运动源** (0=脚手架直控【默认】/ 1=程序面: ③层写 actuator[12..15])
          *            ★ 见 src/step.h 的"运动能力面"与 docs/PLAN-step-motion-v1.md
          *   sub=14 = ★ 只读: 运动能力面状态 (源 / cmd_n / applied_n / rej_n / 已应用频率) 32B
+         *   sub=15 arg=**走 N 个脉冲自停** (硬件计数; 0=取消; 需当前有脉冲在跑, 否则 NAK)
+         *   sub=16 = ★ 只读: 脉冲计数状态 (count_en/goal/pulses/done/abort/rej) 32B
          * ★ 判据: 返回的是**实际**频率(由 ARR 反算), 不是请求值。
          * ★★★ 2026-09-17: sub=3 的 `ena(1)` 现在是 **fail-closed** —— ENA 极性未声明时
          *   **NAK(NAKRH_STEPPOL) 明确拒绝**, 而不是"ACK 但保持失能"(后者正是本次事故的形态:
@@ -3051,6 +3056,14 @@ static void h_device_desc(void)
     put16le(r + k, (uint16_t)STEP_MOT_SLOT_RATE_AP); k += 2u;          /* 镜像基号 = 16 */
     put16le(r + k, 2u); k += 2u;                                       /* 镜像数 = 2 */
     put16le(r + k, 1u); k += 2u;                                       /* 语义版本 = 1 */
+    /* ★★ 脉冲计数（"走 N 个脉冲自停"）—— 同样**追加式**。
+     *   为什么用计数而不是"能力位"：它不需要新能力位，靠本块声明（与 n_motion 同一手法）。
+     *   ★ 实现要点：**TIM4 从模式数 TIM3 的更新事件**（ITR2=TIM3）⇒ 零中断/零 DMA/零 ITCM。
+     *   ★ 单次上限 65535 步（TIM4 是 16 位）。 */
+    put16le(r + k, 1u); k += 2u;                                       /* n_pulsecount */
+    put16le(r + k, 0xFFFFu); k += 2u;                                  /* 单次上限(步) */
+    put16le(r + k, 0u); k += 2u;                                       /* 保留 */
+    put16le(r + k, 0u); k += 2u;                                       /* 保留 */
     ack(r, k);
 }
 

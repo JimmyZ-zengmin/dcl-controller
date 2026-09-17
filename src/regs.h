@@ -243,6 +243,7 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
  *   详见 docs/ASSESS-toolchain-2026-09-16.md。TIM5 = APB1 上的 32 位定时器, 不受调试器影响。 */
 #define TIM5_BASE       0x40000C00UL
 #define RCC_APB1LENR_TIM5EN  (1u << 3)
+#define RCC_APB1LENR_TIM4EN  (1u << 2)   /* ★ TIM4 = 脉冲计数器（从模式），见 TIM4_BASE_ADDR */
 #define TIM_CR1(t)      REG32((t) + 0x00)
 #define TIM_DIER(t)     REG32((t) + 0x0C)
 #define TIM_SR(t)       REG32((t) + 0x10)
@@ -309,6 +310,15 @@ _Static_assert(FLASH_SECTOR_TOTAL * FLASH_SECTOR_SIZE == 1024u * 1024u,
 #define ADC_CFGR_RES_SHIFT   2u    /* 000=16bit */
 
 #define TIM3_BASE_ADDR     0x40000400UL
+/* ★ TIM4 只做**脉冲计数器**（从模式），不用它的任何通道引脚 ⇒ 不需要配 GPIO。
+ *   `TIM4` 的 ITR 映射（ST 通用表，F4/H7 同族）：ITR0=TIM1 · ITR1=TIM2 · **ITR2=TIM3** · ITR3=TIM8
+ *   ⇒ `SMCR.TS=2(ITR2)` + `SMS=7(外部时钟模式1)` ⇒ TIM4 的 CNT 由 **TIM3 的 TRGO** 驱动。 */
+#define TIM4_BASE_ADDR     0x40000800UL
+#define TIM_CR2(t)         REG32((t) + 0x04)
+#define TIM_SMCR(t)        REG32((t) + 0x08)
+#define TIM_CR2_MMS_SHIFT  4u
+#define TIM_SMCR_SMS_SHIFT 0u
+#define TIM_SMCR_TS_SHIFT  4u
 #define TIM_CCMR1(t)       REG32((t) + 0x18)
 #define TIM_CCER(t)        REG32((t) + 0x20)
 #define TIM_CCR1(t)        REG32((t) + 0x34)
