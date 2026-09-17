@@ -103,9 +103,18 @@ def main():
         sx(17, 20000)                          # 斜率 20000 Hz/s
         sx(1, 31000)
         t0 = time.time()
-        mids, reached_at = [], None
+        mids, reached_at, cc_ok, cc_bad = [], None, 0, 0
         while time.time() - t0 < 3.2:
             r = ramp()
+            u = st0()
+            # ★★ 必须同时看**硬件**：`out` 只是软件变量。实测抓到过
+            #   "out/actual 都对、而 CC1E=0 ⇒ 一根脉冲都没发"（轻量路径不碰 CC1E 的缺口）。
+            #   ⇒ 判据只看软件量就是**空判据**。
+            if u is not None:
+                if u[4] & 1:
+                    cc_ok += 1
+                else:
+                    cc_bad += 1
             if r and 0 < r["out"] < 31000:
                 mids.append(r["out"])
             if r and r["out"] >= 31000 and reached_at is None:
@@ -114,6 +123,8 @@ def main():
             time.sleep(0.06)
         record("R2 斜坡**真的在爬**（出现中间值，不是一步到位）",
                len(mids) >= 3, "采到 %d 个中间值，例: %s" % (len(mids), mids[:6]))
+        record("R2b ★ 爬坡期间**硬件在发脉冲**（`CC1E=1`）—— 只看软件量是空判据",
+               cc_bad == 0 and cc_ok >= 3, "CC1E=1 的点 %d 个，=0 的点 %d 个" % (cc_ok, cc_bad))
         exp = 31000.0 / 20000.0                # 1.55 s
         if reached_at is None:
             record("R3 斜率符合（爬完约 %.2f s）" % exp, False, "3.2 s 内没爬到目标")

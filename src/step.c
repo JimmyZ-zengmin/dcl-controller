@@ -271,6 +271,14 @@ static void step_rate_apply_light(uint32_t hz)
     if (arr1 > 65536u)  { arr1 = 65536u; }
     TIM_ARR(TIM3)  = arr1 - 1u;                   /* 预装载 ⇒ 下个更新事件生效 */
     TIM_CCR1(TIM3) = arr1 / 2u;                   /* 预装载 ⇒ 不会出现半个脉冲 */
+    /* ★★★ 2026-09-17 修（实测抓到）：**从静止起步时 `CC1E` 还是关的** ——
+     *   轻量路径只写预装载寄存器，**不碰 `CC1E`**，于是"ARR 改了、一根脉冲都没发"：
+     *   实测 `sub=17(斜坡)+sub=1(10000)` ⇒ `out=10000 / actual=10000` 而 **`CC1E=0`**。
+     *   现象极具迷惑性：**两个软件量都对，引脚上什么都没有**。
+     *   ⇒ 这里补一句"若通道关着就先开"（仍然**不写 `EGR.UG`** ⇒ 不产生额外更新事件）。*/
+    if ((TIM_CCER(TIM3) & TIM_CCER_CC1E) == 0u) {
+        TIM_CCER(TIM3) |= TIM_CCER_CC1E;
+    }
     g_step_arr = TIM_ARR(TIM3); g_step_ccr1 = TIM_CCR1(TIM3);
     g_step_rate_hz = STEP_TIMCLK_HZ / arr1;
     __asm__ volatile("dsb" ::: "memory");
