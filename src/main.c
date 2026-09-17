@@ -2633,6 +2633,34 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
             ack(r19, 32u);
             return;
         }
+        case 20u: {
+            /* ★★★ 2026-09-17: **AS5600 读周期**（拍）。默认 100 拍 = 10 ms ⇒ **反馈 100 Hz**。
+             *   为什么要可配：**反馈率是闭环带宽的上限** —— 而它此前是硬编码。
+             *   单次读 ≈250 µs ⇒ I2C 物理上限 ~4 kHz；提高周期时总线占用同比上升
+             *   （100 拍 ⇒ 2.5%，10 拍 ⇒ 25%）。
+             *   ★ 运行期改动，**复位即回默认**（不污染持久化配置 —— 本项目纪律）。 */
+            as5600_set_period_ticks(arg);
+            break;
+        }
+        case 21u: {
+            /* ★ 只读：**AS5600 反馈通道状态**（32 B，零副作用）
+             *   +0 ok_n  +4 err_n  +8 **skip_bus_n**  +12 period_ticks
+             *   +16 raw  +20 deg_x1000  +24 status  +28 mag_ok
+             *   ★ 判"实际反馈率"= `ok_n` 的**增量** ÷ 时间（不需要黑匣子）。
+             *   ★ `skip_bus_n` 是"因状态机占线**连读都没读**"的次数 —— 它让
+             *     "闭环拿到的是不是新鲜反馈"第一次**可观测**。 */
+            uint8_t r21[32];
+            put32(r21 +  0, g_as_ok_n);
+            put32(r21 +  4, g_as_err_n);
+            put32(r21 +  8, g_as_skip_bus_n);
+            put32(r21 + 12, g_as_period_ticks);
+            put32(r21 + 16, g_as_raw_v);
+            put32(r21 + 20, g_as_deg_x1000);
+            put32(r21 + 24, g_as_status);
+            put32(r21 + 28, g_as_mag_ok);
+            ack(r21, 32u);
+            return;
+        }
         default: break;
         }
         /* ★★★ 修 (2026-09-15): 原为 `uint8_t r[40]` 而本块写了 **68 字节** (r+0..r+67)
@@ -4527,12 +4555,16 @@ int main(void)
         {
             static uint32_t s_as_next = 0u;
             if ((int32_t)(g_tick_count - s_as_next) >= 0) {
-                s_as_next = g_tick_count + 100u;
+                s_as_next = g_tick_count + as5600_period_now();   /* ★ 周期可配（默认仍 100 拍）*/
                 /* ★★ G6-2: 状态机持有总线时**连调用都不发起** —— 门本身已经能拒绝
                  *   （`i2c_bb_*` 内部 acquire），这里只是省掉一次必然失败的 250µs 往返,
-                 *   并避免污染 AS5600 的错误计数（那是判据, err 必须保持 0）。 */
+                 *   并避免污染 AS5600 的错误计数（那是判据, err 必须保持 0）。
+                 * ★★★ 2026-09-17: 这条**以前不可观测** —— 现在记 `g_as_skip_bus_n`，
+                 *   因为它直接决定"闭环拿到的是不是新鲜反馈"（反馈率 = 闭环带宽上限）。 */
                 if (i2c_bus_owner() != I2C_OWNER_SM) {
                     as5600_poll(g_shm);
+                } else {
+                    g_as_skip_bus_n++;
                 }
             }
         }

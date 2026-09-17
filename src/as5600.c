@@ -10,6 +10,18 @@ volatile uint32_t g_as_raw_v = 0xFFFFFFFFu, g_as_deg_x1000 = 0xFFFFFFFFu,
                   g_as_ok_n = 0u, g_as_err_n = 0u, g_as_last_err = 0u;
 volatile uint32_t g_as_scan_lo = 0xFFFFFFFFu, g_as_scan_hi = 0xFFFFFFFFu;
 
+/* ★★★ 反馈率与"被总线挡掉"的计数（见 as5600.h）。默认 100 拍 = 10 ms ⇒ **既有行为不变**。 */
+volatile uint32_t g_as_skip_bus_n    = 0u;
+volatile uint32_t g_as_period_ticks  = 100u;
+
+void as5600_set_period_ticks(uint32_t n)
+{
+    if (n < 2u)       { n = 2u; }          /* 下限：单次读就要 250 µs ⇒ 比这更密没有意义 */
+    if (n > 100000u)  { n = 100000u; }     /* 上限：10 s */
+    g_as_period_ticks = n;
+}
+uint32_t as5600_period_now(void) { return g_as_period_ticks; }
+
 void as5600_init(void)
 {
     i2c_bb_select(&s_pins);
