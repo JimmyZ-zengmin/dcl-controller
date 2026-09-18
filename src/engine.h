@@ -235,6 +235,40 @@ _Static_assert(OFF_TICK_STATS + 12u <= 0x4000u, "SHM: TICK_STATS 不得压到 SE
 _Static_assert((OFF_TIMING_OVERRUN & 3u) == 0u, "SHM: OFF_TIMING_OVERRUN 需 4 字节对齐");
 _Static_assert(OFF_TIMING_OVERRUN + 4u <= OFF_TICK_STATS, "SHM: OVERRUN 与 TICK_STATS 重叠");
 
+/* ---- 执行时长**均值**观测 (2026-09-18 新增; 为"拍级确定性"判据而加) ----
+ * ★★ 为什么非要有它: `OFF_TIMING_EXEC_MIN/MAX` 只给**极值**, 而极值恰好是两个陷阱:
+ *   · `EXEC_MAX` 被**已知的周期重活**占住 —— 黑匣子每 1024 拍做一次快照
+ *     (`blackbox.c:310`: `samp = (s_bb_kicks <= 3u) || ((s_bb_kicks & 0x3FFu) == 0u);`)
+ *     ⇒ 它量的是那一次重活, **不是稳态抖动的上界**;
+ *   · `EXEC_MIN` 会被**空引擎窗口**污染 (RESET 后、deploy 前的那几拍没有程序)。
+ *   ⇒ 问"**典型拍是否恒定**"必须要有**均值**。实测佐证 (128×PID div0 稳态):
+ *     `MIN=8376 / MAX=8496` TB tick, 而 MAX 那次是黑匣子拍 —— 用 MAX 会得出
+ *     "抖动 120 TB"的错结论。
+ * ★ 这与本项目 §5.27/§5.28 是**同一族**: "极值/分位数不免疫采样拍频, 累积量才免疫"。
+ *   本次是它换了个场景的第二次实证 ⇒ 所以直接补**累积量**(和 + 拍数), 而不是补直方图:
+ *   和是 O(1) 的 ISR 外代价、无 ITCM 压力、且信息量足够回答"典型值是不是常数"。
+ *   (直方图留作后续: 若均值暴露了分布, 再决定要不要分桶。)
+ * ★ 落点: DSL 保留洞 `[0x3840,0x4480)` 内**明确未分配**的那一段 —— 见上方 §保留区注释
+ *   ("洞内 0x3840..0x4000 保持未分配, 但**有名字也有尺寸断言**")。不新开洞。
+ * ★ `g_isr_cyc_sum` 是 **u64** ⇒ 拆两个 u32。**固件不做除法**: 均值 = `(hi<<32|lo)/SAMPLES`
+ *   由上位机算 (64 位除法放主循环也是浪费, 何况这个量只在被轮询时才需要)。
+ * ★ 与既有 7 个 timing 域同款: **纯镜像**, 主循环每圈重写 ⇒ 自愈, 无需在
+ *   `cold_start_reset()` 里单独登记 (该函数整段 memset, 天然清零)。 */
+#define OFF_TIMING_EXEC_SUM_LO  0x3860   /* u32: g_isr_cyc_sum 低 32 位 */
+#define OFF_TIMING_EXEC_SUM_HI  0x3864   /* u32: g_isr_cyc_sum 高 32 位 */
+/* ★★ 分子必须有**同口径的分母**（§5.23"差分量的分子与分母必须同口径"）。
+ *   `g_isr_cyc_sum` 在**每个 di≠0 的拍**累加，而既有的 `g_isr_n`（= OFF_TIMING_SAMPLES）
+ *   只在 **RUN 拍**自增 ⇒ `sum / g_isr_n` **不是均值**。实测症状: 算出的"均值"
+ *   比同一窗口的 `EXEC_MAX` 还大（8550.76 > 8504）—— 均值不可能超过极大值,
+ *   一算就露馅, 所以这个字段不是可选的。
+ *   ⇒ `OFF_TIMING_EXEC_SUM_N` 与 sum **在同一次 0x22 突发里**读出 ⇒ 分子分母同批,
+ *     没有读偏斜（跨两次读会让窗口前进几十拍, 本工具第一版就是这么错的）。 */
+#define OFF_TIMING_EXEC_SUM_N   0x3868   /* u32: 与 sum 同口径的拍数（di≠0 的拍） */
+_Static_assert((OFF_TIMING_EXEC_SUM_LO & 3u) == 0u, "SHM: EXEC_SUM_LO 需 4 字节对齐");
+_Static_assert(OFF_TIMING_EXEC_SUM_LO + 4u == OFF_TIMING_EXEC_SUM_HI, "SHM: EXEC_SUM 两半必须相邻");
+_Static_assert(OFF_TIMING_EXEC_SUM_HI + 4u == OFF_TIMING_EXEC_SUM_N, "SHM: SUM_N 必须紧跟 SUM_HI");
+_Static_assert(OFF_TIMING_EXEC_SUM_N + 4u <= 0x4000u, "SHM: EXEC_SUM 块不得压到 SEQ 区(0x4000)");
+
 /* ══════════ W3: 顺序域 SEQ 区 (Sequencer v0) ══════════
  * 落点 = 上面那个保留洞里的**尾部** (0x4000..0x4480, 与 S3 逐字节同偏移)。
  *

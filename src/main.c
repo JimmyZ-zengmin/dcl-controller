@@ -679,6 +679,7 @@ OBS uint32_t g_isr_cyc_min  = 0xFFFFFFFFu;
 OBS uint32_t g_isr_cyc_max  = 0;
 OBS uint64_t g_isr_cyc_sum  = 0;
 OBS uint32_t g_isr_n        = 0;
+OBS uint32_t g_isr_sum_n    = 0;   /* ★ 与 g_isr_cyc_sum **同口径**的拍数 (di≠0 的拍) */
 OBS uint32_t g_isr_overrun  = 0;   /* 本 RUN 段内 ISR 超预算(EXEC_BUDGET_CYCLES)的次数。
                                     * ★ 审查二级 #5: 它此前"不存在"——0x38 里直接填 0。
                                     *   权威值在 DTCM, 主循环镜像到 SHM 0x3850 (与范本同址)。 */
@@ -866,8 +867,8 @@ static ISR_PLACE void stats_reset(void)
     g_isr_cyc_min  = 0xFFFFFFFFu;
     g_isr_cyc_max  = 0;
     g_isr_cyc_sum  = 0;
-    g_isr_n        = 0;
-    g_isr_overrun  = 0;   /* ★ 与范本同语义: 超预算计数只反映**本次 RUN 段**
+    g_isr_sum_n    = 0;    /* ★ 与 g_isr_cyc_sum 同口径的分母 (见 ISR 里的说明) */
+    g_isr_n        = 0;    g_isr_overrun  = 0;   /* ★ 与范本同语义: 超预算计数只反映**本次 RUN 段**
                            *   (S3 在 core0_engine_start 里清 OVERRUN, 这边在 stats_reset 清) */
 
     g_eng_routes_last  = 0;
@@ -1430,6 +1431,12 @@ ISR_PLACE void TIM2_IRQHandler(void)
             if (di < g_isr_cyc_min) g_isr_cyc_min = di;
             if (di > g_isr_cyc_max) g_isr_cyc_max = di;
             g_isr_cyc_sum += di;
+            /* ★★ 与 sum **同口径**的分母 (2026-09-18):
+             *   既有 `g_isr_n` 只在 RUN 拍自增, 而 sum 在**每个 di≠0 的拍**累加
+             *   ⇒ `sum/g_isr_n` 不是均值（实测: 算出的"均值"竟大于同窗口的 EXEC_MAX,
+             *     8550.76 > 8504 —— 均值超过极大值是不可能的, 一算就露馅）。
+             *   这正是 §5.23「差分量的分子与分母必须同口径」。 */
+            g_isr_sum_n++;
         }
         /* ★★ 审查二级 #5: 超预算计数 (原实现是"在 0x38 里直接填 0"冒充"没超预算")。
          *   为什么必须有它: S3 套件 T9 的判据含 `ov == 0` —— 而"恒 0"的字段让它
@@ -4864,6 +4871,15 @@ int main(void)
         SHM_U32(g_shm, OFF_TIMING_EXEC_MAX)    = g_isr_cyc_max;
         SHM_U32(g_shm, OFF_TIMING_LAST_PERIOD) = g_per_cyc_last;
         SHM_U32(g_shm, OFF_TIMING_LAST_EXEC)   = g_isr_cyc_last;
+        /* ★★ 2026-09-18: 执行时长**均值**的两个半边。
+         *   为什么必须补它: `OFF_TIMING_EXEC_MAX` 被**黑匣子每 1024 拍的那次快照**占住
+         *   (`blackbox.c:310`), `EXEC_MIN` 又会被"空引擎窗口"污染 ⇒ **单看 min/max 会得出
+         *   "抖动 120 TB tick"的错结论**。问"典型拍是否恒定"必须看**均值**。
+         *   (同族: 本项目 §5.27/§5.28 —— 极值不免疫采样拍频, 累积量才免疫。)
+         *   放在主循环里, 与上面 7 行同款: 纯镜像、自愈、零 ISR 代价。 */
+        SHM_U32(g_shm, OFF_TIMING_EXEC_SUM_LO) = (uint32_t)(g_isr_cyc_sum & 0xFFFFFFFFu);
+        SHM_U32(g_shm, OFF_TIMING_EXEC_SUM_HI) = (uint32_t)(g_isr_cyc_sum >> 32);
+        SHM_U32(g_shm, OFF_TIMING_EXEC_SUM_N)  = g_isr_sum_n;
         /* ★ 0x3850 与范本**同址** —— 它不在上面 0x18..0x33 这一块里 (那里已排满,
          *   0x34 起是保留的 GPIO_MASK), 是照 S3 的独立位置放的。 */
         SHM_U32(g_shm, OFF_TIMING_OVERRUN)     = g_isr_overrun;

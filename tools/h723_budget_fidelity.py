@@ -123,18 +123,47 @@ def measure(dcl, n, settle=2.0):
     return (budget, st) if st else None
 
 
+# ★★★ 2026-09-18 新增（仪器修复）: **稳态窗口**，用来把"热重载那一拍"从统计里摘出去。
+#   依据 `main.c:3400-3404`:
+#       uint8_t was_run = SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN);
+#       if (!was_run) { stats_reset(); }         /* STOP→START 转变时清统计 */
+#   ⇒ `0x12 STOP` → `0x11 START` **清统计但不动程序表** ⇒ 得到纯稳态窗口。
+#
+#   ★★ 为什么必须有它: F5 原来用**算术归因**
+#       `重载 = (emax − 空引擎基线) − 预测预算`
+#   实测这条路给出 188 TB tick (0.94 µs)，而**直测真值是 2184 TB (4368 cyc, 10.9 µs)**
+#   —— 差 **4.6 倍**，也就是说 F5 报的不是"上界"而是"下界"。
+#   原因: 那个式子里三个量各有自己的口径误差（预算只是**摊薄**值、基线是**空引擎**、
+#   emax 含**每 1024 拍一次的黑匣子重活**），误差叠在一个差值上。
+#   ⇒ 正解 = **两个窗口直接相减**，不做任何算术归因:
+#       窗口A（含部署那一拍）− 窗口B（STOP/START 后，无重载拍）
+def steady_window(dcl, settle=2.0):
+    """STOP → START ⇒ 清统计、**保留程序** ⇒ 不含重载拍的稳态窗口。"""
+    dcl.send(CMD_STOP); time.sleep(0.15)
+    dcl.send(CMD_START); time.sleep(0.15)
+    time.sleep(settle)
+    return read_status(dcl)
+
+
 # ★★ 2026-09-18 新增: 重程序路数**不能写死 128**。
 #   原默认 `--heavy 128` 是在"交付档预算 = 145 cyc/条 ⇒ 128×145 = 18560 ≤ 门 26000"那个
 #   前提下成立的; 路径成本价接上之后, **同一个 128 在 FLASH 档是 128×363 = 46464 > 26000**
 #   ⇒ deploy 被 NAK ⇒ `measure()` 返回 None ⇒ 本工具判 **SKIP(判无效)**, F1 在 FLASH 档
 #   **根本跑不起来**。这正是"工具的隐含前提随固件改变而静默失效"那一类。
 #   ⇒ 改成从固件**自己**问出单价, 再取门下方最大的 N —— 模型换了、路径换了都自动跟得上。
-def auto_heavy(dcl, gate=26000):
+def auto_heavy(dcl, gate=26000, max_routes=128):
+    """★ 2026-09-18 二次修正: 自适应路数**必须同时受"条数上限"约束**。
+    第一版只取 `gate // 单价` ⇒ 交付档算出 179，而 `MAX_ROUTES = 128`
+    ⇒ deploy NAK `counts exceed max` ⇒ 工具又**静默变 SKIP**。
+    —— 与"写死 128 在 FLASH 档 NAK"是**同一个病族的两个方向**:
+    判据的适用域是两个约束的交集, 少写一个就会在某个档位上失效。
+    (engine.h: `MAX_ROUTES`; main.c:1790 `if (nr > MAX_ROUTES ...) return "counts exceed max"`)"""
     b1 = deploy(dcl, 1)
     if not b1:
         return None, None
-    n = max(gate // b1, 1)          # 均匀程序: budget = N × 单价 ⇒ N_max = 门 // 单价
-    print("  [自适应] 固件自报单价 %d cyc/条 ⇒ 门 %d 下方最大 N = %d" % (b1, gate, n))
+    n = max(min(gate // b1, max_routes), 1)   # 门 // 单价, 再按条数上限封顶
+    print("  [自适应] 固件自报单价 %d cyc/条 ⇒ 门 %d 下方 %d 条, 条数上限 %d ⇒ N = %d"
+          % (b1, gate, gate // b1, max_routes, n))
     return n, b1
 
 
@@ -152,6 +181,8 @@ def main():
                     help="重程序路数; **0 = 自适应**(默认) —— 从固件问出单价再取门下方最大 N。"
                          "写死路数会在 FLASH 档被 NAK 从而静默变成 SKIP")
     ap.add_argument("--light", type=int, default=16, help="轻程序路数（F3 反向保护）")
+    ap.add_argument("--settle", type=float, default=2.0,
+                    help="每次测量后的稳定等待秒数（F5 的稳态窗口也用它）")
     a = ap.parse_args()
 
     dcl = Dcl(a.port)
@@ -221,22 +252,33 @@ def main():
         # ★ 背景: 热重载在 ISR **扫描之前**整段执行 ⇒ 部署那一拍的 di = 扫描 + 重载。
         #   `emax` 是"自上次 RESET 以来的最大 di", 而本次测量**包含部署那次重载**
         #   ⇒ **F2 已经把重载拍一起兜住了**（这正是缺口②"Criterion 侧已覆盖"的部分）。
-        # ★ 缺的只是**归因**: "emax 里有多少是重载?"。
-        #   精确归因需要固件把 `g_reload_cyc` 暴露到协议面（当前只有 SWD 能读）——
-        #   已登记为后续。但**现在就能给一个上界**:
-        #       重载上界 = (emax − 空引擎基线) − 预测预算(换算成 tick)
-        #   它的成立**依赖 F1**（模型保真）⇒ 两条判据是耦合的, 这一点必须写明。
-        scan_rl_tick = max(hs["emax"] - base_emax, 0)
-        scan_model_tick = hb * DWT_NS_PER_CYC / tick_ns if hb else 0.0
-        reload_ub_tick = max(scan_rl_tick - scan_model_tick, 0)
-        reserve_tick = 35.0 * 1000.0 / tick_ns     # engine.h 注释里给热重载留的 35 µs 余量
-        record(reload_ub_tick <= reserve_tick,
-               "F5 热重载拍在预算余量内 (上界 ≤ engine.h 的 35 µs)",
-               "(emax−基线)=%.0f − 预测=%.0f ⇒ 重载上界 **%.0f tick = %.2f µs** ≤ %.0f tick"
-               % (scan_rl_tick, scan_model_tick, reload_ub_tick,
-                  reload_ub_tick * tick_ns / 1000.0, reserve_tick))
-        print("       ★ 注: F5 的上界**依赖 F1 成立**（模型准才谈得上归因差）；"
-              "精确归因需把 g_reload_cyc 暴露到协议面（已登记）")
+        #
+        # ★★★ 2026-09-18 二次修正（**原实现给出的是一个错到 4.6 倍的数**）:
+        #   原式 `重载 = (emax − 空引擎基线) − 预测预算` 是**算术归因**, 三个量各有口径误差:
+        #     · "预测预算"只是**摊薄**值（按 div 除过的），不是那一拍的真实扫描量
+        #     · "空引擎基线"是**空程序**的 ISR，不等于重载那一拍的非引擎部分
+        #     · `emax` 还含**每 1024 拍一次的黑匣子重活**（`blackbox.c:310`）
+        #   实测: 原式给 188 TB (0.94 µs)，而**直测真值 2184 TB (4368 cyc, 10.9 µs)** ——
+        #   差 4.6 倍 ⇒ **它报的不是"上界"而是"下界"**，方向都错了。
+        #   正解 = **两窗口直减**，不做任何算术归因:
+        #     窗口A = 含部署那一拍（本次 measure 的结果, 已在 hs 里）
+        #     窗口B = STOP/START 后的稳态窗口（`steady_window`，无重载拍）
+        st_steady = steady_window(dcl, a.settle)
+        if st_steady is None:
+            record(False, "F5 热重载拍可测 (稳态窗口读数)", "STOP/START 后 0x38 读失败")
+        else:
+            reload_tick = max(hs["emax"] - st_steady["emax"], 0)
+            reserve_tick = 35.0 * 1000.0 / tick_ns     # engine.h 注释里给热重载留的 35 µs 余量
+            record(reload_tick <= reserve_tick,
+                   "F5 热重载拍在预算余量内 (**直测值** ≤ engine.h 的 35 µs)",
+                   "含部署窗口 emax=%d − 稳态窗口 emax=%d ⇒ 重载 **%d tick = %.2f µs** ≤ %.0f tick"
+                   % (hs["emax"], st_steady["emax"], reload_tick,
+                      reload_tick * tick_ns / 1000.0, reserve_tick))
+            print("       ★ 两窗口直减, 不做算术归因 —— 原实现（(emax−基线)−摊薄预算）"
+                  "给的是**下界**(0.94 µs), 与直测差 4.6×; 见 docs/exp-TCM-cycles/ §A1.1")
+        print("       ★ 本判据**不再依赖 F1**（不需要「模型准」这个前提），也**不需要**把 "
+              "`g_reload_cyc` 暴露到协议面 —— 两窗口差已经把那个量直接量出来了"
+              "（它本来也读不到: `0x22` 的 `eng_valid_rrange` 不放行 SHM 之外的 DTCM 全局）")
     finally:
         dcl.send(CMD_STOP); time.sleep(0.2)
         dcl.send(CMD_RESET); time.sleep(0.3); dcl.send(CMD_START)
