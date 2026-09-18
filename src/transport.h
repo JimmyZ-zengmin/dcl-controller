@@ -130,7 +130,11 @@
  * GET_VERSION 返回 [fw_ver:u16][cap:u16]; 上位机据此判断能力分支,
  * 不再靠"NAK 文本"猜 (旧 PC 连新固件 / 新 PC 连旧固件都能优雅降级) */
 #define DCL_FW_VERSION      0x0107   /* (S3 线) v1.7: + SRC_HMI 设定值源 + AI 模拟量输入 */
-#define DCL_CAP_MULTICYCLE  0x0001   /* 多周期 div 档 (100μs/1ms/10ms) */
+#define DCL_CAP_MULTICYCLE  0x0001   /* 多周期 div 档 —— **1 / 10 / 64 拍**
+                                      *   ★ 2026-09-18 更正: 原写 (100μs/1ms/10ms) —— 那个 ms 口径**不成立**:
+                                      *     6 位 phase 字段装不下 100 个相位 ⇒ div2 从来不是 10ms, 而是 64 拍;
+                                      *     而拍长可配之后 ms 值本来就会变 ⇒ **用拍表述才对任何档都成立**。
+                                      *     100 µs 档的等价值: 100µs / 1ms / **6.4ms**。 */
 #define DCL_CAP_HOTRELOAD   0x0002   /* deploy 热重载 (staging→ACTIVE ≤1 拍) */
 #define DCL_CAP_PERSISTENT  0x0004   /* 掉电保持 (运行期 0 flash 操作) */
 #define DCL_CAP_STATE_COLD  0x0008   /* RESET/deploy 状态冷启动 (审计 M2) */

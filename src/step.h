@@ -166,6 +166,10 @@ extern volatile uint32_t g_step_count_en;
 extern volatile uint32_t g_step_goal_done_n;   /* 到点自停次数 */
 extern volatile uint32_t g_step_goal_abort_n;  /* 未到点（被限时/停机打断）次数 */
 extern volatile uint32_t g_step_goal_rej_n;    /* 被拒次数 */
+/* ★★ 2026-09-18（2.2）: 「走 N 步」的两个拍号 —— 使「实测时长 = 声明的 N/f」**可直接判定**
+ *   （此前只能组合: 步数 ÷ 实现频率）。★ 武装拍号滞后 ≤1 主循环通过, 停止拍号无额外延迟。 */
+extern volatile uint32_t g_step_arm_tick;     /* 武装后第一次 step_tick 的拍号 */
+extern volatile uint32_t g_step_stop_tick;    /* 停脉冲那一刻的拍号 */
 
 /* ══════════════════════════════════════════════════════════════════════════
  * ★★★ 轨迹规划（加减速 / 斜坡限幅）—— README 能力边界 **A 类第一项**

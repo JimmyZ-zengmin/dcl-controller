@@ -648,6 +648,10 @@ OBS uint32_t g_seq_max_cur    = 0;   /* 历史最大步号 (证明真的走到�
  *     于是删掉了自创的"已 RUN 不清零"分支 (它会让 PC 补发的 0x11 把正在执行的
  *     顺序程序打回第一步, 与 S3 语义不符), 这个量随之改成纯计数器。 */
 OBS uint32_t g_seq_armed      = 0;
+/* ★★★ 2026-09-18（PLAN-completion 2.1）: `0x44 n_seq=0` = **清除顺序域** 的次数。
+ *   为什么要单独计数: "清除"与"部署"是两件事 —— 合并成一个计数就回答不了
+ *   "这次是下发了程序还是把域清空了"（本项目"一个计数只回答一个问题"）。 */
+OBS uint32_t g_seq_clears     = 0;
 /* ══════════ W4: 通信域观测面 ══════════
  * ★ 判据要点: "注入了"与"响应对了"是两件事 —— 必须分开计数, 否则
  *   "全部被拒"与"全部受理"在看总数时无法区分 (同 0x44 观测面的设计理由)。 */
@@ -1986,7 +1990,39 @@ static void h_seq_deploy(const uint8_t *p, uint32_t n)
     if (n < 3) { g_seq_nak++; nak("seq: short frame"); return; }
     uint8_t  n_seq   = p[0];
     uint16_t n_steps = get16(p + 1);
-    if (n_seq == 0 || n_seq > MAX_SEQ_INST) { g_seq_nak++; nak("seq: bad n_seq"); return; }
+    /* ★★★ 2026-09-18（PLAN-completion 2.1）: **`n_seq = 0` = 清除整个顺序域**。
+     *
+     * ## 缺口的代价（当天实测）
+     * 以前 `0x44` 拒 `n_seq=0`，而 `0x10` 部署路由**不碰 seq**、`0x12 STOP` 也不清、
+     * `0x11 START` 还会把 run 重新置 1 ⇒ **一旦部署过顺序程序，除了复位回不到"没有顺序程序"**。
+     * 代价不是理论上的：E-T 在**未复位**的板上测"空程序每拍开销"得到 **816.7 TB**，
+     * 复位后 **542.4 TB** —— 那 **274 TB/拍** 就是残留的 8 个 seq 实例
+     * （逐点实测: 首个 ~34 TB, 之后每个 ~21 TB/拍）。它**污染了一切成本测量**。
+     *
+     * ## 语义（定死三条）
+     *   ① `n_seq=0` 必须同时 `n_steps=0` 且**帧长恰为 3**（不给"半清"留余地）
+     *   ② 清 `OFF_CTRL_N_SEQ=0`（`engine_seq_tick` 的循环上界 ⇒ 每拍零开销）
+     *   ③ 同时把 8 个控制块的 `run` 位清 0（防"计数清了、旧实例被别处再武装"）
+     *   ④ 仍然要求引擎 STOP（与正常部署同款: 无竞争窗口） */
+    if (n_seq == 0u) {
+        if (n_steps != 0u || n != 3u) {
+            g_seq_nak++; nak("seq: clear wants n_steps=0 and 3-byte frame"); return;
+        }
+        if (SHM_U8(g_shm, OFF_CTRL_ENGINE_RUN)) { g_seq_nak++; nak("seq: stop engine first"); return; }
+        for (uint32_t i = 0; i < MAX_SEQ_INST; i++) {
+            uint8_t *c = (uint8_t *)(g_shm + OFF_SEQ_CTRL) + i * 16u;
+            *(volatile uint16_t *)(c + 4) = 0u;      /* step_cur */
+            *(volatile uint32_t *)(c + 12) = 0u;     /* step_tick */
+            c[9] = 0u;                               /* run = 0 */
+        }
+        SHM_U8(g_shm, OFF_CTRL_N_SEQ) = 0u;
+        __asm__ volatile("dsb" ::: "memory");
+        g_persist_dirty = 1;
+        g_seq_clears++;
+        ack(NULL, 0);
+        return;
+    }
+    if (n_seq > MAX_SEQ_INST) { g_seq_nak++; nak("seq: bad n_seq"); return; }
     if (n_steps == 0 || n_steps > MAX_SEQ_STEPS) { g_seq_nak++; nak("seq: bad n_steps"); return; }
     uint32_t need = 3u + (uint32_t)n_seq * 6u + (uint32_t)n_steps * 16u;
     if (need != n) { g_seq_nak++; nak("seq: length mismatch"); return; }
@@ -2660,7 +2696,7 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
              *   +16 abort_n  +20 rej_n    +24 TIM4_CNT(原始) +28 rate(当前 Hz)
              *   ★ +12/+16/+20 **三个计数必须分开**：到点自停 / 被限时或停机打断 / 被拒
              *     是**三件不同的事** —— 合并成一个就回答不了"这次是走到了还是被打断了"。 */
-            uint8_t r16[32];
+            uint8_t r16[40];
             put32(r16 +  0, g_step_count_en);
             put32(r16 +  4, g_step_goal);
             put32(r16 +  8, g_step_pulses);
@@ -2669,7 +2705,13 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
             put32(r16 + 20, g_step_goal_rej_n);
             put32(r16 + 24, step_pulses_now());
             put32(r16 + 28, g_step_rate_hz);
-            ack(r16, 32u);
+            /* ★★ 2026-09-18（PLAN-completion 2.2）: 应答由 32B 扩到 **40B** —— 加两个拍号。
+             *   存量消费方一律用 `len(p) < 32` 作为闸门（三个工具都查过）⇒ **加长向后兼容**;
+             *   ★ 但用 `expect_len=32` 严格比长的调用方会判长度不符 ⇒ 那是**它们该改**（已在
+             *     `h723_client.send` 的 docstring 里写明"长度判据用于挡串帧, 不是版本契约"）。 */
+            put32(r16 + 32, g_step_arm_tick);
+            put32(r16 + 36, g_step_stop_tick);
+            ack(r16, 40u);
             return;
         }
         case 17u: {

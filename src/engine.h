@@ -314,7 +314,7 @@ _Static_assert(OFF_SCAN_CYC_SUM_LO + 4u == OFF_SCAN_CYC_SUM_HI,
  * ★ 语义 (照 S3 core0_isr.c): 每个 u32 = 该档**累计执行的路由条次**(不是拍数)。
  *   为什么是"条次": 1 秒内 "1 条快档 + 60 条慢档" 应得 cnt0≈10000 / cnt2≈6000,
  *   比值 0.6 —— 这正是"分档真的按档跑"的可失败证据 (拍数比会是 0.01, 无区分力)。 */
-#define OFF_TICK_STATS       0x3854   /* u32[3]: cnt0(100μs档) cnt1(1ms档) cnt2(10ms档) */
+#define OFF_TICK_STATS       0x3854   /* u32[3]: cnt0(div0档) cnt1(div1档) cnt2(div2档) —— ★ 别写 ms: 拍长可配后 ms 会变 */
 _Static_assert((OFF_TICK_STATS & 3u) == 0u, "SHM: OFF_TICK_STATS 需 4 字节对齐");
 /* 用字面量 0x4000 而不是 OFF_SEQ_TABLE —— 后者在本文件里声明得更靠后, 此处还不可见 */
 _Static_assert(OFF_TICK_STATS + 12u <= 0x4000u, "SHM: TICK_STATS 不得压到 SEQ 区(0x4000)");
@@ -935,7 +935,7 @@ _Static_assert(_Alignof(SeqCtrl_t) == 4, "SeqCtrl_t alignment must be 4");
 /* ---- period 字段位定义 ---- */
 #define PERIOD_DIV_IDX_FAST  0   /* 1×: 每 100μs */
 #define PERIOD_DIV_IDX_MID   1   /* 10×: 每 1ms */
-#define PERIOD_DIV_IDX_SLOW  2   /* 100×: 每 10ms (★★ H9 第二次修正 —— 旧值 64×(6.4ms) 是误修,
+#define PERIOD_DIV_IDX_SLOW  2   /* 64 拍: 每 64 拍（100µs 档 = 6.4ms） (★★ H9 第二次修正 —— 旧值 64×(6.4ms) 是误修,
                                   *   见 BUCKET_DIV2_PHASES 的说明。真问题是 phase 字段只有 6 位,
                                   *   不是周期该是 64。) */
 #define PERIOD_DIV_MASK      0x03

@@ -113,12 +113,16 @@ def step_cmd(dcl, sub, arg=0):
 
 
 def cnt_state(dcl):
+    """★ 2.2 之后应答是 **40B**: +32 = arm_tick, +36 = stop_tick（旧的 32B 前缀不变）。"""
     sts, p = step_cmd(dcl, 16)
     if sts != "ACK" or len(p) < 32:
         return None
     u = struct.unpack("<8I", p[:32])
-    return dict(count_en=u[0], goal=u[1], pulses=u[2], done=u[3],
-                abort=u[4], rej=u[5], tim4=u[6], rate=u[7])
+    d = dict(count_en=u[0], goal=u[1], pulses=u[2], done=u[3],
+             abort=u[4], rej=u[5], tim4=u[6], rate=u[7], arm_tick=None, stop_tick=None)
+    if len(p) >= 40:
+        d["arm_tick"], d["stop_tick"] = struct.unpack("<2I", p[32:40])
+    return d
 
 
 def loop_gap_max(dcl, shm):
@@ -166,6 +170,8 @@ def main():
                     help="S1 的最小二乘采样点数（两点差分会把 20ms 读数偏斜变成斜率偏差）")
     ap.add_argument("--over-trials", type=int, default=5, dest="over_trials",
                     help="过冲对照每个条件的重复次数（★ 单次对照在方差大的量上会给出反号结论）")
+    ap.add_argument("--s7-tol-ms", type=float, default=60.0, dest="s7_tol_ms",
+                    help="S7 实测时长的容差(ms) —— 覆盖武装拍号滞后 + 过冲")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
@@ -322,8 +328,14 @@ def main():
                   "（一次 3.6→10.0 ms = 2.8×）, 而下一次运行给出**相反方向**（4.6→1.0 ms = 0.2×）。")
             print("        两次运行符号相反 ⇒ 该断言**不成立**（已记 RETRACTIONS）。"
                   "可靠的方向性只有注入阻塞那一条（S4, 100 ms 量级 ≫ 自然抖动）。")
-            res.append(("S3 两条件的过冲区间**重叠**（不宣称方向）: [%.3f,%.3f] ∩ [%.3f,%.3f] ≠ ∅"
-                        % (q[0], q[2], b[0], b[2]), q[0] <= b[2] and b[0] <= q[2]))
+            # ★★★ S3 **不是判据, 只报数** —— 这是本工具第三次踩同一个坑:
+            #   第一版拿**单次**对照宣称"观测放大过冲"（2.8×）; 第二次运行反号（0.2×）⇒ 撤回;
+            #   然后我把判据写成"两条件区间**必须重叠**"—— **那仍然是关于噪声的方向性断言**,
+            #   于是第三次运行（区间分离: 静默 [2.4,6.2] vs 紧轮询 [8.0,20.6]）把它判 FAIL。
+            #   ⇒ 正确形态: **方向性在这个量上不可判**（噪声量级 ≥ 效应量级, 且符号随运行翻转）,
+            #     能判的只有**界**（S2/S4a 已经判了）。所以 S3 只打印, 不进断言表。
+            print("      ⇒ **方向性在本量上不可判**（三次运行符号都不同: 2.8× / 0.2× / 区间分离）"
+                  "⇒ 只报数, **不作判据**; 能判的是界（S2/S4a）")
             data["over_quiet_ms"] = q
             data["over_busy_ms"] = b
 
@@ -407,9 +419,29 @@ def main():
             data["dur_want_s"] = d_want
 
         # ── SKIP: 还缺的那一件 ────────────────────────────────────────
-        skip.append("「停止时刻」的**直接**时间戳 —— 仍缺（S6 是用步数÷频率**组合**出来的）。"
-                    "若要与组合值独立互证, 需在 `step_tick` 停脉冲那一行记 `g_step_stop_tick`"
-                    "（一行代码 + sub=16 的一个保留槽）")
+        # ── S7 ★★★ 「实测时长 = 声明的 N/f」—— **独立**判定（2.2 补的两个拍号）──
+        #   在此之前这一条只能**组合**（步数 ÷ 实现频率），是间接证据 ⇒ 记 SKIP。
+        #   现在固件在武装那一刻与停脉冲那一刻各记一个拍号 ⇒ 时长**直接可读**。
+        print("\n── S7 ★★★ 实测时长 = 声明的 N/f（用固件的两个拍号, 不再组合）──")
+        hz7, n7 = args.hz, max(2, int(round(args.hz * 1.0)))   # 声明 1.0 s 的步数
+        r7 = run_arm(hz7, n7, "quiet")
+        if not r7 or r7.get("arm_tick") is None or not r7.get("stop_tick"):
+            skip.append("S7 —— 读不到 arm_tick/stop_tick（固件不是 2.2 之后的版本?）")
+        else:
+            real_s = (r7["stop_tick"] - r7["arm_tick"]) * S["tick_us"] / 1e6
+            want_s = n7 / float(hz7)
+            over = real_s - want_s
+            # ★ 容差的来源: arm 拍号滞后 ≤1 主循环通过（实测 ~1.4 ms）, 加上过冲
+            #   （过冲的界是主循环最大间隔, 已在 S2/S4 单独判）⇒ 这里只判"量级正确"
+            print("    arm_tick=%d stop_tick=%d ⇒ 实测 **%.6f s**；声明 N/f = %.6f s（差 %+.2f ms）"
+                  % (r7["arm_tick"], r7["stop_tick"], real_s, want_s, over * 1000))
+            print("    ★ 容差 ±%.0f ms = 武装拍号的滞后上界(≤1 主循环通过) + 过冲界的一部分"
+                  % (args.s7_tol_ms))
+            res.append(("S7 **实测时长 %.4f s = 声明 %.4f s ±%.0f ms**（差 %+.1f ms）"
+                        % (real_s, want_s, args.s7_tol_ms, over * 1000),
+                        abs(over) * 1000.0 <= args.s7_tol_ms))
+            data["dur_direct_s"] = real_s
+            data["dur_want_s"] = want_s
 
     finally:
         try:

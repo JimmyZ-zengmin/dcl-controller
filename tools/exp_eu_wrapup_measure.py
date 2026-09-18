@@ -208,9 +208,51 @@ def main():
         print("    %-8d %-12d %-12.1f %.1f" % (K, dt, dt / 10.0, (dt / 10.0) / (K / 100.0)))
     print("    ★ 注意: 这里量的是**两次环头读之间**的 tick 差, 含读本身的串口时间（~17ms 固定）")
     print("      ⇒ 「板侧占时」的上界; E-S 里用的就是每次实测值而不是一条曲线。")
-    dcl.close()
-    return 0
 
+    # ══ M4 ★★★ 顺序域**清除语义**（PLAN-completion 2.1）════════════════
+    #   缺口: `0x44` 以前拒 `n_seq=0`, 而 0x10/0x12 都不清 seq, START 反而重新武装
+    #   ⇒ 一旦部署过顺序程序, **除了复位回不到"没有顺序程序"**。
+    #   代价(实测): 残留 8 实例 = **+274 TB/拍**, 并污染一切成本测量。
+    print("── M4 顺序域清除（n_seq=0）──")
+    dcl.send(CMD_DEPLOY, mk(0x00, 0, 0), expect_len=None); time.sleep(0.2)
+    dcl.send(CMD_STOP); time.sleep(0.2)
+    # ① 先摆出 8 个实例, 拿到"有残留"的基线
+    dirs, tbl = [], []
+    for i in range(8):
+        dirs.append(struct.pack("<BBBBH", 2, 12 + i, 0, 0, 2 * i))
+        for _ in range(2):
+            tbl.append(struct.pack("<BBBBHHHI", 2, 0, 0x02, 0, 0, 0, 0, 0) + b"\x00\x00")
+    pay = struct.pack("<HHH", 0, 1, 1) + struct.pack("<4f", 0.0, 5.0, 0.0, 0.0) + b"\x00" * 16
+    dcl.send(CMD_DEPLOY, pay, expect_len=None); time.sleep(0.2)
+    dcl.send(CMD_STOP); time.sleep(0.2)
+    s8, q8 = dcl.send(CMD_SEQ, struct.pack("<BH", 8, 16) + b"".join(dirs) + b"".join(tbl),
+                      expect_len=None)
+    d_with = di_now(dcl, shm)
+    print("    ① 部署 8 实例: %s ⇒ di(0) = %s TB" % (s8, "%.1f" % d_with if d_with else "?"))
+    # ② 负对照: 帧不自洽（n_steps != 0）⇒ 必须 NAK（证明这不是"一律接受"）
+    sn, qn = dcl.send(CMD_SEQ, struct.pack("<BH", 0, 1), expect_len=None)
+    print("    ② 负对照 n_seq=0 但 n_steps=1 ⇒ %s「%s」"
+          % (sn, qn.decode('utf-8', 'replace') if sn == 'NAK' else ''))
+    # ③ 清除
+    #   ★ 第一次漏了 STOP ⇒ 被**我自己的新门** NAK（"seq: stop engine first"），
+    #     而工具当时**没打印 NAK 原因** ⇒ 现象是"清除没生效、di 没回落"，看起来像固件坏了。
+    #     ⇒ 两处修: ① 先 STOP（与正常部署同一道门）② **NAK 的原因必须打出来**。
+    dcl.send(CMD_STOP); time.sleep(0.25)
+    sc, qc = dcl.send(CMD_SEQ, struct.pack("<BH", 0, 0), expect_len=None)
+    time.sleep(0.3)
+    n_after = live_nseq()
+    d_clean = di_now(dcl, shm)
+    print("    ③ 清除 n_seq=0: %s%s ⇒ N_SEQ 读回 = **%d**；di(0) = %s TB"
+          % (sc, ("「%s」" % qc.decode('utf-8', 'replace')) if sc == 'NAK' else '',
+             n_after, "%.1f" % d_clean if d_clean else "?"))
+    ok_clear = (sc == 'ACK' and n_after == 0 and d_with and d_clean
+                and d_clean < d_with - 100.0)
+    print("    ⇒ 判据: ACK + N_SEQ==0 + **每拍开销回落 ≥100 TB**（%s）"
+          % ("成立" if ok_clear else "**不成立**"))
+    print("    ⇒ **效果: 残留顺序程序从此有清除手段** —— 不再只能靠复位"
+          "（它此前会让每拍白烧 ~21 TB × 实例数, 并污染成本测量）。")
+    dcl.close()
+    return 0 if ok_clear else 1
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -78,6 +78,12 @@ volatile uint32_t g_step_count_en    = 0u;   /* 计数中 */
 volatile uint32_t g_step_goal_done_n = 0u;   /* 到点自停次数 */
 volatile uint32_t g_step_goal_abort_n= 0u;   /* 因限时/停机而未到点的次数 */
 volatile uint32_t g_step_goal_rej_n  = 0u;   /* 被拒（没有脉冲在跑 / 参数非法）*/
+/* ★★ 2026-09-18（PLAN-completion 2.2）: 两个拍号 —— 让「实测时长 = 声明的 N/f」**可直接判定**
+ *   （此前只能组合: 步数 ÷ 实现频率, 属间接证据）。
+ *   ★ 精度边界: `arm_tick` 是**武装后第一次 step_tick** 记的 ⇒ 滞后 ≤1 主循环通过（~1.4 ms）,
+ *     对 1 s 级时长是 0.14%; `stop_tick` 记在停脉冲那一刻, 无额外延迟。 */
+volatile uint32_t g_step_arm_tick    = 0u;
+volatile uint32_t g_step_stop_tick   = 0u;
 
 /* ★★★ 轨迹规划（斜坡限幅）—— 见 step.h。★ **默认 0 = 关** ⇒ 既有行为逐位不变。 */
 volatile uint32_t g_step_ramp_hz_s     = 0u;
@@ -503,18 +509,30 @@ void step_tick(uint32_t tick_now)
      *   名义过冲 0~27 ms; 注入一次大块读（阻塞 ~100 ms）⇒ 过冲 **72~104 ms**（282 倍）。
      *   ⇒ 设计规则: 要求过冲 ≤ k 步 ⇒ `f ≤ k / 主循环最大间隔`。详见 `docs/exp-ES-step-duration.md`。
      * ★ 与"限时"的关系：限时先到会走 `step_stop_safe()` ⇒ 这里把 goal 判为"未到点"（abort）
-     *   ⇒ 两种停法**可区分**（否则"到点"和"被限时打断"会混成一个计数）。 */
+     *   ⇒ 两种停法**可区分**（否则"到点"和"被限时打断"会混成一个计数）。
+     * ★★ 2026-09-18（PLAN-completion 2.2）: **补两个拍号**（`g_step_arm_tick`/`g_step_stop_tick`）
+     *   —— 在此之前"声明的时长 N/f"只能**组合**出来（步数 ÷ 频率），无法独立判定；
+     *   有了这两个拍号，「实测时长 = N/f」第一次成为**可直接量**的量（关掉 E-S 的最后一个 SKIP）。
+     *   ★ 精度边界（如实标注）: 武装拍号是**武装后第一次 step_tick** 记的 ⇒ 滞后 ≤1 个主循环
+     *     通过（~1.4 ms）; 停止拍号记在停脉冲**那一刻**（同函数内，无额外延迟）。 */
+    {
+        static uint32_t s_goal_prev = 0u;
+        if (g_step_count_en && !s_goal_prev) { g_step_arm_tick = tick_now; }
+        s_goal_prev = g_step_count_en;
+    }
     if (g_step_count_en) {
         uint32_t p = TIM_CNT(TIM4);
         g_step_pulses = p;
         if (p >= g_step_goal) {
             TIM_CR1(TIM4) &= ~TIM_CR1_CEN;
             g_step_count_en = 0u;
+            g_step_stop_tick = tick_now;          /* ★ 停脉冲那一刻的拍号 */
             step_set_rate(0u);
             g_step_goal_done_n++;
         } else if (g_step_rate_hz == 0u) {          /* 脉冲被别人停了 ⇒ 未到点 */
             TIM_CR1(TIM4) &= ~TIM_CR1_CEN;
             g_step_count_en = 0u;
+            g_step_stop_tick = tick_now;          /* ★ 未到点也记（两种停法共用拍号, 由计数区分） */
             g_step_goal_abort_n++;
         }
     }

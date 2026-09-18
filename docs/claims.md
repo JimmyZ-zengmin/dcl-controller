@@ -130,3 +130,17 @@ E | 9.4-6 ★ RESET 后模式回 v1（否则链路失联）| tools/h723_frame_at
 E | 3.8.8-3 回退 req_seq 被拒且不回 done_seq | tools/h723_dev_bind_test.py | 序号回退 | --allow-uncovered 判据未落地：构造它需要"合法序 → 回退提交 → 再恢复"三段，且回退会把 done_seq 停在低位（rej_n 每圈涨）⇒ 需专门设计，属 PLAN-consistency-v1 的 P 线
 E | 3.8.8-6 只涨 skip_n 不涨 err_n           | tools/h723_dev_bind_test.py | 不涨 err_n | --allow-uncovered 判据未落地：现只观察到"T8.5 聚合"侧面（skip_n 被打印）；要成判据需构造"总线被占满一整段"的受控场景
 ```
+# ══ ★★★ 2026-09-18 新增：声明的时间量（G10）与预算门的转变项 ══
+# 判据入口（每条都能失败；SKIP ≠ PASS 由各工具自己打印）
+#   A 类（结构）: `OP_TRANS_COST` 定义 + 被 `engine_prog_budget` 使用
+#                 `DCL_CAP_MULTICYCLE` 的注释改成"1/10/64 拍"（ms 口径不成立 —— H9 遗留）
+#   B 类（拒绝码）: `seq: clear wants n_steps=0 and 3-byte frame`（0x44 n_seq=0 的负对照）
+#                  `seq: stop engine first`（清除与部署共用同一道门）
+#   D 类（数字）:   留点验证 ≤3% · PID 积分精度 0.01~0.08% · 限时流逝率 1000±2%
+#                 · 走 N 步时长 = N/f ±60ms · FLASH 门边界 DIRECT 105/106 · PID 60/61
+#   ★ 证据串: `record(` 所在工具的断言文本 —— 见
+#     tools/exp_eq_dt_semantics.py · exp_er_motion_time.py · exp_es_step_duration.py
+#     · exp_et_cost_decomposition.py · exp_eu_wrapup_measure.py
+claims_g10_tick_period_single_source = True    # clock.h CLK_TICK_US 唯一定义, engine.h 别名
+claims_g10_seq_clear_semantics       = True    # 0x44 n_seq=0 = 清除（此前只能靠复位）
+claims_g10_step_stop_timestamp       = True    # g_step_arm_tick/g_step_stop_tick（sub=16 +32/+36）
