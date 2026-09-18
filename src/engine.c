@@ -768,6 +768,11 @@ void eng_force_clear(uint8_t *base)
  *   常见路径省掉一次 DTCM 加载与有限性检查 → 全部原语都变便宜约 10%
  *   (DIRECT 56→50, 全表 ITCM 7225→6476 cyc)。**成本表必须跟着代码走**:
  *   代码一动就要重测, 否则预算模型用的是"上一版代码"的数。 */
+/* ★ 两张表**各按构建存在一张** (BOOT_SEL 选表, 见 `engine_op_cost`)。
+ *   不把两张都编进来: 本仓 `-Werror` 全开, 一张"编进来但没人用"的表会被
+ *   `-Werror=unused-const-variable` 挡下 —— 这不是噪声容忍问题, 而是它同时
+ *   掩盖了"镜像里有两张表, 到底哪张在生效"的歧义 (本项目最忌讳的"同一个语义两处存放")。 */
+#if (BOOT_SEL != 0)
 static const uint16_t k_op_cost_itcm[0x13] = {
     /* DIRECT CMP HYST CLAMP  LPF PID RATE DBN MUX EDGE LUT CNT TMR ARITH SCL AND OR NOT SR */
         56,  76,  79,  74,   97, 145,  68, 76, 70,  87, 89, 83, 80,  74, 67, 77, 78, 71, 85,
@@ -791,6 +796,7 @@ static const uint16_t k_op_cost_itcm[0x13] = {
      *   ⇒ 在那之前, 本表取**当前实测值** —— 预算门是"安全"方向 (偏大 = 偏保守),
      *     且"表必须等于当前代码的实测"是项目铁律 2。 */
 };
+#endif
 
 /* 源类型附加成本: 本平台 4 种源都是"取址 + 一次掩码", 实测差异落在噪声内 (<2 cyc),
  * 故为 0。S3 给 SRC_HMI 记了 +60 (它要 volatile u16 读 + 整数转浮点 + 浮点除),
@@ -798,10 +804,58 @@ static const uint16_t k_op_cost_itcm[0x13] = {
  * 送一个恒 0 的假信号。所以这里不给成本, 而是在 engine_route_validate 里直接拒。 */
 static const uint16_t k_src_cost[4] = { 0, 0, 0, 0 };
 
+#if (BOOT_SEL == 0)
+/* ══════════ FLASH 扫描体 (`.scan_flash`) 的**逐原语**成本表 ══════════
+ * ★ 为什么需要**第二张表**, 而不是给 ITCM 表乘一个倍率:
+ *   两条扫描体是同一个宏 `DEFINE_ENGINE_SCAN` 生成的两份 code, 但落点不同 ——
+ *   `engine_scan_itcm` 在 ITCM (零等待), `engine_scan_flash` 在 FLASH (吃 L1 I-cache)。
+ *   2026-09-18 用同一套两点法 (`tools/h723_op_sweep.py --sel 0`, 19/19 可信,
+ *   原始数据 build/op_sweep_flash.json) 实测出**逐原语**比价:
+ *        DIRECT 250 / 56  = **4.46×**      PID 363 / 145 = **2.51×**
+ *   ⇒ 比值**随原语而变**, 所以任何单标量(当时用的是斜率比 3.03)都**既不是上界也不是下界**:
+ *        · 对 DIRECT 低估 1.47 倍 ⇒ **放行会超载的程序** (静态门失守)
+ *        · 对 PID   高估 1.21 倍 ⇒ **误拒合法程序**   (可用性损失)
+ *   两个方向都**实测到了** (见 `docs/exp-2026-09-18-overload/` 的成对实验):
+ *        · 标量档 ACK 了 128×DIRECT, 模型自报 21760 cyc (54% 拍),
+ *          实跑 **30988 cyc = 77.5% 拍** —— 超了门自己承诺的 26000 cyc, 1.19 倍;
+ *          而运行期兜底 `ov` (80% 拍 = 32000 cyc) **没触发** ⇒ 这条失守不会被 ov 兜住。
+ *        · 标量档 NAK 了 64×PID (自报 28160), 而真实成本 64×363 = 23232 < 26000 ⇒ 误拒。
+ *   ⇒ 结论: **路径差异必须落成表, 不能落成标量** (与"同一个语义两处存放 ⇒ 静默失效"同族,
+ *     只是这里错在"一个数承担了两件事")。
+ *
+ * ★ 本表是**本平台实测值**, 与 k_op_cost_itcm 同源同法 (两点法 n=128/n=64, 除掉常数项),
+ *   单位已由 `h723_op_sweep.py` 从 TB tick(TIM5 5ns) 换算回 cyc。
+ *
+ * ★★ **本表必须建在 `--stat max`(最坏情况) 上, 不能建在 min 上**:
+ *   历史两张表都落在 `g_eng_cyc_min`。对 ITCM(零等待) min≈max ⇒ 无害;
+ *   但 FLASH 走 L1 I-cache ⇒ min 是"cache 全中"的**最好情况**, 而确定性门要的是
+ *   **最坏情况**。实测比价 (2026-09-18, 同一构建):
+ *        PID: min 401 / **max 432** cyc/条 —— 而**已部署程序**的 emax 斜率是 **434**
+ *   即: max 几乎逐点复现部署程序的真实成本(432 vs 434), min 则低估 7%。
+ *   ⇒ 下面这些数取自 `build/op_sweep_flash_max.json`。
+ *
+ * ★★★ 诚实边界 (必须留在场): FLASH 路径的单条成本**随构建布局而变** ——
+ *   同一个 `--stat min` 在两个构建上给 PID = **363**(标量档构建) 与 **401**(本构建),
+ *   差 10%。候选原因: `.scan_flash` 的落点/缓存组别名随链接布局变化。
+ *   **原因尚未隔离**(登记为后续)。两条可操作结论:
+ *     ① 扫描体或影响其布局的改动 ⇒ **本表必须重测**(铁律 2 的一个更严的版本);
+ *     ② 真正的兜底是**运行期** `emax`/`ov` (见 `EXEC_BUDGET_TB`) —— 静态表是"预判",
+ *        它只能逼近, 不可能替代实测。
+ * ★ 代码一动就要重测: 扫描宏里加东西 ⇒ **两张表都要重测**。 */
+static const uint16_t k_op_cost_flash[0x13] = {
+    /* DIRECT CMP HYST CLAMP  LPF PID RATE DBN MUX EDGE LUT CNT TMR ARITH SCL AND OR NOT SR */
+       247, 333, 277, 294, 269, 432, 261, 270, 269, 340, 335, 272, 313, 283, 287, 306, 285, 299, 262,
+};
+#endif
+
 uint16_t engine_op_cost(uint8_t op)
 {
     /* 越界/未知 → 取实测最贵值的 2 倍作保守兜底: 宁可拦错, 不可放错 */
+#if (BOOT_SEL == 0)
+    return (op <= OP_MAX) ? k_op_cost_flash[op] : (uint16_t)(k_op_cost_flash[OP_PID] * 2u);
+#else
     return (op <= OP_MAX) ? k_op_cost_itcm[op] : (uint16_t)(k_op_cost_itcm[OP_PID] * 2u);
+#endif
 }
 
 uint32_t engine_prog_budget(const uint8_t *payload, uint16_t nr)
@@ -815,15 +869,13 @@ uint32_t engine_prog_budget(const uint8_t *payload, uint16_t nr)
         uint32_t mult = (dv == PERIOD_DIV_IDX_MID)  ? OP_COST_DIV1
                       : (dv == PERIOD_DIV_IDX_SLOW) ? OP_COST_DIV2 : OP_COST_DIV0;
         uint32_t s = (r.src_type < 4u) ? k_src_cost[r.src_type] : SRC_COST_FALLBACK;
-        /* ★ 2026-09-18: 按**扫描路径**缩放 —— `k_op_cost_itcm[]` 是 ITCM 扫描体的实测值,
-         *   而本构建的拍 ISR 走 FLASH 还是 ITCM 由 `BOOT_SEL` 定
-         *   (见 engine.h 的 `OP_COST_PATH_NUM/DEN` 与其"为什么"注释)。
-         *   交付档 NUM=DEN=1 ⇒ 下面这条式子与改动前**逐位一致**(无回归)。
-         *   ★ 缩放与 mult 合并成一次向上取整:
-         *     ceil( (op+s)·NUM / (DEN·mult) ) = ((op+s)·NUM + DEN·mult − 1) / (DEN·mult) */
-        uint32_t c  = ((uint32_t)engine_op_cost(r.op) + s) * OP_COST_PATH_NUM;
-        uint32_t dm = OP_COST_PATH_DEN * mult;
-        per += (c + dm - 1u) / dm;
+        /* ★ 2026-09-18: **这里不再乘路径倍率** —— 路径差异已由 `engine_op_cost()`
+         *   选表承载 (`k_op_cost_itcm` / `k_op_cost_flash`, 逐原语实测)。
+         *   曾经的 303/100 单标量已删: 它对 DIRECT 低估 1.47 倍(放行超载)、
+         *   对 PID 高估 1.21 倍(误拒合法), 两个方向都实测到了 ——
+         *   详见 engine.c 里 `k_op_cost_flash` 上方的说明。
+         * 向上取整: 慢档每条每拍至少也要摊 1 cyc (不能因为除法取整把成本算没了) */
+        per += ((uint32_t)engine_op_cost(r.op) + s + mult - 1u) / mult;
     }
     return per;
 }

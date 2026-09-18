@@ -337,6 +337,41 @@ def axis4_cost_table():
     note("4.4 受控对照 (需重测): `python tools/h723_op_sweep.py --dur 0.3 --json build/op_cost.json`"
          " 然后与本表逐项比对 —— 代码改动后本表可能过期, 这一步是把'过期'变成可发现")
 
+    # ★★ 4.5/4.6 (2026-09-18 新增): **FLASH 扫描体**那张表。
+    #   背景: 曾经用单标量 303/100 代表路径差异 —— 实测这条近似**两个方向都错**
+    #   (对 DIRECT 低估 1.47 倍 ⇒ 放行超载; 对 PID 高估 1.21 倍 ⇒ 误拒合法),
+    #   已换成逐原语表。这两条检查保证"表与常量同源"这条规矩**在新表上同样成立**
+    #   —— 否则新表就是又一个"只写在注释里的宣称"。
+    mf = re.search(r"k_op_cost_flash\[(0x[0-9A-Fa-f]+)\]\s*=\s*\{(.*?)\}", src, re.S)
+    if not mf:
+        record("4.5 FLASH 路径成本表存在且可解析", False, "engine.c 里找不到 k_op_cost_flash")
+    else:
+        nf = int(mf.group(1), 16)
+        vf = [int(x) for x in re.findall(r"\b(\d+)\b",
+                                         re.sub(r"/\*.*?\*/", "", mf.group(2), flags=re.S))]
+        record("4.5 FLASH 路径成本表覆盖全部原语且值域合理",
+               len(vf) == nf and all(0 < v < 2000 for v in vf),
+               "声明 %d 项 / 实测 %d 项; 范围 %d~%d" % (nf, len(vf),
+                                                        min(vf) if vf else -1, max(vf) if vf else -1))
+        record("4.6 FLASH 表最贵原语也是 PID",
+               len(vf) > pid_i and vf[pid_i] == max(vf),
+               "k_op_cost_flash[OP_PID]=%d, max=%d" % (vf[pid_i] if len(vf) > pid_i else -1,
+                                                       max(vf) if vf else -1))
+        m3 = re.search(r"#define\s+OP_COST_MAX_FLASH\s+(\d+)", read("src/engine.h"))
+        cf = int(m3.group(1)) if m3 else -1
+        record("4.7 OP_COST_MAX_FLASH == FLASH 表 PID 项 (常量与表同源)",
+               cf > 0 and len(vf) > pid_i and cf == vf[pid_i],
+               "常量=%d, 表[OP_PID]=%d" % (cf, vf[pid_i] if len(vf) > pid_i else -1))
+        # ★ 4.8: 标量近似的**反例**必须仍然成立 —— 若哪天两表逐项成比例了, 单标量
+        #   会重新变成合法近似, 那时这条会 FAIL 提醒人重新评估 (判据必须能失败)。
+        if len(vf) == len(vals) and len(vf) > 2:
+            ratios = [b / float(a) for a, b in zip(vals, vf)]
+            spread = max(ratios) / min(ratios)
+            record("4.8 路径比值**不是常数** (单标量近似仍然不成立)",
+                   spread > 1.15,
+                   "逐原语比值 %.2f~%.2f, 极差 %.2f 倍 (DIRECT %.2f / PID %.2f)"
+                   % (min(ratios), max(ratios), spread, ratios[0], ratios[pid_i]))
+
 
 # ════════════════════════════ main ════════════════════════════
 def main():
