@@ -175,7 +175,15 @@ def main():
         "pmax = %d  [pmin=%d 受 halt 污染, 仅参考]" % (B["g_per_cyc_max"], B["g_per_cyc_min"]))
     chk(B["g_per_glitch_n"] == 0, "③ 时基完好 (g_per_glitch_n == 0)",
         "= %d  ← 非 0 则任何计时结论都不可信" % B["g_per_glitch_n"])
-    chk(B["g_isr_overrun"] == 0, "④ 未超预算 (g_isr_overrun == 0)",
+    # ★★ 2026-09-18 定位（超载实验, 见 docs/exp-2026-09-18-overload/）:
+    #   本项是**必要条件, 不是充分判据** —— 实测最重**合法**程序只吃到运行期门
+    #   (`EXEC_BUDGET_TB` = 80 µs) 的 **66.8%** ⇒ 对任何合法程序 `ov` 都恒 0
+    #   ⇒ 这半条**不可能失败** = 空判据（本项目最忌的那一族）。
+    #   ⇒ 真正的健康判据换成 tools/h723_budget_fidelity.py 的
+    #      **F1 模型保真**（实测扫描/预测 ≤ 1.30）与 **F2 有余量**（emax ≤ 门 × 0.8）。
+    #   本项保留 —— 它仍是"真超载"的必要条件, 只是**不能单独当健康证据**。
+    chk(B["g_isr_overrun"] == 0,
+        "④ 未超预算 (ov==0; ★必要条件而非充分 —— 见 h723_budget_fidelity.py)",
         "= %d, isr_max = %d cyc" % (B["g_isr_overrun"], B["g_isr_cyc_max"]))
     chk(B["g_adc_sm_timeout"] == 0, "⑥a ADC 无超时",
         "= %d" % B["g_adc_sm_timeout"])

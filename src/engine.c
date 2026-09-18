@@ -815,8 +815,15 @@ uint32_t engine_prog_budget(const uint8_t *payload, uint16_t nr)
         uint32_t mult = (dv == PERIOD_DIV_IDX_MID)  ? OP_COST_DIV1
                       : (dv == PERIOD_DIV_IDX_SLOW) ? OP_COST_DIV2 : OP_COST_DIV0;
         uint32_t s = (r.src_type < 4u) ? k_src_cost[r.src_type] : SRC_COST_FALLBACK;
-        /* 向上取整: 慢档每条每拍至少也要摊 1 cyc (不能因为除法取整把成本算没了) */
-        per += ((uint32_t)engine_op_cost(r.op) + s + mult - 1u) / mult;
+        /* ★ 2026-09-18: 按**扫描路径**缩放 —— `k_op_cost_itcm[]` 是 ITCM 扫描体的实测值,
+         *   而本构建的拍 ISR 走 FLASH 还是 ITCM 由 `BOOT_SEL` 定
+         *   (见 engine.h 的 `OP_COST_PATH_NUM/DEN` 与其"为什么"注释)。
+         *   交付档 NUM=DEN=1 ⇒ 下面这条式子与改动前**逐位一致**(无回归)。
+         *   ★ 缩放与 mult 合并成一次向上取整:
+         *     ceil( (op+s)·NUM / (DEN·mult) ) = ((op+s)·NUM + DEN·mult − 1) / (DEN·mult) */
+        uint32_t c  = ((uint32_t)engine_op_cost(r.op) + s) * OP_COST_PATH_NUM;
+        uint32_t dm = OP_COST_PATH_DEN * mult;
+        per += (c + dm - 1u) / dm;
     }
     return per;
 }

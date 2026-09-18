@@ -806,6 +806,36 @@ _Static_assert(_Alignof(SeqCtrl_t) == 4, "SeqCtrl_t alignment must be 4");
 #define OP_COST_DIV2         64   /* ★ 不是 100 (H9) */
 #define SRC_COST_FALLBACK    20   /* 未实测源类型的保守兜底 (cycles/条) */
 
+/* ══════════ 扫描路径成本倍率 (2026-09-18 新增) ══════════════
+ * ★ 为什么需要它: `k_op_cost_itcm[]` 是 **ITCM 扫描体**的实测值, 而拍 ISR 走哪一份扫描体由
+ *   `g_engine_sel` 决定 —— 它**只在 boot 时 = `BOOT_SEL`**(编译期常量), 协议改不了
+ *   (全仓只有 `main.c:4380` 一处赋值)。⇒ 在 `-DBOOT_SEL=0` 的构建里 ISR 跑
+ *   `engine_scan_flash`(`.scan_flash`, 经 L1 I-cache), 每条路由实测慢 ~3 倍;
+ *   若预算模型仍按 ITCM 计价, **静态门会严重低估**, 放行一个会超载的程序。
+ *   ⇒ 这是"预算模型有盲区"的真缺口 (与 S3 的 OA12→OA22 同族)。
+ *
+ * ★ 倍率怎么来的 (2026-09-18 实测; 完整记录 `docs/exp-2026-09-18-overload/`):
+ *   同一套方法(逐档部署 N 条 PID div0, 读 `0x38` 的 `emax`)在两条路径上各量**斜率**:
+ *        ITCM : (6018−4300) tick / 24 条 = **71.6 tick/条**
+ *        FLASH: (15320−10108) tick / 24 条 = **217.2 tick/条**  ⇒ 比值 **3.03**
+ *   ★ 诚实边界 (必须在场):
+ *     ① 这是**斜率比**, 假定各原语倍率一致 —— 而历史 `SCAN_FLASH_PAD` 实验里 DIRECT 档
+ *        实测过 **3.63** (> 3.03) ⇒ **倍率随原语而变**, 本值是中心值不是上界;
+ *     ② 更正确的做法是给 19 个原语各测一张 FLASH 表 (`tools/h723_op_sweep.py` 现成,
+ *        但需在 `-DBOOT_SEL=0` 的构建上跑) ⇒ **登记为后续**, 本次先用单倍率。
+ *   ⇒ 运行期兜底仍是 `emax`/`ov` (见 `EXEC_BUDGET_TB`)。
+ * ★ 取整: 分数表达 + **向上取整**(宁可拦错, 不可放错 —— 与 `engine_op_cost` 的兜底同族)。 */
+#ifndef BOOT_SEL
+#define BOOT_SEL 1
+#endif
+#if (BOOT_SEL == 0)
+#define OP_COST_PATH_NUM  303u   /* FLASH 路径 / ITCM 路径 ≈ 3.03 (实测斜率比) */
+#define OP_COST_PATH_DEN  100u
+#else
+#define OP_COST_PATH_NUM  1u     /* 交付档: ITCM ⇒ 不缩放, 行为与改动前**逐位一致** */
+#define OP_COST_PATH_DEN  1u
+#endif
+
 /* 部署门: 引擎扫描每拍 ≤ 此值。拍长 40000 cyc (100μs @400MHz)。
  * 余下 14000 cyc (35μs) 留给: 骨架 ISR (~45) + 热重载那一拍 (~3000) +
  * 通信域/顺序域/传感域 (阶段 4) + 安全余量。
@@ -850,9 +880,23 @@ _Static_assert(_Alignof(SeqCtrl_t) == 4, "SeqCtrl_t alignment must be 4");
  *   ⇒ 这条断言的作用是**在扩容/加重量级原语的那一刻失败**, 逼人回来重新评估:
  *     届时必须做一次超载实验 (构造 >门 的程序, 确认 NAK + 确认拍没被拉长),
  *     而不是相信一个从没被触发过的判据。
- *   断言通过 = "门还不具约束力, 无需动作"; 断言失败 = "门现在是真的了, 去验证它"。*/
-_Static_assert((uint32_t)MAX_ROUTES * OP_COST_MAX_MEASURED <= EXEC_DEPLOY_BUDGET,
-               "★ 预算门开始具约束力: 必须实测验证它能拦住超载 (见本断言上方注释)");
+ *   断言通过 = "门还不具约束力, 无需动作"; 断言失败 = "门现在是真的了, 去验证它"。
+ *
+ * ★★ 2026-09-18: 断言改成**两侧**, 因为"门具不具约束力"现在**随 `BOOT_SEL` 变**:
+ *   · 交付档 (ITCM, `BOOT_SEL=1`): 128 × 145 × 1    = **18560** ≤ 26000 ⇒ **不具约束力**
+ *   · FLASH 档(`BOOT_SEL=0`): 128 × 145 × 3.03 ≈ **56236** > 26000 ⇒ **具约束力**
+ *   ⇒ 后者是**正确的保守行为**, 而且正是 2026-09-18 超载实验里**第一次让静态门真的
+ *     拦住东西**的那一档 (实测 FLASH 档部署 128×PID div0 ⇒ NAK `exec budget exceeded`)。
+ *   ⇒ 断言表达"**这一档应该是哪一种**"; 一旦与预期不符, 说明倍率/门值/原语表变了 ⇒ 重新评估。 */
+#if (BOOT_SEL == 1)
+_Static_assert((uint32_t)MAX_ROUTES * OP_COST_MAX_MEASURED * OP_COST_PATH_NUM / OP_COST_PATH_DEN
+                 <= (uint32_t)EXEC_DEPLOY_BUDGET,
+               "交付档(ITCM): 预算门**不应**具约束力。若失败 ⇒ 扩容/加了重量级原语, 必须重做超载实验");
+#else
+_Static_assert((uint32_t)MAX_ROUTES * OP_COST_MAX_MEASURED * OP_COST_PATH_NUM / OP_COST_PATH_DEN
+                 > (uint32_t)EXEC_DEPLOY_BUDGET,
+               "FLASH 档: 预算门**应当**具约束力。若不再成立 ⇒ 路径倍率或门值变了, 重新评估");
+#endif
 
 /* ══════════ H723 扩展: deploy 生效确认字段 (S3 的 0x39-0x3F 当时空闲) ══════════
  * ★ 这是对 S3 那笔语义债的偿还点: S3 的 "ACK = 已受理 ≠ 已生效" —— 上位机收到 ACK
