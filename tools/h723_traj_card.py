@@ -219,42 +219,122 @@ def _judge(recs, A, dwell):
 
 
 def cmd_run(a):
-    """只走串口：部署 → 重绑反馈 → 设参数 → 起运动 secs 秒 → 收尾。**不碰 pyocd**。
-    ⇒ 卡插在板子里时执行；这段运动会被卡日志记下来，之后 `analyze` 就能找到。"""
+    """只走串口跑运动；**顺带用 pyocd 做两件卡路径必需的事**：
+      ① 触发「重新开日志」（`SD_CFG[8]=1` + 魔数 `SD_CFG[15]=0xF00DBEEF`）——
+         日志是**开机时**开的，卡插晚了/换卡就必须外部触发；**这正是"卡上找不到我的运动"的最可能原因**。
+      ② **当场证明日志在记**：读 `s_log_blk`（本次上电写了多少块）在运动前后的差 ——
+         差 >0 ⇒ 这段运动真的进了卡；差 =0 ⇒ 别去分析卡，先解决"没在记"。
+    ★ 只读那一段 .bss **不靠猜 map 的换行**，而是**用已知值锚定**（`s_log_cap_data` = 数据区块数、
+      `s_log_blk`+1 = 头部写指针）。"""
     from h723_client import Dcl, find_board, engine_status
     import h723_client as HC
-    dwell = a.dwell
-    slope = int(a.A / dwell)
-    for sc, extra in (("dclc.py", [os.path.join(ROOT, "examples", "h723_step_traj_tri.dcl")]),
-                      ("h723_as5600_bind.py", [])):
-        r = subprocess.run([sys.executable, os.path.join(HERE, sc)] + extra,
-                           capture_output=True, text=True, cwd=ROOT)
-        print("  %s rc=%d" % (sc, r.returncode))
-        if r.returncode != 0:
-            raise SystemExit((r.stdout or "") + (r.stderr or ""))
-    d = Dcl(a.port or find_board())
-    shm = engine_status(d)["shm"]
 
-    def wset(n, v):
-        return d.send(0x21, struct.pack("<II", shm + HC.OFF_WIRE_MAP + n * 4,
-                                        struct.unpack("<I", struct.pack("<f", v))[0]))[0] == "ACK"
-    d.send(0x39, bytes([19, 22]) + struct.pack("<I", 1))
-    d.send(0x39, bytes([19, 20]) + struct.pack("<I", 10))
-    d.send(0x39, bytes([19, 13]) + struct.pack("<I", 1))
-    d.send(0x39, bytes([19, 17]) + struct.pack("<I", slope))
-    time.sleep(0.2)
-    wset(10, 1.0); wset(11, a.A)
-    print("  运动 %.0f s（A=%.0f Hz, 段长 %.0f ms, 周期 %.2f s）..."
-          % (a.secs, a.A, dwell * 1000, 2 * dwell))
-    time.sleep(a.secs)
-    wset(11, 0.0); wset(10, 0.0)
-    d.send(0x39, bytes([19, 17]) + struct.pack("<I", 0))
-    d.send(0x39, bytes([19, 13]) + struct.pack("<I", 0))
-    d.send(0x39, bytes([19, 3]) + struct.pack("<I", 0))
-    print("  已收尾（请求 0 / 关斜坡 / 运动源回脚手架 / 失能）")
-    d.close()
-    print("  ⇒ 现在**断电/拔卡**，把卡插到电脑，跑 `analyze`")
-    return 0
+    SD_CFG = 0x24000400
+    CFG_MAGIC_OFF, CFG_REOPEN_OFF = SD_CFG + 15 * 4, SD_CFG + 8 * 4
+
+    def _syms():
+        """★ 变量地址**用 `nm` 解析**，不从 map 推、更不猜。
+        血证（本工具第一版）：我按 map 的换行约定推，差 4 字节；又用「值 == 数据区块数」去锚定，
+        而那个假设本身就是错的（`s_log_cap_data` ≠ 头部块数）⇒ 锚定失败。
+        ★ 工具链路径**从 `cmake/arm-none-eabi.cmake` 的 TOOLCHAIN_BIN 读**（单一真值源）。"""
+        import re as _re
+        tc = _re.search(r'set\(TOOLCHAIN_BIN\s+"([^"]+)"',
+                        open(os.path.join(ROOT, "cmake", "arm-none-eabi.cmake"), encoding="utf-8").read())
+        if not tc:
+            return {}
+        nm = os.path.join(tc.group(1).replace("/", os.sep), "arm-none-eabi-nm.exe")
+        if not os.path.exists(nm):
+            return {}
+        r = subprocess.run([nm, "-n", os.path.join(ROOT, "build", "dcl_h723")],
+                           capture_output=True, text=True)
+        out = {}
+        for ln in r.stdout.splitlines():
+            p = ln.split()
+            if len(p) == 3:
+                try:
+                    out[p[2]] = int(p[0], 16)
+                except ValueError:
+                    pass
+        return out
+
+    SYM = _syms()
+
+    def _u32(tgt, addr):
+        return struct.unpack("<I", bytes(tgt.read_memory_block8(addr, 4)))[0]
+
+    def log_blk(tgt):
+        a = SYM.get("s_log_blk")
+        return _u32(tgt, a) if a else None
+
+    from pyocd.core.helpers import ConnectHelper
+    sess = ConnectHelper.session_with_chosen_probe(
+        target_override="stm32h723xx",
+        options={"connect_mode": "halt", "resume_on_disconnect": True})
+    sess.open()
+    try:
+        tgt = sess.target
+        tgt.resume()
+        time.sleep(0.3)
+        print("  符号: s_log_blk=%s s_log_cap_data=%s（nm 解析）"
+              % (hex(SYM["s_log_blk"]) if "s_log_blk" in SYM else "?",
+                 hex(SYM["s_log_cap_data"]) if "s_log_cap_data" in SYM else "?"))
+        blk0 = log_blk(tgt)
+        print("  ① 触发重新开日志: SD_CFG[15]=0xF00DBEEF, SD_CFG[8]=1")
+        tgt.write_memory(CFG_MAGIC_OFF, 0xF00DBEEF, 32)     # ★ pyocd 签名: (addr, data, transfer_size)
+        tgt.write_memory(CFG_REOPEN_OFF, 1, 32)
+        time.sleep(3.5)                       # 重开可能几秒（固件自己也声明了窗口）
+        blkR = log_blk(tgt)
+        print("     重开前后 s_log_blk: %s → %s" % (blk0, blkR))
+
+        dwell = a.dwell
+        slope = int(a.A / dwell)
+        for sc, extra in (("dclc.py", [os.path.join(ROOT, "examples", "h723_step_traj_tri.dcl")]),
+                          ("h723_as5600_bind.py", [])):
+            r = subprocess.run([sys.executable, os.path.join(HERE, sc)] + extra,
+                               capture_output=True, text=True, cwd=ROOT)
+            print("  %s rc=%d" % (sc, r.returncode))
+            if r.returncode != 0:
+                raise SystemExit((r.stdout or "") + (r.stderr or ""))
+        d = Dcl(a.port or find_board())
+        shm = engine_status(d)["shm"]
+
+        def wset(n, v):
+            return d.send(0x21, struct.pack("<II", shm + HC.OFF_WIRE_MAP + n * 4,
+                                            struct.unpack("<I", struct.pack("<f", v))[0]))[0] == "ACK"
+        d.send(0x39, bytes([19, 22]) + struct.pack("<I", 1))
+        d.send(0x39, bytes([19, 20]) + struct.pack("<I", 10))
+        d.send(0x39, bytes([19, 13]) + struct.pack("<I", 1))
+        d.send(0x39, bytes([19, 17]) + struct.pack("<I", slope))
+        time.sleep(0.2)
+        blk1 = log_blk(tgt)
+        wset(10, 1.0); wset(11, a.A)
+        print("  ② 运动 %.0f s（A=%.0f Hz, 段长 %.0f ms, 周期 %.2f s）..."
+              % (a.secs, a.A, dwell * 1000, 2 * dwell))
+        time.sleep(a.secs)
+        wset(11, 0.0); wset(10, 0.0)
+        blk2 = log_blk(tgt)
+        d.send(0x39, bytes([19, 17]) + struct.pack("<I", 0))
+        d.send(0x39, bytes([19, 13]) + struct.pack("<I", 0))
+        d.send(0x39, bytes([19, 3]) + struct.pack("<I", 0))
+        print("  已收尾（请求 0 / 关斜坡 / 运动源回脚手架 / 失能）")
+        d.close()
+
+        # ③ 判定"运动到底有没有被记进卡"
+        if blk1 is not None and blk2 is not None:
+            delta = blk2 - blk1
+            print("\n  ③ **日志在不在记**：运动前 s_log_blk=%d → 运动后 %d（Δ=%d 块 = %d 条记录）"
+                  % (blk1, blk2, delta, delta * 2))
+            if delta > 0:
+                print("     ✅ 这段运动**确实写进了卡**（Δ>0）⇒ 拔卡插电脑跑 `analyze` 一定能找到")
+            else:
+                print("     ⛔ Δ=0 ⇒ **这次运动没进卡**：先解决「日志没在记」（卡接触 / SD_CFG / SD 初始化），")
+                print("        不然分析卡是白费 —— 这也**排除了「窗口在别处」的猜测**。")
+        else:
+            print("\n  ⚠ 没能锚定 s_log_blk ⇒ 无法判定「是否进卡」；仍可拔卡后跑 analyze 试。")
+        print("  ⇒ 现在**断电/拔卡**，把卡插到电脑，跑 `analyze`")
+        return 0
+    finally:
+        sess.close()
 
 
 def main():
