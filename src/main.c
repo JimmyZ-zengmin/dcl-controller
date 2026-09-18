@@ -4943,6 +4943,9 @@ int main(void)
         SHM_U32(g_shm, OFF_SCAN_CYC_SUM_HI) = (uint32_t)(g_scan_cyc_sum >> 32);
         SHM_U32(g_shm, OFF_SCAN_CYC_SUM_N)  = g_scan_cyc_sum_n;
         SHM_U32(g_shm, OFF_SCAN_NRUN_LAST)  = g_scan_nrun_last;
+        /* ★★ 累计吞吐（验"分档把每条路由都轮到"的**行为**判据, 见 engine.h 说明）*/
+        SHM_U32(g_shm, OFF_ENG_ROUTES_LO)   = (uint32_t)(g_eng_routes_total & 0xFFFFFFFFu);
+        SHM_U32(g_shm, OFF_ENG_TICKS)       = g_eng_ticks;
         /* ★ 0x3850 与范本**同址** —— 它不在上面 0x18..0x33 这一块里 (那里已排满,
          *   0x34 起是保留的 GPIO_MASK), 是照 S3 的独立位置放的。 */
         SHM_U32(g_shm, OFF_TIMING_OVERRUN)     = g_isr_overrun;

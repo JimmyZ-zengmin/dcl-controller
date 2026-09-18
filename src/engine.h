@@ -266,6 +266,17 @@ _Static_assert(BUCKET_DIV2_PHASES_USED <= BUCKET_DIV2_PHASES,
 #define OFF_SCAN_CYC_SUM_LO 0x3810   /* u32: u64 低半 */
 #define OFF_SCAN_CYC_SUM_HI 0x3814   /* u32: u64 高半 */
 #define OFF_SCAN_NRUN_LAST  0x3818   /* u32: 最近一拍的 `nrun`（**结构侧要用它**）*/
+/* ★★ 2026-09-18 新增: 累计**吞吐**两字 —— 用来验"分档确实把每条路由都轮到"。
+ *   为什么必须补它: 修 `div2 相位溢出` 缺陷时, 我能证明"路由的相位现在都在 0..63"
+ *   （结构判据）, 但**证明不了"引擎真的把每条都跑了"**（行为判据）。
+ *   本项目纪律: 结构对 ≠ 行为对 —— 必须有一个**能失败的**行为判据。
+ *   判据: `Δroutes_total / Δticks` 必须等于 Σ nrun 的算术均值。
+ *         div2 n=128 ⇒ 期望 1.28（128 条 / 100 拍）; 缺陷时只有 92 条可跑 ⇒ 会偏低。
+ *   ★ 镜像放主循环（与其它域同款）, ISR 只加两条自增（已在 `main.c` 的统计段里）。 */
+#define OFF_ENG_ROUTES_LO   0x381C   /* u32: g_eng_routes_total 低 32 位 */
+#define OFF_ENG_TICKS       0x3820   /* u32: g_eng_ticks（参与累计的拍数）*/
+_Static_assert(OFF_ENG_TICKS + 4u <= OFF_RSVD_DSL_DOMAIN,
+               "SHM: ENG_ROUTES 块不得压到 DSL 保留洞(0x3840)");
 _Static_assert((OFF_SCAN_CYC_LAST & 3u) == 0u, "SHM: SCAN_CYC 需 4 字节对齐");
 _Static_assert(OFF_SCAN_NRUN_LAST + 4u <= OFF_RSVD_DSL_DOMAIN,
                "SHM: SCAN_CYC 块不得压到 DSL 保留洞(0x3840)");
