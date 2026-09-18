@@ -498,7 +498,11 @@ ATTR_ITCM uint32_t engine_seq_tick(uint8_t *base, uint32_t tick)
     volatile SeqCtrl_t *scw = (volatile SeqCtrl_t *)(void *)(base + OFF_SEQ_CTRL);
 
     uint32_t ph1 = tick % (uint32_t)BUCKET_DIV1_PHASES;      /* 10 */
-    uint32_t ph2 = tick % (uint32_t)BUCKET_DIV2_PHASES;      /* 100 —— 原注写 64 是过期值, 见 engine.h:191 */
+    /* ★★★ 2026-09-18 修复: 用**实际相位数**(64) 而不是桶表尺寸(100)。
+     *   原写法 `tick % BUCKET_DIV2_PHASES`(=100) 会选出相位 64..99,
+     *   而路由的 phase 字段只有 6 位 ⇒ 那些相位**永远匹配不到任何路由**。
+     *   详见 `engine.h` 的 `BUCKET_DIV2_PHASES_USED` 段。 */
+    uint32_t ph2 = tick % (uint32_t)BUCKET_DIV2_PHASES_USED;
     uint32_t wrote = 0u;
 
     for (uint32_t i = 0; i < n_seq; i++) {
@@ -584,7 +588,7 @@ ATTR_ITCM uint32_t engine_tick(uint8_t *base, uint32_t tick, engine_scan_fn impl
     uint32_t *ts = (uint32_t *)(void *)(base + OFF_TICK_STATS);
 
     uint32_t ph1 = tick % (uint32_t)BUCKET_DIV1_PHASES;
-    uint32_t ph2 = tick % (uint32_t)BUCKET_DIV2_PHASES;
+    uint32_t ph2 = tick % (uint32_t)BUCKET_DIV2_PHASES_USED;   /* ★ 64, 不是 100 */
     uint32_t nrun = 0, ck = 0;
 
     uint32_t n0 = off1[0];                       /* div0 段: [0, n0) 每拍全跑 */
@@ -677,14 +681,15 @@ void engine_fill_tables(uint8_t *base, int profile)
         /* ---- 档位/相位分配 (★ 必须与工具里的 Python 预测逐字对应) ----
          * profile 3/4 = 三档混合: div = i % 3, 约 1/3 落在 div0/1/2;
          *   div1 phase = (i/3) % BUCKET_DIV1_PHASES
-         *   div2 phase = (i/3) % BUCKET_DIV2_PHASES   (**100**, 见 engine.h:191) 
+         *   div2 phase = (i/3) % BUCKET_DIV2_PHASES_USED  (**64**, 见 engine.h 的说明:
+ *                "实际相位数"必须装得进 6 位 phase 字段; 此前误用 100 导致静默丢路由) 
          * 其它 profile = 全 div0 (与阶段 2 的表保持一致, 便于对照)。 */
         uint8_t dv = PERIOD_DIV_IDX_FAST, ph = 0;
         if (profile == 3 || profile == 4) {
             uint32_t g = (uint32_t)i / 3u;
             uint32_t m = (uint32_t)i % 3u;
             if (m == 1)      { dv = PERIOD_DIV_IDX_MID;  ph = (uint8_t)(g % BUCKET_DIV1_PHASES); }
-            else if (m == 2) { dv = PERIOD_DIV_IDX_SLOW; ph = (uint8_t)(g % BUCKET_DIV2_PHASES); }
+            else if (m == 2) { dv = PERIOD_DIV_IDX_SLOW; ph = (uint8_t)(g % BUCKET_DIV2_PHASES_USED); }
         }
         rt[i].src_type     = (uint8_t)((i % 3 == 0) ? SRC_SENSOR
                                      : (i % 3 == 1) ? SRC_WIRE : SRC_CONST);
@@ -965,7 +970,7 @@ uint16_t engine_stage_program(uint8_t *base, const uint8_t *payload,
             if (!(r.flags & ROUTE_FLAG_ACTIVE)) continue;
             uint8_t dv = r.period & PERIOD_DIV_MASK;
             if      (dv == PERIOD_DIV_IDX_MID)  cnt1[s1++ % BUCKET_DIV1_PHASES]++;
-            else if (dv == PERIOD_DIV_IDX_SLOW) cnt2[s2++ % BUCKET_DIV2_PHASES]++;
+            else if (dv == PERIOD_DIV_IDX_SLOW) cnt2[s2++ % BUCKET_DIV2_PHASES_USED]++;
         }
     }
 
@@ -988,7 +993,7 @@ uint16_t engine_stage_program(uint8_t *base, const uint8_t *payload,
         uint16_t slot = 0;
         if      (dv == PERIOD_DIV_IDX_FAST) { slot = cur0++; }
         else if (dv == PERIOD_DIV_IDX_MID)  { ph = (uint8_t)(q1++ % BUCKET_DIV1_PHASES); slot = cur1[ph]++; }
-        else                                { ph = (uint8_t)(q2++ % BUCKET_DIV2_PHASES); slot = cur2[ph]++; }
+        else                                { ph = (uint8_t)(q2++ % BUCKET_DIV2_PHASES_USED); slot = cur2[ph]++; }
         r.period   = (uint8_t)(dv | (uint8_t)(ph << PERIOD_PHASE_SHIFT));
         r.reserved = 0;                       /* 显式写 0: 填充字节不参与语义, 但参与逐字节校验和 */
         memcpy(dst + (size_t)slot * 16u, &r, 16u);
