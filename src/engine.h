@@ -228,13 +228,37 @@
  *   `engine_route_validate` 拒绝）。那是**路由表格式变更**, 影响 S3 兼容与校验和,
  *   不在本次修复范围内 —— 登记为后续项。
  * ══════════════════════════════════════════════════════════════════════════ */
-#define BUCKET_DIV2_PHASES_USED 64
+/* ★★★ 2026-09-18（④ 拍长可配）: `TICK_PERIOD_US` **不再自己写一个 100** ——
+ *   它是 `clock.h` 的 `CLK_TICK_US` 的**别名**。以前两处各写一个 `100u`（**两份真相**）:
+ *   改这里只动 dt 不动 TIM2 ⇒ 所有声明的秒/毫秒整体缩放, 且**没有任何断言会响**。
+ *   ★ 可配入口: `bash build.sh -DDCL_TICK_US=200`（CMake 转发成 `-DCLK_TICK_US=200`）。
+ *   ★ 范围由 `clock.h` 三条断言守着（整除 1e6 / 整除 1000 / TIM2 ARR ≤ 16 位）。
+ *   ★★ 定义位置必须**在 `BUCKET_DIV2_PHASES_USED` 之前** —— 后者由它派生。 */
+#include "clock.h"
+#define TICK_PERIOD_US   CLK_TICK_US
+#ifndef DIV2_NOMINAL_US
+#define DIV2_NOMINAL_US 10000u     /* 能力位宣称的 div2 档周期（µs） */
+#endif
+/* ★★★ 2026-09-18（④ 拍长可配）: 相位数**由「能力位宣称的 div2 周期上限」导出** ——
+ *   原来它是写死的 64，而"64 × 拍长 = 6.4 ms"与能力位宣称的 10 ms **对不上**
+ *   （H9 遗留: 6 位 phase 字段装不下 100 个相位 ⇒ 10 ms 从来就达不到）。
+ *   现在写成 `min(64, DIV2_NOMINAL_US / 拍长)`:
+ *     · 拍长 100 µs ⇒ min(64,100) = **64**（**与改动前逐位相同** ⇒ 交付档无回归）
+ *     · 拍长 200 µs ⇒ min(64, 50) = **50**（div2 周期仍是 10 ms，能力位的宣称**结构性成立**）
+ *   而 `DT_SLOW` 与 `OP_COST_DIV2` 都从它派生 ⇒ **拍长是唯一的旋钮**。 */
+/* ★ 相位数与 `DIV2_NOMINAL_US` 的定义见本文件上方「拍长可配」段 —— 相位数由拍长派生,
+ *   所以那一段必须排在它前面。 */
+#define BUCKET_DIV2_PHASES_USED \
+    (((DIV2_NOMINAL_US / (uint32_t)TICK_PERIOD_US) < (uint32_t)(BUCKET_DIV2_PHASE_MAX + 1)) \
+     ? (DIV2_NOMINAL_US / (uint32_t)TICK_PERIOD_US) : (uint32_t)(BUCKET_DIV2_PHASE_MAX + 1))
 /* ★ 编译期闸门: 实际相位数必须**装得进 6 位字段**, 否则相位生成又会溢出。
  *   这条断言就是本缺陷的机器判据 —— 谁再把"实际相位数"改到 64 以上, 当场编译失败。 */
 _Static_assert(BUCKET_DIV2_PHASES_USED <= (BUCKET_DIV2_PHASE_MAX + 1),
                "div2 实际相位数超出 6 位 phase 字段 ⇒ 会重演 2026-09-18 的静默丢路由");
 _Static_assert(BUCKET_DIV2_PHASES_USED <= BUCKET_DIV2_PHASES,
                "div2 实际相位数不得超出桶表尺寸");
+_Static_assert(BUCKET_DIV2_PHASES_USED >= 1u,
+               "div2 相位数至少为 1（拍长 > DIV2_NOMINAL_US 时会退化到这里）");
 
 /* ---- 未落地保留区 (显式命名, 不留"无名字的空洞") ----
  * ★ 审计 H3/A7 指出: 下面两段既没有名字也没有断言, 将来往这里放新域不会报错,
@@ -926,8 +950,8 @@ _Static_assert(_Alignof(SeqCtrl_t) == 4, "SeqCtrl_t alignment must be 4");
  *   (tools/h723_op_sweep.py 两点法, 19/19 原语, 表校验和逐 op 与 Python 预测吻合)。
  *   S3 那张表是 240MHz 上的数 (DIRECT=234), 照抄就是"宣称≠实现"。 */
 #define OP_COST_DIV0         1
-#define OP_COST_DIV1         10
-#define OP_COST_DIV2         64   /* ★ 不是 100 (H9) */
+#define OP_COST_DIV1         BUCKET_DIV1_PHASES   /* ★ 2026-09-18(④): 派生, 不许手写 */
+#define OP_COST_DIV2         BUCKET_DIV2_PHASES_USED /* ★ 同上（原来是手写的 64）*/
 #define SRC_COST_FALLBACK    20   /* 未实测源类型的保守兜底 (cycles/条) */
 
 /* ══════════ 扫描路径成本: 两张**逐原语**表 (2026-09-18 定稿) ══════════════
@@ -1193,18 +1217,32 @@ static inline int op_is_stateful_h(uint8_t op)
  * ## 编译期闸门
  * 两条断言把"实际 dt ≤ 标称 dt"钉住 —— 若谁再把相位模数改大而不动 dt, 当场编译失败。
  */
-#define TICK_PERIOD_US   100u      /* 拍长（µs）—— ★ 规划中此项将变为可配 */
-#define DT_FAST  0.0001f   /* div0: 每拍全跑 ⇒ 1 拍 = 100µs */
-#define DT_MID   0.001f    /* div1: `tick % BUCKET_DIV1_PHASES` = 10 拍 = 1ms */
-/* ★ div2: 周期 = 扫描器实际用的相位模数（不是标称的 100） */
-#define DT_SLOW  ((float)BUCKET_DIV2_PHASES_USED * (float)TICK_PERIOD_US / 1000000.0f)
-/* ★ 三条编译期闸门（能失败）:
- *   ① div2 实际周期必须 ≤ 标称 10ms（超了说明相位模数被改大而 dt 没跟上）
- *   ② dt 必须 > 0（防止模数被改成 0 之类的退化）
+/* ★★★ 2026-09-18（④ 拍长可配）: `TICK_PERIOD_US` = `CLK_TICK_US` 的别名
+ *   —— 定义在**本文件上方**（相位数由它派生, 所以必须先定义）。见那一段的长注释。 */
+/* ★ dt 的三档 —— **全部由 (拍长 × 相位数) 派生**。
+ * ★★ 2026-09-18（④）: `DT_FAST`/`DT_MID` 以前是**手写字面量** `0.0001f` / `0.001f`
+ *   —— 它们只在拍长 = 100 µs 时才等于"1 拍 / 10 拍"。拍长一改，这两个就**静默变错**
+ *   （而 `DT_SLOW` 早就派生好了）⇒ 同一个语义又是"一处派生、两处手写"。
+ *   ⇒ 现在三档同源，拍长是唯一旋钮。 */
+#define DT_FAST  ((float)(1u * TICK_PERIOD_US) / 1000000.0f)
+#define DT_MID   ((float)((uint32_t)BUCKET_DIV1_PHASES * (uint32_t)TICK_PERIOD_US) / 1000000.0f)
+#define DT_SLOW  ((float)((uint32_t)BUCKET_DIV2_PHASES_USED * (uint32_t)TICK_PERIOD_US) / 1000000.0f)
+/* ★ 编译期闸门:
+ *   ① dt 必须 > 0（防止模数被改成 0 之类的退化）
+ *   ② 三档与各自的**实际扫描周期(拍)** 必须自洽 —— 这条在派生之后是**定义式**
+ *      （写出来只为把语义固定在编译期；它不会失败。真正能失败的断言在下面与 clock.h）
  *   ③ TICK_PERIOD_US 与 EXEC_BUDGET 档必须自洽 —— 见 timebase.h 的 TB_US 断言族 */
-_Static_assert((float)BUCKET_DIV2_PHASES_USED * TICK_PERIOD_US <= 10000.0f,
-               "div2 实际扫描周期超过标称 10ms ⇒ dt 语义会漂, 见 exp-EJ-throughput.md");
 _Static_assert(BUCKET_DIV2_PHASES_USED > 0, "div2 相位模数不得为 0");
+_Static_assert((float)TICK_PERIOD_US / 1000000.0f == DT_FAST &&
+               (float)((uint32_t)BUCKET_DIV1_PHASES * (uint32_t)TICK_PERIOD_US) / 1000000.0f == DT_MID,
+               "dt 必须等于「相位数 × 拍长」—— 不许手写");
+/* ★★ 预算除数必须等于**实际扫描周期(拍)** —— 这两条**能失败**:
+ *   改拍长/相位数而忘了同步 `OP_COST_DIV*`, 门就会按错误的周期摊成本
+ *   （例: 拍长 200 µs ⇒ 相位数变 50 而 `OP_COST_DIV2` 还是 64 ⇒ 门高估除数 1.28 倍 ⇒ 放行超载）。 */
+_Static_assert((uint32_t)OP_COST_DIV1 == (uint32_t)BUCKET_DIV1_PHASES,
+               "div1 的预算除数必须 = 实际扫描周期(拍)");
+_Static_assert((uint32_t)OP_COST_DIV2 == (uint32_t)BUCKET_DIV2_PHASES_USED,
+               "div2 的预算除数必须 = 实际扫描周期(拍)");
 
 /* ══════════ 编译期布局断言 (S3 A4 纪律: 任何区域不得重叠) ══════════
  * ★★ 覆盖范围必须**无缝**, 而且相邻区**必须精确相接** —— 所以下面用 `==` 而不是

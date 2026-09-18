@@ -66,10 +66,37 @@ B_CCER, B_DTMAX = 16, 64
 def read_src():
     """★ tick 周期从源码解析（与 E-Q 同纪律：**不手写 10**）。"""
     txt = open(os.path.join(ROOT, "src", "engine.h"), encoding="utf-8", errors="replace").read()
-    m = re.search(r"^#define\s+TICK_PERIOD_US\s+(\d+)u?\b", txt, re.M)
-    if not m:
-        raise SystemExit("!! src/engine.h 找不到 TICK_PERIOD_US —— ticks↔ms 的来源断了")
-    us = int(m.group(1))
+    # ★★ 2026-09-18（④ 拍长可配）: `TICK_PERIOD_US` 现在是 `CLK_TICK_US` 的**别名**
+    #   （定义在 `clock.h`）⇒ 解析器必须**跟着别名走**, 否则会以 SystemExit 报"来源断了"。
+    #   ★ 它**响亮地失败**而不是退回 100 —— 这正是"工具的隐含前提随固件改变而失效"该有的样子
+    #     （对比 h723_tick_ring 那次：写死 100 而固件早就是 64，判据静默错了一整天）。
+    def _tick_us():
+        # ★★ A/B 时板子跑的是**另一个 -DCLK_TICK_US 档**, 而源码里的默认值是 100
+        #   ⇒ 判据的期望值来源必须能被显式指定（`DCL_TICK_US` 环境变量）。
+        #   ★ 这一步**不会让假设变成沉默的**: 期望拍长若与板子不符, Q0a「tick 速率 vs
+        #     上位机墙钟」会立刻 FAIL（那是一条与源码无关的**独立**测量）⇒ A/B 自证。
+        env = os.environ.get("DCL_TICK_US")
+        if env:
+            return int(env), "环境变量 DCL_TICK_US（A/B 档）"
+        src_dir = os.path.join(ROOT, "src")
+        hdrs = {}
+        for f in ("engine.h", "clock.h"):
+            hdrs[f] = open(os.path.join(src_dir, f), encoding="utf-8", errors="replace").read()
+        for f in ("engine.h", "clock.h"):
+            m = re.search(r"^#define\s+TICK_PERIOD_US\s+(\d+)u?\b", hdrs[f], re.M)
+            if m:
+                return int(m.group(1)), "engine.h 字面量"
+        m = re.search(r"^#define\s+TICK_PERIOD_US\s+([A-Z_][A-Z0-9_]*)\b", hdrs["engine.h"], re.M)
+        if m:
+            alias = m.group(1)
+            for f in ("clock.h", "engine.h"):
+                m2 = re.search(r"^#define\s+%s\s+(\d+)u?\b" % alias, hdrs[f], re.M)
+                if m2:
+                    return int(m2.group(1)), "engine.h 别名 -> %s（在 %s）" % (alias, f)
+        raise SystemExit("!! 解析不到拍长（engine.h/clock.h 的 TICK_PERIOD_US 链断了）—— "
+                         "判据的期望值来源不可信, **拒绝静默退回旧值**")
+    us, how = _tick_us()
+    print('    拍长来源: %s ⇒ %d µs' % (how, us))
     return dict(tick_us=us, ticks_per_ms=1000.0 / us)
 
 

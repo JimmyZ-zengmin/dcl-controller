@@ -103,9 +103,35 @@ _Static_assert(CLK_APB_DIV == 2u || CLK_APB_DIV == 4u,
                "会变成 timx_ker_ck = PCLK (拍周期差 2 倍)");
 
 /* 拍 (tick) */
+/* ★★★ 2026-09-18（④ 拍长可配）：**拍长从此只有一个定义处**。
+ *
+ * ## 缺陷（本日扫描发现）
+ * 同一个物理常数以前有**两份**：
+ *   · 本文件的 `CLK_TICK_US`（决定 TIM2 的 ARR ⇒ **真实拍长**）
+ *   · `engine.h` 的 `TICK_PERIOD_US`（派生 dt ⇒ **代码以为的拍长**）
+ * 两者都是 `100u`，于是**看不出来**；而 `engine.h` 那处注释写着"★ 规划中此项将变为可配"
+ *   ⇒ 谁按那句话去改 `TICK_PERIOD_US`，**TIM2 仍然是 100 µs**，而 `dt` 变成新值
+ *   ⇒ **所有声明的秒/毫秒整体缩放**，且没有任何断言会响。
+ * ★ 这是"同一个语义两处存放"在**物理常数**上的形态（本日第 5/6/7 处见 E-Q/E-R/RETRACTIONS）。
+ *
+ * ## 修法
+ * 拍长在这里定义一次（可 `-DCLK_TICK_US=...` 覆盖），`engine.h` 的 `TICK_PERIOD_US`
+ * **别名到它** ⇒ 两者不可能分叉。三条断言把"可用的拍长范围"钉住（**都能失败**）：
+ *   ① `1e6 % 拍长 == 0` ② `1000 % 拍长 == 0` —— 否则 `step.c` 的 拍→秒/毫秒 换算不精确
+ *      （例: 150 µs ⇒ 1000/150 非整数 ⇒ **编译失败**）
+ *   ③ `TIM2 的 ARR = 200 × 拍长 ≤ 65536` —— 16 位上限 ⇒ 拍长 > 327 µs **编译失败**
+ */
+#ifndef CLK_TICK_US
 #define CLK_TICK_US     100u
+#endif
 #define CLK_TICK_CYCLES ((CLK_CPU_HZ / 1000000UL) * CLK_TICK_US)            /* 40000 周期 */
 #define CLK_TICK_TIMCNT ((CLK_TIMXCLK_HZ / 1000000UL) * CLK_TICK_US)        /* 20000 计数 */
+_Static_assert(1000000UL % CLK_TICK_US == 0UL,
+               "拍长必须整除 1e6 µs —— 否则 step.c 的「拍→秒」换算不精确（余数被丢）");
+_Static_assert(1000UL % CLK_TICK_US == 0UL,
+               "拍长必须整除 1000 µs —— 否则 step.c 的「拍→毫秒」换算不精确");
+_Static_assert(CLK_TICK_TIMCNT <= 65536UL,
+               "TIM2 的 ARR 是 16 位 ⇒ 拍长上限 = 65536/200 = 327 µs");
 
 /* ══════════ 错误码 (clock_init 返回值) ══════════ */
 #define CLK_OK               0

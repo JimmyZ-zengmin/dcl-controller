@@ -120,6 +120,17 @@ static uint32_t s_ramp_acc = 0u;
  * （对照档仍是 `dt/10` 截断, 便于 A/B）。 */
 static uint32_t s_dl_acc = 0u;
 
+/* ★★★ 2026-09-18（④ 拍长可配）: 「拍 ↔ 秒/毫秒」的换算**从拍长派生**, 不许写死。
+ *   原来斜坡写 `dv * 10000u`（"10000 拍 = 1 s"）、限时写 `s_dl_acc / 10u`（"10 拍 = 1 ms"）
+ *   —— 两者都只在**拍长 = 100 µs** 时成立。拍长一改（这是规划中的事），
+ *   **限时与斜坡会静默变成声明值的 1/N**，而且**没有任何断言会响**。
+ *   ⇒ 现在由 `TICK_PERIOD_US` 派生; `clock.h` 的三条断言保证这两个除法是**精确**的
+ *     （拍长必须整除 1e6 与 1000），否则当场编译失败。 */
+#define STEP_TICKS_PER_S   (1000000u / (uint32_t)TICK_PERIOD_US)   /* 拍/秒 */
+#define STEP_TICKS_PER_MS  (1000u    / (uint32_t)TICK_PERIOD_US)   /* 拍/毫秒 */
+_Static_assert(STEP_TICKS_PER_S  >= 1u, "拍长过大: 1 秒不足 1 拍");
+_Static_assert(STEP_TICKS_PER_MS >= 1u, "拍长过大: 1 毫秒不足 1 拍");
+
 static uint8_t *s_base = NULL;
 static uint32_t s_sync = 1u;   /* ★ 首次/重新武装后先对齐 s_last, 见 step_tick */
 
@@ -542,8 +553,8 @@ void step_tick(uint32_t tick_now)
          *   ⇒ 改成按**真实 `dt`（单位=拍，10 kHz）**算，并用**余数累加器**保证任意斜率都不丢精度
          *     （原来那个 `if (dv == 0u) dv = 1u;` 会把慢斜率量化抬到 ~2.7 kHz/s 的下限）。 */
         s_ramp_acc += (uint32_t)((uint64_t)g_step_ramp_hz_s * (uint64_t)dt);
-        uint32_t dv = s_ramp_acc / 10000u;          /* 10000 拍 = 1 s */
-        s_ramp_acc -= dv * 10000u;
+        uint32_t dv = s_ramp_acc / STEP_TICKS_PER_S;  /* ★ 派生: 原来是写死的 10000 */
+        s_ramp_acc -= dv * STEP_TICKS_PER_S;
 #else
         uint32_t dt_ms = (dt + 9u) / 10u;              /* 拍→ms，向上取整 */
         uint32_t dv    = (g_step_ramp_hz_s * dt_ms) / 1000u;
@@ -566,9 +577,9 @@ void step_tick(uint32_t tick_now)
      *   原写法 `dm = dt / 10u; if (dm == 0u) return;` 在主循环 ~3.7 拍/圈下**每圈丢 0.37 ms**
      *   ⇒ 实测流逝率 747 ms/s（部署条件）而不是 1000。 */
     s_dl_acc += dt;
-    uint32_t dm = s_dl_acc / 10u;
+    uint32_t dm = s_dl_acc / STEP_TICKS_PER_MS;
     if (dm == 0u) { return; }               /* 还不够 1 ms ⇒ 余数留着, 下圈继续攒 */
-    s_dl_acc -= dm * 10u;
+    s_dl_acc -= dm * STEP_TICKS_PER_MS;
     if (g_step_deadline_tick > dm) { g_step_deadline_tick -= dm; }
     else { g_step_deadline_tick = 0u; step_stop_safe(); }
 }

@@ -124,6 +124,7 @@ TIMER_PT     = (3.0, 5.0, 7.0)
 def read_src():
     path = os.path.join(ROOT, "src", "engine.h")
     txt = open(path, encoding="utf-8", errors="replace").read()
+    chx = open(os.path.join(ROOT, "src", "clock.h"), encoding="utf-8", errors="replace").read()
 
     def cint(name):
         m = re.search(r"^#define\s+%s\s+(\d+)u?\b" % re.escape(name), txt, re.M)
@@ -131,10 +132,52 @@ def read_src():
             raise SystemExit("!! 源码里找不到 `#define %s`（engine.h 变了? 判据的期望值来源断了）" % name)
         return int(m.group(1))
 
+    # ★★ 2026-09-18（④ 拍长可配）: `TICK_PERIOD_US` 现在是 `clock.h` 的 `CLK_TICK_US` 的
+    #   **别名**；而 `BUCKET_DIV2_PHASES_USED` 也变成了**表达式**（拍长 > 156 µs 时会变小）
+    #   ⇒ 解析器必须跟着走。★ 解析不到就**响亮退出**，不退回旧值 —— 这正是
+    #   `h723_tick_ring`（写死 100、而固件早是 64、判据静默错了一整天）该有的反面教材。
+    def _tick_us():
+        # ★★ A/B 时板子跑的是**另一个 -DCLK_TICK_US 档**, 而源码里的默认值是 100
+        #   ⇒ 判据的期望值来源必须能被显式指定（`DCL_TICK_US` 环境变量）。
+        #   ★ 这一步**不会让假设变成沉默的**: 期望拍长若与板子不符, Q0a「tick 速率 vs
+        #     上位机墙钟」会立刻 FAIL（那是一条与源码无关的**独立**测量）⇒ A/B 自证。
+        env = os.environ.get("DCL_TICK_US")
+        if env:
+            print("    拍长来源: 环境变量 DCL_TICK_US（A/B 档） ⇒ %s µs" % env)
+            return int(env)
+        for h in (txt, chx):
+            m = re.search(r"^#define\s+TICK_PERIOD_US\s+(\d+)u?\b", h, re.M)
+            if m:
+                return int(m.group(1))
+        m = re.search(r"^#define\s+TICK_PERIOD_US\s+([A-Z_][A-Z0-9_]*)\b", txt, re.M)
+        if m:
+            for h in (chx, txt):
+                m2 = re.search(r"^#define\s+%s\s+(\d+)u?\b" % m.group(1), h, re.M)
+                if m2:
+                    return int(m2.group(1))
+        raise SystemExit("!! 解析不到拍长（engine.h/clock.h 的 TICK_PERIOD_US 链断了）—— "
+                         "**拒绝静默退回旧值**")
+
+    def _div2_phases(tick_us):
+        """div2 相位数：字面量, 或固件里那条 `min(64, DIV2_NOMINAL_US/拍长)` 的**同一条规则**。
+        ★ 不解析 C 表达式（跨行续行、三元运算符太脆）—— 只认这两条明确形态；
+          认不出来就**响亮退出**，绝不猜。"""
+        m = re.search(r"^#define\s+BUCKET_DIV2_PHASES_USED\s+(\d+)u?\s*$", txt, re.M)
+        if m:
+            return int(m.group(1))
+        nom = re.search(r"^#define\s+DIV2_NOMINAL_US\s+(\d+)u?\s*(?:/\*.*)?$", txt, re.M)
+        is_expr = re.search(r"^#define\s+BUCKET_DIV2_PHASES_USED\s*\\", txt, re.M)
+        if nom and is_expr:
+            # 固件规则: min(6 位字段上限 64, DIV2_NOMINAL_US / 拍长)
+            return min(64, int(nom.group(1)) // tick_us)
+        raise SystemExit("!! 解析不到 BUCKET_DIV2_PHASES_USED 的形态（既不是字面量, 也不带 "
+                         "DIV2_NOMINAL_US）⇒ 拒绝猜 —— 判据的 div2 周期来源必须可信")
+
+    tk = _tick_us()
     out = dict(
-        tick_us     = cint("TICK_PERIOD_US"),
+        tick_us     = tk,
         ph1         = cint("BUCKET_DIV1_PHASES"),
-        ph2_used    = cint("BUCKET_DIV2_PHASES_USED"),
+        ph2_used    = _div2_phases(tk),
         ph2_table   = cint("BUCKET_DIV2_PHASES"),
         max_routes  = cint("MAX_ROUTES"),
     )
@@ -167,13 +210,19 @@ ROUTES = [
     (OP_TIMER, DIV_SLOW, SRC_CONST, 3,  9, 11, 10),
     (OP_TIMER, DIV_FAST, SRC_CONST, 3, 10, 12, 11),
     (OP_TIMER, DIV_SLOW, SRC_CONST, 3, 11, 13, 12),
-    # —— 脉冲量: RATE / PID-D（÷dt 族）；div2 的两个**相邻存放**（22,23）便于快读 ——
+    # —— 脉冲量: RATE / PID-D（÷dt 族）——
     (OP_RATE,  DIV_FAST, SRC_WIRE, W_FORCE, 20, 20, 13),
     (OP_RATE,  DIV_MID,  SRC_WIRE, W_FORCE, 21, 21, 14),
     (OP_RATE,  DIV_SLOW, SRC_WIRE, W_FORCE, 22, 22, 15),
-    # ★ PID-D 只留 div2: div0 的脉冲 100µs 不可采样; div1 的 +0.5/0.001 = 500 会撞
-    #   PID 输出的 [0,100] 上限 ⇒ 测到的是**钳位值**不是 dt（判据会假 FAIL）。
-    #   div1 的 ÷dt 由同一常量族的 LPF/PID-I div1 两条精确判据覆盖。
+    # ★★★ 2026-09-18（本工具第二版）: **原先删掉的 PID-D div0/div1 又装回来了**。
+    #   第一版删它们的理由是"div0 的脉冲 100µs 不可采样 / div1 的 Kd/dt=500 会撞 [0,100] 钳位"
+    #   —— 前半句**是错的**（见下面 LATCH 段的更正），后半句**只需把 Kd 调小**即可：
+    #       div0: Kd = 0.005 ⇒ Kd/dt =   50  （< 100 ✓）
+    #       div1: Kd = 0.05  ⇒ Kd/dt =   50  （< 100 ✓）
+    #       div2: Kd = 0.5   ⇒ Kd/dt = 78.125（不变, 与 E-Q 第一版一致）
+    #   ⇒ 三档同一个量子 50, 于是**一条阈值梯 (30,70) 就能同时夹住 div0 与 div1**。
+    (OP_PID,   DIV_FAST, SRC_WIRE, W_FORCE2, 25, 23, 16),
+    (OP_PID,   DIV_MID,  SRC_WIRE, W_FORCE2, 24, 24, 17),
     (OP_PID,   DIV_SLOW, SRC_WIRE, W_FORCE2, 23, 25, 18),
 ]
 
@@ -196,24 +245,57 @@ ROUTES = [
 #       正确 dt ⇒ RATE div2 峰值 156.25 ⇒ 超过 145 但不超 165
 #       陈旧 dt ⇒              峰值 100    ⇒ 一个都不超
 #   两个方向的读数都必须是"对的"才算 PASS —— 只判"超了 145"无法排除"超得多得多"。
-LATCH = [
-    # (源 wire, 阈值, 锁存 wire) —— 22 = RATE div2, 23 = PID-D div2, 21 = RATE div1
-    (22, 105.0, 40), (22, 125.0, 41), (22, 145.0, 42), (22, 165.0, 43),
-    (23,  55.0, 44), (23,  85.0, 45),
-    (21, 900.0, 46), (21, 1100.0, 47),   # div1 对照: 脉冲宽仅 1ms, 靠锁存照样抓得住
-]
-# ★ 每个源上的阈值**成对跨过期望值**, 于是图案给出一个**区间**而不是一个布尔:
-#     超了低阈值 = 峰值确实到了; 没超高阈值 = 峰值没有失控。
-#   只判前者会漏掉"超得多得多", 只判后者会漏掉"根本没动" —— 两个方向都要对。
-LATCH_EXPECT = {22: (145.0, 165.0), 23: (55.0, 85.0), 21: (900.0, 1100.0)}
+# ★★★ 阈值梯的**阈值必须由量子派生**, 不许写死。
+#   ★ 这是 200 µs A/B 当场暴露的**我自己的判据退化**:
+#     阈值原先是按 100 µs 档的量子手写的（RATE div0 用 9000/11000 夹 10000）。
+#     拍长改成 200 µs 后, 量子变成 5000 ⇒ **5000 根本不超 9000** ⇒ 测到的图案是 [0,0],
+#     而"期望图案"也是按 5000 算出来的 [0,0] ⇒ **判据照样 PASS**。
+#     ⇒ 它从一个"夹住区间"退化成"只给上界", 而且**不响**。
+#   ⇒ 现在阈值 = (0.9×量子, 1.1×量子), 量子由拍长派生 ⇒ 任何拍长下都夹得住。
+_LADDER_SPEC = {22: ("RATE  div2", 1.0, DIV_SLOW), 23: ("PID-D div2", 0.5, DIV_SLOW),
+                21: ("RATE  div1", 1.0, DIV_MID), 20: ("RATE  div0", 1.0, DIV_FAST),
+                25: ("PID-D div0", 0.005, DIV_FAST), 24: ("PID-D div1", 0.05, DIV_MID)}
+
+
+def _quantum(scale, dv):
+    """该 (op, 档) 的 ÷dt 量子 —— 与固件同一条式子: scale / (相位数 × 拍长)。"""
+    tk = int(os.environ.get("DCL_TICK_US") or 100)
+    import re as _re
+    try:
+        _t = open(os.path.join(ROOT, "src", "clock.h"), encoding="utf-8",
+                  errors="replace").read()
+        _m = _re.search(r"^#define\s+CLK_TICK_US\s+(\d+)u?\b", _t, _re.M)
+        if _m and not os.environ.get("DCL_TICK_US"):
+            tk = int(_m.group(1))
+    except Exception:
+        pass
+    ph = {DIV_FAST: 1, DIV_MID: 10, DIV_SLOW: min(64, 10000 // tk)}[dv]
+    return scale / (ph * tk / 1e6)
+
+
+LATCH = []
+LATCH_EXPECT = {}
+LATCH_LABEL = {}
+for _k, (_si, (_lab, _sc, _dv)) in enumerate(sorted(_LADDER_SPEC.items())):
+    _q = _quantum(_sc, _dv)
+    LATCH.append((_si, round(0.9 * _q, 4), 40 + 2 * _k))
+    LATCH.append((_si, round(1.1 * _q, 4), 41 + 2 * _k))
+    LATCH_EXPECT[_si] = (round(0.9 * _q, 4), round(1.1 * _q, 4))
+    LATCH_LABEL[_si] = _lab
+QPRE = {_si: _quantum(_sc, _dv) for _si, (_l, _sc, _dv) in _LADDER_SPEC.items()}
 # ★ HYST 是**有状态**原语 ⇒ 每条锁存路由必须有**独立且非零**的 state_offset
 #   （共用状态 ⇒ 六个阈值互相置位, 而症状是"锁存图案看起来也像数据"）。
 #   param_idx = 29+k（阈值 T 存 value_a）, state_offset = 19+k。
 for _k, (_si, _thr, _dst) in enumerate(LATCH):
     ROUTES.append((OP_HYST, DIV_FAST, SRC_WIRE, _si, _dst, 29 + _k, 19 + _k))
 
-NPARAMS = 29 + len(LATCH)
+NPARAMS = 29 + len(LATCH) + 2          # +2 = 条件路径的两个阈值/超时参数
 NSTATES = 19 + len(LATCH)
+# ★ SEQ 条件路径的两个参数索引（放在最后, 与 params_blob 的赋值一致）
+SEQ_COND_A_PIDX = NPARAMS - 2
+SEQ_COND_B_PIDX = NPARAMS - 1
+W_SEQ_COND = 32                        # 条件路径用的**强制源 wire**（无生产者）
+SEQ_COND_W0 = 18                       # 两个条件实例的步号镜像 wire（18/19, 与 12..17 不撞）
 
 
 def params_blob():
@@ -229,13 +311,19 @@ def params_blob():
         p[8 + 2 * k] = (pt, 0.0, 0.0, 0.0)
         p[9 + 2 * k] = (pt, 0.0, 0.0, 0.0)
     p[20] = p[21] = p[22] = (0.0, 0.0, 0.0, 0.0)   # RATE 不用参数
-    p[23] = p[24] = p[25] = (0.0, 0.0, 0.5, 0.0)   # PID-D: Kp=0 Ki=0 Kd=0.5 sp=0
+    # ★ PID-D 三档共用同一个**量子 50**, 靠各自调小 Kd 躲开输出的 [0,100] 钳位:
+    p[23] = (0.0, 0.0, 0.005, 0.0)                 # div0: 0.005/0.0001 =  50
+    p[24] = (0.0, 0.0, 0.05,  0.0)                 # div1: 0.05 /0.001  =  50
+    p[25] = (0.0, 0.0, 0.5,   0.0)                 # div2: 0.5  /0.0064 =  78.125
     p[26] = (0.0, 2.0, 0.0, 0.0)                   # SEQ 超时秒 = value_b
     p[27] = (0.0, 4.0, 0.0, 0.0)
     p[28] = (0.0, 6.0, 0.0, 0.0)
     for k, (_si, thr, _dst) in enumerate(LATCH):
         # HYST: value_a = 置位阈值, value_b = 复位阈值 = 0 ⇒ **永不复位**的一次性锁存
         p[29 + k] = (thr, 0.0, 0.0, 0.0)
+    # ★ SEQ 条件路径（阈值 + 超时同时使能）: value_a = 阈值(>), value_b = 超时秒
+    p[SEQ_COND_A_PIDX] = (5.0, 3.0, 0.0, 0.0)      # 阈值 5 ⇒ 我在 t≈1s 把它拉过 5 ⇒ 阈值先到
+    p[SEQ_COND_B_PIDX] = (50.0, 3.0, 0.0, 0.0)     # 阈值 50 ⇒ 永远不到 ⇒ 只能靠超时 3s
     return b"".join(struct.pack("<4f", *q) for q in p)
 
 
@@ -271,17 +359,24 @@ def deploy_payload():
 def seq_payload():
     """0x44: [n_seq:u8][n_steps:u16] + 目录(n_seq×6B) + 步表(n_steps×16B)
 
-    实例 0..2 = div0（PT=2/4/6）, 实例 3..5 = div2（PT=2/4/6）。
+    实例 0..2 = div0（纯超时 PT=2/4/6）, 实例 3..5 = div2（纯超时 PT=2/4/6）。
+    ★★ 实例 6/7（本工具第二版新增）= **条件路径**: `cond_type=1`（读 WIRE 阈值 > value_a）
+       且同时使能超时（value_b 秒）。两者读**同一条强制 wire[32]**:
+         实例 6: 阈值 5.0  ⇒ 我在 t≈1s 把 wire 拉过 5 ⇒ **阈值路径**先到（3s 超时远在后面）
+         实例 7: 阈值 50.0 ⇒ 永远到不了     ⇒ **只能靠超时**在 3s 到
+       ⇒ 一条强制 wire 同时判两条路径, 而且两条的**到达时刻**可区分（1s vs 3s）。
     period 字节只给 div —— **相位由固件分配**（h_seq_deploy: phase = 同 div 组内序号）。
-    每实例 2 步, 两步都是「无条件 + 使能超时」（cond_type=2 必须配 timeout_en, 否则 NAK）。
-    步 1 是末步 ⇒ 反复"推进到自己", out_wire 恒 2.0（单调, 便于判翻转）。
+    每实例 2 步；步 1 是末步 ⇒ 反复"推进到自己", out_wire 恒 2.0（单调, 便于判翻转）。
     """
-    insts = [(DIV_FAST, 26), (DIV_FAST, 27), (DIV_FAST, 28),
-             (DIV_SLOW, 26), (DIV_SLOW, 27), (DIV_SLOW, 28)]
+    insts = [(DIV_FAST, 26, 2, 0), (DIV_FAST, 27, 2, 0), (DIV_FAST, 28, 2, 0),
+             (DIV_SLOW, 26, 2, 0), (DIV_SLOW, 27, 2, 0), (DIV_SLOW, 28, 2, 0),
+             (DIV_FAST, SEQ_COND_A_PIDX, 1, W_SEQ_COND),   # 阈值 5.0 + 超时 3s
+             (DIV_FAST, SEQ_COND_B_PIDX, 1, W_SEQ_COND)]   # 阈值 50 + 超时 3s
     dirs, tbl = [], []
     off = 0
-    for i, (div, pidx) in enumerate(insts):
-        dirs.append(struct.pack("<BBBBH", 2, SEQ_W0 + i, div, 0, off))
+    for i, (div, pidx, cond_type, cond_idx) in enumerate(insts):
+        ow = (SEQ_COND_W0 + (i - 6)) if i >= 6 else (SEQ_W0 + i)
+        dirs.append(struct.pack("<BBBBH", 2, ow, div, 0, off))
         for _ in range(2):
             # SeqStepEntry_t: cond_type u8, cond_idx u8, flags u8, rsvd u8,
             #                 param_idx u16, state_offset u16, jump_idx u16, rsvd2 u32
@@ -290,7 +385,8 @@ def seq_payload():
             #    ★ 这一条是**离线对拍**抓到的: 我第一版按字段和写了 14 字节/步,
             #      12 步就少 24 字节 ⇒ 固件会 NAK "seq: length mismatch"。
             #      手写打包结构与 C 结构体不一致, 是本项目的老族（§5.67 载荷字段错位）。
-            tbl.append(struct.pack("<BBBBHHHI", 2, 0, 0x02, 0, pidx, 0, 0, 0) + b"\x00\x00")
+            tbl.append(struct.pack("<BBBBHHHI", cond_type, cond_idx, 0x02, 0, pidx, 0, 0, 0)
+                       + b"\x00\x00")
         off += 2
     return (struct.pack("<BH", len(insts), off) + b"".join(dirs) + b"".join(tbl))
 
@@ -513,8 +609,24 @@ def main():
         #   常数偏斜在**斜率**里抵消, 在 div0/div2 配对里也抵消（两侧同偏）。
         print("    ★ 读数顺序 = 先 wire 块后环头 ⇒ tick 相对 wire 有常数偏斜(~5 拍);")
         print("      斜率与 div0/div2 配对都把它抵消掉。")
-        res.append(("Q0a tick 速率 = %.1f Hz ±0.3%%（实测 %.3f）" % (S["hz"], b_t),
-                    abs(b_t / S["hz"] - 1.0) <= 0.003))
+        # ★★ 2026-09-18（第二版）: **σ 不能只信拟合残差** —— 残差自相关（读数延迟在窗口内漂移）
+        #   会让 σ 被严重低估: 实测四轮斜率 −0.03% / +0.10% / +0.07% / +0.01%,
+        #   而单轮拟合给的 σ 只有 ~0.03% ⇒ 两轮之间"差 4σ"却都"通过"。
+        #   ⇒ 这里补一个**分段（split-half）估计**: 把窗口对半各拟合一次, 取两个斜率之差
+        #     作为**漂移**的实测上界, 判据容差取 max(3×标准误, 3×漂移)。
+        half = len(rec) // 2
+        b1 = lin([r[2] for r in rec[:half]], [r[0] for r in rec[:half]])[0]
+        b2 = lin([r[2] for r in rec[half:]], [r[0] for r in rec[half:]])[0]
+        drift = abs(b2 - b1) / S["hz"]
+        print("    分段(前半/后半)斜率 = %.3f / %.3f Hz ⇒ **漂移 = %.3f%%**（σ_fit 只有 %.3f%%）"
+              % (b1, b2, 100.0 * drift, 100.0 * (rms_t / (len(rec) ** 0.5) / b_t)))
+        print("    ⇒ 判据容差 = max(0.3%%, 3×漂移) = %.3f%%（★ 只信 σ_fit 会把"
+              "「读数延迟漂移」当成不存在）" % (100.0 * max(0.003, 3.0 * drift)))
+        tol_tick = max(0.003, 3.0 * drift)
+        res.append(("Q0a tick 速率 = %.1f Hz ±%.3f%%（实测 %.3f；分段漂移 %.3f%%）"
+                    % (S["hz"], 100.0 * tol_tick, b_t, 100.0 * drift),
+                    abs(b_t / S["hz"] - 1.0) <= tol_tick))
+        data["tick_drift_pct"] = 100.0 * drift
         d_w = rec[-1][3] - w0
         d_t = rec[-1][0] - tk0
         print("    交叉核对: 环写增量 %d, tick 增量 %d ⇒ 差 %+d（RUN 段应 1:1）"
@@ -703,13 +815,14 @@ def main():
                     if abs(val) > 1e-6:
                         hits[wi] += 1
         # ★ 主判据: 锁存梯（免竞态）—— 读一次即可, 与采样时刻无关
-        raw = rd(dcl, shm + OFF_WIRE_MAP + 4 * 40, 8)
-        lat = list(struct.unpack("<8f", raw[:32])) if raw else [float("nan")] * 8
+        #   ★ 第二版: 锁存路由 12 条（6 源 × 2 阈值）⇒ 锁存 wire 40..51 ⇒ 一次读 16 字（40..55）
+        raw = rd(dcl, shm + OFF_WIRE_MAP + 4 * 40, 16)
+        lat = list(struct.unpack("<16f", raw[:64])) if raw else [float("nan")] * 16
         print("\n    锁存梯（读一次就知道, 与采样时刻无关）:")
         for k, (si, thr, dst) in enumerate(LATCH):
-            print("      源 wire[%-2d] > %-6.1f → 锁存 wire[%d] = %.1f" % (si, thr, dst, lat[k]))
-        for si, lab, pred in ((22, "RATE  div2", exp["q_rate"]), (23, "PID-D div2", exp["q_pid"]),
-                              (21, "RATE  div1", exp["q_rate1"])):
+            print("      源 wire[%-2d] > %-9.2f → 锁存 wire[%d] = %.1f" % (si, thr, dst, lat[k]))
+        for si, lab in LATCH_LABEL.items():
+            pred = QPRE[si]      # ★ 派生量子（随拍长走）—— 不再用写死的 exp[...]
             lo, hi = LATCH_EXPECT[si]
             pat = [lat[k] >= 0.5 for k, (s2, _t, _d) in enumerate(LATCH) if s2 == si]
             want = [t <= pred for (s2, t, _d) in LATCH if s2 == si]
@@ -730,15 +843,63 @@ def main():
             else:
                 res.append(("Q5-次级 %s 轮询峰值 = %.4f（1/dt 结构值 %.4f ±2%%）" % (lab, pk, pred),
                             abs(pk / pred - 1.0) <= 0.02))
-        # ★ div0 的 ÷dt 族**结构上测不到**: 脉冲宽 = 1 拍 = 100µs, 而锁存路由也是 div0
-        #   —— 它和 RATE 在**同一拍**执行, 而 div0 段内 RATE 在锁存之后 ⇒ 锁存看到的
-        #   永远是"上一拍"的值, 而上一拍 RATE 的输出已经是 0（脉冲早在一拍内过去了）。
-        #   ⇒ 记 SKIP 并写明**为什么**, 不记 PASS。div0 的 dt 由 TIMER/LPF/PID 三条覆盖。
-        print("    ★ RATE/PID-D **div0** 不判（SKIP, 不是 PASS）: 脉冲宽 = 1 拍 = 100µs,")
-        print("      而锁存器也是 div0 且同拍内排在 RATE 之后 ⇒ 它读到的永远是 0。")
-        print("      div0 的 dt 由 TIMER(div0 斜率)/LPF(div0 τ)/PID-I(div0 斜率) 三条覆盖。")
-        skip.append("Q5 RATE/PID-D div0 —— 脉冲宽 1 拍, 同拍锁存读不到（结构性不可测）")
+        # ★★★ 2026-09-18 更正: 第一版在这里写下「div0 的 ÷dt 族结构性不可测」——
+        #   **理由是反的**。div0 组内按表序扫描, 而锁存路由排在 RATE/PID-D div0 之后
+        #   ⇒ 它读到的正是本拍刚写下的脉冲。已补上 3 条锁存路由（wire 48..53）。
+        #   ★ 这条更正本身比它补上的判据更重要: **SKIP 的理由也必须能被推翻**。
+        print("    ★ div0 ÷dt 族已补判据（第一版的『结构性不可测』是**错的**, 见工具内更正）:")
+        print("      · RATE  div0 峰值应落在 (9000, 11000]  ∋ 1/0.0001 = 10000")
+        print("      · PID-D div0/div1 峰值应落在 (30, 70] ∋ Kd/dt = 0.005/0.0001 = 0.05/0.001 = 50")
         data["peaks"] = {str(k): max((abs(x) for x in v), default=0.0) for k, v in peaks.items()}
+
+        # ══ 阶段 C（第二版新增）: SEQ **条件路径**（阈值 + 超时同时使能）══
+        #   E-Q 第一版只测了纯超时步（cond_type=2）⇒ "阈值转移"这条路径**一条判据都没有**。
+        #   设计: 两个 div0 实例读**同一条强制 wire[32]**（无生产者）:
+        #     实例6 阈值 5.0  + 超时 3s ⇒ 我在 t≈1.0s 把 wire 拉过 5 ⇒ **阈值**先到
+        #     实例7 阈值 50.0 + 超时 3s ⇒ 永远到不了                ⇒ **只能靠超时**在 3s 到
+        #   ⇒ 两条路径的到达时刻可区分（≈1s vs ≈3s）, 且都在同一个窗口里量。
+        print("\n── 阶段 C: SEQ 条件路径（阈值转移 + 超时同时使能）──")
+        dcl.send(CMD_FORCE, struct.pack("<HBf", W_SEQ_COND, 1, 0.0)); time.sleep(0.05)
+        dcl.send(CMD_STOP); time.sleep(0.15)
+        dcl.send(CMD_START)                 # ★ START 把所有 seq 实例复位到 step0 / step_tick=0
+        t0h = ring_head(dcl, shm); tk0 = t0h[1]
+        forced_tk = None
+        crec = []
+        c_end = time.time() + 4.6
+        while time.time() < c_end:
+            raw = rd(dcl, shm + OFF_WIRE_MAP, 34)      # wire[0..33]（含 18/19 = 条件实例）
+            h = ring_head(dcl, shm)
+            if raw is None or h is None:
+                skip.append("阶段 C —— 读失败"); break
+            ws = struct.unpack("<34f", raw[:136])
+            tk = h[1]
+            crec.append((tk, ws[18], ws[19], ws[W_SEQ_COND]))
+            if forced_tk is None and (tk - tk0) * S["tick_s"] >= 1.0:
+                dcl.send(CMD_FORCE, struct.pack("<HBf", W_SEQ_COND, 1, 10.0))   # 拉过阈值 5.0
+                forced_tk = ring_head(dcl, shm)[1]
+        if crec:
+            def _cross(idx, thr=1.5):
+                for tk, a, b, s in crec:
+                    if (a if idx == 0 else b) >= thr:
+                        return tk
+                return None
+            ta, tb = _cross(0), _cross(1)
+            print("    阈值源 wire[%d] 在 tick=%s 被拉过 5.0（相对 t0 = %.3f s）"
+                  % (W_SEQ_COND, forced_tk, ((forced_tk - tk0) * S["tick_s"]) if forced_tk else float('nan')))
+            if ta and tb and forced_tk:
+                sa, sb = (ta - tk0) * S["tick_s"], (tb - tk0) * S["tick_s"]
+                print("    实例6（阈值 5.0）在 %.3f s 推进；实例7（阈值 50, 只能靠超时）在 %.3f s 推进"
+                      % (sa, sb))
+                res.append(("C1 SEQ **阈值路径**: 阈值 5.0 实例在拉起后 %.0f ms 内推进（声明超时是 3 s）"
+                            % ((ta - forced_tk) * S["tick_s"] * 1000.0),
+                            abs((ta - forced_tk) * S["tick_s"]) <= 0.30))
+                res.append(("C2 SEQ **超时路径**: 阈值 50 实例在声明超时 3.0 s 附近推进（±0.3 s）"
+                            % (), abs(sb - 3.0) <= 0.30))
+                res.append(("C3 两条路径**可区分**: 阈值实例(%.3f s) 明显早于超时实例(%.3f s)"
+                            % (sa, sb), sa < sb - 1.0))
+            else:
+                skip.append("阶段 C —— 没同时抓到两条路径的推进（tk0=%s forced=%s ta=%s tb=%s）"
+                            % (tk0, forced_tk, ta, tb))
 
     finally:
         try:

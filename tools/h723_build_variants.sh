@@ -17,7 +17,10 @@ cd "$(dirname "$0")/.." || exit 9
 RC_ALL=0
 
 echo "════ A) 交付档 (BOOT_SEL=1) —— 期望 RC=0 ════"
-bash build.sh > /tmp/h723_variants_delivery.log 2>&1
+# ★★ 显式传"可粘性"选项: CMake 的 `-D` 会**留在缓存里**, 无参 build.sh 会沿用上一次的值
+#   ⇒ 实测踩过: `-DDCL_TICK_US=200` 之后这里产出的"交付档"其实是 **200 µs 档**
+#     （见 RETRACTIONS P30 / docs/exp-EU-tick-and-cost.md §④）。
+bash build.sh -DDCL_TICK_US=100 -DDCL_BOOT_SEL=1 -DDCL_LOOP_RESET=1 > /tmp/h723_variants_delivery.log 2>&1
 RC=$?; echo "  DELIVERY_RC=$RC"
 if [ "$RC" -ne 0 ]; then
     echo "  ❌ 交付档构建失败 —— **不要往下走, 也不要烧旧镜像**"

@@ -168,6 +168,15 @@ set(DCL_DO_MASK_UNION "1" CACHE STRING "DO 掩码保留位 (1 保留位不可剔
 #        => 声明 12000 Hz/s 实测 ~32 kHz/s (四量互证, 见 MEMORY §5.31)
 set(DCL_STEP_RAMP_FIX "1" CACHE STRING "斜坡 dt 修复 (1 按真实 dt=交付 / 0 改前行为=对照)")
 
+# ---- ★★★ 拍长可配 (2026-09-18, E-U/④) ----
+#   以前"拍长"有**两份真相**: `clock.h` 的 `CLK_TICK_US`(决定 TIM2 的 ARR = 真实拍长)
+#   与 `engine.h` 的 `TICK_PERIOD_US`(派生 dt = 代码以为的拍长), 两处都写 100u。
+#   谁按后者的注释("规划中此项将变为可配")去改, TIM2 仍是 100µs 而 dt 变了
+#     ⇒ **所有声明的秒/毫秒整体缩放**, 且没有任何断言会响。
+#   ⇒ 现在只有这一个旋钮; 派生链: 拍长 → TIM2 ARR / dt 三档 / div2 相位数 / 门的除数 /
+#     step.c 的「拍↔秒·毫秒」换算。范围由 clock.h 三条断言守着(整除 1e6 / 整除 1000 / ARR≤16位)。
+set(DCL_TICK_US "100" CACHE STRING "拍长 (µs) —— 可用范围 1..327 且必须整除 1000 与 1000000")
+
 # ---- ★★★ 步进 ENA 极性 + 停止保持力矩 (2026-09-17, PLAN-device-config-v1 P0) ----
 #   起因: 现场"电机响但轴不动" = `g_step_ena_pol` 的**隐藏默认值**与实机接线相反,
 #         把「使能 / 失能 / 上电安全态」**三处同时弄反** (H723-MOTION-QUALITY-AUDIT §16)。
@@ -249,6 +258,7 @@ add_compile_options(
     -DDCL_DO_LATCH=${DCL_DO_LATCH}
     -DDCL_DO_MASK_UNION=${DCL_DO_MASK_UNION}
     -DDCL_STEP_RAMP_FIX=${DCL_STEP_RAMP_FIX}
+-DCLK_TICK_US=${DCL_TICK_US}
     -DDCL_TIMEBASE=${DCL_TIMEBASE}
     -DDCL_STEP_ENA_POL=${DCL_STEP_ENA_POL}
     -DDCL_STEP_STOP_HOLD=${DCL_STEP_STOP_HOLD}
