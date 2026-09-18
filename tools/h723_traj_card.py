@@ -113,7 +113,73 @@ def _backward_blocks(d, hdr, want, max_blocks):
     return [], None, scanned
 
 
+def _read_range(d, hdr, max_blocks):
+    """从写指针往回**读满 max_blocks 块**（不做早停），返回全部记录（按块内物理顺序 = 时间序）。
+    ★ 为什么需要"不早停"：判别实验会在卡上留下**多次**运行，要一次都判掉 ⇒
+      只找到第一个窗口就停会把后面两次白跑（还要再拔插一次卡）。"""
+    start, nblk, wp = hdr[H_START], hdr[H_NBLK], hdr[H_WP]
+    out, scanned = [], 0
+    step = 4096
+    chunks = []
+    while scanned < max_blocks:
+        lo = wp - step
+        if lo < start:
+            lo += nblk
+        parts, lba, left = [], lo, step
+        while left > 0:
+            n = min(left, start + nblk - lba)
+            parts.append(d.read(lba, n * BLK))
+            lba += n
+            left -= n
+            if lba >= start + nblk:
+                lba = start
+        chunks.append((lo, _decode(b"".join(parts))))
+        scanned += step
+        wp = lo
+    # 按时间（从旧到新）拼起来：chunk 是从新往旧收集的 ⇒ 反转
+    for lo, recs in reversed(chunks):
+        out += recs
+    return out
+
+
+def cmd_analyze_all(a):
+    """把扫描范围内**所有**含 A 相的窗口都判一遍（每次运行一个窗口）⇒ 一次换卡拿到多组结论。"""
+    d = _find_card(a.disk)
+    try:
+        hdr = _hdr(d)
+        print("  头部: 写指针 LBA=%d 已落盘=%d 条" % (hdr[H_WP], hdr[H_RECS]))
+        print("  往回读满 %d 块（%.0f MB）..." % (a.blocks, a.blocks * BLK / 1e6))
+        recs = _read_range(d, hdr, a.blocks)
+        print("  共 %d 条记录" % len(recs))
+        nwin = 0
+        for gi, g in enumerate(_split_boots(recs)):
+            on = [i for i, r in enumerate(g) if r[3] > a.A / 2]
+            if len(on) < 50:
+                continue
+            # 把 A 相按"间隔 > 2 s"切成不同次运行（tick 单位 100 µs ⇒ 20000）
+            runs, s, prev = [], on[0], on[0]
+            for i in on[1:]:
+                if g[i][0] - g[prev][0] > 20000:
+                    runs.append((s, prev)); s = i
+                prev = i
+            runs.append((s, prev))
+            for x, y in runs:
+                if y - x < 50:
+                    continue
+                nwin += 1
+                print("\n══════ 窗口 #%d：%d 条 A 相（段 %d, tick %d..%d）══════"
+                      % (nwin, y - x + 1, gi, g[x][0], g[y][0]))
+                _judge(g[max(0, x - 200):min(len(g), y + 200)], a.A, a.dwell)
+        if not nwin:
+            print("  没找到任何含 A 相的窗口 ⇒ 检查 `run` 是否写进卡（看它的 s_log_blk Δ）")
+            return 2
+        return 0
+    finally:
+        d.close()
+
+
 def cmd_analyze(a):
+    """只判**最新一个** A 相窗口（首跑/单次运行用）。"""
     d = _find_card(a.disk)
     try:
         hdr = _hdr(d)
@@ -334,7 +400,13 @@ def cmd_run(a):
         print("     重开前后 s_log_blk: %s → %s" % (blk0, blkR))
 
         dwell = a.dwell
-        slope = int(a.A / dwell)
+        # ★ `--slope` 覆盖：本实验要判"40 ms 死区 / 3.25×A 过冲"**跟不跟着斜率变**
+        #   ⇒ 固定段长、只动斜率（不用重编 .dcl），看峰值与形状怎么变。
+        slope = int(a.slope) if a.slope else int(a.A / dwell)
+        peak_expected = min(a.A, slope * dwell)
+        print("  斜率 = %d Hz/s（段长 %.0f ms ⇒ 相位末理论峰值 %.0f Hz%s）"
+              % (slope, dwell * 1000, peak_expected,
+                 "" if peak_expected >= a.A else " ← **达不到 A**"))
         for sc, extra in (("dclc.py", [os.path.join(ROOT, "examples", "h723_step_traj_tri.dcl")]),
                           ("h723_as5600_bind.py", [])):
             r = subprocess.run([sys.executable, os.path.join(HERE, sc)] + extra,
@@ -386,11 +458,12 @@ def cmd_run(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["run", "analyze"])
+    ap.add_argument("cmd", choices=["run", "analyze", "analyze-all"])
     ap.add_argument("--disk", type=int, default=None)
     ap.add_argument("--blocks", type=int, default=131072, help="analyze: 往回最多搜多少块")
     ap.add_argument("--A", type=float, default=1200.0)
     ap.add_argument("--secs", type=float, default=6.0)
+    ap.add_argument("--slope", type=int, default=0, help="覆盖斜坡斜率 Hz/s（0=用 A/段长）")
     ap.add_argument("--dwell", type=float, default=None, help="秒；缺省从 .dcl 读")
     ap.add_argument("--port", default=None)
     a = ap.parse_args()
@@ -399,7 +472,11 @@ def main():
         txt = open(os.path.join(ROOT, "examples", "h723_step_traj_tri.dcl"), encoding="utf-8").read()
         a.dwell = float(re.search(r"DWELL\s+([\d.]+)ms", txt).group(1)) / 1000.0
     print("=== h723_traj_card: %s (A=%.0f, 段长 %.0f ms) ===" % (a.cmd, a.A, a.dwell * 1000))
-    return cmd_run(a) if a.cmd == "run" else cmd_analyze(a)
+    if a.cmd == "run":
+        return cmd_run(a)
+    if a.cmd == "analyze-all":
+        return cmd_analyze_all(a)
+    return cmd_analyze(a)
 
 
 if __name__ == "__main__":
