@@ -520,10 +520,26 @@ ATTR_ITCM uint32_t engine_seq_tick(uint8_t *base, uint32_t tick)
         /* ---- (div, phase) 门: 与本拍的路由扫描同一套数 (相位对齐) ---- */
         uint8_t pd = (uint8_t)(period & PERIOD_DIV_MASK);
         uint8_t ph = (uint8_t)((period >> PERIOD_PHASE_SHIFT) & 0x3Fu);
+        /* ★★★ 2026-09-18 (E-Q): dt 的取值从此**只有一个来源**。
+         *
+         * 这里原来手写了 `0.0001f / 0.001f / 0.01f` 三个字面量 —— 而 `DT_SLOW` 的缺陷
+         * （div2 实际周期 = 64 拍 = 6.4ms, 却按标称 10ms 计）在**路由档**修好之后,
+         * 顺序档这一份**副本没有被修**: 同一个错误数字活在两处, 只改了一处。
+         *
+         * ## 实测后果（E-Q 量化, 见 `docs/exp-EQ-dt-semantics.md`）
+         * 声明 2/4/6 秒的顺序超时, **实际在 1.29/2.56/3.84 秒就触发**（早 36%）。
+         * 而部署 ACK、步号单调推进、无任何报错 —— 与路由档当初的缺陷**逐字同族**。
+         *
+         * ## 修法
+         * 直接用 `DT_FAST/DT_MID/DT_SLOW` —— 它们**由 (相位数 × 拍长) 导出**,
+         * 且被 `engine.h` 的编译期断言守着。于是"相位模数 / 拍长 / dt"三者
+         * **在两个域里都不可能各自漂移**（原来只有路由域受这条保证）。
+         * ⇒ 这不是"再改一个数字", 而是把**两份语义合并成一份**;
+         *   下次谁调 `TICK_PERIOD_US` 或相位数, 两个域会一起跟着动。 */
         float dt;
-        if (pd == PERIOD_DIV_IDX_FAST)      dt = 0.0001f;
-        else if (pd == PERIOD_DIV_IDX_MID)  { if (ph1 != ph) continue; dt = 0.001f; }
-        else if (pd == PERIOD_DIV_IDX_SLOW) { if (ph2 != ph) continue; dt = 0.01f; }
+        if (pd == PERIOD_DIV_IDX_FAST)      dt = DT_FAST;
+        else if (pd == PERIOD_DIV_IDX_MID)  { if (ph1 != ph) continue; dt = DT_MID; }
+        else if (pd == PERIOD_DIV_IDX_SLOW) { if (ph2 != ph) continue; dt = DT_SLOW; }
         else continue;                                       /* div=3 非法: 不收不推 */
 
         /* ---- 读本步条目 (越界保护: 表损坏时宁可不动, 不读别人的槽) ---- */

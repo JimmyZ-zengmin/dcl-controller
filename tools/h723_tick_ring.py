@@ -9,7 +9,7 @@ h723_tick_ring.py — **逐拍**预测 vs 逐拍实测（E4 的严格形态）
 
 ★★ 判据为什么先做"纯结构性"的那一条
   成本模型（Σc + k×转变数 + c₀）只在 2 个原语对上验过。而**桶调度的结构**是确定的:
-      nrun(t) = n_div0 + cnt1[t%10] + cnt2[t%100]
+      nrun(t) = n_div0 + cnt1[t%10] + cnt2[t%64]
   ⇒ 实测 `di` 的**不同取值**应与**不同的 nrun** 一一对应, 且**每个取值的出现频次**
     应等于 `t ∈ [0,100)` 中该 nrun 出现的次数。
   这条判据**完全不依赖成本模型** ⇒ 它能在"模型还不全"的时候就判定
@@ -23,7 +23,7 @@ h723_tick_ring.py — **逐拍**预测 vs 逐拍实测（E4 的严格形态）
 
   P1 ★ **模型预言均值 vs 实测窗口均值**（本工具现在唯一的主判据）
      模型: `E[di] = c0 + c_route × E[nrun]`, 其中 `E[nrun]` 由**实读的桶表**算出
-     （`nrun(t) = n_div0 + cnt1[t%10] + cnt2[t%100]`），`c0`/`c_route` 由 E1 两点法
+     （`nrun(t) = n_div0 + cnt1[t%10] + cnt2[t%64]`），`c0`/`c_route` 由 E1 两点法
      **独立标定**、经 `--c0/--c-route` 传入 —— **不是**从本窗口拟合。
      判据: |实测均值 − 预言| ≤ `--sigma` × 标准误（默认 3）。
 
@@ -58,7 +58,36 @@ cmd_status, cmd_deploy, cmd_stop, cmd_start, cmd_burst = 0x38, 0x10, 0x12, 0x11,
 OFF_ROUTE_TABLE, OFF_ROUTE_BUCKETS = 0x0840, 0x4480
 OFF_EXEC_RING_HDR, OFF_EXEC_RING = 0x3880, 0x3890
 RING_SLOTS = 256
-B1P, B2P = 10, 100
+# ★★★ 2026-09-18 (E-Q): **相位模数必须来自源码, 不能手写。**
+#   本工具原来写死 `B2P = 100`（= 桶表尺寸）, 但固件选 div2 相位用的是
+#   `BUCKET_DIV2_PHASES_USED`（**64** —— 路由的 phase 字段只有 6 位）。
+#   固件修好之后这两者**分了叉**, 而工具里这一份**没人改** ⇒ `pred_nrun` 按 `t%100`
+#   算, 于是"128 条 div2 路由"被预测成"36/100 拍跑 0 条、64/100 拍跑 2 条"（均值 1.28）,
+#   真相却是**每拍都跑 2 条**（均值 2.0）⇒ P1 以 **+106 cyc / 53 个标准误** FAIL。
+#   ★ 这是"同一个语义两处存放, 只改一处"的**第三个现场**:
+#       ① 路由档 DT_SLOW（已修） ② 顺序档 engine_seq_tick 的 dt（E-Q 修, engine.c）
+#       ③ **上位机**这一个（本次修）
+#   ⇒ 现在从 `src/engine.h` 解析; 解析不到就**当场退出**（不静默退回 100）。
+def _src_phase_modulus():
+    import re as _re
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _txt = open(os.path.join(_root, "src", "engine.h"), encoding="utf-8", errors="replace").read()
+    _m = _re.search(r"^#define\s+BUCKET_DIV2_PHASES_USED\s+(\d+)u?\b", _txt, _re.M)
+    if not _m:
+        raise SystemExit("!! src/engine.h 里找不到 BUCKET_DIV2_PHASES_USED —— 相位模数的"
+                         "来源断了（判据的期望值不可信）; **拒绝静默退回旧值 100**")
+    return int(_m.group(1))
+
+
+B1P = 10
+B2P = _src_phase_modulus()   # ★ 固件**实际**用的相位模数（参与相位算术）
+B2_TABLE = 100               # 桶表里 div2 的槽数（只用于**读表**, 不参与相位算术）
+def _lcm(a, b):
+    import math as _m
+    return a * b // _m.gcd(a, b)
+
+
+B2_PERIOD = _lcm(B1P, B2P)   # 一个完整调度周期的拍数（原来写死 100）
 ACTIVE = 0x01
 SRC_CONST, DST_WIRE = 2, 2
 # ★ `tick` 健康阈值与判读（2026-09-18 实测标定, 依据见 `_wait_healthy`）
@@ -213,6 +242,11 @@ def main():
                     help="时基频率（TIM5=200 MHz）；`di` 的单位是它的 tick")
     ap.add_argument("--sigma", type=float, default=3.0,
                     help="均值判据的容差（标准误的倍数）")
+    # ★★ 容差的**第二项**: 模型常数(c0/c_route)自己的标定不确定度。
+    #   来源见 docstring 的留点检验: +1.6 cyc(±11.4) / −0.6 cyc(±13.2) ⇒ 取 15。
+    #   ★ 不加它, 判据会把"标定精度的极限"当成"模型错", 见 P1 处的长注释。
+    ap.add_argument("--tol-cyc", type=float, default=15.0, dest="tol_cyc",
+                    help="模型常数自身的标定不确定度 (CPU cyc) —— 判据容差的**下限**")
     # ★★ 黑匣子对照（`0x39 CMD_PIN_PATTERN` op=4）: `di` 量的是**整段 ISR**, 除引擎扫描外
     #   还含 `bb_kick()`（每拍一次 AXI 写 + 每 1024 拍的重活）、`adc_poll_kick()`、
     #   `rtc_latch()`、`i2c_sm_tick()`。要谈"周期的精确计算", 必须先把**引擎扫描**从
@@ -390,7 +424,9 @@ def main():
             print("  [SKIP] P1/P2/P3 —— 窗口不足, **不是 PASS**")
             return 2
 
-        # ── 结构预测: nrun(t) = n_div0 + cnt1[t%10] + cnt2[t%100] ─────────
+        # ── 结构预测: nrun(t) = n_div0 + cnt1[t%10] + cnt2[t%64] ───────────
+        # ★ 两个模数**不同**（10 与 64）, 所以一个完整周期是 lcm(10,64) = 320 拍,
+        #   不是 100 拍。原来按 `t%100` 走一遍, 只是**碰巧**覆盖了 div1 的周期。
         bk = rd(dcl, shm + OFF_ROUTE_BUCKETS, 110)
         rt = rd(dcl, shm + OFF_ROUTE_TABLE, 128 * 4)
         if bk is None or rt is None:
@@ -400,10 +436,14 @@ def main():
         off2, cnt2 = list(u[20:120]), list(u[120:220])
         nr = off1[0] + sum(cnt1) + sum(cnt2)
         n0 = off1[0]
-        pred_nrun = Counter(n0 + cnt1[t % B1P] + cnt2[t % B2P] for t in range(100))
-        print("\n结构预测（一个 100 拍周期内）: n_routes=%d  div0=%d" % (nr, n0))
+        if any(cnt2[B2P:]):
+            # 死槽判据（与固件 engine_bucket_dead_slots 同义）: phase 64..99 必须恒 0
+            print("!! 警告: div2 桶表的相位 %d..99 非零 ⇒ 桶表与相位模数不自洽" % B2P)
+        pred_nrun = Counter(n0 + cnt1[t % B1P] + cnt2[t % B2P] for t in range(B2_PERIOD))
+        print("\n结构预测（一个 %d 拍周期内; div1 模数 %d, div2 模数 %d, 桶表槽 %d）:"
+              " n_routes=%d  div0=%d" % (B2_PERIOD, B1P, B2P, B2_TABLE, nr, n0))
         for k, c in sorted(pred_nrun.items()):
-            print("    本拍跑 %-4d 条 ⇒ 占 %3d/100 拍" % (k, c))
+            print("    本拍跑 %-4d 条 ⇒ 占 %3d/%d 拍" % (k, c, B2_PERIOD))
 
         # ★★★ 2026-09-18 判据改写：**原来的 P1/P2/P3 被数据推翻了**。
         #
@@ -433,7 +473,7 @@ def main():
         #     而分母（拍数）是独立数出来的**实测**值, 不与模型共享。
         obs = sorted(hist.items())
         pn = sorted(pred_nrun.items())
-        mean_nrun = sum(k * v for k, v in pred_nrun.items()) / 100.0
+        mean_nrun = sum(k * v for k, v in pred_nrun.items()) / float(B2_PERIOD)
         mu = sum(vals) / float(cnt)
         var = sum((x - mu) ** 2 for x in vals) / float(cnt - 1) if cnt > 1 else 0.0
         sd = var ** 0.5
@@ -449,15 +489,26 @@ def main():
               % (mu, sd, sem, cnt))
         print("    换成 CPU cyc: 实测 %.0f  预言 %.0f  ⇒ 偏差 %+.0f cyc"
               % (mu * unit, pred_mean * unit, (mu - pred_mean) * unit))
-        tol = a.sigma * sem
+        # ★★★ 2026-09-18 (E-Q): 容差必须**同时**包含两件事, 取大者:
+        #   ① 抽样不确定度 `σ×标准误`（窗口本身有多准）
+        #   ② **模型常数自己的不确定度** `--tol-cyc`
+        #   ★ 为什么必须加 ②: `c0`/`c_route` 是 E1 两点法标定的, 它们自带 ~±12 cyc 的
+        #     标定散布（本文件 docstring 记录: 留点检验 +1.6(±11.4) / −0.6(±13.2)）。
+        #     而窗口均值 256 拍的标准误只有 ~1 TB = 2 cyc ⇒ 只按 ① 判, 判据实际问的是
+        #     "标定常数是不是精确到 2 cyc", 而不是"模型对不对" ——
+        #     于是一个 **+7 cyc(0.5%)** 的系统差会以 **7 个标准误** FAIL。
+        #   ★ 判据因此**仍然能失败**: 它抓到过的真实偏差是 **+106 cyc**(相位模数错),
+        #     是这条容差的 7 倍。
+        tol = max(a.sigma * sem, a.tol_cyc / unit)
         dev = mu - pred_mean
-        print("    偏差 = %+.1f cyc = %+.2f 标准误（判据: |偏差| ≤ %.2f 标准误）"
-              % (dev, dev / sem if sem else 0.0, a.sigma))
-        # ★ 取值个数只作**描述**打印, 不再当判据 —— 它测的是"噪声有多少", 不是"模型对不对"。
+        print("    偏差 = %+.1f cyc = %+.2f 标准误" % (dev, dev / sem if sem else 0.0))
+        print("    判据容差 = max(%.0f×标准误 = %.1f cyc , 标定不确定度 %.1f cyc) = **%.1f cyc**"
+              % (a.sigma, a.sigma * sem * unit, a.tol_cyc, tol * unit))
         print("    参考: 实测 %d 个不同取值（模型只预言 %d 个档位）—— 差额即拍内其它工作"
               % (len(obs), len(pn)))
 
-        res.append(("P1 实测窗口均值落在模型预言 ±%.1f 标准误内" % a.sigma, abs(dev) <= tol))
+        res.append(("P1 实测窗口均值落在模型预言 ±%.1f cyc 内（= max(%.0f×标准误, 标定 %.0f cyc)）"
+                    % (tol * unit, a.sigma, a.tol_cyc), abs(dev) <= tol))
         if a.json:
             import json
             os.makedirs(os.path.dirname(a.json) or ".", exist_ok=True)
