@@ -45,13 +45,20 @@ OUTPUT  o     TO wire[12] FROM slow
 
 
 def compile_text(text, tag):
-    """返回 (rc, 输出)；rc==0 表示编过。★ 用**真子进程**调 dclc: 与用户路径完全一致。"""
+    """返回 (rc, 输出)；rc==0 表示编过。★ 用**真子进程**调 dclc: 与用户路径完全一致。
+
+    ★★★ 2026-09-18 修: 原来没给 `encoding=` ⇒ Windows 上 subprocess 用 **GBK** 解 dclc 的
+      **UTF-8** 输出 ⇒ 要么抛 UnicodeDecodeError、要么错码 ⇒ 下面比对中文报错文本
+      (`"跨档速率不合法" in out`) **恒不命中** ⇒ **C1 从来就是假 FAIL**。
+      这不是小毛病: 它意味着"这条检查能红"的**唯一证明**一直是无效的
+      （而本文件开头的理由恰恰是"必须有能失败的对照"）。"""
     fd, path = tempfile.mkstemp(suffix=".dcl", prefix="_ratetest_")
     os.close(fd)
     try:
         io.open(path, "w", encoding="utf-8").write(text)
         r = subprocess.run([sys.executable, DCLC, path, "--dump"],
-                           capture_output=True, text=True, cwd=ROOT)
+                           capture_output=True, text=True, cwd=ROOT,
+                           encoding="utf-8", errors="replace")
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     finally:
         try:
@@ -87,7 +94,8 @@ def main():
     bad = []
     for f in ex:
         r = subprocess.run([sys.executable, DCLC, os.path.join(ROOT, "examples", f), "--dump"],
-                           capture_output=True, text=True, cwd=ROOT)
+                           capture_output=True, text=True, cwd=ROOT,
+                           encoding="utf-8", errors="replace")
         if r.returncode != 0:
             bad.append(f)
     print("  [%s] C3 既有 examples 全部仍能编过（%d 个，回归）"

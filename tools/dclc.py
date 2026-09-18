@@ -12,10 +12,17 @@ v0/v0.1 支持语句:
   PID    <name> FROM <sig> SP=<v> KP=<v> KI=<v> [KD=<v>]   # 输出自带 0..100 限幅
   ALARM  <name> FROM <sig> <op> <thr>           # op: > >= < <=  输出 1/0
   LOGIC  <name> = <a> AND <b> | <a> OR <b> | NOT <a>
-  OUTPUT <name> TO wire[<n>] FROM <sig>         # DIRECT sig→固定槽 wire[n], name 是其别名
+  OUTPUT <name> TO wire[<n>] FROM <sig> [PERIOD=<t>]   # DIRECT sig→固定槽 wire[n], name 是其别名
+                                                #   PERIOD= 缺省 div0(每拍); 见下方"档位"段
   CONST/GT-GE-LT-LE-EQ-NE/TON-TOF-TP/CTU-CTD/CTUD/SR-RS/R_TRIG-F_TRIG/
   LIMIT/ADD-SUB-MUL-DIV-MAX-MIN/SEL   (FBD 标准块, 见下方)
+  ABS   <name> FROM <sig>              # 绝对值 —— **组合展开** MAX(x, 0-x), 引擎无此原语
+  # ★ `THR=`(GT/GE/LT/LE/EQ/NE) 与 `ALARM` 的右端可以写**信号**: 引擎 prim_cmp 只从 param
+  #   取阈值 ⇒ 变量阈值展开成 `SUB`+`CMP`(2 路由); 字面量仍是 1 条原生 CMP。
   SEQ <name> TO wire[<n>] [PERIOD=<t>]          # 顺序域 (Sequencer v0.2)
+  # ★ 档位: PERIOD= 只选 **div 档**(1/10/64 拍), **不承诺相位** —— 相位由固件
+  #   engine_stage_program 按'档内到达序 % 相位数'轮转分配, 载荷里的 phase 位被覆写
+  #   (见 docs/exp-EV-gate-phase-dependency.md)。可用值由固件源码派生, 报错时会列出。
       UNTIL <sig> > <thr>                       #   该步: 条件推进
       DWELL <time>                              #   该步: 超时强推
       LOOP                                      #   末步行为: 回卷 (缺省=停完成态)
@@ -46,7 +53,7 @@ v0/v0.1 支持语句:
 #   语义等价性的证据: 同一套协议下 S3 的 test_dcl.py **一行不改** 能打 H723 (22/30)。
 # ══════════════════════════════════════════════════════════════════════════
 
-import sys, re, struct, time
+import sys, re, struct, time, os, io
 
 # ---------- 常量 (与 shared_mem.h 对齐) ----------
 OP = dict(DIRECT=0x00, CMP=0x01, HYST=0x02, CLAMP=0x03, LPF=0x04, PID=0x05,
@@ -54,8 +61,93 @@ OP = dict(DIRECT=0x00, CMP=0x01, HYST=0x02, CLAMP=0x03, LPF=0x04, PID=0x05,
           TIMER=0x0C, SCALE=0x0E, AND=0x0F, OR=0x10, NOT=0x11,
           ARITH=0x0D, SR=0x12)      # FBD 第二批
 ARITH_MODE = dict(ADD=0, SUB=1, MUL=2, DIV=3, MAX=4, MIN=5)
-# PERIOD= 时间字面量 → div 档索引 (与 shared_mem.h PERIOD_DIV_IDX_* 一致)
-PERIOD_DIV = {0.0001: 0, 0.001: 1, 0.01: 2}
+# ══════════════════════════════════════════════════════════════════════════
+# PERIOD= 时间字面量 → div 档索引 —— ★★ 2026-09-18(3.1): **由固件源码派生, 不写死**
+#
+# 血证(这就是本条改动的由来): 这张表原来写的是 `{0.0001: 0, 0.001: 1, 0.01: 2}` ——
+#   即"div2 = 10ms"。而引擎真实的 div2 周期 = `BUCKET_DIV2_PHASES_USED × 拍长`
+#   = **64 × 100µs = 6.4ms**(phase 只有 6 位, 装不下 100 个相位 ⇒ 10ms 在 100µs 档上
+#   **从来达不到** —— 固件自己的注释就是这么写的), 而编译器仍在承诺 10ms
+#   ⇒ 典型"宣称 ≠ 实现", 且**没有任何东西会响**。
+# ⇒ 处方: 三档周期全部从 `src/` 派生(与固件 `DT_FAST/DT_MID/DT_SLOW` 同一条规则);
+#   读不到就**响亮退出**, 绝不退回写死的旧值。
+#
+# ★ `10ms` 仍被收下, 但只作为**能力位标称值 `DIV2_NOMINAL_US` 的别名**, 且用时报出
+#   真实周期 —— 代价为零(它只是"选档"), 但不许再让读的人以为真的是 10ms。
+# ══════════════════════════════════════════════════════════════════════════
+_R = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _src_text(path):
+    try:
+        return io.open(path, encoding="utf-8", errors="replace").read()
+    except OSError as e:
+        raise SystemExit(
+            "错误: 读不到 %s (%s)\n"
+            "  ⇒ dclc 的 PERIOD= 档位表**由固件源码派生**(拍长/相位数), 拒绝退回写死的旧值\n"
+            "    (旧值里的 div2=10ms 在 100µs 档上从来达不到 —— 见 tools/dclc.py 本段注释)"
+            % (path, e))
+
+
+def _src_int(txt, name, where):
+    m = re.search(r"^#define\s+%s\s+(\d+)u?\b" % re.escape(name), txt, re.M)
+    if not m:
+        raise SystemExit("错误: %s 里找不到 `#define %s` ⇒ PERIOD= 档位表的来源断了(拒绝猜)"
+                         % (where, name))
+    return int(m.group(1))
+
+
+def engine_timeline():
+    """引擎三档的**真实**周期(µs) ⇒ `(tick_us, [div0_us, div1_us, div2_us])`。
+    ★ div2 相位数在固件里是表达式 `min(BUCKET_DIV2_PHASE_MAX+1, DIV2_NOMINAL_US/拍长)`
+      (`engine.h` 的 `BUCKET_DIV2_PHASES_USED`) ⇒ 这里按**同一条规则**重算, 不解析 C 表达式。
+    ★ 拍长可用环境变量 `DCL_TICK_US` 覆盖(A/B 档: 板子跑的是另一个 -DCLK_TICK_US)。"""
+    ch = _src_text(os.path.join(_R, "src", "clock.h"))
+    eh = _src_text(os.path.join(_R, "src", "engine.h"))
+    env = os.environ.get("DCL_TICK_US")
+    if env:
+        tick = int(env)
+    else:
+        tick = None
+        for txt in (eh, ch):
+            m = re.search(r"^#define\s+TICK_PERIOD_US\s+(\d+)u?\b", txt, re.M)
+            if m:
+                tick = int(m.group(1))
+                break
+        if tick is None:                     # `TICK_PERIOD_US = CLK_TICK_US` 别名形态
+            m = re.search(r"^#define\s+TICK_PERIOD_US\s+([A-Z_][A-Z0-9_]*)\b", eh, re.M)
+            if m:
+                tick = _src_int(ch, m.group(1), "clock.h")
+        if tick is None:
+            raise SystemExit("错误: 解析不到拍长(engine.h 的 TICK_PERIOD_US → clock.h 的 "
+                             "CLK_TICK_US 链断了) ⇒ 拒绝静默退回 100")
+    ph1 = _src_int(eh, "BUCKET_DIV1_PHASES", "engine.h")
+    m = re.search(r"^#define\s+BUCKET_DIV2_PHASES_USED\s+(\d+)u?\s*$", eh, re.M)
+    if m:
+        ph2 = int(m.group(1))
+    else:
+        cap = _src_int(eh, "BUCKET_DIV2_PHASE_MAX", "engine.h") + 1
+        nom = _src_int(eh, "DIV2_NOMINAL_US", "engine.h")
+        if not re.search(r"^#define\s+BUCKET_DIV2_PHASES_USED\s*\\", eh, re.M):
+            raise SystemExit("错误: BUCKET_DIV2_PHASES_USED 既不是字面量、也不带 "
+                             "DIV2_NOMINAL_US ⇒ 拒绝猜(它是 PERIOD= 档位表的来源)")
+        ph2 = min(cap, nom // tick)
+    return tick, [1 * tick, ph1 * tick, ph2 * tick]
+
+
+TICK_US, TIER_US = engine_timeline()
+PERIOD_DIV = {round(us / 1e6, 6): i for i, us in enumerate(TIER_US)}      # 真实值
+_div2_nom = _src_int(_src_text(os.path.join(_R, "src", "engine.h")), "DIV2_NOMINAL_US",
+                     "engine.h")
+PERIOD_NOMINAL_ALIAS = round(_div2_nom / 1e6, 6)      # 能力位标称(div2 的别名)
+if PERIOD_NOMINAL_ALIAS in PERIOD_DIV:                # 相等时别名无意义(200µs 档就是 10ms)
+    PERIOD_NOMINAL_ALIAS = None
+
+
+def tier_name(div):
+    """给 dump/desc/报错用: 报**真实**周期, 不报标称。"""
+    us = TIER_US[div]
+    return ("%gus" % us) if us < 1000 else ("%gms" % (us / 1000.0))
 SRC = dict(SENSOR=0, WIRE=1, CONST=2, HMI=3)   # HMI=3: 通信域设定区 (40065-40128)
 DST_WIRE = 2
 MAX_WIRES, MAX_ROUTES, MAX_PARAMS, MAX_STATES = 128, 128, 128, 128
@@ -120,6 +212,22 @@ EDGE_MODE  = dict(R_TRIG=0, F_TRIG=1)                   # prim_edge: value_a
 CNT_MODE   = dict(CTU=0, CTD=1)                         # prim_cnt: value_a
 TIME_UNIT  = dict(us=1e-6, ms=1e-3, s=1.0, m=60.0, h=3600.0)
 
+# ★★ 2026-09-18(3.3): **数字文法只有这一处** —— 原来 11 个语句各写一份
+#   `-?[\d.eE+]+`, 后果有两条(都实测过):
+#     ① 收不下带符号指数的写法(`1e-3`/`2.5E-7`) —— 而这是工程里最常用的写法;
+#     ② `CONST x = 1e` 这类会被正则**收下**, 然后在裸 `float()` 上抛 ValueError
+#        **栈回溯** —— 使用者看到的是 Python 崩了, 而不是"第几行的字面量非法"。
+NUMPAT = r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
+
+
+def parse_num(tok, what="值"):
+    """数字字面量 → float; 非法 ⇒ **干净报错**(不抛 ValueError 栈回溯)。"""
+    if not re.fullmatch(NUMPAT, tok):
+        raise SystemExit("错误: %s 不是合法数字字面量 '%s'（例: 1 / -2.5 / .5 / 1e-3 / 2E+7）"
+                         % (what, tok))
+    return float(tok)
+
+
 def parse_time(tok):
     """时间字面量 → 秒 (引擎 TIMER 阈值单位): 3s / 500ms / 100us / 2m / 1h / 裸数字=秒"""
     m = re.fullmatch(r'(-?[\d.]+(?:[eE][-+]?\d+)?)(us|ms|s|m|h)?', tok)
@@ -158,6 +266,7 @@ class Sym:
         self.params = []     # 每项 4 floats
         self.routes = []     # 每项 route 参数字典
         self.state_next = 1  # state 槽从 1 起 (0 保留/非法)
+        self._zero_w = None  # ★ 全程序共享的隐藏常量 0.0 (ABS/变量阈值组合用), 首次用时才建
         self.cur_period = 0  # 当前语句的 div 档 (PERIOD= 后缀设置, 缺省 0=每拍)
         # 顺序域 (Sequencer v0.2): 单实例, SEQ 块须文件尾
         self.seq = None          # dict: out_wire, div, steps[(cond_t,cond_i,thr,dwell,loop_last)]
@@ -267,6 +376,61 @@ class Sym:
             raise SystemExit("错误: STATE 槽耗尽")
         return so
 
+    def is_sig(self, tok):
+        """该 token 是不是**信号引用**（裸 wire[n] / sensor[n] / hmi[n] / 已声明名）。
+        用于 `THR=`/ALARM 右端"字面量 vs 信号"的判定 —— 判定规则写死在这里一处。"""
+        if re.fullmatch(r'(wire|sensor|hmi)\[\d+\]', tok):
+            return True
+        return tok in self.slot
+
+    def zero_wire(self):
+        """隐藏常量 0.0 的 wire 槽（全程序共享一条 CONST 路由）。"""
+        if self._zero_w is None:
+            self._zero_w = self.alloc_wire('_zero')
+            p = self.add_param([0.0, 0.0, 0.0, 0.0])
+            self.add_route(SRC['CONST'], p, OP['DIRECT'], self._zero_w)
+        return self._zero_w
+
+    def to_wire(self, tok, hint):
+        """把任意源取成 **wire 槽号** —— 组合算子(ARITH)的第二输入只能是 wire。
+        ★ 源本来就是 wire ⇒ 0 额外路由; 否则补一条隐藏 DIRECT（否则"传感器直接进
+          ABS/变量阈值"要么报怪错、要么更坏: 静默用错槽）。"""
+        t, i = self.ref(tok)
+        if t == SRC['WIRE']:
+            return i
+        w = self.alloc_wire('_w_%s' % hint)
+        self.add_route(t, i, OP['DIRECT'], w)
+        return w
+
+    def cmp_out(self, name, src_tok, op_s, thr_tok, kw='CMP'):
+        """比较的**唯一出口** —— 阈值可以是字面量或信号。
+        字面量 ⇒ 1 条原生 `CMP`; 信号 ⇒ 2 条组合 `SUB`(求差) + `CMP`(与 0 比)。
+        ★ 为什么变量阈值必须组合: `prim_cmp` 只从 `param.value_a` 取阈值,
+          固件**没有**"第二输入当阈值"的形态(见 src/primitives.h) ⇒ 不动 ① 层就只能组合。
+        ★ 组合的等价性边界（实测与推理, 见 docs/exp-EX-composed-blocks.md）:
+          `x - r` 在 IEEE 下**精确**(近值相减无误差; 反号大数可能上溢到 inf ⇒
+          极端量级下 EQ/NE 的语义仍是"差不为 0", 与直觉一致但不再是"位相等"）。"""
+        mode = {'>': 0, '>=': 1, '<': 2, '<=': 3, '==': 4, '!=': 5}[op_s]
+        st, si = self.ref(src_tok)
+        if self.is_sig(thr_tok):
+            wi = self.to_wire(thr_tok, 'cmpref_%s' % name)
+            wd = self.alloc_wire('_cmpd_%s' % name)
+            ch = self.alloc_wire(name)
+            p_sub = self.add_param([float(ARITH_MODE['SUB']), 0.0, 0.0, 0.0])
+            self.add_route(st, si, OP['ARITH'], wd, param_idx=p_sub, wire2=wi)
+            p_cmp = self.add_param([0.0, float(mode), 0.0, 0.0])
+            self.add_route(SRC['WIRE'], wd, OP['CMP'], ch, param_idx=p_cmp)
+            self.desc.append("%-7s %s = wire[%d]  <- (%s %s %s)  [2 路由组合: SUB+CMP"
+                             " —— 引擎 CMP 无 wire 阈值]" % (kw, name, ch, src_tok, op_s, thr_tok))
+        else:
+            thr = parse_num(thr_tok, '%s 的阈值' % kw)
+            ch = self.alloc_wire(name)
+            p = self.add_param([thr, float(mode), 0.0, 0.0])
+            self.add_route(st, si, OP['CMP'], ch, param_idx=p)
+            self.desc.append("%-7s %s = wire[%d]  <- (%s %s %g)"
+                             % (kw, name, ch, src_tok, op_s, thr))
+        return ch
+
     def add_param(self, vals):
         if len(self.params) >= MAX_PARAMS:
             raise SystemExit(f"错误: PARAM 槽耗尽 (>{MAX_PARAMS})")
@@ -294,8 +458,11 @@ class Sym:
         if len(self.seq["steps"]) > MAX_SEQ_STEPS:
             raise SystemExit(f"错误: SEQ 步数超限 (>{MAX_SEQ_STEPS})")
 
-    def kv(self, body, key, default=None, required=False, cast=float):
-        m = re.search(r'\b' + key + r'=(-?[\d.eE+]+)', body)
+    def kv(self, body, key, default=None, required=False, cast=None):
+        # ★ 当前**仓内无调用者**(grep 可证); 保留它是因为它是 DSL 的通用键值解析。
+        #   数字文法必须与别处一致 ⇒ 默认走 parse_num, 不再各写一份。
+        cast = parse_num if cast is None else cast
+        m = re.search(r'\b' + key + r'=([^\s]+)', body)
         if not m:
             if required:
                 raise SystemExit(f"错误: 缺少必填参数 {key}=")
@@ -303,8 +470,55 @@ class Sym:
         return cast(m.group(1))
 
 
+def split_period(stmts):
+    """★★ 2026-09-18(3.1): `PERIOD=` 的**唯一**解析点(预扫) —— 返回 `[(kw, body, div)]`。
+
+    为什么必须预扫(这是一个真缺陷, 不是洁癖): PERIOD= 原来只在**第二遍**里剥掉,
+    而**第一遍**(OUTPUT 固定槽预检)拿的是**没剥后缀**的原文 ⇒
+    `OUTPUT o TO wire[12] FROM x PERIOD=1ms` 在第一遍就被 fullmatch 判"语法错误",
+    于是 `OUTPUT` **不接受 `PERIOD=`**(错误提示里还专门写了一句让人绕开它)。
+    ⇒ 现在两个 pass 用**同一个**已剥后缀的列表, "同一个语义两处解析"这条隐患一并消掉。
+
+    ★ SEQ 块内(UNTIL/DWELL/LOOP)带 `PERIOD=` ⇒ **显式报错**: 档位是 SEQ 行上的属性,
+      逐步档不存在; 若默默剥掉就是"设了就算"。
+    """
+    out = []
+    for kw, body in stmts:
+        div, had = 0, False
+        m = re.search(r'\s+PERIOD=(\S+)\s*$', body)
+        if m:
+            had = True
+            tok = m.group(1)
+            t = round(parse_time(tok), 6)
+            if t in PERIOD_DIV:
+                div = PERIOD_DIV[t]
+            elif PERIOD_NOMINAL_ALIAS is not None and t == PERIOD_NOMINAL_ALIAS:
+                div = 2      # 能力位标称值 → div2, 但**报真实周期**(统一打印, 不静默)
+                print("  ! PERIOD=%s 是能力位的**标称值**; 本档真实周期 = %s "
+                      "(div2 = %d 拍 x %guS; phase 只有 6 位 ⇒ 标称的 %s 达不到)"
+                      % (tok, tier_name(2), TIER_US[2] // TICK_US, TICK_US, tok))
+            else:
+                raise SystemExit(
+                    "错误: PERIOD=%s 不是引擎能给的档位\n"
+                    "  ⇒ 本引擎只有三档(由固件源码派生): %s\n"
+                    "     div0 = 1 拍 = %s · div1 = %d 拍 = %s · div2 = %d 拍 = %s\n"
+                    "  ★ div2 是 %d 拍而**不是**标称的 %gms —— phase 字段只有 6 位。"
+                    % (tok,
+                       " / ".join("div%d=%s" % (i, tier_name(i)) for i in range(3)),
+                       tier_name(0), TIER_US[1] // TICK_US, tier_name(1),
+                       TIER_US[2] // TICK_US, tier_name(2),
+                       TIER_US[2] // TICK_US, _div2_nom / 1000.0))
+            body = body[:m.start()]
+        if had and kw in ('UNTIL', 'DWELL', 'LOOP'):
+            raise SystemExit("错误: SEQ 块内不允许 PERIOD= (第 '%s' 行) ⇒ 档位是 SEQ 行上的"
+                             "属性, 逐步档位不存在" % kw)
+        out.append((kw, body, div))
+    return out
+
+
 def compile_stmts(stmts):
     S = Sym()
+    stmts = split_period(stmts)
     # ★★★ 2026-09-17 预扫: 把**所有被引用的裸 wire 槽**先占住, 再开始分配。
     #   为什么必须"预扫"而不是"用到时才记账": 各语句处理器都是
     #   **先 `alloc_wire(输出名)` 再 `ref(源)`** ⇒ 若只在 ref 里记账, 那么"第一次引用
@@ -312,14 +526,14 @@ def compile_stmts(stmts):
     #   ⇒ 预扫一遍语句文本, 把裸槽全部登记进 `in_wires`(自动分配跳过)。
     #   ★ 把 OUTPUT 的 `TO wire[n]` 也一并登记**无害**: 它本来就在 `pinned` 里既跳过,
     #     而"读+写同一个槽"(自锁存)是合法用法, 不该被拒。
-    for _kw, _body in stmts:
+    for _kw, _body, _dv in stmts:
         for _m in re.finditer(r'wire\[(\d+)\]', _body):
             S.in_wires.add(int(_m.group(1)))
     # 第一遍: 先处理 OUTPUT 的固定槽, 避免自动槽占用
     # (M5 审计: set.add 幂等对"两个不同名 OUTPUT 钉同一 wire"静默 — 编译期给清晰错误,
     # 不靠固件 NAK 兜底)
     pin_owner = {}   # wire 槽 -> OUTPUT 名 (唯一写者预检)
-    for kw, body in stmts:
+    for kw, body, _dv in stmts:
         if kw == 'OUTPUT':
             m = re.fullmatch(r'(\S+)\s+TO\s+wire\[(\d+)\]\s+FROM\s+(\S+)', body)
             if not m:
@@ -332,17 +546,9 @@ def compile_stmts(stmts):
             pin_owner[n] = name
             S.pinned.add(n)
     # 第二遍: 生成 (SEQ 块须在文件尾 — 用 enumerate 以便收集其后所有块行)
-    for _seq_pos, (kw, body) in enumerate(stmts):
-        # PERIOD=<t> 后缀: 该语句跑在哪个 div 档 (引擎仅三档: 100us / 1ms / 10ms)
-        S.cur_period = 0
-        mp = re.search(r'\s+PERIOD=(\S+)\s*$', body)
-        if mp:
-            t = round(parse_time(mp.group(1)), 6)
-            if t not in PERIOD_DIV:
-                raise SystemExit(f"错误: PERIOD={mp.group(1)} 不是引擎支持的档 "
-                                 f"(仅 100us / 1ms / 10ms)")
-            S.cur_period = PERIOD_DIV[t]
-            body = body[:mp.start()]
+    for _seq_pos, (kw, body, _dv) in enumerate(stmts):
+        # PERIOD=<t> 已在 split_period() 预扫里解析(唯一解析点) —— 这里直接取档位
+        S.cur_period = _dv
         # ---- SEQ 顺序域块 (Sequencer v0.2): 独立 if (非 elif 链, break 提前收尾) ----
         if kw == 'SEQ':
             m = re.fullmatch(r'(\S+)\s+TO\s+wire\[(\d+)\]', body)
@@ -369,7 +575,7 @@ def compile_stmts(stmts):
             if not block:
                 raise SystemExit("错误: SEQ 块为空 (至少一步)")
             n_line = len(block)
-            for li, (bkw, bbody) in enumerate(block):
+            for li, (bkw, bbody, _bdv) in enumerate(block):
                 if bkw not in ('UNTIL', 'DWELL', 'LOOP'):
                     raise SystemExit(f"错误: SEQ 块须在文件末尾, '{bkw}' 不能出现在块内")
                 if bkw == 'LOOP':
@@ -386,10 +592,10 @@ def compile_stmts(stmts):
                     dwell = parse_time(rest.strip())
                     rest = ""
                 else:                                 # UNTIL 行: body = "sig > thr [DWELL t]"
-                    mu = re.match(r'(\S+)\s*>\s*(-?[\d.eE+]+)', rest)
+                    mu = re.match(r'(\S+)\s*>\s*([^\s]+)', rest)
                     if mu:
                         cond_t, cond_i = S.ref(mu.group(1))
-                        thr = float(mu.group(2))
+                        thr = parse_num(mu.group(2), 'SEQ UNTIL 的阈值')
                         rest = rest[mu.end():].strip()
                     md = re.match(r'DWELL\s+(\S+)', rest)
                     if md:
@@ -435,22 +641,25 @@ def compile_stmts(stmts):
             S.add_route(st, si, OP['DIRECT'], ch)
             S.desc.append(f"HMI     {name} = wire[{ch}]  <- HMI[{n}] (40065+{n})")
         elif kw == 'SCALE':
-            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+K=(-?[\d.eE+]+)\s+B=(-?[\d.eE+]+)', body)
+            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+K=([^\s]+)\s+B=([^\s]+)', body)
             if not m:
                 raise SystemExit(f"语法错误 SCALE: {body}")
-            name, src, k, b = m.group(1), m.group(2), float(m.group(3)), float(m.group(4))
+            name, src = m.group(1), m.group(2)
+            k, b = parse_num(m.group(3), 'SCALE 的 K'), parse_num(m.group(4), 'SCALE 的 B')
             ch = S.alloc_wire(name)
             st, si = S.ref(src)
             p = S.add_param([k, b, 0.0, 0.0])
             S.add_route(st, si, OP['SCALE'], ch, param_idx=p)
             S.desc.append(f"SCALE   {name} = wire[{ch}]  <- {k:.4f}*{src}{b:+.4f}")
         elif kw == 'PID':
-            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+SP=(-?[\d.eE+]+)\s+KP=(-?[\d.eE+]+)\s+KI=(-?[\d.eE+]+)(?:\s+KD=(-?[\d.eE+]+))?', body)
+            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+SP=([^\s]+)\s+KP=([^\s]+)\s+KI=([^\s]+)(?:\s+KD=([^\s]+))?', body)
             if not m:
                 raise SystemExit(f"语法错误 PID: {body}")
             name, src = m.group(1), m.group(2)
-            sp, kp, ki = float(m.group(3)), float(m.group(4)), float(m.group(5))
-            kd = float(m.group(6)) if m.group(6) else 0.0
+            sp = parse_num(m.group(3), 'PID 的 SP')
+            kp = parse_num(m.group(4), 'PID 的 KP')
+            ki = parse_num(m.group(5), 'PID 的 KI')
+            kd = parse_num(m.group(6), 'PID 的 KD') if m.group(6) else 0.0
             ch = S.alloc_wire(name)
             st, si = S.ref(src)
             p = S.add_param([kp, ki, kd, sp])
@@ -462,34 +671,28 @@ def compile_stmts(stmts):
         elif kw == 'ALARM':
             # 审计 M3/M4 修正: 旧版 '>=' 实际编译成 '>' (静默语义错), '<'/'<=' 直接报错。
             # prim_cmp 现在支持模式 value_b, 六种比较全部真实编译。
-            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+(>=|<=|==|!=|>|<)\s+(-?[\d.eE+]+)', body)
+            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+(>=|<=|==|!=|>|<)\s+([^\s]+)', body)
             if not m:
                 raise SystemExit(f"语法错误 ALARM: {body}")
-            name, src, op_s, thr = m.group(1), m.group(2), m.group(3), float(m.group(4))
-            mode = {'>': 0, '>=': 1, '<': 2, '<=': 3, '==': 4, '!=': 5}[op_s]
-            ch = S.alloc_wire(name)
-            st, si = S.ref(src)
-            p = S.add_param([thr, float(mode), 0.0, 0.0])
-            S.add_route(st, si, OP['CMP'], ch, param_idx=p)
-            S.desc.append(f"ALARM   {name} = wire[{ch}]  <- ({src} {op_s} {thr})")
+            name, src, op_s, thr = m.group(1), m.group(2), m.group(3), m.group(4)
+            # ★ 2026-09-18(3.3): 右端可以是**字面量或信号** —— 判定与展开都在 cmp_out 里
+            S.cmp_out(name, src, op_s, thr, kw='ALARM')
         elif kw in ('GT', 'GE', 'LT', 'LE', 'EQ', 'NE'):
             # FBD 标准比较族 (等价 ALARM, 标准名写法)
-            m = re.fullmatch(r'(\S+)\s+IN=(\S+)\s+THR=(-?[\d.eE+]+)', body)
+            m = re.fullmatch(r'(\S+)\s+IN=(\S+)\s+THR=([^\s]+)', body)
             if not m:
                 raise SystemExit(f"语法错误 {kw}: {body}  (应为: {kw} <name> IN=<sig> THR=<v>)")
-            name, src, thr = m.group(1), m.group(2), float(m.group(3))
-            ch = S.alloc_wire(name)
-            st, si = S.ref(src)
-            p = S.add_param([thr, float(CMP_MODE[kw]), 0.0, 0.0])
-            S.add_route(st, si, OP['CMP'], ch, param_idx=p)
-            S.desc.append(f"{kw:<7} {name} = wire[{ch}]  <- ({src} {kw} {thr})")
+            name, src, thr = m.group(1), m.group(2), m.group(3)
+            # ★ `THR=` 可以是字面量**或信号**（信号 ⇒ 组合展开, 见 cmp_out）
+            _op = {'GT': '>', 'GE': '>=', 'LT': '<', 'LE': '<=', 'EQ': '==', 'NE': '!='}[kw]
+            S.cmp_out(name, src, _op, thr, kw=kw)
         elif kw == 'LPF':
             # 一阶惯性滤波 (Filter_PT1): y += α·(src-y), α=dt/(τ+dt). τ 秒
-            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+T=(-?[\d.eE+]+)', body)
+            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+T=([^\s]+)', body)
             if not m:
                 raise SystemExit(f"语法错误 LPF: {body}  (应为: LPF <name> FROM <sig> T=<τ秒>)")
             name, src = m.group(1), m.group(2)
-            tau = float(m.group(3))
+            tau = parse_num(m.group(3), 'LPF 的 T')
             if not (tau > 0.0):
                 raise SystemExit(f"错误: LPF {name} 的 T 必须 > 0 (τ=0 直通无意义, 固件同拒)")
             ch = S.alloc_wire(name)
@@ -500,11 +703,11 @@ def compile_stmts(stmts):
             S.desc.append(f"LPF     {name} = wire[{ch}]  <- FROM {src} T={tau}s (st@{so})")
         elif kw == 'HYST':
             # 滞回比较: src>ON 置 1, src<OFF 清 0 (中间带内保持). 要求 ON>OFF 才有滞回带
-            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+ON=(-?[\d.eE+]+)\s+OFF=(-?[\d.eE+]+)', body)
+            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+ON=([^\s]+)\s+OFF=([^\s]+)', body)
             if not m:
                 raise SystemExit(f"语法错误 HYST: {body}  (应为: HYST <name> FROM <sig> ON=<a> OFF=<b>)")
             name, src = m.group(1), m.group(2)
-            on, off = float(m.group(3)), float(m.group(4))
+            on, off = parse_num(m.group(3), 'HYST 的 ON'), parse_num(m.group(4), 'HYST 的 OFF')
             if not (on > off):
                 raise SystemExit(f"错误: HYST {name} 需 ON > OFF (否则滞回带不存在, 语义退化)")
             ch = S.alloc_wire(name)
@@ -527,11 +730,11 @@ def compile_stmts(stmts):
             S.desc.append(f"RATE    {name} = wire[{ch}]  <- FROM {src} (/s, st@{so})")
         elif kw == 'DEADBAND':
             # 死区 (变化量过带才更新输出, 带内保持上一有效值)
-            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+B=(-?[\d.eE+]+)', body)
+            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)\s+B=([^\s]+)', body)
             if not m:
                 raise SystemExit(f"语法错误 DEADBAND: {body}  (应为: DEADBAND <name> FROM <sig> B=<带宽>)")
             name, src = m.group(1), m.group(2)
-            band = float(m.group(3))
+            band = parse_num(m.group(3), 'DEADBAND 的 B')
             if band < 0:
                 raise SystemExit(f"错误: DEADBAND {name} 的 B 必须 >= 0")
             ch = S.alloc_wire(name)
@@ -540,11 +743,30 @@ def compile_stmts(stmts):
             so = S.alloc_state()
             S.add_route(st, si, OP['DEADBAND'], ch, param_idx=p, state_off=so)
             S.desc.append(f"DEADBAND {name} = wire[{ch}]  <- FROM {src} B={band} (st@{so})")
+        elif kw == 'ABS':
+            # ★★ 2026-09-18(3.2): 引擎**没有** ABS 原语 ⇒ 组合展开 `MAX(x, 0-x)`。
+            #   · `0-x`: ARITH SUB, src=隐藏零常量 wire, wire2=x 的 wire
+            #   · `MAX(x, 0-x)`: ARITH MAX, src=x 的 wire, wire2=上一条
+            #   ★ IEEE 边界(与 math.fabs 对照): x=-0.0 ⇒ 0-(-0.0)=+0.0 ⇒ MAX(-0.0,+0.0)
+            #     取 wb ⇒ **+0.0** ✓ ; x=+0.0 ⇒ +0.0 ✓ ; NaN 由引擎上游的有限性检查挡住。
+            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)', body)
+            if not m:
+                raise SystemExit(f"语法错误 ABS: {body}  (应为: ABS <name> FROM <sig>)")
+            name, src = m.group(1), m.group(2)
+            wz = S.zero_wire()
+            wx = S.to_wire(src, 'abs_in_%s' % name)
+            wn = S.alloc_wire('_absneg_%s' % name)
+            ch = S.alloc_wire(name)
+            p_sub = S.add_param([float(ARITH_MODE['SUB']), 0.0, 0.0, 0.0])
+            p_max = S.add_param([float(ARITH_MODE['MAX']), 0.0, 0.0, 0.0])
+            S.add_route(SRC['WIRE'], wz, OP['ARITH'], wn, param_idx=p_sub, wire2=wx)
+            S.add_route(SRC['WIRE'], wx, OP['ARITH'], ch, param_idx=p_max, wire2=wn)
+            S.desc.append(f"ABS     {name} = wire[{ch}]  <- |{src}|  [2 路由组合: MAX(x, 0-x)]")
         elif kw == 'CONST':
-            m = re.fullmatch(r'(\S+)\s*=\s*(-?[\d.eE+]+)', body)
+            m = re.fullmatch(r'(\S+)\s*=\s*([^\s]+)', body)
             if not m:
                 raise SystemExit(f"语法错误 CONST: {body}  (应为: CONST <name> = <值>)")
-            name, val = m.group(1), float(m.group(2))
+            name, val = m.group(1), parse_num(m.group(2), 'CONST 的值')
             ch = S.alloc_wire(name)
             p = S.add_param([val, 0.0, 0.0, 0.0])
             S.add_route(SRC['CONST'], p, OP['DIRECT'], ch)   # SRC_CONST: src_index=param 槽
@@ -594,10 +816,11 @@ def compile_stmts(stmts):
             S.add_route(st, si, OP['EDGE'], ch, param_idx=p, state_off=so)
             S.desc.append(f"{kw:<7} {name} = wire[{ch}]  <- CLK={src} (st@{so})")
         elif kw == 'LIMIT':
-            m = re.fullmatch(r'(\S+)\s+IN=(\S+)\s+MN=(-?[\d.eE+]+)\s+MX=(-?[\d.eE+]+)', body)
+            m = re.fullmatch(r'(\S+)\s+IN=(\S+)\s+MN=([^\s]+)\s+MX=([^\s]+)', body)
             if not m:
                 raise SystemExit(f"语法错误 LIMIT: {body}  (应为: LIMIT <name> IN=<sig> MN=<v> MX=<v>)")
-            name, src, mn, mx = m.group(1), m.group(2), float(m.group(3)), float(m.group(4))
+            name, src = m.group(1), m.group(2)
+            mn, mx = parse_num(m.group(3), 'LIMIT 的 MN'), parse_num(m.group(4), 'LIMIT 的 MX')
             if mn > mx:
                 raise SystemExit(f"错误: LIMIT {name} 的 MN > MX")
             ch = S.alloc_wire(name)
@@ -747,9 +970,10 @@ def compile_stmts(stmts):
         else:
             raise SystemExit(f"未知语句 {kw}")
         # div 档标注 (宣称必须等于实现: dump 里必须看得出这条跑在哪个档)
+        # ★ 档位标注报**真实**周期(派生值), 不报标称 —— 宣称必须等于实现
         if S.cur_period:
-            S.desc[-1] += "   [div%d=%s]" % (
-                S.cur_period, ('100us', '1ms', '10ms')[S.cur_period])
+            S.desc[-1] += "   [div%d=%s = %d 拍]" % (
+                S.cur_period, tier_name(S.cur_period), TIER_US[S.cur_period] // TICK_US)
     # ══════════════════════════════════════════════════════════════════════════
     # ★★★ 2026-09-17: **跨档速率检查的编译期镜像**（权威仍是固件 `src/main.c:1838`）
     #
@@ -786,7 +1010,7 @@ def compile_stmts(stmts):
             + "\n".join(lines) +
             "\n  ⇒ 固件会在 deploy 时以 `NAK: rate mismatch` 拒绝（`src/main.c:1838`）。\n"
             "  ⇒ 修法: 把**下游整条链**都降到同一档（或更慢）—— 用 `PERIOD=<t>` 后缀。\n"
-            "     ★ 注意 `OUTPUT` **不接受 `PERIOD=`** ⇒ 让最后一级留在**快档**通常最省事。\n"
+            "     ★ `OUTPUT` 现在**收 `PERIOD=`**（2026-09-18 3.1 修）⇒ 最后一级也能降档。\n"
             "     ★ 若目的是「跟慢采样信号同速」，**优先用 `LPF` 低通**而不是降档\n"
             "       （降档会一路传染到 OUTPUT，实测撞死；见 MEMORY §5.20）。")
     return S
