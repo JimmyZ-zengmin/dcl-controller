@@ -34,6 +34,20 @@ import subprocess
 import sys
 from collections import deque
 
+# ★★★ GBK 控制台护栏 —— 与 ~90 个兄弟工具同一写法（本题曾漏，且后果最重）。
+#   本脚本第 322 行要 print 一个 "ℹ️"（U+2139）。在 GBK(936) 控制台上，
+#   Python 的 stdout 编码是 gbk ⇒ print 直接抛 UnicodeEncodeError ⇒
+#   **整个闸门崩在"打印豁免名单"这一步**，退出码 1 ⇒ 构建脚本读成
+#   「ISR 调用树闸门失败 ⇒ 拒绝通过」，而它会把这行红字指向"你新加的代码"。
+#   ⇒ 症状：**换了控制台编码就"坏"的假 FAIL**（2026-09-18 实测：清空
+#     PYTHONIOENCODING 时 RC=1；设 PYTHONIOENCODING=utf-8 时同一份源码 RC=0）。
+#   同族：h723_i2c_leak_check.py / ref_claims_check.py 的同一行注释「本项目踩过」。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 TOOLCHAIN = os.environ.get("DCL_TOOLCHAIN",
                            r"C:\ST\STM32CubeIDE_1.5.1\STM32CubeIDE\plugins"
                            r"\com.st.stm32cube.ide.mcu.externaltools"

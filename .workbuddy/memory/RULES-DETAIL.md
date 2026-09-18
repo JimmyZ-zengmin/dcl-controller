@@ -572,3 +572,60 @@ Get-ChildItem "$env:USERPROFILE\.workbuddy\sessions" -File | ForEach-Object {
 ⇒ 约 **5000:1**，且**损失偏斜**：**"被推翻的结论"在第 1 代（日报）就已丢**
 （实测：09-12 的**六次误判链**整段不在日报里；`ARCH-H723.md` 737 行、W3/W4 交付也没记）。
 ⇒ 处置：另立 **`RETRACTIONS.md`**（每行一条、抗压缩），并列为**接手第一读物**。
+
+---
+
+## §5.38 ★★ 脚本必须在**任何外部命令之前**导出 `PATH`（本机 bash 起来时 `PATH` 为空）
+
+- **实测（2026-09-18）**：在裸 bash 下 `bash build.sh` **直接失败**：
+  `build.sh: line 25: dirname: command not found` → `cd: null directory`（第 25 行就是 `HERE="$(cd "$(dirname "$0")" && pwd)"`）。
+- **根因**：`build.sh` **完全没有 `export PATH`**；
+  `tools/h723_full_regress.sh` **有** `export PATH=...`，但写在 `cd "$(dirname "$0")/.."`（第 25 行）**之后** ⇒ 同样失效。
+- **现状之所以能工作**，只因为 `MEMORY.md` 速查要求**调用方先 export**（`export PATH=...` 那行）——
+  一个**隐式前置条件**。⇒ 与铁律族同源：**"能工作"依赖调用者的约定 = 迟早静默失效**。
+- **修法**：`export PATH="/usr/bin:/bin:/mingw64/bin:/c/Windows/System32:$PATH"`
+  放在 shebang / `set -e` **之后、任何外部命令之前**（自建脚本 `tools/h723_push.sh`、`tools/h723_git_setup.sh` 已按此写）。
+- ★ **同族（我本次自己踩的）**：**过闸门绝不用管道** ——
+  我跑 `bash build.sh | Select-Object -Last 40` ⇒ 拿到的是 `Select-Object` 的退出码，
+  **不是 build.sh 的**。正解：`bash build.sh > /tmp/x.log 2>&1; RC=$?`（§11.8）。
+
+---
+
+## §十九 保障图谱（「效果 ← 靠什么保证」）
+
+> 权威文件 **`docs/ARCH-GUARANTEE-MAP.md`**（2026-09-18 由用户提出后建立）。
+> **为什么需要它**：日常叙述混着三种东西 —— **① 设计意图 / ② 实际机制 / ③ 曾被设计、已被推翻的方案**
+> ⇒ 不分开写，就会把①当②去推、把③当②去信。
+>
+> **根机制只有五个**（其余效果都是它们的组合）：
+> `R1 零等待 TCM`（消除 cache/仲裁）· `R2 单一硬拍`（消除调度）· `R3 静态表`（消除分支/不可枚举 WCET）·
+> `R4 判据+闸门`（消除人的遗忘）。
+> ★ **R1–R3 让时间可预测，R4 让人不把可预测性弄丢**；缺 R4，前三条的收益会随时间衰减。
+>
+> ★★ **最示范性的一格（G1 输出抖动）**：曾设计"写影子 → 硬件定时器触发锁存到引脚"，
+> **实测不仅无效、还反向**（MDMA 自循环 ⇒ 引脚时刻 = CPU 写影子 + 0.12 µs；1 档 54~60 ns vs 0 档 3.6 ns）。
+> ⇒ 交付档是 **CPU 直写 `BSRR`**；"输出由硬件锚定"**从未达成**（`RETRACTIONS.md` P6）。
+> **一个听起来完全合理的设计意图，可能是错的** —— 这就是图谱存在的理由。
+>
+> **上层评估**见 **`docs/ASSESS-project-2026-09-18.md`**（补 README/SUPPORTED-SCOPE 之外那一格：
+> 它成不成、缺什么、往哪走；含"设计意图 ⇄ 实现效果"差距表与 8 条上层问题）。
+
+---
+
+## §5.39 ★★★ 构建闸门缺 GBK 护栏 ⇒ **假 FAIL**（闸门自己崩，却被读成"你的代码有问题"）
+
+- **实测（2026-09-18）**：`bash build.sh` 在 **GBK(936) 控制台**下 **RC=1**，红字是
+  `★★ ISR 调用树闸门失败 ⇒ 拒绝通过`，紧跟一个
+  `UnicodeEncodeError: 'gbk' codec can't encode character '\u2139'`。
+- **真因**：`tools/gate_isr_itcm.py` 第 322 行要 print 一个 `ℹ️`（U+2139）。
+  **它是本项目唯一漏掉 `sys.stdout.reconfigure(errors="replace")` 的构建期脚本** ——
+  而 **~90 个兄弟工具都有**（`tools/h723_i2c_leak_check.py:34` 与 `tools/ref_claims_check.py:47`
+  甚至写着注释「★ GBK 控制台上 print 一个 ⇒ 就崩（本项目踩过）」）。
+- **正对照（同一份源码、同一台机器）**：清空 `PYTHONIOENCODING` ⇒ **RC=1**；
+  设 `PYTHONIOENCODING=utf-8` ⇒ **RC=0** ⇒ **纯编码差异，不是真的 ISR 越界**。已修，修后 GBK 下也 RC=0。
+- ★★ **为什么这条最贵**：它是**闸门**，所以失败输出会**主动把矛头指向"你新加的代码"**
+  （原文：「上表列出的函数**擦 flash 时会让拍 ISR 卡死**」）⇒ 属本项目**第一号病族**
+  「**工具/观测动作把故障现象指向错误方向**」，且与铁律 0 同源。
+- **纪律**：① **新增任何构建期脚本，必须带 `sys.stdout.reconfigure(errors="replace")`**；
+  ② **闸门报"失败"时先看有没有 Traceback** —— **工具自己崩 ≠ 被测对象违规**；
+  ③ 同族自省：本次我自己用 `bash build.sh | Select-Object` 过闸门，拿到的是**管道的退出码**（§11.8）。
