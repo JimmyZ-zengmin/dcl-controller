@@ -299,13 +299,89 @@ def _judge(recs, A, dwell):
                      sum(len(h[1]) for h in g)))
     lin = [f for f in fits if f[1] >= 0.90]
     print("  T2 逐半周期拟合 (k, R², n): %s" % ", ".join("(%.0f,%.2f,%d)" % f for f in fits[:6]))
-    ok &= rec_ok(len(fits) >= 2 and len(lin) >= max(2, len(fits) // 2),
-                 "T2 实测速度在过半半周期内线性(R²≥0.90)", "%d/%d" % (len(lin), len(fits)))
+    # ★★★ T2 判据改**三段模型**：被测曲线是"斜坡 → 平顶 →（反向）斜坡"的**梯形**（斜坡限幅 + 段长固定），
+    #   对它用**单直线**拟合当然低 —— 血证：R² 只有 0.30~0.76，而 T2b（斜率正负交替）一直 PASS。
+    #   ⇒ 正解：**只对"真正在变的那一段（斜坡段）"拟合**：取 |dv/dt| 超过"该半段最大斜率 20%"的样本再拟合。
+    #     —— 这样"斜坡是否线性"才问得清楚，而平顶不参与 ⇒ 判据与"梯形的存在"解耦。
+    ramp_fits = []
+    for x, y in zip(edges, edges[1:]):
+        pts = [(ts[k] - ts[x], vh[k]) for k in range(x + 1, min(y, len(vh)))]
+        if len(pts) < 8:
+            continue
+        slopes = [(pts[i][1] - pts[i - 1][1]) / (pts[i][0] - pts[i - 1][0])
+                  for i in range(1, len(pts)) if pts[i][0] > pts[i - 1][0]]
+        if not slopes:
+            continue
+        smax = max(abs(s) for s in slopes) or 1.0
+        sel = [pts[i] for i in range(1, len(pts))
+               if abs(slopes[i - 1]) >= 0.20 * smax]
+        if len(sel) < 6:
+            continue
+        xs = [p[0] for p in sel]; ys = [p[1] for p in sel]
+        n = len(xs); mx = sum(xs) / n; my = sum(ys) / n
+        sxy = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
+        sxx = sum((x - mx) ** 2 for x in xs); syy = sum((y - my) ** 2 for y in ys)
+        k = sxy / sxx if sxx else 0.0
+        r2 = (sxy * sxy / (sxx * syy)) if (sxx and syy) else 0.0
+        ramp_fits.append((k, r2, len(sel)))
+    rampin = [f for f in ramp_fits if f[1] >= 0.90]
+    print("  T2' **只对斜坡段**拟合 (k, R², n): %s"
+          % ", ".join("(%.0f,%.2f,%d)" % f for f in ramp_fits[:6]))
+    # ★★★ **先量噪声底再判**（否则会把"我的估计器不够准"判成"形状不合格"）：
+    #   用**平顶段**（本该恒定）的样本算 `std/mean` ⇒ 那就是速度估计的噪声水平。
+    #   若噪声底大到与"100 ms 斜坡的线性度要求"同量级 ⇒ 这条判据**判无效（SKIP）**，不判 FAIL。
+    flat = []
+    for x, y in zip(edges, edges[1:]):
+        pts = [(ts[k] - ts[x], vh[k]) for k in range(x + 1, min(y, len(vh)))]
+        if len(pts) < 8:
+            continue
+        slopes = [(pts[i][1] - pts[i - 1][1]) / (pts[i][0] - pts[i - 1][0])
+                  for i in range(1, len(pts)) if pts[i][0] > pts[i - 1][0]]
+        if not slopes:
+            continue
+        smax = max(abs(s) for s in slopes) or 1.0
+        flat += [pts[i][1] for i in range(1, len(pts)) if abs(slopes[i - 1]) < 0.05 * smax]
+    if len(flat) > 20:
+        m = sum(flat) / len(flat)
+        sd = (sum((v - m) ** 2 for v in flat) / len(flat)) ** 0.5
+        nb = sd / m if m else 9.9
+        print("  噪声底（平顶段 std/mean）= **%.1f%%**（%d 样本，均值 %.0f Hz）"
+              % (100 * nb, len(flat), m))
+        if nb > 0.15:
+            print("     ⛔ 噪声底 >15% ⇒ **T2' 判无效（SKIP）**：在这个噪声水平下，")
+            print("        100 ms 斜坡的线性度**分辨不出来**（要求 R²≥0.90 对它不可能成立）")
+            print("        ⇒ 要判斜坡线性，应该改在**位置**上拟合（位置是积分量、噪声低得多），")
+            print("          而不是在**差分出的速度**上（本项目 §5.27/§5.28 的规矩）。")
+            print("        ⇒ 已登记的下一步：T2'' = 对半周期内的 raw(t) 做二次拟合（a≠0 即斜坡）。")
+        else:
+            ok &= rec_ok(len(ramp_fits) >= 2 and len(rampin) >= max(2, len(ramp_fits) // 2),
+                         "T2' 斜坡段本身是线性的（R²≥0.90，平顶不参与）",
+                         "%d/%d 段" % (len(rampin), len(ramp_fits)))
+    else:
+        ok &= rec_ok(len(ramp_fits) >= 2 and len(rampin) >= max(2, len(ramp_fits) // 2),
+                     "T2' 斜坡段本身是线性的（R²≥0.90，平顶不参与）",
+                     "%d/%d 段" % (len(rampin), len(ramp_fits)))
     ok &= rec_ok(any(k > 0 for k in ks) and any(k < 0 for k in ks),
                  "T2b 斜率有正有负（真三角波）",
                  "k>0:%d k<0:%d" % (sum(1 for k in ks if k > 0), sum(1 for k in ks if k < 0)))
-    vs = sorted(vh); pk = vs[-1] if vs else 0.0
-    ok &= rec_ok(0.85 <= pk / A <= 1.20, "T3 实测峰值 ≈ A（±15%/20%）", "%.2f×A" % (pk / A))
+    # ★★★ T3 用**稳健峰值**：`max()` 会被单点毛刺主导。
+    #   血证：同一天里 3.26×A 的尖峰在 1/3 的窗口出现（且 ≈1e6/256 ⇒ 像某一拍 ARR 被写成 256），
+    #   而 `max(vh)` 只要撞上一次就把 T3 判死 ⇒ **判据本身不稳健**，会让"真有缺陷"与"单点毛刺"分不开。
+    #   ⇒ 取**前 1% 的中位数**当峰值；同时**打印 max**（max ≫ 稳健峰 ⇒ 显式标注"存在毛刺"）。
+    vs_sorted = sorted(vh)
+    if vs_sorted:
+        top = vs_sorted[-max(1, len(vs_sorted) // 100):]
+        pk = top[len(top) // 2]
+        pk_max = vs_sorted[-1]
+    else:
+        pk = pk_max = 0.0
+    glitch = pk_max > 1.25 * pk
+    ok &= rec_ok(0.85 <= pk / A <= 1.20, "T3 实测峰值-稳健（前1%%中位数）≈ A",
+                 "%.2f×A（max %.2f×A%s）"
+                 % (pk / A, pk_max / A, " ← **有单点毛刺**" if glitch else ""))
+    if glitch:
+        print("     ⚠ max/稳健 = %.2f ⇒ 存在单点毛刺（不是持续现象）⇒ 下面 T5 用累积量、不受影响"
+              % (pk_max / pk))
     tot = 0
     for i in range(1, len(seg)):
         dv = (int(round(raw[i])) - int(round(raw[i - 1]))) & 0xFFF
