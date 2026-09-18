@@ -137,12 +137,36 @@ def cmd_analyze(a):
         d.close()
 
 
+def _split_boots(recs):
+    """★★★ 按**上电段**切分 —— 卡上的日志横跨多次上电，而 `tick`/`seq` **每次上电归零**
+    （读卡技能的第一条纪律：「每次上电归零的计数器不能用来排跨上电的数据」）。
+    ★ 血证（本工具第一版漏了这步）：找到的窗口跨了上电边界 ⇒ 用 `(tick-t0)&0xFFFFFFFF` 算时间
+      ⇒ 跨度读出 **429478 s**（5 天）、峰值 **23×A**、累积 0 —— **全是荒谬值**，
+      而"命令侧 A 相占 49%"却是对的（那一项不需要时间连续性）⇒ **最容易蒙混过去的那种错**。
+    判据：`seq` 回减 或 `tick` 倒退 ⇒ 新上电（两个独立指标，避免单指标误判）。"""
+    segs, s = [], 0
+    for i in range(1, len(recs)):
+        if recs[i][1] <= recs[i - 1][1] or recs[i][0] < recs[i - 1][0]:
+            segs.append(recs[s:i]); s = i
+    segs.append(recs[s:])
+    return [g for g in segs if len(g) >= 32] or [recs]
+
+
 def _judge(recs, A, dwell):
-    """按卡片数据判形状。★ 速度口径：**滑窗累积**（窗宽 ≥ 编码器回填间隔）——
-    逐记录差分在本装置上不可用（环记录率 ≠ 被测更新率，见记忆 §5.28）。"""
+    segs = _split_boots(recs)
+    if len(segs) > 1:
+        print("  ⚠ 窗口跨 %d 个上电段（tick/seq 每次上电归零）⇒ **选含 A 相最多的那一段**判；"
+              % len(segs))
+        for g in segs:
+            print("     段 %d 条（tick %d..%d, seq %d..%d, A相 %d）"
+                  % (len(g), g[0][0], g[-1][0], g[0][1], g[-1][1],
+                     sum(1 for r in g if r[3] > A / 2)))
+    # ★ 不能盲取"最新段"：运动常发生在**上一次上电**里，而最新段是运动之后的空闲
+    #   （本工具第二版就是这么判成"0 条 A 相"的）。⇒ 取**含 A 相最多**的那一段。
+    recs = max(segs, key=lambda g: sum(1 for r in g if r[3] > A / 2))
     on = [i for i, r in enumerate(recs) if r[3] > A / 2]
     if len(on) < 50:
-        print("  ⛔ 窗口内 A 相只有 %d 条 ⇒ **判无效**（采样不足）" % len(on))
+        print("  ⛔ 各段里 A 相最多的那段也只有 %d 条 ⇒ **判无效**（采样不足）" % len(on))
         return 2
     i0, i1 = on[0], on[-1]
     seg = recs[max(0, i0 - 200):min(len(recs), i1 + 200)]
@@ -180,8 +204,13 @@ def _judge(recs, A, dwell):
     ok &= rec_ok(0.35 < nz / len(seg) < 0.65, "T1 命令侧是 0/A 交替方波(≈50%占空)",
                  "%.0f%%" % (100.0 * nz / len(seg)))
     # 半周期划分：命令的下降沿
-    edges = [i for i in range(1, len(w12)) if w12[i - 1] > A / 2 and w12[i] <= A / 2]
-    fits, ks = [], []
+    # ★★★ 分段必须按**所有跳变**（上升沿 + 下降沿）切"半周期"。
+    #   血证（本工具第三版）：按"下降沿到下降沿"切 ⇒ 切出来的是**一整个周期**（先降后升）
+    #   ⇒ 线性拟合 R² 只有 0.42~0.74、且斜率**全是正的**（看起来像"不是三角波"）。
+    #   那是**分段错**，不是硬件错。
+    edges = [i for i in range(1, len(w12))
+             if (w12[i - 1] > A / 2) != (w12[i] > A / 2)]
+    fits, ks, halves = [], [], []
     for x, y in zip(edges, edges[1:]):
         pts = [(ts[k] - ts[x], vh[k]) for k in range(x + 1, min(y, len(vh)))]
         if len(pts) < 8:
@@ -193,6 +222,15 @@ def _judge(recs, A, dwell):
         k = sxy / sxx if sxx else 0.0
         r2 = (sxy * sxy / (sxx * syy)) if (sxx and syy) else 0.0
         ks.append(k); fits.append((k, r2, n))
+        halves.append((w12[x] > A / 2, ys))          # 这一半是 A 相还是 0 相，及其速度样本
+    # ★ 诊断：把升/降两半的**时长与速度均值**分别打出来 ⇒ 直接看"平均只有 74%"丢在哪
+    for isA in (True, False):
+        g = [h for h in halves if h[0] == isA]
+        if g:
+            print("  诊断 %s相：%d 半，速度均值 %.0f Hz（样本 %d）"
+                  % ("A " if isA else "0 ", len(g),
+                     sum(sum(h[1]) / len(h[1]) for h in g) / len(g),
+                     sum(len(h[1]) for h in g)))
     lin = [f for f in fits if f[1] >= 0.90]
     print("  T2 逐半周期拟合 (k, R², n): %s" % ", ".join("(%.0f,%.2f,%d)" % f for f in fits[:6]))
     ok &= rec_ok(len(fits) >= 2 and len(lin) >= max(2, len(fits) // 2),
@@ -211,9 +249,18 @@ def _judge(recs, A, dwell):
     mean_hz = abs(tot) / span / K
     ok &= rec_ok(0.75 <= mean_hz / (A / 2) <= 1.25, "T5 累积平均 ≈ A/2（三角波均值）",
                  "%.0f Hz vs %.0f" % (mean_hz, A / 2))
-    zs = [vh[i] for i in range(len(vh)) if tw[i] <= 0.01]
-    zmax = max(zs) if zs else 0.0
-    ok &= rec_ok(zmax < 0.15 * A, "R 命令=0 时不应有速度", "max %.0f Hz" % zmax)
+    # ★ R 反向：**带斜坡的曲线不能要求"命令=0 ⇒ 立刻 0"** —— 命令落到 0 之后轴还在**减速**，
+    #   减完要 `A/slope` 秒（本档 1200/12000 = 0.1 s = 整个半周期）⇒ 旧判据把"正常的减速"
+    #   判成了"命令=0 还在转"。正解：只看**每个 0 相的末段**（已经减完）速度是否 ≈0。
+    zt = []
+    for x, y in zip(edges, edges[1:]):
+        if w12[x] > A / 2:
+            continue
+        tail = range(max(x + 2, y - max(2, (y - x) // 5)), min(y, len(vh)))
+        zt += [vh[i] for i in tail]
+    zmax = max(zt) if zt else 0.0
+    print("  R 每个 0 相**末段**（已减完）的最大速度 = %.0f Hz（%d 点）" % (zmax, len(zt)))
+    ok &= rec_ok(zmax < 0.15 * A, "R 0 相末段速度≈0（斜坡正常减到零）", "max %.0f Hz" % zmax)
     print("=== %s ===" % ("全部通过" if ok else "有 FAIL —— 见上"))
     return 0 if ok else 1
 
