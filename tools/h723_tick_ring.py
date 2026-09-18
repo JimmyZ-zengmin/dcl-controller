@@ -90,20 +90,38 @@ def main():
         shm = struct.unpack("<I", p[23:27])[0]
         print("SHM = 0x%08X" % shm)
 
+        def probe(tag):
+            """★ 给工具自己装探针: 在**它自己的序列**里分点看四个计数器。
+            第一版没有这个, 于是"窗口只有 78 拍"只能靠猜; 探针（别的序列）全都正常
+            ⇒ 必须让工具自证在哪一步被清零。"""
+            h = rd(dcl, shm + OFF_EXEC_RING_HDR, 2)
+            sts2, s2 = dcl.send(cmd_status, expect_len=51)
+            smp = struct.unpack("<I", s2[:4])[0] if sts2 == "ACK" else -1
+            nr = struct.unpack("<H", s2[20:22])[0] if sts2 == "ACK" else -1
+            print("    [探针] %-22s 环写=%-8s tick=%-10s samples=%-8s n_routes=%s"
+                  % (tag, h[0] if h else "?", h[1] if h else "?", smp, nr))
+            return h
+
         op, div, n = (int(x, 0) for x in a.prog.split(","))
+        probe("① 连接后")
         dcl.send(cmd_stop); time.sleep(0.15)
         dcl.send(cmd_start); time.sleep(0.15)
+        probe("② 首个 STOP/START 后")
         sts, pp = dcl.send(cmd_deploy, mk(op, div, n), expect_len=None)
         if sts != "ACK":
             print("!! deploy 被拒: %s" % (pp.decode('utf-8', 'replace') if sts == 'NAK' else sts))
             return 2
         print("已部署 op=%d div=%d n=%d ⇒ ACK budget=%d"
               % (op, div, n, struct.unpack("<HI", pp[:6])[1]))
+        probe("③ deploy(含补发 0x11) 后")
 
         # STOP/START ⇒ 清统计 + 清环, 保留程序
         dcl.send(cmd_stop); time.sleep(0.15)
+        probe("④ STOP 后")
         dcl.send(cmd_start); time.sleep(0.15)
+        probe("⑤ START 后")
         time.sleep(a.settle)
+        probe("⑥ 静默 %.2fs 后" % a.settle)
 
         # ★★ 顺序修正（第一版踩过）: **先读头、再读环、再读头**。
         #   第一版是"先读环再读头", 结果两次都读到 `写计数=57 / tick=69` —— 而探针
