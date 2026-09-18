@@ -22,7 +22,14 @@ echo "== 1) 重建默认档 =="
 #     ① 这里**显式传交付档的全部可粘性选项**（不靠默认值）;
 #     ② 构建后**比指纹**（下面 EXPECT_MD5）⇒ 与基线不符就**大声失败**, 不烧。
 DELIVERY_OPTS="-DDCL_TICK_US=100 -DDCL_BOOT_SEL=1 -DDCL_BOOT_SCAN_MODE=0 -DDCL_LOOP_RESET=1 -DDCL_STEP_RAMP_FIX=1"
-EXPECT_MD5="c7c366c18232fcd36de12473d01f7329"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
+EXPECT_MD5="6daa7e65a778ac308267785104426f17"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
+# ★★★ 2026-09-18 第二次实测踩到（同一个机制的另一半）: 上面这行**忘更新**过一次 ——
+#   812b687（E-U）把它设成 c7c366c1…, 而**下一天 2.1/2.2 动了部署期代码**
+#   （顺序域清除 + `sub=16` 加两个拍号）⇒ hex 变成 6daa7e65…, 基线却还是旧的
+#   ⇒ 本脚本此后**每次都中止**（fail-closed, 方向是安全的, 但**恢复路径已死**）。
+#   ★ 教训: "比指纹"只挡住"**改动了却不说**", 挡不住"**基线忘了更新**" ——
+#     期望值是**第二处**需要维护的地方。⇒ 所以下面把失败信息做成**可判断**的:
+#     打印"最近一次改动 src/ 的提交", 让人一眼分清"预期改动, 该更新基线"与"不该变的却变了"。
 echo "  显式交付档选项: $DELIVERY_OPTS"
 bash build.sh $DELIVERY_OPTS > /tmp/h723_restore_build.log 2>&1
 RC=$?; echo "  BUILD_RC=$RC"
@@ -37,7 +44,14 @@ echo "  hex md5: $GOT_MD5"
 if [ "$GOT_MD5" != "$EXPECT_MD5" ]; then
     echo "  ❌ **指纹与交付基线不符** ⇒ 这**不是**交付档（粘性选项? 源码改动?）"
     echo "     期望 $EXPECT_MD5"
-    echo "     ⇒ **中止, 不烧**。确认无误后再更新本脚本的 EXPECT_MD5。"
+    echo "     实测 $GOT_MD5"
+    echo "  ── 判断材料（**这一行就是为了让人分得清两种情况**）──"
+    echo "     最近一次改动 src/ 的提交: $(git log -1 --format='%h %ad %s' --date=short -- src/ 2>/dev/null)"
+    echo "     最近一次改动 src/ 的文件: $(git log -1 --format='%h' -- src/ 2>/dev/null) 之后被改的部署期文件名:"
+    git diff --name-only "$(git log -1 --format='%h' -- src/ 2>/dev/null)^" -- src/ 2>/dev/null | sed 's/^/       /'
+    echo "     · 若那是**有意的**部署期改动 ⇒ 更新本脚本 EXPECT_MD5（并在提交信息里写清新 hex）"
+    echo "     · 若**不该变** ⇒ 查粘性选项（build/CMakeCache.txt）与未提交改动（git status）"
+    echo "     ⇒ **中止, 不烧**。"
     exit 3
 fi
 echo "  ✓ 指纹与交付基线一致"
