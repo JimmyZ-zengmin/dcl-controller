@@ -21,6 +21,7 @@ h723_audit_full.py — H723 线**一次性审计**（对照 S3 四轮审计口�
     python tools/h723_audit_full.py --offline       # 只做读源码/符号的离线项(不连板)
 """
 import argparse
+import json
 import os
 import re
 import struct
@@ -272,6 +273,55 @@ def axis1_sentinel_scan():
              "只有两者都不是的才叫『恒真』。本条的**启发式自身**由 `--selftest-11` 证伪。")
     note("另有 %d 处 `record(..., False, ...)` = fail-fast/错误路径, 它们不会产生假 PASS"
          " (只报错不报成功), 不计入缺陷" % failsafe)
+
+
+def axis1_rig_registry():
+    """1.3 台架依赖判据登记表（`.workbuddy/rig-dependent.json`）的**机械校验**。
+
+    ★ 判据是**能失败的**:
+      · 登记表缺失/JSON 坏 ⇒ FAIL（不是"没有就是没问题"）
+      · 条目里的 `tool` 文件不存在 ⇒ FAIL（条目指向了已删除的工具 = 腐烂）
+      · 条目里的 `criterion` 文本在该文件里找不到 ⇒ FAIL（判据被改名/删掉, 条目已成**传说**）
+      · 条目缺 mechanism/reproduce ⇒ FAIL（没有机制的登记等于没登记）
+    ★ 为什么值得: 这类判据 FAIL 的机制**在台架/历史里, 不在固件里** —— 不登记的话,
+      每次都要有人重新查一遍"是不是回归"（R5 已经这样消耗过一次, E-Y 又造了一例）。
+    """
+    p = os.path.join(ROOT, ".workbuddy", "rig-dependent.json")
+    if not os.path.exists(p):
+        record("1.3 台架依赖判据登记表存在且自洽", False,
+               "缺 %s ⇒ 台架依赖判据没有登记处（FAIL, 不是「没有问题」）" % p)
+        return
+    try:
+        with open(p, encoding="utf-8") as f:
+            js = json.load(f)
+    except Exception as e:
+        record("1.3 台架依赖判据登记表存在且自洽", False, "JSON 解析失败: %s" % e)
+        return
+    bad, ok_n = [], 0
+    for e in js.get("entries", []):
+        eid = e.get("id", "?")
+        f = e.get("tool", "")
+        crit = e.get("criterion", "")
+        fp = os.path.join(ROOT, f)
+        if not f or not os.path.exists(fp):
+            bad.append("%s: tool 不存在 (%s)" % (eid, f))
+            continue
+        body = open(fp, encoding="utf-8", errors="replace").read()
+        if not crit or crit not in body:
+            bad.append("%s: criterion '%s' 在 %s 里找不到（判据被改名? 条目已腐烂）"
+                       % (eid, crit, f))
+            continue
+        if not e.get("mechanism") or not e.get("reproduce"):
+            bad.append("%s: 缺 mechanism/reproduce" % eid)
+            continue
+        ok_n += 1
+    record("1.3 台架依赖判据登记表存在且自洽（%d 条已核）" % ok_n, not bad,
+           "；".join(bad) if bad else
+           "登记表: " + ", ".join("%s(%s %s)" % (e["id"], os.path.basename(e["tool"]),
+                                                e["criterion"]) for e in js.get("entries", [])))
+    if not bad:
+        note("★ 口径: 登记在案的判据**不进回归判据表** —— 命中它们时先读 mechanism/reproduce, "
+             "不要当回归重查。要判定固件侧有无缺陷, 必须换**不依赖台架/历史**的观测量。")
 
 
 def axis1_obs_scan():
@@ -573,6 +623,7 @@ def main():
     print("\n── 轴 1: 判据可失败性 ──")
     axis1_sentinel_scan()
     axis1_obs_scan()
+    axis1_rig_registry()
 
     print("\n── 轴 2: 宣称 = 实现 ──")
     axis2_claims()
