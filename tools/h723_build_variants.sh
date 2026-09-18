@@ -30,6 +30,10 @@ else
     echo "  警告数: $(grep -ci warning /tmp/h723_variants_delivery.log)"
     echo "  ★ 历史基线 (2026-09-18 路径成本改动前后的**逐字节**对照值):"
     echo "      80c05c0eb8f00ade3ba5b8985b711826  ← 两者曾相同 ⇒ 该改动对交付档零回归"
+    echo "  ★★ 当前基线 (2026-09-18 晚, 修 2 个缺陷 + 加 3 个观测域之后):"
+    echo "      6af8ca281e8ae48f26a1422b94b1ac2a  ← **现在的交付档指纹**"
+    echo "      (旧值 80c05c0e… 已作废; 原因见 .workbuddy/memory/MEMORY.md)"
+    echo "      ⇒ 上面那行 hex md5 与这一行**相同**才算交付档无回归。"
 fi
 
 echo
