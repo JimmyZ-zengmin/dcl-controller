@@ -65,35 +65,211 @@ def read(p):
 
 
 # ════════════════════════ 轴 1: 判据可失败性 ════════════════════════
+def _split_args(src, i):
+    """从 `(` 之后开始切**顶层**逗号参数（跳过字符串与嵌套括号）。返回 (args, end)。"""
+    depth, args, cur, instr = 1, [], "", None
+    while i < len(src) and depth:
+        c = src[i]
+        if instr:
+            if c == "\\" and i + 1 < len(src):
+                cur += src[i:i + 2]
+                i += 2
+                continue
+            cur += c
+            if c == instr:
+                instr = None
+        elif c in "\"'":
+            instr = c
+            cur += c
+        elif c in "([{":
+            depth += 1
+            cur += c
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append(cur)
+                break
+            cur += c
+        elif c == "," and depth == 1:
+            args.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    return [a.strip() for a in args], i
+
+
+def _strip_spans(src):
+    """返回 (字符串字面量区间, 注释起点判定器)。
+
+    ★ 为什么不能像第一版那样把字符串整体替换成 `""`: 那样**标签也一起没了** ——
+      而分诊恰恰要看标签（"失败分支是否写过同一个判据"）⇒ 替换后所有 key 都等于 `''`,
+      于是**每一处** record 都会被误判成"有守卫"（一个恒真的分类器）。
+      ⇒ 正解: 保留原文, 只把落在字符串/注释里的匹配**跳过**。"""
+    STR = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', re.S)
+    spans = [m.span() for m in STR.finditer(src)]
+    return spans
+
+
+def _pos_ok(src, spans, pos):
+    """位置 pos 既不在字符串字面量里、也不在注释里 ⇒ 是真代码。"""
+    for a, b in spans:
+        if a <= pos < b:
+            return False
+    line_start = src.rfind("\n", 0, pos) + 1
+    h = src.find("#", line_start, pos)
+    return h < 0
+
+
+def _label_key(arg):
+    """标签的**首 token**（形如 "T0.3" / "T1.0" / "D0"）—— 守卫匹配用的键。"""
+    a = re.sub(r'^[frb]*["\']', "", arg.strip())
+    a = a.split("%")[0]
+    toks = a.split()
+    return toks[0] if toks else ""
+
+
+def classify_true_records(src):
+    """把所有 `record(<label>, True, ...)` 分成三类 ⇒ `(guarded, branch, bare)`。
+
+    ★★ 为什么必须分诊（RETRACTIONS P26 的实质）: 它们**没有一处**是"恒真" ——
+      失败路径就写在紧邻上方:
+          if <坏>:  record("T0.3 …", False, "…");  return False
+          record("T0.3 …", True,  "…")            # ← 走到这里 = 上一条没成立
+      或落在 `if/else/try` 分支里。⇒ 一律判 FAIL 会造出**假 FAIL**。
+
+    三类的判据（**都能失败** —— 见 selftest_axis1）:
+      branch  : 缩进**比所属 def 的函数体更深** ⇒ 只在一个分支里被记一次
+      guarded : 同一函数内、在它**之前**有 `record(<同一首 token>, False, ...)`
+      bare    : 以上都不是 ⇒ **这才是"恒真"判据**, 计 FAIL
+    """
+    spans = _strip_spans(src)
+    lines = src.split("\n")
+
+    def calls():
+        """★ 按**参数切分**取每个 `record(...)` 的顶层参数（不是正则抓标签）。
+
+        为什么: 标签里可能出现逗号/括号（`"…（0x01 → ACK 4B, CRC 通过）"`、
+        `"…(0x%X)" % cap_bit`）⇒ `[^,()]+` 抓不到 ⇒ **静默少覆盖**。
+        （旧版把字符串剥成 `""` 之后反而抓得到, 所以换实现时必须**对数**:
+          换实现前 14 处, 换实现后必须仍是 14 处 —— 见本文件 `--selftest-11` 之外的
+          那次人工对数记录, RETRACTIONS P26 的更正当中有。）"""
+        out = []
+        for m in re.finditer(r"\brecord\s*\(", src):
+            if not _pos_ok(src, spans, m.start()):
+                continue
+            args, end = _split_args(src, m.end())
+            if len(args) < 2:
+                continue
+            ln = src[:m.start()].count("\n") + 1
+            out.append((ln, args[0], args[1].strip(), m.start()))
+        return out
+
+    all_calls = calls()
+    true_calls = [c for c in all_calls if c[2] == "True"]
+    false_calls = [c for c in all_calls if c[2] == "False"]
+    bare, branch, guarded = [], [], []
+    for ln, lab, _ok, _pos in true_calls:
+        line = lines[ln - 1]
+        ind = len(line) - len(line.lstrip())
+        key = _label_key(lab)
+        body_ind, fn_start = 0, -1
+        for k in range(ln - 2, -1, -1):
+            dm = re.match(r"^(\s*)def\s", lines[k])
+            if dm:
+                body_ind, fn_start = len(dm.group(1)) + 4, k
+                break
+        hit_guard = any(nln > fn_start and _label_key(nlab) == key
+                        for nln, nlab, _o, _p in false_calls if nln < ln)
+        if hit_guard:
+            guarded.append((ln, key))
+        elif ind > body_ind:
+            branch.append((ln, key))
+        else:
+            bare.append((ln, key))
+    return guarded, branch, bare
+
+
+def selftest_axis1():
+    """★ 1.1 启发式自检：三份合成源码，三类必须各归各位。
+
+    为什么需要: 1.1 原来自己就是坏的（把 14 个可失败判据全判成恒真）。
+    一条"用来抓坏判据"的判据**尤其**必须证明自己会红 —— 否则它只是一个恒 FAIL。
+    本自检是**能失败的**: 分类器一旦退化成"全 bare"或"全 guarded", 下面就有 FAIL。
+    """
+    CASES = (
+        ("guarded", 'def t():\n'
+                    '    if bad:\n'
+                    '        record("T1.1 x", False, "why")\n'
+                    '        return False\n'
+                    '    record("T1.1 x", True, "ev")\n', "guarded"),
+        ("branch", 'def t():\n'
+                   '    if s["reject"] == 0:\n'
+                   '        record("T2.2 y", True, "ev")\n'
+                   '    else:\n'
+                   '        record("T2.2 y", False, "ev")\n', "branch"),
+        ("bare", 'def t():\n'
+                 '    record("T3.3 z", True, "no failure path")\n', "bare"),
+        # ★ 反例保护: "有 False 但在**别的函数**里" 不算守卫 ⇒ 必须判 bare
+        ("bare(他函数有同名 False)", 'def a():\n'
+                                     '    record("T4.4 w", False, "x")\n'
+                                     '\n'
+                                     '\n'
+                                     'def b():\n'
+                                     '    record("T4.4 w", True, "y")\n', "bare"),
+    )
+    ok = True
+    for tag, code, want in CASES:
+        g, b, r = classify_true_records(code)
+        got = "guarded" if g else ("branch" if b else ("bare" if r else "none"))
+        hit = (got == want.split("(")[0])
+        ok = ok and hit
+        print("    [%s] 合成样例 '%s' 归类 = %s（期望 %s）"
+              % ("PASS" if hit else "FAIL", tag, got, want))
+    return ok
+
+
 def axis1_sentinel_scan():
-    """1.1 静态扫描: 有没有"注定为真/注定为假"的判据写法。
+    """1.1 静态扫描: 有没有"注定为真/注定为假"的判据写法（★ 2026-09-18 **分诊版**）。
 
     ★ 为什么这一条能机械查: 判据不可失败的**常见写法是有限的几种** ——
       `record(..., True, ...)` (字面量常数)、`assert True`、`if True:`。
-      真实项目里它们几乎总是"调试时临时的 pass", 事后忘了删。
       实测本项目第一版 T26 的 `g_persist_auto_gate` 恒为 0 就是同一族 (登记处已排除 RUN,
       于是"因 RUN 放弃"这个分支永远不会走到) —— 那种查不出来, 但**字面量常数能**。
+
+    ★★ 修 (2.4): 原来把 `record(..., True, ...)` **一律**判 FAIL ⇒ 14 处假 FAIL。
+      现在分诊成 branch / guarded / bare, **只有 bare 计 FAIL**, 且逐处打印文件:行号。
     """
-    # ★ 必须先剥掉**字符串字面量**: 否则"描述这个模式的字符串"(本函数的判据名里就写了
-    #   `record(...,True)`) 会被自己的正则命中 —— 自指假阳性。审计工具自身的假阳性
-    #   会把真问题淹掉, 与本项目"噪声不清零真警告必被漏掉"是同一条纪律。
-    STR = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', re.S)
-    bad = []
+    bare, branch, guarded, hard = [], [], [], []
     failsafe = 0
     for fn in sorted(os.listdir(os.path.join(ROOT, "tools"))):
         if not fn.endswith(".py") or fn == os.path.basename(__file__):
             continue
-        src = STR.sub('""', read(os.path.join("tools", fn)))
+        src = read(os.path.join("tools", fn))
+        g, b, r = classify_true_records(src)
+        guarded += [(fn, ln, k) for ln, k in g]
+        branch += [(fn, ln, k) for ln, k in b]
+        bare += [(fn, ln, k) for ln, k in r]
         # ★ 只盯 **True**: 审计要防的是**假 PASS** (空判据)。
         #   `record(..., False, ...)` 永远不会声称成功, 它是 fail-fast/错误路径, 不会骗人
         #   —— 把它也算 FAIL 只会制造噪声 (而噪声会淹掉真问题, 本项目铁律)。
-        for m in re.finditer(r"record\(\s*[^,()]+,\s*True\s*,", src):
-            bad.append("%s: record(..., True, ...)" % fn)
+        spans = _strip_spans(src)
         for m in re.finditer(r"^\s*assert\s+True\b", src, re.M):
-            bad.append("%s: assert True" % fn)
+            if _pos_ok(src, spans, m.start()):
+                hard.append("%s: assert True" % fn)
         failsafe += len(re.findall(r"record\(\s*[^,()]+,\s*False\s*,", src))
-    record("1.1 无『恒真』判据 (record(...,True) / assert True)", not bad,
-           "全部判据都依赖运行时值" if not bad else "发现 %d 处: %s" % (len(bad), bad[:4]))
+    hard += ["%s:%d %s" % t for t in bare]
+    det = ("分诊: **分支内 %d** + **守卫落空 %d** + **真无条件 %d**"
+           % (len(branch), len(guarded), len(bare)))
+    if bare:
+        det += "；★ 真无条件(**必须修**): " + "; ".join("%s:%d %s" % t for t in bare[:6])
+    record("1.1 无『恒真』判据 (record(...,True) 分诊 / assert True)", not hard, det)
+    if not bare:
+        note("1.1 明细（前 6 处, 全部**可失败**）: "
+             + (", ".join("%s:%d %s" % t for t in (branch + guarded)[:6]) or "无"))
+        note("★ 口径: `record(...,True)` 落在这两类里**不是**缺陷 —— ① 条件分支内; "
+             "② 紧邻上方有 `record(同一判据首 token, False)+return` 的守卫。"
+             "只有两者都不是的才叫『恒真』。本条的**启发式自身**由 `--selftest-11` 证伪。")
     note("另有 %d 处 `record(..., False, ...)` = fail-fast/错误路径, 它们不会产生假 PASS"
          " (只报错不报成功), 不计入缺陷" % failsafe)
 
@@ -377,7 +553,18 @@ def axis4_cost_table():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--offline", action="store_true", help="只做离线项 (读源码/符号, 不连板)")
+    ap.add_argument("--selftest-11", action="store_true",
+                    help="只跑 1.1 启发式自检（三份合成源码, 证明分诊能红能绿）")
     a = ap.parse_args()
+
+    if a.selftest_11:                       # ★ 属性名由 argparse 把 '-' 换成 '_'
+        print("=" * 76)
+        print("审计 1.1 启发式自检 —— 分类器必须能区分 守卫落空 / 分支内 / 真无条件")
+        print("=" * 76)
+        ok = selftest_axis1()
+        print("\n%s" % ("[PASS] 1.1 分诊启发式可区分三类" if ok
+                        else "[FAIL] 1.1 分诊启发式失效（它自己就是坏判据）"))
+        return 0 if ok else 1
 
     print("=" * 76)
     print("H723 一次性审计 — 四口径机械检查 (范围: b690b15 之后的全部增量)")
