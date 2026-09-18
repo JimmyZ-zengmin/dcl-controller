@@ -38,6 +38,14 @@
  *   (继电器模块的输入若悬空, 吸合与否不确定 —— 那才是真危险)。 */
 #define STEP_DO_MASK   0x0F00u
 
+/* ★★★ 2026-09-18 A/B 开关: 斜坡推进的"拍→ms 向上取整"缺陷是否修复
+ *   1 = **交付**: 按真实 dt(拍)算 + 余数累加器 ⇒ 斜率按声明生效
+ *   0 = **对照**: 改前行为(`dt_ms=(dt+9)/10`)⇒ 实测 slew = 设定 × (1ms / 主循环周期) ≈ 2.7×
+ *   ★ 判据(能失败): 位置域半周期位移比应回到 1±0.15；对照档下为 升1.40×/降0.43×。见 MEMORY §5.31。 */
+#ifndef DCL_STEP_RAMP_FIX
+#define DCL_STEP_RAMP_FIX 1
+#endif
+
 /* ---- `step_set_ena()` 的返回码（对外可读；**不要**用哨兵值） ---- */
 #define STEP_RC_OK            0u   /* 已执行 */
 #define STEP_RC_ENAPOL_UNSET  1u   /* ★ fail-closed: ENA 极性未声明 ⇒ 拒绝使能，且保持物理失能 */

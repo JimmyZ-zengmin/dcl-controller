@@ -85,6 +85,15 @@ volatile uint32_t g_step_rate_cmd      = 0u;
 volatile uint32_t g_step_rate_out      = 0u;
 volatile uint32_t g_step_ramp_active   = 0u;
 volatile uint32_t g_step_ramp_done_n   = 0u;
+/* ★★★ 2026-09-18: 斜坡推进的**余数累加器**（单位 = Hz·拍）。
+ *   为什么需要它：修掉"向上取整到 1 ms"之后，`slope × dt / 10000` 对**慢斜率**会长期为 0
+ *   （例如 100 Hz/s 在主循环 0.37 ms 下每次只有 0.0037 Hz）⇒ 必须把余数攒起来，
+ *   否则慢斜率永远不动，而原来那个 `dv=1` 的兜底会把慢斜率**量化抬到 ~2.7 kHz/s**。
+ *   ★ 定义也放进 `#if`：否则**对照档**（FIX=0）里它"定义了但没用到" ⇒ `-Werror` 直接编译失败
+ *     ⇒ 那就没有对照可以比了（A/B 的第一版就栽在这）。 */
+#if DCL_STEP_RAMP_FIX
+static uint32_t s_ramp_acc = 0u;
+#endif
 
 static uint8_t *s_base = NULL;
 static uint32_t s_sync = 1u;   /* ★ 首次/重新武装后先对齐 s_last, 见 step_tick */
@@ -492,9 +501,23 @@ void step_tick(uint32_t tick_now)
      *   · ★ 落地走**轻量路径**（只写预装载寄存器）⇒ 不切断脉冲、不产生额外更新事件
      *     ⇒ **不污染"走 N 个脉冲"的硬件计数**。 */
     if (g_step_ramp_hz_s != 0u && g_step_rate_out != g_step_rate_cmd) {
+#if DCL_STEP_RAMP_FIX
+        /* ★★★ 2026-09-18 修复：原来的 `dt_ms = (dt + 9u) / 10u` 把"拍→ms"**向上取整到 ≥1 ms**，
+         *   而本函数由**主循环**每 **~0.37 ms（≈3.7 拍）** 调一次 ⇒ `dt_ms` 被算成 1 ms
+         *   而真实间隔只有 0.37 ms ⇒ **每次多爬 2.7 倍** ⇒ 声明 12000 Hz/s 实测 **~32 kHz/s**。
+         *   血证（四个独立量互证，见 MEMORY §5.31）：位置域半周期位移比 **升1.40×/降0.43×**、
+         *   T5 累积均值 **686 ≈ 方波(0.15A↔A)均值**、`sub=19` 的 `rate_out` **几乎无中间值**、
+         *   反认最佳斜率 **30000**（≈12000×2.7）。
+         *   ⇒ 改成按**真实 `dt`（单位=拍，10 kHz）**算，并用**余数累加器**保证任意斜率都不丢精度
+         *     （原来那个 `if (dv == 0u) dv = 1u;` 会把慢斜率量化抬到 ~2.7 kHz/s 的下限）。 */
+        s_ramp_acc += (uint32_t)((uint64_t)g_step_ramp_hz_s * (uint64_t)dt);
+        uint32_t dv = s_ramp_acc / 10000u;          /* 10000 拍 = 1 s */
+        s_ramp_acc -= dv * 10000u;
+#else
         uint32_t dt_ms = (dt + 9u) / 10u;              /* 拍→ms，向上取整 */
         uint32_t dv    = (g_step_ramp_hz_s * dt_ms) / 1000u;
         if (dv == 0u) { dv = 1u; }
+#endif
         if (g_step_rate_out < g_step_rate_cmd) {
             uint32_t t = g_step_rate_out + dv;
             g_step_rate_out = (t > g_step_rate_cmd) ? g_step_rate_cmd : t;

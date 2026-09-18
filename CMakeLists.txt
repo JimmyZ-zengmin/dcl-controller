@@ -162,6 +162,12 @@ set(DCL_DO_LATCH "0" CACHE STRING "DO 输出路径 (0 CPU直写=交付 / 1 影�
 #     交付档上 **必须为 0** 且 `do_mask_step_drop_n` 涨 1（同一套测量方法打两份, 缺一不成证据）。
 set(DCL_DO_MASK_UNION "1" CACHE STRING "DO 掩码保留位 (1 保留位不可剔=交付 / 0 掩码说了算=对照)")
 
+# ---- ★★★ 斜坡推进 dt 修复开关 (2026-09-18) ----
+#   1 = 交付(按真实 dt 算 + 余数累加器) / 0 = 对照(改前: dt_ms 向上取整到 >=1ms)
+#   病灶: step_tick 由主循环每 ~0.37ms 调一次, 而 dt_ms 被算成 1ms => 每次多爬 2.7 倍
+#        => 声明 12000 Hz/s 实测 ~32 kHz/s (四量互证, 见 MEMORY §5.31)
+set(DCL_STEP_RAMP_FIX "1" CACHE STRING "斜坡 dt 修复 (1 按真实 dt=交付 / 0 改前行为=对照)")
+
 # ---- ★★★ 步进 ENA 极性 + 停止保持力矩 (2026-09-17, PLAN-device-config-v1 P0) ----
 #   起因: 现场"电机响但轴不动" = `g_step_ena_pol` 的**隐藏默认值**与实机接线相反,
 #         把「使能 / 失能 / 上电安全态」**三处同时弄反** (H723-MOTION-QUALITY-AUDIT §16)。
@@ -242,6 +248,7 @@ add_compile_options(
     -DIO_IN_ISR=${DCL_IO_IN_ISR}
     -DDCL_DO_LATCH=${DCL_DO_LATCH}
     -DDCL_DO_MASK_UNION=${DCL_DO_MASK_UNION}
+    -DDCL_STEP_RAMP_FIX=${DCL_STEP_RAMP_FIX}
     -DDCL_TIMEBASE=${DCL_TIMEBASE}
     -DDCL_STEP_ENA_POL=${DCL_STEP_ENA_POL}
     -DDCL_STEP_STOP_HOLD=${DCL_STEP_STOP_HOLD}

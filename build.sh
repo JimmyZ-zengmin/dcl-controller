@@ -77,7 +77,9 @@ DEFAULTS=(
     -DDCL_HIL_SAFE=1
     -DDCL_IO_IN_ISR=1
     -DDCL_DO_LATCH=0          # DO 输出路径: 0=CPU 直写(交付) 1=影子+MDMA锁存(对照)
-    -DDCL_DO_MASK_UNION=1     # ★ DO 掩码保留位: 1=PE8..PE11 不可被上位机剔出掩码(交付)
+    -DDCL_DO_MASK_UNION=1
+    -DDCL_STEP_RAMP_FIX=1     # ★ 斜坡 dt 修复: 1=按真实 dt 算(交付) / 0=改前"向上取整到1ms"(对照)
+                              #   病灶: 主循环 0.37ms 而 dt_ms 算成 1ms ⇒ 多爬 2.7 倍 ⇒ 声明12000实测~32kHz/s     # ★ DO 掩码保留位: 1=PE8..PE11 不可被上位机剔出掩码(交付)
                               #   /0=掩码说了算(对照档)。见 CMakeLists 的长注释:
                               #   `mismatch_n` 涨到 327616 的真因就是掩码把 PE9 剔掉了。
     -DDCL_STEP_ENA_POL=1      # ★ 步进 ENA 极性: -1=未配置(→fail-closed, 拒绝使能)/0=拉低使能
