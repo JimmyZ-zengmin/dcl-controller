@@ -194,10 +194,20 @@ def main():
     #     它含该配置特有的拍内工作; 用作线性模型的截距会带来 **−185 cyc** 的系统偏差
     #     （实测 |偏差| = 47 个标准误 —— 统计上极显著, 但那是**常数选错**, 不是模型错）。
     #     ⇒ 教训: **"截距"必须与"斜率"在同一组配置下标定**, 不能跨配置借用。
-    ap.add_argument("--c0", type=float, default=1200.0,
-                    help="拍内固定开销 CPU cyc（div1 标定, n=16/128 两点法定标）")
-    ap.add_argument("--c-route", type=float, default=121.2, dest="c_route",
-                    help="每条路由的平均增量 CPU cyc（div1 标定, 三段斜率 120.6~122.3）")
+    #
+    # ★★★ 2026-09-18 重标（修复 div2 相位缺陷之后, 见 `docs/exp-EI-recalibration.md`）:
+    #   · **本工具量的是 `di`（整段 ISR）, 不是扫描段** ⇒ 默认常数必须含 C_other。
+    #   · E-D 实测 `C_other = 474 TB`（每拍固定、与程序无关, 24 配置一致）
+    #   · E-I 实测扫描段 `C_scan ≈ 100~122 TB`（随 op 略变, PID 121.7 / DIRECT 99.6）
+    #   · E-C/E-I 实测 `m_op`: DIRECT 29.5 · PID 64.0（TB/条）
+    #   ⇒ 默认值改为 **PID 口径**（本工具原默认就是按 PID/div1 标定的）:
+    #         C = (121.7 + 474) = 595.7 TB → ×2 = **1191 cyc**
+    #         m = 64.0 TB/条 → ×2 = **128 cyc/条**
+    #   ★ 注意现在是 **`di` 口径**, 所以默认含 C_other; 若要算"引擎本身"请自行减 474 TB。
+    ap.add_argument("--c0", type=float, default=1191.0,
+                    help="每拍固定开销 CPU cyc（di 口径 = C_scan + C_other; PID 标定）")
+    ap.add_argument("--c-route", type=float, default=128.0, dest="c_route",
+                    help="每条路由的平均增量 CPU cyc（PID, m_op=64.0 TB/条；换 op 请改）")
     ap.add_argument("--cpu-hz", type=float, default=400e6, dest="cpu_hz")
     ap.add_argument("--tb-hz", type=float, default=200e6, dest="tb_hz",
                     help="时基频率（TIM5=200 MHz）；`di` 的单位是它的 tick")
