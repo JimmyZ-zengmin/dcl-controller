@@ -259,7 +259,7 @@ def _judge_position(seg, A, dwell, cands):
     # ── ① 用候选斜率反认 + 位移比 ──
     best, _cand_rows = None, []
     for S in cands:
-        rs = []
+        rs, rs_r, rs_f = [], [], []
         for x, y, isA in halves:
             T = ts[y] - ts[x]
             v0, v1 = (0.15 * A, A) if isA else (A, 0.15 * A)
@@ -268,12 +268,23 @@ def _judge_position(seg, A, dwell, cands):
             area = (c0 + c1) / 2 * tr + c1 * (T - tr)    # counts
             d = abs(u[y] - u[x])
             if area > 1:
-                rs.append(d / area)
+                r = d / area
+                rs.append(r)
+                (rs_r if isA else rs_f).append(r)
         rs.sort()
         med = rs[len(rs) // 2] if rs else 0.0
         _cand_rows.append((S, rs, med))
         if best is None or abs(med - 1) < abs(best[2] - 1):
             best = (S, rs, med)
+        # ★★ 升/降要**分开报**：混在一起的"中位数"是无意义的统计量
+        #   （血证：升段 +70%、降段 −52% ⇒ 中位给 1.309，既不像升也不像降 ⇒ 什么都说明不了）
+        if len(cands) == 1:
+            for tag, arr in (("升段", rs_r), ("降段", rs_f)):
+                arr.sort()
+                mm = arr[len(arr) // 2] if arr else 0.0
+                print("  T2''-1 %s：位移比中位 **%.3f**（%d 半）%s"
+                      % (tag, mm, len(arr),
+                         "← **比模型快**" if mm > 1.15 else ("← **比模型慢**" if mm < 0.85 else "✓")))
     S, rs, med = best
     # ★★ 自检：这个"反认"到底分不分得开？——下限 0.15A 时，斜坡长短对**模型面积**的影响很小
     #   （12000 与 30000 的模型面积只差几个百分点）⇒ 若各候选的比值都接近 1，则**认不出斜率**。
@@ -281,17 +292,17 @@ def _judge_position(seg, A, dwell, cands):
     print("  T2''-1 **位移比**（实测/模型）各候选：%s"
           % ", ".join("%d→%.3f" % (r[0], r[2]) for r in _cand_rows))
     print("  T2''-1 取最佳：**斜率≈%d Hz/s**，比值中位 **%.3f**" % (S, med))
-    if spread < 0.02:
+    # ★ 弱判别闸门**只在"多候选"时适用**：若 `--slope` 已显式给出（单候选），
+    #   斜率是**已知参数**而不是"反认结果" ⇒ 不存在"认不出来"的问题（第一版把它误判成 SKIP）。
+    if len(_cand_rows) > 1 and spread < 0.02:
         print("     ⛔ 各候选的比值都接近 1（极差 <2%%）⇒ **这条反认不出斜率**（弱判别）")
         print("        ⇒ T2''-2 需要「斜率」当输入，而它认不出来 ⇒ **T2''-2 判无效（SKIP）**")
         print("        ⇒ 正解：把 `--slope` 显式传进来（已知这次跑的是哪档），或让程序把斜率也写进卡。")
         ok2 = True
     else:
         ok = rec_ok(0.85 <= med <= 1.15, "T2''-1 实测位移 ≈ 模型位移（模型=斜坡 A↔0.15A）",
-                    "%.3f" % med)
-        ok2 = False
-        ok = ok and ok2
-        return ok
+                    "%.3f（>1 ⇒ **实际 slew 快于设定**；<1 ⇒ 慢于设定）" % med)
+        # ★ 不 early-return：T2''-1 FAIL 时更要跑 T2''-2 —— 它给出**定量的 slew 比**（正如下面）。
     # ── ② 斜坡窗内的二次拟合 ──
     aa, resid = [], []
     for x, y, isA in halves:
@@ -535,6 +546,8 @@ def _judge(recs, A, dwell):
     # ★ R 反向：**带斜坡的曲线不能要求"命令=0 ⇒ 立刻 0"** —— 命令落到 0 之后轴还在**减速**，
     #   减完要 `A/slope` 秒（本档 1200/12000 = 0.1 s = 整个半周期）⇒ 旧判据把"正常的减速"
     #   判成了"命令=0 还在转"。正解：只看**每个 0 相的末段**（已经减完）速度是否 ≈0。
+    # ★ R 反向判据**要按"带底三角波"更新**：下限是 0.15A（=180 Hz）⇒ 0 相"末段"本就该≈**底线**，
+    #   而不是≈0。第一版仍按"降到 0"判 ⇒ 实测 242 Hz（≈底线+噪声）被误判成 FAIL。
     zt = []
     for x, y in zip(edges, edges[1:]):
         if w12[x] > A / 2:
@@ -542,8 +555,11 @@ def _judge(recs, A, dwell):
         tail = range(max(x + 2, y - max(2, (y - x) // 5)), min(y, len(vh)))
         zt += [vh[i] for i in tail]
     zmax = max(zt) if zt else 0.0
-    print("  R 每个 0 相**末段**（已减完）的最大速度 = %.0f Hz（%d 点）" % (zmax, len(zt)))
-    ok &= rec_ok(zmax < 0.15 * A, "R 0 相末段速度≈0（斜坡正常减到零）", "max %.0f Hz" % zmax)
+    print("  R 每个 0 相**末段**的最大速度 = %.0f Hz（底线理论 0.15A=%.0f Hz，%d 点）"
+          % (zmax, 0.15 * A, len(zt)))
+    ok &= rec_ok(0.05 * A <= zmax <= 0.30 * A,
+                 "R 0 相末段速度 ≈ 下限 0.15A（不是 0 —— 下限是设计值）",
+                 "%.0f Hz" % zmax)
     print()
     ok &= _judge_position(seg, A, dwell, getattr(_judge, "_cands", [4000, 12000, 30000]))
     print("=== %s ===" % ("全部通过" if ok else "有 FAIL —— 见上"))
@@ -643,7 +659,23 @@ def cmd_run(a):
         d.send(0x39, bytes([19, 20]) + struct.pack("<I", 10))
         d.send(0x39, bytes([19, 13]) + struct.pack("<I", 1))
         d.send(0x39, bytes([19, 17]) + struct.pack("<I", slope))
-        time.sleep(0.2)
+        time.sleep(0.25)
+        # ★★★ **设了就算必错**（本项目铁律）：写完必须**读回**。
+        #   血证（就在今天）：工具只打印"斜率 = 12000"（那是**我发的**、不是**它读回的**），
+        #   于是"实际 slew 比设定快 70%"这个结论里混着"斜率根本没生效"的可能 ⇒ 判据不可归因。
+        #   `sub=19` 是只读斜坡态：+0 ramp_hz_s / +4 rate_cmd / +8 rate_out / +12 rate_actual。
+        st19, p19 = d.send(0x39, bytes([19, 19]) + struct.pack("<I", 0))
+        if st19 == "ACK" and len(p19) >= 16:
+            rb = struct.unpack("<4I", p19[:16])
+            print("  读回 sub=19: ramp_hz_s=%d rate_cmd=%d rate_out=%d rate_actual=%d"
+                  % rb)
+            if rb[0] != slope:
+                print("  ⛔ **回读 != 设定**（设 %d、读回 %d）⇒ 斜坡根本没按声明生效；"
+                      % (slope, rb[0]))
+                print("     这一轮的「实际 slew」结论**不可归因** ⇒ 先解决写入路径，别急着判硬件。")
+
+        else:
+            print("  ⚠ sub=19 读回失败（sts=%s len=%d）⇒ 本轮的斜率生效性**未证实**" % (st19, len(p19)))
         blk1 = log_blk(tgt)
         wset(10, 1.0); wset(11, a.A)
         print("  ② 运动 %.0f s（A=%.0f Hz, 段长 %.0f ms, 周期 %.2f s）..."
@@ -691,7 +723,8 @@ def main():
         import re
         txt = open(os.path.join(ROOT, "examples", "h723_step_traj_tri.dcl"), encoding="utf-8").read()
         a.dwell = float(re.search(r"DWELL\s+([\d.]+)ms", txt).group(1)) / 1000.0
-    _judge._cands = [int(x) for x in a.cands.split(",")]
+    # ★ 给了 --slope 就用它当**唯一候选**（斜率是已知参数, 不做"反认"）⇒ 映射无歧义
+    _judge._cands = [a.slope] if a.slope else [int(x) for x in a.cands.split(",")]
     print("=== h723_traj_card: %s (A=%.0f, 段长 %.0f ms) ===" % (a.cmd, a.A, a.dwell * 1000))
     if a.cmd == "run":
         return cmd_run(a)
