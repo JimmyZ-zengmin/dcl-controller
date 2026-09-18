@@ -105,16 +105,36 @@ def main():
         dcl.send(cmd_start); time.sleep(0.15)
         time.sleep(a.settle)
 
-        # ★ 先读环, 再读头; 只采信头里写计数**之前**的条目 ⇒ 无需加锁
+        # ★★ 顺序修正（第一版踩过）: **先读头、再读环、再读头**。
+        #   第一版是"先读环再读头", 结果两次都读到 `写计数=57 / tick=69` —— 而探针
+        #   （读 2 个字, 不做大读）显示环以 1:1 于 RUN 拍推进、10.3 kHz。
+        #   ⇒ 问题在**读数时序**: 大 `0x22` 读(256 字 = 2 块 ≈140 ms)会阻塞主循环,
+        #     让头里读到的是"读之后"的状态。现在读头两次, 不一致就**判无效**而不是硬算。
+        #   ★ 同时读 `0x38.samples`, 用它**独立核对窗口大小**（不许只信一个计数器）。
+        def hdr():
+            h = rd(dcl, shm + OFF_EXEC_RING_HDR, 4)
+            sts2, s2 = dcl.send(cmd_status, expect_len=51)
+            smp = struct.unpack("<I", s2[:4])[0] if sts2 == "ACK" else -1
+            return (h, smp)
+
+        h1, smp1 = hdr()
         ring = rd(dcl, shm + OFF_EXEC_RING, RING_SLOTS)
-        hdr = rd(dcl, shm + OFF_EXEC_RING_HDR, 4)
-        if ring is None or hdr is None:
-            print("!! 读环失败 ⇒ 判无效"); return 2
-        w, last_tick, slots = hdr[0], hdr[1], hdr[2]
-        print("环头: 写计数=%d 最后 tick=%d 槽数=%d" % (w, last_tick, slots))
+        h2, smp2 = hdr()
+        if ring is None or h1 is None or h2 is None:
+            print("!! 读失败 ⇒ 判无效"); return 2
+        w, last_tick, slots = h2[0], h2[1], h2[2]
+        print("环头(读环前): 写计数=%d tick=%d samples=%d" % (h1[0], h1[1], smp1))
+        print("环头(读环后): 写计数=%d tick=%d samples=%d" % (w, last_tick, smp2))
+        print("⇒ 本次大读横跨了 %d 拍（%d 个 RUN 拍）" % (w - h1[0], smp2 - smp1))
         if w == 0:
             print("!! 写计数为 0 ⇒ 环没在动 ⇒ 判无效（固件没烧对？）"); return 2
         res.append(("P0 环缓冲在动（写计数 > 0）", True))
+        # ★ 窗口自检: 环写计数必须与 RUN 拍数**同量级**（1:1 附近）
+        #   —— 第一版就是缺这一条, 才会拿一个 68 拍的窗口去算频次。
+        if smp2 > 0 and w > 0:
+            ratio = w / float(smp2) if smp2 else 0
+            print("   环写/RUN拍 = %.3f（应 ≈1.000；实测探针 0.999~1.004）" % ratio)
+            res.append(("P0b 环写计数 ≈ RUN 拍数（0.9~1.1）", 0.9 <= ratio <= 1.1))
 
         # 取出最近 min(w, slots) 条, 并回推每条的 tick
         cnt = min(w, RING_SLOTS)
@@ -127,6 +147,20 @@ def main():
         print("\n逐拍 di 的取值分布（共 %d 拍，跨度 %d..%d）:" % (cnt, ticks[0], ticks[-1]))
         for v, c in sorted(hist.items()):
             print("    di=%-7d 出现 %4d 次  (%.1f%%)" % (v, c, 100.0 * c / cnt))
+
+        # ★★ 窗口下限闸门（第一版缺这一条, 于是拿 **3 拍**的窗口跑出了 P1/P2/P3 三个
+        #   "PASS" —— 因为预测频次也一起缩到 3, 于是"看起来对上了"。**假绿**。
+        #   本项目纪律: 覆盖不到判 **SKIP, 不许读成 PASS**。窗口至少要盖住 2 个调度周期
+        #   （div2 的周期是 100 拍 ⇒ 取 200 拍）。
+        MIN_WIN = 200
+        if cnt < MIN_WIN:
+            print("\n  [SKIP] 窗口只有 %d 拍 < %d ⇒ **判无效, 不评 P1/P2/P3**" % (cnt, MIN_WIN))
+            print("     为什么: 频次判据在小子样上会被「等比例缩小」骗过去 —— 那是假绿。")
+            print("     这条闸门正是被第一版的一次 3 拍窗口换来的。")
+            for k, v in res:
+                print("  [%s] %s" % ("PASS" if v else "FAIL", k))
+            print("  [SKIP] P1/P2/P3 —— 窗口不足, **不是 PASS**")
+            return 2
 
         # ── 结构预测: nrun(t) = n_div0 + cnt1[t%10] + cnt2[t%100] ─────────
         bk = rd(dcl, shm + OFF_ROUTE_BUCKETS, 110)
