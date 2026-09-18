@@ -680,6 +680,7 @@ OBS uint32_t g_isr_cyc_max  = 0;
 OBS uint64_t g_isr_cyc_sum  = 0;
 OBS uint32_t g_isr_n        = 0;
 OBS uint32_t g_isr_sum_n    = 0;   /* ★ 与 g_isr_cyc_sum **同口径**的拍数 (di≠0 的拍) */
+OBS uint32_t g_exec_ring_w  = 0;   /* ★ 逐拍环形缓冲的写计数 (单调; SHM 头里另有一份) */
 OBS uint32_t g_isr_overrun  = 0;   /* 本 RUN 段内 ISR 超预算(EXEC_BUDGET_CYCLES)的次数。
                                     * ★ 审查二级 #5: 它此前"不存在"——0x38 里直接填 0。
                                     *   权威值在 DTCM, 主循环镜像到 SHM 0x3850 (与范本同址)。 */
@@ -868,6 +869,7 @@ static ISR_PLACE void stats_reset(void)
     g_isr_cyc_max  = 0;
     g_isr_cyc_sum  = 0;
     g_isr_sum_n    = 0;    /* ★ 与 g_isr_cyc_sum 同口径的分母 (见 ISR 里的说明) */
+    g_exec_ring_w  = 0;    /* ★ 逐拍环形缓冲: 每个 RUN 段从 0 起, 与统计同窗口 */
     g_isr_n        = 0;    g_isr_overrun  = 0;   /* ★ 与范本同语义: 超预算计数只反映**本次 RUN 段**
                            *   (S3 在 core0_engine_start 里清 OVERRUN, 这边在 stats_reset 清) */
 
@@ -1437,6 +1439,18 @@ ISR_PLACE void TIM2_IRQHandler(void)
              *     8550.76 > 8504 —— 均值超过极大值是不可能的, 一算就露馅）。
              *   这正是 §5.23「差分量的分子与分母必须同口径」。 */
             g_isr_sum_n++;
+            /* ★★ 逐拍环形缓冲 (2026-09-18; E4「逐拍预测 vs 逐拍实测」的载体):
+             *   由 **ISR 直接写 SHM**（不经主循环镜像 ⇒ 无滞后）。
+             *   上位机: **先读环, 再读头**, 只采信头里写计数之前的条目 ⇒ 无需加锁。
+             *   成本 3 次 DTCM 写 + 1 次加, 相对 17000 cyc 的 ISR 可忽略。 */
+            {
+                uint32_t w = g_exec_ring_w;
+                SHM_U32(g_shm, OFF_EXEC_RING + ((w & (EXEC_RING_SLOTS - 1u)) * 4u)) = di;
+                w++;
+                SHM_U32(g_shm, OFF_EXEC_RING_HDR)     = w;
+                SHM_U32(g_shm, OFF_EXEC_RING_HDR + 4u) = g_tick_count;
+                g_exec_ring_w = w;
+            }
         }
         /* ★★ 审查二级 #5: 超预算计数 (原实现是"在 0x38 里直接填 0"冒充"没超预算")。
          *   为什么必须有它: S3 套件 T9 的判据含 `ov == 0` —— 而"恒 0"的字段让它

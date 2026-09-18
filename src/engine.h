@@ -269,6 +269,23 @@ _Static_assert(OFF_TIMING_EXEC_SUM_LO + 4u == OFF_TIMING_EXEC_SUM_HI, "SHM: EXEC
 _Static_assert(OFF_TIMING_EXEC_SUM_HI + 4u == OFF_TIMING_EXEC_SUM_N, "SHM: SUM_N 必须紧跟 SUM_HI");
 _Static_assert(OFF_TIMING_EXEC_SUM_N + 4u <= 0x4000u, "SHM: EXEC_SUM 块不得压到 SEQ 区(0x4000)");
 
+/* ---- 逐拍执行时长环形缓冲 (2026-09-18 新增; E4「逐拍预测 vs 逐拍实测」的载体) ----
+ * ★ 为什么非要"逐拍": `MIN/MAX/SUM` 三个累积量已经能回答"典型拍稳不稳"（实测
+ *   0.02~0.06 cyc），但它们**回答不了"哪一拍贵、贵多少"**。而 E4 要判的是
+ *   **逐拍预测 = 逐拍实测** —— 必须能按 tick 号把预测值与实测值对齐。
+ * ★ 为什么不复用黑匣子: 黑匣子记的是**控制量**且"变化才记"（跨度 ~0.4 s、会丢拍），
+ *   而这里要的是**每拍一条、不丢拍**。
+ * ★ 同步策略: 环形缓冲与它的写指针都由 **ISR 直接写 SHM**（不经主循环镜像）⇒ 无滞后。
+ *   上位机的读法: **先读环, 再读头**, 只采信"头里那个写计数之前"的条目 ⇒ 无需加锁。
+ * ★ 成本: 每拍 3 次 DTCM 写 + 1 次加（≈10~12 cyc，占 17000 cyc 的 ISR 的 0.07%）。
+ * ★ 落点: 同一个 DSL 保留洞 `[0x3840,0x4000)` 的尾部（0x3C90 < 0x4000 ✓）。 */
+#define OFF_EXEC_RING_HDR  0x3880   /* u32[4]: [0]=写计数(单调) [1]=最后一拍的 tick [2]=槽数 [3]=保留 */
+#define OFF_EXEC_RING      0x3890   /* u32[256]: 逐拍 di（TB tick），槽 = 写计数 & 255 */
+#define EXEC_RING_SLOTS    256u
+#define OFF_EXEC_RING_END  (OFF_EXEC_RING + EXEC_RING_SLOTS * 4u)
+_Static_assert((OFF_EXEC_RING & 3u) == 0u, "SHM: EXEC_RING 需 4 字节对齐");
+_Static_assert(OFF_EXEC_RING_END <= 0x4000u, "SHM: EXEC_RING 不得压到 SEQ 区(0x4000)");
+
 /* ══════════ W3: 顺序域 SEQ 区 (Sequencer v0) ══════════
  * 落点 = 上面那个保留洞里的**尾部** (0x4000..0x4480, 与 S3 逐字节同偏移)。
  *
