@@ -1,0 +1,5 @@
+# 换行符策略 —— 本机 `core.autocrlf=true`，若不钉死，下次 checkout 会把
+# shell 脚本换成 CRLF ⇒ `#!/bin/sh\r` 使 shebang 失效 ⇒ **钩子静默不执行**
+# （"配置全对但功能不可用"同族：不报错，只是不生效）。见 memory §八。
+*.sh                text eol=lf
+tools/git-hooks/*   text eol=lf
