@@ -865,7 +865,20 @@ uint16_t engine_op_cost(uint8_t op)
 
 uint32_t engine_prog_budget(const uint8_t *payload, uint16_t nr)
 {
+    /* ★★ 2026-09-18 (E-L 实测): 加**相邻 op 改变代价**。
+     *   原实现是**纯可加**, 而实测证明纯可加**系统性低估、永不反向**
+     *   ⇒ **不是上界** ⇒ 用它做门会放行实际超载的程序。
+     *   实测（PID/DIRECT 各 64 条, 只改排列）: 最坏低估 **+350 TB = 700 cyc (5.3%)**,
+     *   且噪声底为 **0**; 每转变成本**不是常数**（8.50→5.56 cyc, 严格交替反而 1.29）
+     *   ⇒ 取**最小安全系数 17.8 cyc 的 1.4 倍 = 25 cyc**（见 `engine.h` 的 `OP_TRANS_COST`）。
+     *   ★ 计数口径与计算口径一致: 对**桶化后的执行序**数"相邻 op 不同"的次数
+     *     —— 即按 division 分三组, 组内按到达序, 与 `engine_stage_program` 的分桶同一口径。
+     *   ★ 代价: 部署期一次 O(nr) 扫描, **零运行期代价**。
+     *   ★ 对交付档行为无影响: 交付档的门本就不具约束力（见 engine.h 的绊线断言）。 */
     uint32_t per = 0;
+    uint32_t trans = 0;
+    uint8_t  prev_op[3];
+    uint8_t  have_prev[3] = { 0u, 0u, 0u };
     for (uint16_t i = 0; i < nr; i++) {
         RouteEntry_t r;
         memcpy(&r, payload + (size_t)i * 16u, 16u);
@@ -881,8 +894,16 @@ uint32_t engine_prog_budget(const uint8_t *payload, uint16_t nr)
          *   详见 engine.c 里 `k_op_cost_flash` 上方的说明。
          * 向上取整: 慢档每条每拍至少也要摊 1 cyc (不能因为除法取整把成本算没了) */
         per += ((uint32_t)engine_op_cost(r.op) + s + mult - 1u) / mult;
+        /* ★ 相邻 op 改变计数（按 division 分组, 组内按到达序 —— 与分桶同口径）。
+         *   div 索引只到 2（索引 3 已被 engine_route_validate 拒绝）⇒ 数组大小 3 够。 */
+        uint32_t g = (dv <= PERIOD_DIV_IDX_SLOW) ? (uint32_t)dv : 0u;
+        if (have_prev[g] && (prev_op[g] != r.op)) trans++;
+        prev_op[g] = r.op;
+        have_prev[g] = 1u;
     }
-    return per;
+    /* ★ 转变代价**不除 mult**: 每次转变是在**某一拍内**真实发生的（该组本拍执行),
+     *   ⇒ 它已经是"每拍"口径, 与 `per` 同量纲, 直接相加。 */
+    return per + trans * (uint32_t)OP_TRANS_COST;
 }
 
 /* ★ op_is_stateful_h() 已移到 engine.h —— 表填充与 deploy 校验必须共用同一份清单,
