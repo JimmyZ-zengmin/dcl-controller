@@ -861,7 +861,13 @@ typedef struct __attribute__((packed, aligned(4))) {
                              *   越界在 engine_route_validate **下载期拒绝**
                              *   (范本是 u32 位图所以上界 32, 照搬会误杀合法的 32..63)。 */
     uint16_t wire2_idx;
-    uint8_t  period;   /* offset 14: div_idx(2bit) + phase(6bit) */
+    uint8_t  period;   /* offset 14: div_idx(2bit) + phase(6bit)
+                        * ★★★ 2026-09-18（E-V）: **phase 位由固件覆写, 主机控不了** ——
+                        *   `engine_stage_program` 尾部按「档内到达序 % 相位数」**轮转分配**相位
+                        *   (`r.period = dv | ph<<2`)。写在这里是因为: 载荷里带着相位**但被忽略**
+                        *   是一个静默语义（协议字段存在 ⇒ 读的人会以为能控）。
+                        *   ★ 而「轮转铺开」正是闸门摊薄口径成立的前提 ⇒ 两处有隐含依赖,
+                        *     由 tools/exp_ev_gate_worst_phase.py 的 V2/V3/V4 钉住。 */
     uint8_t  reserved; /* offset 15: S3 里这是编译器的**尾部填充字节** (15 个字段
                         * + aligned(4) → sizeof 补齐到 16)。这里显式命名, 使
                         * 逐字节校验和**不依赖填充内容** —— 否则任何"逐字段赋值"
