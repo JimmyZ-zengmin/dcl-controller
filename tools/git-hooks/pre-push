@@ -1,0 +1,25 @@
+#!/bin/sh
+# pre-push —— 拦截误推 dcl-controller（对外发布仓库，由人工上传）
+#
+# 为什么存在：本项目 `remote.pushdefault` 曾是 dcl，而两个远程的语义不同
+#   · origin = H723PLC      = 私人开发仓库  ← 日常开发推这里（自动）
+#   · dcl    = dcl-controller = 对外公布新版本的官方仓库 ← 人工上传
+# 「推错仓库」不可逆（对外仓库一旦推出就收不回），所以要 fail-closed。
+#
+# 日常开发：  bash tools/h723_push.sh
+# 确实要发布：DCL_ALLOW_PUBLIC_PUSH=1 git push dcl main
+remote_name="$1"
+remote_url="$2"
+
+case "$remote_name $remote_url" in
+  *dcl-controller*)
+    if [ "${DCL_ALLOW_PUBLIC_PUSH:-0}" != "1" ]; then
+      echo "✗ pre-push 拦截：本次目标是 dcl-controller（对外发布仓库）。" >&2
+      echo "  · 日常开发请推 H723PLC：bash tools/h723_push.sh" >&2
+      echo "  · 确实要对外发布：    DCL_ALLOW_PUBLIC_PUSH=1 git push dcl main" >&2
+      exit 1
+    fi
+    echo "⚠ DCL_ALLOW_PUBLIC_PUSH=1 —— 允许推送对外仓库 dcl-controller" >&2
+    ;;
+esac
+exit 0
