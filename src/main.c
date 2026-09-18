@@ -685,6 +685,17 @@ OBS uint32_t g_isr_overrun  = 0;   /* 本 RUN 段内 ISR 超预算(EXEC_BUDGET_C
                                     * ★ 审查二级 #5: 它此前"不存在"——0x38 里直接填 0。
                                     *   权威值在 DTCM, 主循环镜像到 SHM 0x3850 (与范本同址)。 */
 
+/* ── ★ E-D (2026-09-18): **引擎扫描段**时长（与整段 ISR 分开记）──
+ * 为什么必须分开: `di` = 整段 ISR, 含 bb_kick/adc_poll_kick/rtc_latch/i2c_sm_tick/seq
+ * ⇒ 拿它去对"结构侧算出的引擎成本"是**两个量**（§5.47）。
+ * 夹取点在 main.c 的 engine_tick 调用前后（那两个 tb_cyc() 本来就存在）。*/
+OBS uint32_t g_scan_cyc_last = 0;
+OBS uint32_t g_scan_cyc_min  = 0xFFFFFFFFu;
+OBS uint32_t g_scan_cyc_max  = 0;
+OBS uint32_t g_scan_cyc_sum_n = 0;
+OBS uint64_t g_scan_cyc_sum  = 0;
+OBS uint32_t g_scan_nrun_last = 0;   /* 最近一拍的 nrun（结构侧直接拿它比对）*/
+
 /* ── 拍周期 (相邻 ISR 入口 CYCCNT 差) ── */
 OBS uint32_t g_per_cyc_last = 0;
 OBS uint32_t g_per_cyc_min  = 0xFFFFFFFFu;
@@ -869,6 +880,13 @@ static ISR_PLACE void stats_reset(void)
     g_isr_cyc_max  = 0;
     g_isr_cyc_sum  = 0;
     g_isr_sum_n    = 0;    /* ★ 与 g_isr_cyc_sum 同口径的分母 (见 ISR 里的说明) */
+    /* ★ E-D: 扫描段统计与整段 ISR 统计**同窗口**清零（否则均值跨段混口径）*/
+    g_scan_cyc_last = 0;
+    g_scan_cyc_min  = 0xFFFFFFFFu;
+    g_scan_cyc_max  = 0;
+    g_scan_cyc_sum  = 0;
+    g_scan_cyc_sum_n = 0;
+    g_scan_nrun_last = 0;
     g_exec_ring_w  = 0;    /* ★ 逐拍环形缓冲: 每个 RUN 段从 0 起, 与统计同窗口 */
     g_isr_n        = 0;    g_isr_overrun  = 0;   /* ★ 与范本同语义: 超预算计数只反映**本次 RUN 段**
                            *   (S3 在 core0_engine_start 里清 OVERRUN, 这边在 stats_reset 清) */
@@ -1257,6 +1275,25 @@ ISR_PLACE void TIM2_IRQHandler(void)
             }
             uint32_t tz = tb_cyc();
             uint32_t wz = DWT_CYCCNT;
+
+            /* ★★ E-D (2026-09-18): **扫描段 = tz − ta**, 归进独立的统计面。
+             *   为什么这里是最佳夹取点:
+             *     · `ta` 在扫描之前、`tz` 在扫描之后, 两点**本来就存在**（用于整段统计）
+             *     · 本段代码在 `tz` **之后** ⇒ 不进入被测量的区间（不污染）
+             *     · 位置在 `if (g_engine_gate && !g_engine_run_seen) return;` **之后**
+             *       ⇒ STOP 时不累加, 统计只反映 RUN 段（与 g_isr_* 同语义）
+             *   ★ 判据 D-3（能失败）: 引擎 STOP 后本域应**停止增长**; 若仍涨 ⇒ 夹错了位置。 */
+            {
+                uint32_t ds = tz - ta;
+                g_scan_cyc_last = ds;
+                g_scan_nrun_last = nrun;
+                if (ds != 0u) {
+                    if (ds < g_scan_cyc_min) g_scan_cyc_min = ds;
+                    if (ds > g_scan_cyc_max) g_scan_cyc_max = ds;
+                    g_scan_cyc_sum += ds;
+                    g_scan_cyc_sum_n++;
+                }
+            }
 
             /* ★★ 两条路径**互相监看** —— "时基在走"从此是一个**可读走的量**, 不再靠约定:
              *   时基动/DWT 不动 ⇒ DWT 被调试器关了（`g_dwt_dead_n`）
@@ -4894,6 +4931,18 @@ int main(void)
         SHM_U32(g_shm, OFF_TIMING_EXEC_SUM_LO) = (uint32_t)(g_isr_cyc_sum & 0xFFFFFFFFu);
         SHM_U32(g_shm, OFF_TIMING_EXEC_SUM_HI) = (uint32_t)(g_isr_cyc_sum >> 32);
         SHM_U32(g_shm, OFF_TIMING_EXEC_SUM_N)  = g_isr_sum_n;
+        /* ★★ E-D (2026-09-18): **扫描段**（引擎本体）与上面那个"整段 ISR"分别镜像。
+         *   分开的理由见 engine.h 的 OFF_SCAN_CYC_* 说明:
+         *   `di` 含拍内其它全部工作, 而"结构侧算的是引擎成本" ⇒ 拿 `di` 比是比两个量。
+         *   ★ 同时镜 `nrun`: 结构侧要判"每拍跑几条", 它必须与**同一拍**的时长配对,
+         *     跨窗口取会引入读偏斜（本项目已因这类错栽过: §A1.5 的 sum/g_isr_n 口径）。 */
+        SHM_U32(g_shm, OFF_SCAN_CYC_LAST)   = g_scan_cyc_last;
+        SHM_U32(g_shm, OFF_SCAN_CYC_MIN)    = pn_or_0(g_scan_cyc_min);
+        SHM_U32(g_shm, OFF_SCAN_CYC_MAX)    = g_scan_cyc_max;
+        SHM_U32(g_shm, OFF_SCAN_CYC_SUM_LO) = (uint32_t)(g_scan_cyc_sum & 0xFFFFFFFFu);
+        SHM_U32(g_shm, OFF_SCAN_CYC_SUM_HI) = (uint32_t)(g_scan_cyc_sum >> 32);
+        SHM_U32(g_shm, OFF_SCAN_CYC_SUM_N)  = g_scan_cyc_sum_n;
+        SHM_U32(g_shm, OFF_SCAN_NRUN_LAST)  = g_scan_nrun_last;
         /* ★ 0x3850 与范本**同址** —— 它不在上面 0x18..0x33 这一块里 (那里已排满,
          *   0x34 起是保留的 GPIO_MASK), 是照 S3 的独立位置放的。 */
         SHM_U32(g_shm, OFF_TIMING_OVERRUN)     = g_isr_overrun;

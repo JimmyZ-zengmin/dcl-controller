@@ -210,6 +210,34 @@
 #define OFF_RSVD_DSL_DOMAIN     0x3840   /* 保留洞: 开头给 SEQ 区, 尾部仍未落地 */
 #define OFF_RSVD_DSL_DOMAIN_SZ  (OFF_ROUTE_BUCKETS - OFF_RSVD_DSL_DOMAIN)   /* 0xC40 */
 
+/* ══════════ 引擎扫描段时长（E-D, 2026-09-18 新增）══════════
+ * ★★ 为什么必须有它（这是 E-D 的全部目的）:
+ *   既有的 `di`（`OFF_TIMING_LAST_EXEC` / `OFF_EXEC_RING`）量的是**整段 ISR** ——
+ *   含 `bb_kick` / `adc_poll_kick` / `rtc_latch` / `i2c_sm_tick` / `seq` 等。
+ *   ⇒ 用 `di` 去和"结构侧算出的引擎成本"比对时, **两边不是同一个量**。
+ *   §5.47 已把这条记为"观测口径不一致", 这里是它的**解药**。
+ *
+ * ★ 夹取点: `main.c` 里 `engine_tick()/engine_scan_itcm()` 调用的**前后各一次 `tb_cyc()`**。
+ *   那两个时基读**本来就已经存在**（`ta` 与 `tz`）⇒ 本域只多一次减法 + 几次比较,
+ *   而且这几次比较发生在 `tz` **之后**, 不进扫描段（不污染被测量）。
+ *
+ * ★ 落点: `0x3800` —— 位于 `OFF_CTRL_GPIO_MASK` 之后、`OFF_RSVD_DSL_DOMAIN(0x3840)` 之前。
+ *   ★ 这个位置是**从 map 核对的**: 之前误以为它是空的, 而"无人设防的空洞"正是
+ *     §保留区 那条教训要防的东西 ⇒ 所以照样给名字 + 尺寸断言, 不白用。
+ */
+#define OFF_SCAN_CYC_LAST   0x3800   /* u32: 最近一拍的**扫描段**时长 (TB tick) */
+#define OFF_SCAN_CYC_MIN    0x3804   /* u32: 本 RUN 段最小 (0xFFFFFFFF = 无样本) */
+#define OFF_SCAN_CYC_MAX    0x3808   /* u32: 本 RUN 段最大 */
+#define OFF_SCAN_CYC_SUM_N  0x380C   /* u32: 与 sum 同口径的拍数（扫描段 ≠0 的拍）*/
+#define OFF_SCAN_CYC_SUM_LO 0x3810   /* u32: u64 低半 */
+#define OFF_SCAN_CYC_SUM_HI 0x3814   /* u32: u64 高半 */
+#define OFF_SCAN_NRUN_LAST  0x3818   /* u32: 最近一拍的 `nrun`（**结构侧要用它**）*/
+_Static_assert((OFF_SCAN_CYC_LAST & 3u) == 0u, "SHM: SCAN_CYC 需 4 字节对齐");
+_Static_assert(OFF_SCAN_NRUN_LAST + 4u <= OFF_RSVD_DSL_DOMAIN,
+               "SHM: SCAN_CYC 块不得压到 DSL 保留洞(0x3840)");
+_Static_assert(OFF_SCAN_CYC_SUM_LO + 4u == OFF_SCAN_CYC_SUM_HI,
+               "SHM: SCAN_CYC sum 两半必须相邻");
+
 /* ---- 档级触发统计 (多周期) —— ★★ 偏移与 S3 **同址** (0x3854) ----
  * ★ 为什么不搬: S3 回归套件 (test_dcl.py 的 T17) **直接按 0x3854 读这三个计数**,
  *   而"脚本零改动"是迁移验收的硬条件 ⇒ 凡套件依赖的偏移一律保持同址。
