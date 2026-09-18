@@ -83,8 +83,18 @@ def mk(op, div, n):
                          "载荷头 n_routes 是 u8, >255 会直接崩在打包处）" % n)
     if not (0 <= div <= 2):
         raise SystemExit("!! div=%d 超出范围 0..2" % div)
+    # ★★ 2026-09-18: 必须给路由带上**第二输入**（`ROUTE_FLAG_WIRE2` + `wire2_idx`）。
+    #   否则固件的 deploy 校验会 NAK:
+    #       "this op needs wire2 source (set ROUTE_FLAG_WIRE2 or wire2_idx!=0)"
+    #   实测: CNT(0x0B) / ARITH(0x0D) / AND(0x0F) / OR(0x10) / SR(0x12) 这 5 个原语
+    #   用不到第二输入就无法部署 ⇒ E-C 的 19 个原语里**缺了 5 个**。
+    #   ★ 判据见 `engine.h:1038` 的 `wire2_valid`: `(flags & WIRE2) || wire2_idx`。
+    #   ★ 教训: 这是**第三类**同类问题 —— 前两类是 `mk()` 崩在打包(§入参闸门)与
+    #     "payload 字段错位"。三次都表现为"板子没反应/工具报错", 而根因都在上位机。
+    FLAGS = ACTIVE | 0x02                      # 0x01 ACTIVE | 0x02 ROUTE_FLAG_WIRE2
     routes = b"".join(struct.pack("<BBBBBBHHHHBB", SRC_CONST, i, DST_WIRE, i, op,
-                                  ACTIVE, i, (i % 64) + 1, 0, 0, div, 0) for i in range(n))
+                                  FLAGS, i, (i % 64) + 1, 0, i, div, 0) for i in range(n))
+    #                                                 ↑wire2_idx=i（非零 ⇒ wire2_valid 成立）
     params = b"".join(struct.pack("<4f", 1.0, 0.0, 0.0, 0.0) for _ in range(n))
     states = b"\x00" * (16 * (min(n, 64) + 1))
     return struct.pack("<HHH", n, n, min(n, 64) + 1) + routes + params + states + b"\x00" * 16
