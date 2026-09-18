@@ -102,26 +102,27 @@ def main():
                   % (tag, h[0] if h else "?", h[1] if h else "?", smp, nr))
             return h
 
+        # ★★★ 2026-09-18: **回到"已被证明能工作的最小序列"**。
+        #   六个假设全部排除后（§A3.8），症状被定为"板子被某个动作带进复位—恢复态"。
+        #   而 `probe_ring5` 阶段 3 已证明下面这条**最小序列**是健康的:
+        #       STOP → START → deploy → STOP → START → 静默 1.5 s → 读
+        #       ⇒ 环写 = 15037（正是预期的 ~15000）
+        #   ⇒ 先**绕开**（本工具不再在序列中间做任何额外的 0x38/探针），
+        #     把"哪个动作让主循环停了一次"降级成一个**独立的、不阻塞 E4 的**问题。
+        #   ★ 保留一条健康判据: `tick`（自由计数, **不随 stats_reset 归零**）
+        #     必须单调递增到百万级; 掉回两位数 ⇒ 板子在复位循环里 ⇒ **判无效**。
         op, div, n = (int(x, 0) for x in a.prog.split(","))
-        probe("① 连接后")
-        dcl.send(cmd_stop); time.sleep(0.15)
-        dcl.send(cmd_start); time.sleep(0.15)
-        probe("② 首个 STOP/START 后")
         sts, pp = dcl.send(cmd_deploy, mk(op, div, n), expect_len=None)
         if sts != "ACK":
             print("!! deploy 被拒: %s" % (pp.decode('utf-8', 'replace') if sts == 'NAK' else sts))
             return 2
         print("已部署 op=%d div=%d n=%d ⇒ ACK budget=%d"
               % (op, div, n, struct.unpack("<HI", pp[:6])[1]))
-        probe("③ deploy(含补发 0x11) 后")
 
-        # STOP/START ⇒ 清统计 + 清环, 保留程序
+        # STOP/START ⇒ 清统计 + 清环, 保留程序（**这是最小序列里唯一的 STOP/START 对**）
         dcl.send(cmd_stop); time.sleep(0.15)
-        probe("④ STOP 后")
         dcl.send(cmd_start); time.sleep(0.15)
-        probe("⑤ START 后")
         time.sleep(a.settle)
-        probe("⑥ 静默 %.2fs 后" % a.settle)
 
         # ★★ 顺序修正（第一版踩过）: **先读头、再读环、再读头**。
         #   第一版是"先读环再读头", 结果两次都读到 `写计数=57 / tick=69` —— 而探针
@@ -141,11 +142,12 @@ def main():
         if ring is None or h1 is None or h2 is None:
             print("!! 读失败 ⇒ 判无效"); return 2
         w, last_tick, slots = h2[0], h2[1], h2[2]
-        print("环头(读环前): 写计数=%d tick=%d samples=%d" % (h1[0], h1[1], smp1))
-        print("环头(读环后): 写计数=%d tick=%d samples=%d" % (w, last_tick, smp2))
-        print("⇒ 本次大读横跨了 %d 拍（%d 个 RUN 拍）" % (w - h1[0], smp2 - smp1))
+        print("环头: 写计数=%d tick=%d（读环前写计数=%d）" % (w, last_tick, h1[0]))
+        # ★ 健康判据: `tick` 是**自由计数**, 不随 stats_reset 归零 ⇒
+        #   健康的板子上它应该在百万级; 掉回两位数说明板子在复位循环里。
+        res.append(("P0a 板子健康（tick 在百万级，非复位循环）", last_tick > 100000))
         if w == 0:
-            print("!! 写计数为 0 ⇒ 环没在动 ⇒ 判无效（固件没烧对？）"); return 2
+            print("!! 写计数为 0 ⇒ 环没在动 ⇒ 判无效"); return 2
         res.append(("P0 环缓冲在动（写计数 > 0）", True))
         # ★ 窗口自检: 环写计数必须与 RUN 拍数**同量级**（1:1 附近）
         #   —— 第一版就是缺这一条, 才会拿一个 68 拍的窗口去算频次。
