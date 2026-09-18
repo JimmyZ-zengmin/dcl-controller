@@ -2641,7 +2641,9 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
             /* ★★★ 2026-09-17: **"走 N 个脉冲自停"**（硬件计数，见 src/step.h）。
              *   arg = 目标步数（0 = 取消）。★ 前置：**当前必须有脉冲在跑**，否则 NAK 并给原因
              *   （`NAKRH_STEPNCNT`）—— 不能"接受了却什么也没发生"。
-             *   ★ 到点由 `step_tick`（主循环）停脉冲 ⇒ 会多走 ≤1 圈的几步；
+             *   ★ 到点由 `step_tick`（主循环）停脉冲 ⇒ 会多走几步；**过冲的界是
+             *     「本次停脉冲前主循环的最大间隔」而不是"1 圈 0.37ms"**（2026-09-18 E-S 更正:
+             *     名义 0~27ms, 注入一次大块读可达 72~104ms; 见 `docs/exp-ES-step-duration.md`）。
              *     但 `g_step_pulses`（= `TIM4_CNT`）**精确记录实际步数**，可读回（sub=16）。
              *   ★ 16 位上限 65535 步，超出**钳位**（在 `step_set_remaining` 里）。 */
             uint32_t rc15 = step_set_remaining(arg);
