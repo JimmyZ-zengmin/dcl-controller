@@ -94,6 +94,31 @@ volatile uint32_t g_step_ramp_done_n   = 0u;
 #if DCL_STEP_RAMP_FIX
 static uint32_t s_ramp_acc = 0u;
 #endif
+/* ★★★ E-R (2026-09-18): **限时的拍余数累加器** —— 与斜坡同款, 但这是**另一处**语义。
+ *
+ * ## 缺陷（实测量化, `tools/exp_er_motion_time.py`）
+ * 原实现是 `uint32_t dm = dt / 10u; if (dm == 0u) { return; }`
+ * —— 把"拍→ms"做**整数截断**, 而 `step_tick` 由主循环每 **~0.37 ms（≈3.7 拍）** 调一次
+ * ⇒ `floor(3.7/10) = 0` ⇒ **那一圈的时间被整块丢掉**, 只有偶尔的长圈才走 1 ms。
+ *
+ * | 条件 | 实测流逝率 | 声明 2000 ms 的限时实走 |
+ * |---|---|---|
+ * | **部署条件**（无上位机读） | **747 ms/s**（−25%） | **2677 ms** |
+ * | 持续读串口 | **990 ms/s**（−1%） | 2020 ms |
+ *
+ * ⇒ 两条后果:
+ *   ① 安全网（限时）在真实运行下比声明**松 34%**;
+ *   ② **实现值依赖"有没有人在读串口"** —— 所有回归都在持续读, 于是它一直看起来是对的。
+ *
+ * ## 为什么是"同一个语义两处存放"的第二次
+ * 正上方 20 行的**斜坡**路径在 2026-09-18 已经改成余数累加器（`s_ramp_acc`）,
+ * 而**限时这一处没跟上** —— 与顺序档 dt 表（E-Q）**逐字同族**: 改了一处, 另一处留着。
+ * ★ 全仓 `拍→ms` 的换算只有两处（本次已扫）: 斜坡的**对照分支**与这里。
+ *
+ * ## 修法
+ * 把拍攒够 10 拍才换 1 ms, 余数留在累加器里 ⇒ **任意 dt 分布下都不丢时间**
+ * （对照档仍是 `dt/10` 截断, 便于 A/B）。 */
+static uint32_t s_dl_acc = 0u;
 
 static uint8_t *s_base = NULL;
 static uint32_t s_sync = 1u;   /* ★ 首次/重新武装后先对齐 s_last, 见 step_tick */
@@ -394,6 +419,7 @@ void step_set_stop_hold(uint32_t hold)
 void step_set_deadline_ms(uint32_t ms)
 {
     g_step_deadline_tick = ms;      /* 存"剩余毫秒"; step_tick 按拍差递减 */
+    s_dl_acc = 0u;                  /* ★ 余数清零: 否则上一段的 ≤9 拍会漏进新限时 */
     s_sync = 1u;                    /* ★ 必须: 否则下一次 step_tick 用旧 s_last 算出巨大 dt */
 }
 
@@ -530,9 +556,14 @@ void step_tick(uint32_t tick_now)
         if (g_step_ramp_active == 0u) { g_step_ramp_done_n++; }
     }
 
-    if (g_step_deadline_tick == 0u) { return; }
-    uint32_t dm = dt / 10u;                 /* 拍 → 毫秒 */
-    if (dm == 0u) { return; }
+    if (g_step_deadline_tick == 0u) { s_dl_acc = 0u; return; }
+    /* ★★★ E-R (2026-09-18): 拍 → 毫秒 —— **必须带余数累加器**（见 s_dl_acc 处的长注释）。
+     *   原写法 `dm = dt / 10u; if (dm == 0u) return;` 在主循环 ~3.7 拍/圈下**每圈丢 0.37 ms**
+     *   ⇒ 实测流逝率 747 ms/s（部署条件）而不是 1000。 */
+    s_dl_acc += dt;
+    uint32_t dm = s_dl_acc / 10u;
+    if (dm == 0u) { return; }               /* 还不够 1 ms ⇒ 余数留着, 下圈继续攒 */
+    s_dl_acc -= dm * 10u;
     if (g_step_deadline_tick > dm) { g_step_deadline_tick -= dm; }
     else { g_step_deadline_tick = 0u; step_stop_safe(); }
 }
