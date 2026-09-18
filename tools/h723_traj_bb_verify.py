@@ -105,6 +105,12 @@ def capture(port, prog, A, slope, out):
         def wset(n, v):
             return d.send(0x21, struct.pack("<II", shm + owm + n * 4,
                          struct.unpack("<I", struct.pack("<f", v))[0]))[0] == "ACK"
+        # ★★ 先把编码器回填提到 ~1 kHz（阶段 0 的结论）：否则半周期里只有 ~14 次回填，
+        #   速度剖面太粗（实测回填 ~600 Hz ⇒ 100ms 半周期只有 ~60 点，够用；
+        #   但拍内模式更稳：`sub=22 arg=1` + `sub=20 arg=10`）。
+        d.send(0x39, bytes([19, 22]) + struct.pack("<I", 1))
+        d.send(0x39, bytes([19, 20]) + struct.pack("<I", 10))
+        time.sleep(0.2)
         d.send(0x39, bytes([19, 13]) + struct.pack("<I", 1))      # 运动源 = 程序面
         d.send(0x39, bytes([19, 17]) + struct.pack("<I", slope))  # 斜坡斜率
         time.sleep(0.2)
@@ -171,22 +177,41 @@ def decode(path):
         rows[seq] = (tick, struct.unpack("<60f", d[o + 16:o + 16 + 240]))
     if not rows:
         raise SystemExit("没有一条合法记录（magic 全不匹配）⇒ 环是空的或未启动")
-    ks = sorted(rows)
-    segs, cur = [], [ks[0]]
-    for k in ks[1:]:
-        if k == cur[-1] + 1:
-            cur.append(k)
-        else:
-            segs.append(cur); cur = [k]
-    segs.append(cur)
-    if len(segs) > 1:
-        print("  ⚠ 环里有 %d 段不连续的 seq（陈旧残余）⇒ **只分析最新段**，其余列出以便自知：" % len(segs))
-        for s in segs[:-1]:
-            print("     陈旧段 seq %6d..%-6d 共 %3d 条（tick %d..%d）"
-                  % (s[0], s[-1], len(s), rows[s[0]][0], rows[s[-1]][0]))
-    last = segs[-1]
-    print("  最新段 seq %d..%d（%d 条）" % (last[0], last[-1], len(last)))
-    return [rows[k] for k in last]
+    # ★★★ 2026-09-18 第二次修这里的解码：**按 `tick` 排序，不要按 `seq`**。
+    #   血证：同一会话内连拍两次，环里其实是**满的 960 条连续记录**（seq 在环内**回绕**：
+    #   36480…38399 然后 0…1919）。而"按 seq 排序 + 取最新连续段"遇到回绕就把它**切成假的不连续段**
+    #   ⇒ 只取到 128 条 ⇒ 覆盖度 0.33 ⇒ 误判 SKIP（**看起来像硬件不够，其实是解码器不够**）。
+    #   ⇒ `tick` 是单调的（10 kHz，本会话内不回绕）⇒ 它才是正确的时间轴。
+    # ★★★ 一致性闸门（2026-09-18 加）：同一份 dump 用三种排序会给出三个互相矛盾的跨度
+    #   （按 seq 取最新段 → 128 条 / 按 slot → 960 条 / 按 tick → 跨 20 s）。
+    #   在**环的写指针/水位语义定案之前**，任何「形状」结论都是建在没解释的机制上 ⇒
+    #   本工具在这种状态下**必须拒绝给结论**（而不是悄悄挑一个看起来合理的）。
+    _by_tick = sorted(rows, key=lambda k: rows[k][0])
+    _span_tick = (rows[_by_tick[-1]][0] - rows[_by_tick[0]][0]) / TICK_HZ
+    _by_slot = sorted(rows)
+    _gap = sum(1 for a, b in zip(_by_slot, _by_slot[1:]) if b != a + 1)
+    _stale = sum(1 for k in rows if rows[k][0] + 5000 * TICK_HZ < rows[_by_tick[-1]][0])
+    print("  【环读出语义自检】三种排序给出的跨度：")
+    print("    按 slot：%d 条，slot 不连续处 %d" % (len(_by_slot), _gap))
+    print("    按 tick：%d 条，跨度 %.3f s；其中 %d 条比最新记录早 >5000 s（陈旧残余）"
+          % (len(_by_tick), _span_tick, _stale))
+    if _stale > BB_SLOTS // 4 or _span_tick > 2.0:
+        print("\n  ⛔ **环的读出语义未定案** ⇒ 本工具**拒绝给出形状结论**（判 SKIP）。")
+        print("     三次读出互相矛盾（按 seq / 按 slot / 按 tick 各说各话）⇒")
+        print("     在解释清楚「写指针/水位」之前，任何形状结论都不可信")
+        print("     （本项目纪律：**别把结论建在没解释的机制上**）。")
+        print("     ⇒ 下一步：读 **SD 日志头里的环元数据**，或从固件侧直接确认写指针语义。")
+        # ★ 用 SystemExit(2) 而不是 `return 2`：`decode()` 的契约是"返回记录序列"，
+        #   返回一个 int 会让调用方 `len(rows)` 直接 TypeError（第一版就这么炸了）。
+        #   （SKIP 用退出码 2 表达："判无效"既不是 0=通过 也不是 1=失败。）
+        raise SystemExit(2)
+    ks = sorted(rows, key=lambda k: rows[k][0])          # 按 tick
+    wrap = sum(1 for a, b in zip(ks, ks[1:]) if rows[b][0] <= rows[a][0])
+    if wrap:
+        print("  ⚠ tick 出现 %d 处回绕/重复 ⇒ 时间轴可能不单调（下面的跨度要打折看）" % wrap)
+    if len(ks) < BB_SLOTS:
+        print("  ⚠ 只有 %d / %d 槽是合法记录（其余为零填充或未写）" % (len(ks), BB_SLOTS))
+    return [rows[k] for k in ks]
 
 
 def fit(xs, ys):
@@ -200,6 +225,20 @@ def fit(xs, ys):
     return k, r2
 
 
+def read_dwell(prog):
+    """★ 从 `.dcl` 里**读出**段长，而不是在两个工具里各写一份常量。
+    ★ 血证（本项目通病）："同一个量两处存放" ⇒ 只改一处就静默失效。
+      这次段长从 600/250ms 改到 100/35ms，若工具里还写死旧值，算出的"周期""覆盖度"全是错的。"""
+    import re as _re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    f = os.path.join(root, "examples", "h723_step_traj_%s.dcl" % prog)
+    txt = open(f, encoding="utf-8").read()
+    ms = [float(x) for x in _re.findall(r"DWELL\s+([\d.]+)ms", txt)]
+    if not ms:
+        raise SystemExit("在 %s 里找不到 DWELL ⇒ 无法确定周期" % f)
+    return ms[0] / 1000.0, len(ms)
+
+
 def main():
     prog = "tri"
     if "--prog" in sys.argv:
@@ -209,7 +248,7 @@ def main():
         A = float(sys.argv[sys.argv.index("--A") + 1])
     port = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else None
     binp = sys.argv[sys.argv.index("--bin") + 1] if "--bin" in sys.argv else None
-    dwell = 0.6 if prog == "tri" else 0.25
+    dwell, nseg = read_dwell(prog)   # ★ 单一真值源 = 那个 .dcl 文件
     slope = int(A / dwell) if prog == "tri" else 0
     if binp is None:
         binp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build",
@@ -241,7 +280,8 @@ def main():
         print("\n  ⛔ **形状判据判无效（SKIP，不是通过也不是失败）**")
         print("     黑匣子的保留跨度 = 960 槽 ÷ 变化率：运动时变化率 ~2.5 kHz ⇒ 只留 **~0.4 s**；")
         print("     而这次 dump 的最新连续段只有 **%.0f ms**（环里有陈旧残余段，工具已按最新段切）。" % (span * 1e3))
-        print("     ⇒ 覆盖不到一个三角波周期(1.2 s)，**无法判形状**。")
+        print("     ⇒ 覆盖不到一个周期(%.3f s)，**无法判形状**。" % period)
+
         print("     ⇒ 要做形状验收，三选一：① 把段长缩到 ≤50 ms；② 扩大环（①层，240 KB→更大）；")
         print("       ③ 只保留\"命令侧 WIRE[12]\"一路的变化率（映射表是编译期的 ⇒ 也要①层）。")
         print("     ★ 但有几条**不依赖覆盖一个周期**的判据仍然可判（下面给出）：")

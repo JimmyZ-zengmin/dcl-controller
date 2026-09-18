@@ -48,6 +48,20 @@ def sub(d, n, arg=0):
     return (st, p)
 
 
+def read_dwell(prog):
+    """★ 从 `.dcl` 里**读出**段长，而不是在两个工具里各写一份常量。
+    ★ 血证（本项目通病）："同一个量两处存放" ⇒ 只改一处就静默失效。
+      这次段长从 600/250ms 改到 100/35ms，若工具里还写死旧值，算出的"周期""覆盖度"全是错的。"""
+    import re as _re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    f = os.path.join(root, "examples", "h723_step_traj_%s.dcl" % prog)
+    txt = open(f, encoding="utf-8").read()
+    ms = [float(x) for x in _re.findall(r"DWELL\s+([\d.]+)ms", txt)]
+    if not ms:
+        raise SystemExit("在 %s 里找不到 DWELL ⇒ 无法确定周期" % f)
+    return ms[0] / 1000.0, len(ms)
+
+
 def main():
     prog = "tri"
     if "--prog" in sys.argv:
@@ -56,7 +70,9 @@ def main():
     if "--A" in sys.argv:
         A = float(sys.argv[sys.argv.index("--A") + 1])
     port = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else None
-    f, dwell, tab = PROG[prog]
+    f = PROG[prog][0]
+    dwell, nseg = read_dwell(prog)   # ★ 段长从 .dcl 读（单一真值源）
+    tab = PROG[prog][2]      # tri 是 0.0（无表）；sine 是那个 6 元素因子表
     d = Dcl(port or find_board())
     shm = engine_status(d)["shm"]
     print("=== 轨迹规划验证: %s  (A=%.0f Hz, 段长 %dms) ===" % (prog, A, dwell * 1000))
