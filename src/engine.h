@@ -1138,10 +1138,40 @@ static inline int op_is_stateful_h(uint8_t op)
 /* ---- 目标类型 ---- */
 #define DST_WIRE    2
 
-/* ---- dt 感知 (秒) —— 与 S3 primitives.h 同口径 ---- */
-#define DT_FAST  0.0001f   /* div0: 100μs */
-#define DT_MID   0.001f    /* div1: 1ms  */
-#define DT_SLOW  0.01f     /* div2: 10ms */
+/* ---- dt 感知 (秒) —— 与 S3 primitives.h 同口径 ----
+ * ★★★ 2026-09-18: `DT_SLOW` 由"标称 10ms"改为**从实际扫描周期导出**。
+ *
+ * ## 缺陷（E-J 实测定位, 见 `docs/exp-EJ-throughput.md`）
+ * 扫描器选 div2 相位用 `tick % BUCKET_DIV2_PHASES_USED`（**64**）,
+ * 而 `tick` 是 100µs 拍计数器 ⇒ **div2 的实际扫描周期 = 64 拍 = 6.4ms**,
+ * 但 `DT_SLOW` 一直写着 `0.01f`(10ms) ⇒ **dt 偏大 56%**。
+ *
+ * 后果（**静默**）: 跑在 div2 上的 `TIMER`/`LPF`/`RATE`/`PID` 拿到的 dt 全错 ——
+ * 例如 PID 的 `D = Kd*(err-prev)/dt` ⇒ **D 项只有预期的 64%**。
+ * 没有任何一处报错: 部署 ACK、校验和正常、扫描器"正常"运行。
+ *
+ * ## 修法: 让 dt **由决定它的那两个量算出来**, 不再手写
+ *   `周期(拍) = BUCKET_DIV2_PHASES_USED`（扫描器实际用的模数）
+ *   `拍长(s)  = TICK_PERIOD_US / 1e6`
+ * ⇒ 三者（相位模数 / 拍长 / dt）从此**不可能各自漂移**。
+ * ★ 这条正好接住"周期后续要变成可调"的规划: 调 `TICK_PERIOD_US` 或相位模数时,
+ *   `dt` **自动跟着变**, 不需要有人记得同步改一个手写常量。
+ *
+ * ## 编译期闸门
+ * 两条断言把"实际 dt ≤ 标称 dt"钉住 —— 若谁再把相位模数改大而不动 dt, 当场编译失败。
+ */
+#define TICK_PERIOD_US   100u      /* 拍长（µs）—— ★ 规划中此项将变为可配 */
+#define DT_FAST  0.0001f   /* div0: 每拍全跑 ⇒ 1 拍 = 100µs */
+#define DT_MID   0.001f    /* div1: `tick % BUCKET_DIV1_PHASES` = 10 拍 = 1ms */
+/* ★ div2: 周期 = 扫描器实际用的相位模数（不是标称的 100） */
+#define DT_SLOW  ((float)BUCKET_DIV2_PHASES_USED * (float)TICK_PERIOD_US / 1000000.0f)
+/* ★ 三条编译期闸门（能失败）:
+ *   ① div2 实际周期必须 ≤ 标称 10ms（超了说明相位模数被改大而 dt 没跟上）
+ *   ② dt 必须 > 0（防止模数被改成 0 之类的退化）
+ *   ③ TICK_PERIOD_US 与 EXEC_BUDGET 档必须自洽 —— 见 timebase.h 的 TB_US 断言族 */
+_Static_assert((float)BUCKET_DIV2_PHASES_USED * TICK_PERIOD_US <= 10000.0f,
+               "div2 实际扫描周期超过标称 10ms ⇒ dt 语义会漂, 见 exp-EJ-throughput.md");
+_Static_assert(BUCKET_DIV2_PHASES_USED > 0, "div2 相位模数不得为 0");
 
 /* ══════════ 编译期布局断言 (S3 A4 纪律: 任何区域不得重叠) ══════════
  * ★★ 覆盖范围必须**无缝**, 而且相邻区**必须精确相接** —— 所以下面用 `==` 而不是
