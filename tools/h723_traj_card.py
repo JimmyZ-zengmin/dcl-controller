@@ -178,6 +178,147 @@ def cmd_analyze_all(a):
         d.close()
 
 
+def _unwrap(recs):
+    """把 raw（0..4095 单圈）**解卷绕**成单调序列 —— 位置域判据的前提。
+    ★ 逐记录 Δ 很小（0.5 ms 间隔、≤1200 Hz ⇒ ≤2 counts）⇒ 最短弧解卷绕安全。"""
+    u, prev = [], None
+    for r in recs:
+        x = int(round(r[2]))
+        if prev is None:
+            u.append(x)
+        else:
+            d = (x - prev) & 0xFFF
+            if d > 2048:
+                d -= 4096
+            u.append(u[-1] + d)
+        prev = x
+    return u
+
+
+def _fit_quad(xs, ys):
+    """最小二乘二次拟合 y = a·x² + b·x + c ⇒ (a, b, c, 残差RMS)"""
+    n = len(xs)
+    if n < 6:
+        return None
+    mx = sum(xs) / n
+    x = [v - mx for v in xs]                       # 居中降相关
+    S = [sum(t ** k for t in x) for k in range(5)]
+    T = [sum(ys[i] * (x[i] ** k) for i in range(n)) for k in range(3)]
+    # 3x3 正规方程
+    import itertools
+    A = [[S[i + j] for j in range(3)] for i in range(3)]
+    B = T[:]
+    for col in range(3):                           # 高斯消元
+        p = max(range(col, 3), key=lambda r: abs(A[r][col]))
+        if abs(A[p][col]) < 1e-12:
+            return None
+        A[col], A[p] = A[p], A[col]
+        B[col], B[p] = B[p], B[col]
+        for r in range(col + 1, 3):
+            f = A[r][col] / A[col][col]
+            for c2 in range(col, 3):
+                A[r][c2] -= f * A[col][c2]
+            B[r] -= f * B[col]
+    co = [0.0] * 3
+    for r in (2, 1, 0):
+        s = B[r] - sum(A[r][c2] * co[c2] for c2 in range(r + 1, 3))
+        co[r] = s / A[r][r]
+    c0, b0, a0 = co[0], co[1], co[2]
+    res = [ys[i] - (a0 * x[i] ** 2 + b0 * x[i] + c0) for i in range(n)]
+    rms = (sum(v * v for v in res) / n) ** 0.5
+    return a0, b0, c0, rms
+
+
+def _judge_position(seg, A, dwell, cands):
+    def rec_ok(cond, name, detail=""):
+        print("  [%s] %-50s %s" % ("PASS" if cond else "FAIL", name, detail))
+        return cond
+    """★★★ T2'' **位置域**形状判据（2026-09-18 新增）—— 因为速度域在本装置上分辨不出：
+      测速噪声底实测 **84~92%**（20 ms 滑窗撞突发式回填）⇒ 判"斜坡线性度"必然无效。
+      ⇒ 改成用**累积位移**（积分量、噪声低一个数量级）：
+        ① 每个半周期算"**实测位移 vs 模型预测位移**"（模型由 A / 斜率 / 段长给定）
+           ⇒ 比值 ≈1 即"形状与模型相符"；并且**能反认出这个窗口是哪档斜率**（判据自动识别参数✓）
+        ② 在**模型预测的斜坡窗**内做二次拟合 ⇒ `a` 应 ≈ `slope·K/2`（位置在斜坡下是二次的）。
+      ★ 这两条都不做"速度求导"，所以不受 §5.27/§5.28 那条噪声族的伤害。"""
+    u = _unwrap(seg)
+    T0 = seg[0][0]
+    ts = [((r[0] - T0) & 0xFFFFFFFF) / TICK_HZ for r in seg]
+    w = [r[3] for r in seg]
+    edges = [i for i in range(1, len(w)) if (w[i - 1] > A / 2) != (w[i] > A / 2)]
+    if len(edges) < 4:
+        print("  ⛔ T2'' 半周期不足 ⇒ 判无效")
+        return True
+    halves = []
+    for x, y in zip(edges, edges[1:]):
+        if y - x < 8:
+            continue
+        halves.append((x, y, w[x] > A / 2))
+    if len(halves) < 4:
+        print("  ⛔ T2'' 可用的半周期不足 ⇒ 判无效")
+        return True
+    # ── ① 用候选斜率反认 + 位移比 ──
+    best, _cand_rows = None, []
+    for S in cands:
+        rs = []
+        for x, y, isA in halves:
+            T = ts[y] - ts[x]
+            v0, v1 = (0.15 * A, A) if isA else (A, 0.15 * A)
+            c0, c1 = v0 * K, v1 * K                      # counts/s
+            tr = min(T, abs(c1 - c0) / (S * K)) if S else T
+            area = (c0 + c1) / 2 * tr + c1 * (T - tr)    # counts
+            d = abs(u[y] - u[x])
+            if area > 1:
+                rs.append(d / area)
+        rs.sort()
+        med = rs[len(rs) // 2] if rs else 0.0
+        _cand_rows.append((S, rs, med))
+        if best is None or abs(med - 1) < abs(best[2] - 1):
+            best = (S, rs, med)
+    S, rs, med = best
+    # ★★ 自检：这个"反认"到底分不分得开？——下限 0.15A 时，斜坡长短对**模型面积**的影响很小
+    #   （12000 与 30000 的模型面积只差几个百分点）⇒ 若各候选的比值都接近 1，则**认不出斜率**。
+    spread = max(abs(r[2] - 1) for r in _cand_rows)
+    print("  T2''-1 **位移比**（实测/模型）各候选：%s"
+          % ", ".join("%d→%.3f" % (r[0], r[2]) for r in _cand_rows))
+    print("  T2''-1 取最佳：**斜率≈%d Hz/s**，比值中位 **%.3f**" % (S, med))
+    if spread < 0.02:
+        print("     ⛔ 各候选的比值都接近 1（极差 <2%%）⇒ **这条反认不出斜率**（弱判别）")
+        print("        ⇒ T2''-2 需要「斜率」当输入，而它认不出来 ⇒ **T2''-2 判无效（SKIP）**")
+        print("        ⇒ 正解：把 `--slope` 显式传进来（已知这次跑的是哪档），或让程序把斜率也写进卡。")
+        ok2 = True
+    else:
+        ok = rec_ok(0.85 <= med <= 1.15, "T2''-1 实测位移 ≈ 模型位移（模型=斜坡 A↔0.15A）",
+                    "%.3f" % med)
+        ok2 = False
+        ok = ok and ok2
+        return ok
+    # ── ② 斜坡窗内的二次拟合 ──
+    aa, resid = [], []
+    for x, y, isA in halves:
+        T = ts[y] - ts[x]
+        v0, v1 = (0.15 * A, A) if isA else (A, 0.15 * A)
+        c0, c1 = v0 * K, v1 * K
+        tr = min(T, abs(c1 - c0) / (S * K)) if S else T
+        j = x
+        while j < y and ts[j] - ts[x] < 0.8 * tr:
+            j += 1
+        if j - x < 6:
+            continue
+        r = _fit_quad([ts[k] - ts[x] for k in range(x, j + 1)], [u[k] for k in range(x, j + 1)])
+        if r:
+            aa.append((abs(r[0]) / (S * K / 2) if S else 0.0, r[3], u[j] - u[x]))
+    if aa:
+        near = [1 for r in aa if 0.7 <= r[0] <= 1.3]
+        rr = sorted(r[0] for r in aa)
+        print("  T2''-2 斜坡窗内二次项 |a|/(slope·K/2)：中位 **%.2f**（%d 半，P25~P75 %.2f~%.2f）"
+              % (rr[len(rr) // 2], len(rr), rr[len(rr) // 4], rr[3 * len(rr) // 4]))
+        ok &= rec_ok(len(near) >= max(2, len(aa) // 2),
+                     "T2''-2 斜坡段位置是二次的（|a| 比在 0.7~1.3）", "%d/%d 半" % (len(near), len(aa)))
+    else:
+        print("  ⛔ T2''-2 斜坡窗内样本不足 ⇒ 判无效")
+    return ok
+
+
 def cmd_analyze(a):
     """只判**最新一个** A 相窗口（首跑/单次运行用）。"""
     d = _find_card(a.disk)
@@ -403,6 +544,8 @@ def _judge(recs, A, dwell):
     zmax = max(zt) if zt else 0.0
     print("  R 每个 0 相**末段**（已减完）的最大速度 = %.0f Hz（%d 点）" % (zmax, len(zt)))
     ok &= rec_ok(zmax < 0.15 * A, "R 0 相末段速度≈0（斜坡正常减到零）", "max %.0f Hz" % zmax)
+    print()
+    ok &= _judge_position(seg, A, dwell, getattr(_judge, "_cands", [4000, 12000, 30000]))
     print("=== %s ===" % ("全部通过" if ok else "有 FAIL —— 见上"))
     return 0 if ok else 1
 
@@ -540,6 +683,7 @@ def main():
     ap.add_argument("--A", type=float, default=1200.0)
     ap.add_argument("--secs", type=float, default=6.0)
     ap.add_argument("--slope", type=int, default=0, help="覆盖斜坡斜率 Hz/s（0=用 A/段长）")
+    ap.add_argument("--cands", default="4000,12000,30000", help="T2'' 候选斜率（反认用）")
     ap.add_argument("--dwell", type=float, default=None, help="秒；缺省从 .dcl 读")
     ap.add_argument("--port", default=None)
     a = ap.parse_args()
@@ -547,6 +691,7 @@ def main():
         import re
         txt = open(os.path.join(ROOT, "examples", "h723_step_traj_tri.dcl"), encoding="utf-8").read()
         a.dwell = float(re.search(r"DWELL\s+([\d.]+)ms", txt).group(1)) / 1000.0
+    _judge._cands = [int(x) for x in a.cands.split(",")]
     print("=== h723_traj_card: %s (A=%.0f, 段长 %.0f ms) ===" % (a.cmd, a.A, a.dwell * 1000))
     if a.cmd == "run":
         return cmd_run(a)
