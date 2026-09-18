@@ -221,6 +221,24 @@ def main():
                     res.append(("B1 偏差 ∝ 转变次数（剔除离群后 R² > 0.98）", True))
                     res.append(("B2 每次转变的代价 k 显著（|k| > 0.5 cyc）", abs(k2) > 0.5))
                     res.append(("B3 离群点被**点名**而非被忽略", True))
+                    # ★★ 残差检验（这才是"预测 vs 实测"的对齐判据）:
+                    #   用拟合出来的 (k, c) 去**预测**每个点的均值, 看残差有多小。
+                    #   ★ 判据必须能失败: 残差 > 1 cyc 就红。
+                    print("\n  ── 拟合模型对每个点的**预测 vs 实测**(偏差尺度, cyc) ──")
+                    print("     块大小  转变数   实测偏差     预测偏差     残差")
+                    rx = []
+                    for d in data:
+                        pv = k2 * d[2] + c2          # ★ 预测的是**偏差**, 不是均值
+                        rx.append((d[0], pv - d[4]))
+                        print("     %-6d  %-7d %11.2f %13.2f %9.2f%s"
+                              % (d[0], d[2], d[4], pv, pv - d[4],
+                                 "   ← 离群（已排除出拟合）" if d is worst else ""))
+                    inner = [abs(r_) for bs_, r_ in rx if bs_ != worst[0]]
+                    if inner:
+                        print("     拟合内各点 |残差| 最大 = **%.2f cyc**（%d 个点）"
+                              % (max(inner), len(inner)))
+                        res.append(("B4 拟合内各点 |残差| ≤ 1 cyc（模型能预测，不只是能拟合）",
+                                    max(inner) <= 1.0))
                 else:
                     print("  ⇒ 剔离群后仍不成正比（R²=%.3f）⇒ 非可加性另有机制, 需继续隔离" % r22)
                     res.append(("B1 偏差 ∝ 转变次数（剔除离群后 R² > 0.98）", False))
