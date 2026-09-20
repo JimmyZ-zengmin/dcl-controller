@@ -15,6 +15,7 @@
 #include "transport.h"   /* DCL_FW_VERSION_H723 */
 #include <stddef.h>
 #include <string.h>
+#include "memmap.h"
 
 volatile uint32_t g_prog_ok_n = 0, g_prog_fail_n = 0, g_prog_reject_n = 0;
 volatile uint32_t g_prog_last_rc = PROG_RC_OK, g_prog_loaded_n = 0, g_prog_active_copy = 0xFFFFFFFFu;
@@ -32,24 +33,20 @@ const char *volatile g_prog_reject_str = 0;
  *   症状: 读回来的载荷头是 `444c424b` = `BBLOG_REC_MAGIC 0x4B424C44`("DLBK")
  *   ⇒ **每拍被黑匣子记录覆写** ⇒ `nr` 读成 19524 ⇒ stage 数出 0 条 ACTIVE。
  *
- * ★★★ **AXI 真实地图（320KB @0x24000000..0x24050000，已用满）**:
- *       0x24000000 .. 0x24000600   引擎诊断结构固定区
- *                                  (`SD_DIAG` 0x24000200 / `BB_DIAG` 0x24000300 /
- *                                   `SD_CFG` 0x24000400 / `BOOT_AXI` 0x24000500;
- *                                   协议 `0x20 READ` 的放行窗口 = 0x24000000..0x24000600)
- *       0x24000600 .. 0x24003000   **← 唯一可用的空档 (约 10.5KB)**
- *       0x24003000 / 0x24003100    MDMA 锁存快照 / 链表节点 (`do.c`)
- *       0x24004000 .. 0x24040000   黑匣子环 (960 槽 × 256B = **240KB**)
- *       0x24040000 .. 0x24050000   日志冻结区 `SD_STAGE` (64KB)
- *   ⇒ 512B 栈式的"往大地址找空地"在这个平台上**没有空地可找**, 只能填这个 10.5KB 的缝。
+ * ★★★ **AXI 地图: 唯一权威源是 `src/memmap.h`**（2026-09-19 收口）。
+ *   ⇒ 本平台**没有"往大地址找空地"这回事** —— AXI 已被固定区铺满，
+ *     本模块只能用 memmap.h 里声明的 `AXI_PROG_PAY` / `AXI_PROG_BLK` 两个区。
  *
- * ★★ 并加**构建期硬判据**: 地址一旦越出 `0x24000600..0x24003000` 就**编译不过**。 */
-#define PROG_PAY_ADDR   0x24000800u    /* 程序载荷缓冲 7680B (0x24000800..0x24002600) */
-#define PROG_BLK_ADDR   0x24002800u    /* 单块读写缓冲 512B (0x24002800..0x24002A00) */
-#if (PROG_PAY_ADDR < 0x24000600u) || (PROG_PAY_ADDR + 0x2000u > 0x24003000u) || \
-    (PROG_BLK_ADDR < 0x24000600u) || (PROG_BLK_ADDR + 0x200u > 0x24003000u)
-#error "程序存储缓冲越出 AXI 唯一空档 0x24000600..0x24003000 —— 见 prog_store.c 的 AXI 地图"
-#endif
+ * ★★ 并加**构建期硬判据**（2026-09-19 起改为引用 `memmap.h` 的区尺寸，
+ *   不再手写 `#if` + `#error`）：缓冲必须**恰好**落在自己的区里，越界或尺寸不符 ⇒ 编译不过。 */
+#define PROG_PAY_ADDR   AXI_PROG_PAY    /* 程序载荷缓冲（地址唯一源: src/memmap.h）*/
+#define PROG_BLK_ADDR   AXI_PROG_BLK    /* 单块读写缓冲（同上）*/
+_Static_assert(AXI_PROG_PAY_SZ == 0x1E00u,   /* 7680 B */
+               "memmap: PROG_PAY 区尺寸变了 —— 载荷上限 PROG_PAYLOAD_MAX(7680) 要一起改");
+_Static_assert(AXI_PROG_BLK_SZ == 0x200u, "memmap: PROG_BLK 区尺寸变了");
+/* ★ 2026-09-19: 这里原本还有一条 `AXI_PROG_PAY + AXI_PROG_PAY_SZ <= AXI_LATCH`
+ *   （载荷缓冲不得越进 MDMA 锁存区）—— 已删：memmap.h 的**平铺断言**（相邻区精确相接）
+ *   已经蕴含它，而跨区引用会让 prog_store 出现在 do.c 的区 refs 白名单里（不变量 M5 的噪声）。*/
 
 static uint8_t *const s_pay = (uint8_t *)PROG_PAY_ADDR;
 static uint8_t *const s_blk = (uint8_t *)PROG_BLK_ADDR;

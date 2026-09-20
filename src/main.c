@@ -80,6 +80,7 @@ static volatile uint32_t g_i2c_hold_until = 0u;
 #include "blackbox.h"
 #include "sd.h"
 #include "prog_store.h"   /* S5: DCL 程序持久化 (SD A/B 双副本 + 事务式上传) */
+#include "memmap.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -251,7 +252,7 @@ OBS uint32_t g_opt_sr = 0;   /* FLASH_OPTSR_CUR (bit4=IWDG1_SW: 1=软件看门�
  * ★ 基址必须与 manifest.h 的 `MF_ENTRY("BOOT_AXI", 0x24000500u, ...)` 一致。
  *   在这里起一个名字, 是为了**消掉地址的第二份副本** —— 审计 P2 指出的"字段语义有两份副本"
  *   已经害过一次 (工具写死 PR=4/RLR=99, 换档即假报警), 地址同理。 */
-#define BOOT_REC_ADDR        0x24000500u
+#define BOOT_REC_ADDR        AXI_BOOT_REC   /* 地址唯一源: src/memmap.h */
 /* ★★ 挂死归因锚点 (2026-09-13, 回应审计 P1②)。
  *   为什么必须有它: 复位后读到的 `RSR=IWDG1RSTF` **无法区分**两种完全不同的世界 ——
  *     (a) ISR 按设计走进死循环 ⇒ 没人喂狗 ⇒ 看门狗复位        ← 我们想证明的
@@ -4444,6 +4445,18 @@ int main(void)
      *       **之前** (恢复要写 ACTIVE 表, 此刻无 ISR 扫描 = 无撕裂风险)。 */
     cold_start_reset();
     shm_guard_paint();
+    /* ★★ 内存账本（2026-09-19 / D 期）：铺无名 DTCM 区 → 可选变异探针 → 扫水位。
+     *   顺序不能换: 探针必须在 paint **之后**（否则它踩不到魔术字，F3 判据就失效）。 */
+    mem_stat_paint();
+#if defined(DCL_STACK_PROBE_BYTES) && (DCL_STACK_PROBE_BYTES > 0)
+    {   /* ★ 变异探针：故意吃掉 DCL_STACK_PROBE_BYTES 字节栈 ⇒ 水位必须跟着涨。
+         *   只在验收时用 `-DDCL_STACK_PROBE_BYTES=16384` 打开，默认 0（交付档不含它）。*/
+        volatile uint8_t probe[DCL_STACK_PROBE_BYTES];
+        probe[0] = 1u; probe[DCL_STACK_PROBE_BYTES - 1u] = 1u;
+        (void)probe[0];
+    }
+#endif
+    mem_stat_scan();
 #if MB_DEFAULT_USE_UART
     /* W4: 通信域物理口 (USART2 PA2/PA3) —— **只调一次**, 不随冷启动重复。
      * 与 mb_config 的分工见 modbus.h。 */
@@ -5174,6 +5187,10 @@ int main(void)
                              g_guard_bad_off);
             }
         }
+        /* 内存账本：限频扫描（内部 1/1024 分频 ⇒ 约 0.1~0.4 s 一次）
+         *   ★ 它只读魔术字与写 AXI 的 16 个字 ⇒ 不进拍内热路径，也不改被测对象。 */
+        mem_stat_scan_poll();
+
         g_stage = 9;
         __asm__ volatile("wfi");
     }

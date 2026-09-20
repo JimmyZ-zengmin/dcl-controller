@@ -60,6 +60,7 @@
 #include "itcm.h"       /* ★ ISR 调用树必须住 ITCM —— 见该头文件 (sd_cfg_take) */
 #include "regs.h"
 #include "blackbox.h"   /* 记录格式 BB_SLOT_SZ / bb_slots_produced() */
+#include "memmap.h"
 
 /* ── SDMMC1 (D1 域, 0x52007000) ── */
 #define SDMMC1_BASE   0x52007000u
@@ -187,25 +188,22 @@ volatile uint32_t g_sd_blocks = 0;
  *   [16..19] 分频自检: (CLKDIV<<8) | 结果码 (0=OK)
  *   结果码: 1=CMD0 无 CMDSENT  2=CMD8 失败  3=CMD8 回显不符
  */
-#define SD_DIAG  ((volatile uint32_t *)0x24000200u)
+#define SD_DIAG  ((volatile uint32_t *)AXI_SD_DIAG)   /* 地址唯一源: src/memmap.h */
 
 /* ★★ 实验配置字 (2026-09-12, 提速研究用): 调试器**在复位前预写**, 固件读一次即清。
  *   好处: 换 CLKDIV / 开关 High Speed 不需要重新编译烧录 (项目"非侵入式交互"纪律)。
  *   [0] 数据期 CLKDIV (0 / 未写 ⇒ 用默认 SD_DATA_CLKDIV)
  *   [1] =1 ⇒ 识别后发 CMD6 把卡切到 High Speed (50MHz 前必须; 25MHz 不需要)
- * ★★ AXI SRAM 布局 (2026-09-12 重排, 空出整块冻结区):
- *   0x24000000 低 16KB 预留   0x24000200 SD_DIAG   0x24000300 BB_DIAG
- *   0x24000400 SD_CFG         0x24001000 SD 校验 scratch(512B)
- *   0x24003000/0x24003100     do.c 锁存快照 / MDMA 链表节点 (勿动)
- *   0x24004000 + 240KB        黑匣子 RAM 环 (**960** 槽 × 256B = 96ms 缓冲)
- *   0x24040000 + 64KB         **SD 冻结区** (落盘前把这一批拷过来, 见 sd_log_one_batch)
+ * ★★ AXI 布局: **唯一权威源是 `src/memmap.h`**（2026-09-19 收口）。
+ *   本文件原先在这里写了第二份地图（三份并存 ⇒ 曾因读到过期的那份而撞进黑匣子环）。
+ *   现在这里只留名字，地址一律从 memmap.h 取。
  * ★ 环做大的唯一理由: 丢包判据是"落后量 > 槽数"(avail > BB_SLOTS)。
  *   增大槽数 = 提高对**瞬时卡顿**(SD 卡编程尾巴变长)的吸收量。
  *   读完清零 ⇒ 不会悄悄改变下次上电的行为。 */
-#define SD_CFG      ((volatile uint32_t *)0x24000400u)
+#define SD_CFG      ((volatile uint32_t *)AXI_SD_CFG)  /* 地址唯一源: src/memmap.h */
 #define SD_DATA_CLKDIV_DEF  1u      /* 100MHz/(2*1) = 50MHz (实测 5.63MB/s) */
-#define SD_RING    ((const uint8_t *)0x24004000u)   /* 黑匣子 RAM 环 (活的, 512×256B) */
-#define SD_STAGE   ((uint8_t *)0x24040000u)         /* 64KB 冻结/暂存区 (紧接 240KB 环之后) */
+#define SD_RING    ((const uint8_t *)AXI_BB_RING)   /* 黑匣子 RAM 环（960 槽 × 256B）*/
+#define SD_STAGE   ((uint8_t *)AXI_SD_STAGE)        /* 64KB 冻结/暂存区 */
 #define SD_HS_ARG           0x80FFFFF1u  /* CMD6 SET, group1(Access Mode) = 1 (High Speed) */
 
 static uint32_t s_sd_ready = 0;

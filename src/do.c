@@ -14,6 +14,7 @@
 #include "itcm.h"   /* ★ ISR 调用树必须住 ITCM —— 见该头文件 */
 #include "engine.h"
 #include "regs.h"
+#include "memmap.h"
 
 /* ★ 硬件就绪门: 拍中断从阶段 8 就在跑, 而 GPIOE 时钟/引脚配置在 do_init (阶段 26)。
  *   没有这扇门, 阶段 8~26 之间每一拍都会去配未使能时钟的 GPIOE —— 与 adc.c 的
@@ -63,8 +64,8 @@ volatile uint32_t g_do_write_n = 0;   /* 实际写 BSRR 的次数 (区分"活着
 #define DMAMUX1_C8    0x40020820u
 #define DMAMUX_REQ_TIM2_UP  22u     /* DMAMUX1 请求 22 = TIM2_UP (三源核对) */
 #define MDMA_REQ_DMA2S0_TC  8u      /* MDMA_REQUEST_DMA2_Stream0_TC */
-#define LATCH_SNAP_ADDR     0x24003000u  /* AXI: 锁存时刻 TIM2_CNT 快照落点 */
-#define LNODE_ADDR          0x24003100u  /* AXI: MDMA 链表节点 (32B 对齐) */
+#define LATCH_SNAP_ADDR     AXI_LATCH_SNAP  /* 地址唯一源: src/memmap.h */
+#define LNODE_ADDR          AXI_LNODE       /* 地址唯一源: src/memmap.h */
 
 /* PEi = ACTUATOR[i] > 0.5。返回本拍要写进 ODR 的 16 位值 (只含管辖位)。 */
 static uint32_t do_pack(uint8_t *base, uint32_t mask)

@@ -18,6 +18,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # ★ 独立的"最小固件"开关: 1 = 只编 src/min_uart.c (与 DCL 引擎/中断/协议全无关)。
 #   排障用: 当"串口不通"时, 用它把自研代码整体排除, 先证明 USART 通路本身可用。
 set(DCL_MIN_UART "0" CACHE STRING "1 = 只编最小 UART 固件 (src/min_uart.c), 与引擎无关")
+
+# ---- ★★ 内存宪法的**变异开关** (2026-09-19): 故意吃栈, 证明栈水位真的在量栈 ----
+#   0 (默认) = 交付档不含探针。验收时: bash build.sh -DDCL_STACK_PROBE_BYTES=16384
+#   ⇒ tools/exp_fa_mem_account.py 的 F3 必须看到 stack_used 至少涨 ~16 KB。
+set(DCL_STACK_PROBE_BYTES "0" CACHE STRING ">0 = 引导时故意吃掉这么多字节栈 (栈水位判据的对照)")
 # ★★ 第二个最小固件 (2026-09-13): 把"485 收不到"这件事从自研代码里彻底摘出来。
 #   与 DCL_MIN_UART 的区别: 那一档只测 USART1 (观察窗), 这一档测的是**被测口**
 #   —— USART2 @ PD5/PD6, 并且额外做一次"整口逐脚活动扫描", 用来回答
@@ -262,6 +267,8 @@ add_compile_options(
     -DDCL_TIMEBASE=${DCL_TIMEBASE}
     -DDCL_STEP_ENA_POL=${DCL_STEP_ENA_POL}
     -DDCL_STEP_STOP_HOLD=${DCL_STEP_STOP_HOLD}
+    # ★★ 内存宪法的变异开关（默认 0 = 交付档不含探针）
+    -DDCL_STACK_PROBE_BYTES=${DCL_STACK_PROBE_BYTES}
 )
 
 # syscalls.c 是 newlib 桩: 函数签名由 newlib 规定, 参数天然用不上。
@@ -301,6 +308,7 @@ else()
     set(SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/engine.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mem_stat.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/clock.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/flash.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/persist.c

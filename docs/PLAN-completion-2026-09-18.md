@@ -192,3 +192,17 @@
 | 机制 | 审计新增 **axis 1.3**：`tool` 文件必须存在 · `criterion` 文本必须**在该文件里出现** · `mechanism`/`reproduce` 必填 ⇒ **条目不会随代码改动静默腐烂** | `python tools/h723_audit_full.py --offline` ⇒ **13 PASS / 0 FAIL** |
 | ★ 负对照 | 把 RIG-1 的 `criterion` 改成 `R5-NOPE` ⇒ 1.3 **必须 FAIL**（实测 `12 PASS / 1 FAIL`，报错点名"条目已腐烂"） | `python .tmpctl/negctl_43.py`（跑完自动复原） |
 | 口径 | 登记在案的判据**不进回归判据表**；命中时先读 mechanism/reproduce。要判定固件侧有无缺陷，必须换**不依赖台架/历史**的观测量 | 审计 1.3 的 INFO 行 |
+
+
+---
+
+### 2026-09-19 · **内存宪法**（独立战线，权威源 `docs/PLAN-memmap-constitution.md`）
+
+| 项 | 结果 | 判据 |
+|---|---|---|
+| 公理⑤ + **M1~M6** | 立为平台不变量（与 `CORE-ENGINE.md` 四公理并列） | 六条不变量 ↔ 13 条判据，全带变异对照 |
+| A 宪法 | `src/memmap.h` 唯一地图（15 区 / 平铺断言 / refs 白名单）；**删掉压在诊断区上的 `.axi_buf` 空段**；三份地图合一 | 编译期断言 + C0/C9 |
+| B 账本 | `tools/mem_report.py` → **build.sh 第 7 道闸门**；账本与 `--check-docs` 都由**构建派生** | NC1/NC2 变异对照实测会红 |
+| C 容量 | `dclc` 容量从 `src/engine.h` 派生；超限报错可执行 | C11 变异（128→64）实测生效 |
+| D 性质 | `hardcode_audit.py`（C0/C9/C12）+ `mem_stat.c` 栈水位（AXI `MEM_STAT`，只读窗内） | 14 项 0 FAIL / **1 SKIP（板子不在场 = RIG-3）** |
+| ★ 顺手抓到 | **"ITCM 64/64 KB 已满"是过期数字**，写在 **7 处**（含 README 与两份 PLAN）并被当作**多轴的真阻塞**；实测 **14.32 KB / 64 KB = 22.4%** | 新账本第一次运行就抓到 ⇒ 见 `RETRACTIONS` **P33** |

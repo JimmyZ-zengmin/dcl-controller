@@ -235,6 +235,7 @@
  *   ★ 范围由 `clock.h` 三条断言守着（整除 1e6 / 整除 1000 / TIM2 ARR ≤ 16 位）。
  *   ★★ 定义位置必须**在 `BUCKET_DIV2_PHASES_USED` 之前** —— 后者由它派生。 */
 #include "clock.h"
+#include "memmap.h"
 #define TICK_PERIOD_US   CLK_TICK_US
 #ifndef DIV2_NOMINAL_US
 #define DIV2_NOMINAL_US 10000u     /* 能力位宣称的 div2 档周期（µs） */
@@ -1503,6 +1504,13 @@ uint16_t engine_stage_program(uint8_t *base, const uint8_t *payload,
  *    (同 OA20 族: "无人设防的区域迟早出事")。 */
 void shm_guard_paint(void);
 int  shm_guard_ok(void);
+
+/** @brief 内存账本（运行期半边，见 src/mem_stat.c 的文件头）
+ *  ★ 铺魔术字 → 扫最深水位 → 写进 AXI 的 MEM_STAT 块（只读协议窗口内 + 跨复位保持）。
+ *  顺序必须是 paint → (可选变异探针) → scan；scan_poll 在主循环里限频调用。 */
+void mem_stat_paint(void);
+void mem_stat_scan(void);
+void mem_stat_scan_poll(void);
 
 /* ══════════════════ W1: SHM 读写命令的地址守卫 ══════════════════
  * S3 `main.c:83-140` 的同构实现。**逐字搬的是判据, 不是地址表** ——

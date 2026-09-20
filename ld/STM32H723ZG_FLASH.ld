@@ -212,15 +212,12 @@ SECTIONS
     _shm_end = .;
   } >DTCM
 
-  /* ---- AXI SRAM: 大缓冲 (非热路径) ---- */
-  .axi_buf (NOLOAD) : ALIGN(32)
-  {
-    . = ALIGN(32);
-    _axi_start = .;
-    KEEP(*(.axi_buf))
-    . = ALIGN(32);
-    _axi_end = .;
-  } >AXI
+  /* ★★★ 2026-09-19 删除 `.axi_buf` 段（不变量 **M2 所有权互斥**）:
+   *   它的起点 = AXI ORIGIN = 0x24000000 = **诊断区起点**（SD_DIAG/BB_DIAG/SD_CFG/
+   *   BOOT_AXI）⇒ 链接器不知道那些固定地址被占了，谁往这个段里放东西就**静默盖住**
+   *   四个诊断区。而它一直是**空的**（size -A 实测 0x0）⇒ 删掉零成本。
+   *   ⇒ AXI 现在**100% 固定地址拥有**，唯一权威源 = src/memmap.h（含平铺断言）。
+   *   需要 AXI 大缓冲时的正确做法见 memmap.h 与 PLAN-memmap-constitution §2.1。 */
 
   /* ---- 栈/堆检查 ---- */
   ._user_heap_stack (NOLOAD) : ALIGN(8)

@@ -17,6 +17,7 @@
 #include "engine.h"
 #include "regs.h"
 #include "faultlog.h"   /* 台账: 既作为记录流的两列(BB_MAP_SEG_FAULT), 也进日志头快照 */
+#include "memmap.h"
 
 /* ── MDMA ch1 寄存器 (ch_n 基址 = MDMA_BASE + 0x40×(n+1); ch1 = +0x80) ── */
 #define BB_M        0x52000080u   /* MDMA ch1 寄存器组基址 (ch0=+0x40, 间距 0x40) */
@@ -64,13 +65,15 @@
  *   固定版本寄存器 IPVR 都读回 0 ⇒ 那是读失败不是真值)。所以 MDMA 的状态
  *   只能由**固件自己**读出来放进 SRAM, 再让 pyocd 读 SRAM。
  *   布局见文件末尾 bb_diag_dump 注释。 */
-#define BB_DIAG  ((volatile uint32_t *)0x24000300u)
+#define BB_DIAG  ((volatile uint32_t *)AXI_BB_DIAG)   /* 地址唯一源: src/memmap.h */
 
 /* ★ 诊断钩子 (SD_CFG @0x24000400, 调试器复位前预写, 读一次即清):
  *   [4] = CTCR 覆盖值 (0 ⇒ 用默认) —— 用来扫出"一次请求到底能搬多少字节"的正确配置
  *   [5] = 1 ⇒ 上电先把 RAM 环整片填 0xDEADBEEF 哨兵, 之后数"有多少字变了" = 传输长度
  */
-#define BB_CFG   ((volatile uint32_t *)0x24000400u)
+/* ★ 2026-09-19 删: `BB_CFG` 与 sd.c 的 `SD_CFG` 是**同一个地址的两个名字**，
+ *   而本文件从未引用过它（全仓 grep = 0 次引用）⇒ 不变量 M5「归属唯一」：
+ *   该区的 owner 是 sd.c，名字是 `SD_CFG`（历史注释里出现过的 BB_CFG 指的就是它）。 */
 #define BB_SENT  0xDEADBEEFu
 
 /* SHM 紧凑快照区 (SHM 尾部, 256B) */

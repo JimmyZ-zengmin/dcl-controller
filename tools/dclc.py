@@ -150,7 +150,37 @@ def tier_name(div):
     return ("%gus" % us) if us < 1000 else ("%gms" % (us / 1000.0))
 SRC = dict(SENSOR=0, WIRE=1, CONST=2, HMI=3)   # HMI=3: 通信域设定区 (40065-40128)
 DST_WIRE = 2
-MAX_WIRES, MAX_ROUTES, MAX_PARAMS, MAX_STATES = 128, 128, 128, 128
+# ══════════════════════════════════════════════════════════════════════════
+# ★★★ 2026-09-19（内存宪法 C 期 / 不变量 **M4 容量派生**）:
+#   下面这些容量**从 `src/engine.h` 派生**，不再手抄。
+#
+# 血证（这就是本项存在的理由）: 原来写的是
+#     MAX_WIRES, MAX_ROUTES, MAX_PARAMS, MAX_STATES = 128, 128, 128, 128   # 手抄
+#     MB_NREG = 64      # 注释自己写着"改容量须三处同步"
+#     MAX_SEQ_INST, MAX_SEQ_STEPS = 8, 64  # "与 shared_mem.h 一致"
+#   而**同一个文件**里 `FW_RESERVED_WIRES` 早就做成了从 `step.h` 读 ⇒ 两种做法并存。
+#   后果: 改了固件上限，编译器仍按旧值放行 ⇒ 用户看到的是"编过了 → deploy NAK"。
+#   ⇒ 现在统一走派生；**解析不到就响亮退出**（不退回旧值 —— 那正是本项目最恨的形态）。
+# ══════════════════════════════════════════════════════════════════════════
+_CAP_SRC = os.path.join(_R, "src", "engine.h")
+_CAP_TXT = _src_text(_CAP_SRC)
+
+
+def _cap(name):
+    return _src_int(_CAP_TXT, name, "engine.h")
+
+
+MAX_WIRES    = _cap("MAX_WIRES")
+MAX_ROUTES   = _cap("MAX_ROUTES")
+MAX_PARAMS   = _cap("MAX_PARAMS")
+MAX_STATES   = _cap("MAX_STATES")
+MAX_SENSORS  = _cap("MAX_SENSORS")
+MAX_LUT      = _cap("MAX_LUT")
+MB_NREG      = _cap("MB_NREG")          # 通信域寄存器数（原注释写"须三处同步"，现派生）
+MAX_SEQ_INST = _cap("MAX_SEQ_INST")
+MAX_SEQ_STEPS = _cap("MAX_SEQ_STEPS")
+CAPACITY_SRC = "src/engine.h"           # 报错时告诉用户"这个上限是从哪读来的"
+
 # ══════════════════════════════════════════════════════════════════════════
 # ★★★ 2026-09-17 修一处**静默失效**：自动分配撞上固件保留的镜像槽
 #
@@ -202,8 +232,8 @@ def _load_fw_reserved_wires():
 
 
 FW_RESERVED_WIRES = _load_fw_reserved_wires()
-MB_NREG = 64      # 通信域设定区寄存器数 (shared_mem.h MB_NREG — 改容量须三处同步)
-MAX_SEQ_INST, MAX_SEQ_STEPS = 8, 64      # 与 shared_mem.h 一致 (Sequencer v0)
+# ★ MB_NREG / MAX_SEQ_INST / MAX_SEQ_STEPS 已在上面的"容量派生"段统一从 src/engine.h 读；
+#   原来这里各写一份并注明"须三处同步 / 与 shared_mem.h 一致"（那份注释本身就是缺陷的登记）。
 
 # 原语模式参数 (与 primitives.h 一致)
 CMP_MODE   = dict(GT=0, GE=1, LT=2, LE=3, EQ=4, NE=5)   # prim_cmp: value_b
@@ -365,7 +395,12 @@ class Sym:
                                 wire2=wire2, wire2_valid=wire2 is not None,
                                 period=self.cur_period if period is None else period))
         if len(self.routes) > MAX_ROUTES:
-            raise SystemExit(f"错误: 路由数超限 (>{MAX_ROUTES})")
+            raise SystemExit(
+                f"错误: 路由数超限 —— **板上限 {MAX_ROUTES} 条**（来源 {CAPACITY_SRC}），"
+                f"本程序排了 {len(self.routes)} 条。\n"
+                f"  ⇒ 可做: ① 把某些信号的 `PERIOD=` 降档（少占扫描预算，但不减条数）\n"
+                f"          ② 合并同类中间量（`SEL` 吃 4 条、`ABS` 吃 2 条、变量阈值吃 2 条）\n"
+                f"          ③ 拆成两个程序，用 `wire[]` 交接")
 
     def alloc_state(self):
         """有状态原语 (TIMER/CNT/EDGE/LPF/PID/HYST/RATE/DEADBAND) 必须挂 state 槽;
@@ -433,7 +468,9 @@ class Sym:
 
     def add_param(self, vals):
         if len(self.params) >= MAX_PARAMS:
-            raise SystemExit(f"错误: PARAM 槽耗尽 (>{MAX_PARAMS})")
+            raise SystemExit(
+                f"错误: PARAM 槽耗尽 —— **板上限 {MAX_PARAMS} 个**（来源 {CAPACITY_SRC}）。\n"
+                f"  ⇒ 每个 FB/比较/常量各占一个 param 槽；可合并常量或复用中间量")
         for v in vals:
             if not (isinstance(v, (int, float)) and v == v):  # NaN 检查
                 raise SystemExit(f"错误: 参数含 NaN/非法值")
@@ -665,7 +702,9 @@ def compile_stmts(stmts):
             p = S.add_param([kp, ki, kd, sp])
             so = S.state_next; S.state_next += 1
             if so >= MAX_STATES:
-                raise SystemExit("错误: STATE 槽耗尽")
+                raise SystemExit(
+                    f"错误: STATE 槽耗尽 —— **板上限 {MAX_STATES} 个**（来源 {CAPACITY_SRC}）。\n"
+                    f"  ⇒ 有状态原语（PID/LPF/RATE/TIMER/CNT/EDGE/HYST/DEADBAND/SR）各吃一个槽")
             S.add_route(st, si, OP['PID'], ch, param_idx=p, state_off=so)
             S.desc.append(f"PID     {name} = wire[{ch}]  <- {src} (SP={sp} KP={kp} KI={ki} KD={kd} st@{so})")
         elif kw == 'ALARM':
@@ -1093,6 +1132,9 @@ def main():
     S = compile_stmts(stmts)
 
     print(f"=== dclc: {path} → {len(S.routes)} 路由 / {len(S.params)} 参数 ===")
+    print(f"    容量（派生自 {CAPACITY_SRC}）: 路由 {MAX_ROUTES} · 参数 {MAX_PARAMS} · "
+          f"状态 {MAX_STATES} · 线槽 {MAX_WIRES} · 传感 {MAX_SENSORS} · LUT {MAX_LUT} · "
+          f"SEQ {MAX_SEQ_INST}×{MAX_SEQ_STEPS} · MB 寄存器 {MB_NREG}")
     for d in S.desc:
         print("  " + d)
 

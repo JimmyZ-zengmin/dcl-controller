@@ -15,7 +15,36 @@ import h723_dev_bind_test as T
 SHM_SIZE = 0x8000
 CTRL_MAGIC = 0x5A5A1234
 SHM_BASE = 0x20000000
-CAP_FULL = 0x1DF7
+def _cap_full_from_header():
+    """★ 2026-09-19: 原为手写 `CAP_FULL = 0x1DF7` —— 那是**加 DEVBIND_PERSIST(0x2000)
+    与 FRAME_V2(0x4000) 之前**的快照，而当前 `DCL_CAP_H723_IMPL` 展开 = **0x7DF7**
+    ⇒ 仿真器会判"能力位在"而实际固件没有（或反之）⇒ **假 PASS**。
+    ⇒ 改为从 `src/transport.h` 派生：取 impl 表达式里引用的所有 `DCL_CAP_*` 的按位或。
+       ★ 解析不到就**响亮退出**（不退回旧值 —— 那正是本项要治的病）。"""
+    import re as _re
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "transport.h")
+    txt = io.open(p, encoding="utf-8", errors="replace").read()
+    vals = {m.group(1): int(m.group(2), 16)
+            for m in _re.finditer(r'^#define\s+(DCL_CAP_[A-Z0-9_]+)\s+(0x[0-9A-Fa-f]+)u?',
+                                  txt, _re.M)}
+    m = _re.search(r'^#define\s+DCL_CAP_H723_IMPL\s+(.*?)\n(?=\s*(?:/\*|#|$))', txt,
+                   _re.M | _re.S)
+    if not m:
+        raise SystemExit("!! transport.h 里找不到 DCL_CAP_H723_IMPL 的定义 ⇒ "
+                         "能力字来源断了（拒绝退回手写值）")
+    body = m.group(1)
+    names = _re.findall(r'DCL_CAP_[A-Z0-9_]+', body)
+    if not names:
+        raise SystemExit("!! DCL_CAP_H723_IMPL 里没解析出任何能力位名 ⇒ 拒绝继续")
+    out = 0
+    for n in names:
+        if n not in vals:
+            raise SystemExit("!! transport.h 里 %s 没有数值定义 ⇒ 拒绝继续" % n)
+        out |= vals[n]
+    return out
+
+
+CAP_FULL = _cap_full_from_header()      # ★ 派生自 src/transport.h（不再手写快照）
 # AS5600 reg 0x0C/0x0D 读回的字节（假器件固定值: raw=3347=0xD13）
 AS_B0, AS_B1 = 0x0D, 0x13
 

@@ -245,6 +245,28 @@ if [ -n "$PY_BIN" ]; then
     fi
 fi
 
+# ── ★★ 内存账本闸门 (2026-09-19 接入 / 内存宪法 B 期): 四区账 + 六条判据 + 文档对账 ──
+# ★ 为什么必须有 (血证): `build.sh` 以前**全文不报尺寸** ⇒ "ITCM 64/64 KB 已满" 这句话在
+#   **6 份文档**里活了数月, 还被 README 当成"多轴的三个真阻塞"之一 ——
+#   而 `arm-none-eabi-size -A` 实测只用了 **14.32 KB / 64 KB（22.4%）**。
+#   ⇒ 过期数字会去支撑产品决策; 账本必须由**构建派生**, 且文档里的容量宣称要**对得上账**。
+# ★ 判据六条 (见 tools/mem_report.py 的文件头):
+#   C2 链接器不得往 AXI 放段 (M2) · C3 SHM 段长 == SHM_SIZE (M4) ·
+#   C4 memmap.h 的 heapstack == .ld 的 heap+stack (M4 跨文件) · C5 AXI 恰好铺满 320 KB (M2) ·
+#   C6 ITCM 使用率 < 80% (M3, >60% 告警) · C7 栈余量 ≥ 8 KB (M3) · C8 文档容量宣称对账 (M4)
+# ★ 规格与上面几道相同: 自带 `--selftest`（合成数据证明 C2/C3 会红）。
+if [ -n "$PY_BIN" ]; then
+    echo
+    echo "── 内存账本闸门 (四区账 + C2~C8; 权威源 src/memmap.h + 构建产物) ──"
+    if ! "$PY_BIN" "$WIN_HERE/tools/mem_report.py" --check-docs; then
+        echo
+        echo "★★ 内存账本闸门失败 ⇒ 拒绝通过。"
+        echo "   修法三选一: ① 改代码/地图让性质与用途匹配; ② 改文档里的容量宣称(或加成'更正'横幅);"
+        echo "   ③ 若确属有意变更地图 ⇒ 改 src/memmap.h 并重跑本工具核对账本。"
+        exit 1
+    fi
+fi
+
 # ── 打印**实际生效**的开关 (不是"我以为传了什么") ──
 echo
 echo "── 生效开关 (读自 CMakeCache) ──"

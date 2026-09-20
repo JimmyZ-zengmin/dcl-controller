@@ -211,7 +211,11 @@ int shm_layout_ok(void)
 
     if (p != s)                                        return 0;  /* 段首不吻合 */
     if (e != p + SHM_SIZE)                             return 0;  /* 段长不吻合 */
-    if (p < 0x20000000u || p + SHM_SIZE > 0x20020000u) return 0;  /* 不在 DTCM 128KB */
+    /* ★★ 2026-09-19（内存宪法 D 期 / 不变量 **M3 性质匹配**）：地址域改用 memmap.h 的
+     *   常量，并显式断言"每拍访问的表**不与 AXI 相交**" —— 后者是"数据落在慢内存"
+     *   这一类缺陷的机器判据（AXI: HCLK=CPU/2 且 cache 不可预测 ⇒ 每拍时间变随机量）。 */
+    if (p < DTCM_BASE || p + SHM_SIZE > DTCM_BASE + DTCM_SIZE)    return 0;  /* 不在 DTCM */
+    if (p < AXI_BASE + AXI_SIZE && AXI_BASE < p + SHM_SIZE)       return 0;  /* ∩ AXI ≠ ∅ */
     /* 反向检查: 哨兵区必须落在 SHM 之后而不是与 SHM 重叠 */
     if (e < p + SHM_SIZE)                              return 0;
     return 1;
@@ -1151,8 +1155,8 @@ void engine_reload_active(uint8_t *base)
  *   **一条协议帧能改 SD_CFG(调试钩子) 或踩坏黑匣子 AXI 环**。读只读, 写不碰。
  *   窗口上界 0x24000600 = BOOT_AXI(0x24000500)+24B 之后留余量;
  *   ★ 此窗内含 SD_CFG —— 允许读(看得到钩子现值), 但写仍被 eng_valid_addr 拒。 */
-#define ENG_AXIDIAGF  0x24000000u
-#define ENG_AXIDIAGFE 0x24000600u
+#define ENG_AXIDIAGF  AXI_DIAG_WIN_BASE   /* 地址唯一源: src/memmap.h */
+#define ENG_AXIDIAGFE AXI_DIAG_WIN_END    /* 且 memmap.h 断言它盖住 MEM_STAT、不盖住用户数据 */
 
 /* RCC / PWR / FLASH 各自 1KB 的禁区, valid_addr 里逐个排除 */
 #define ENG_IS_FORBIDDEN(a) \

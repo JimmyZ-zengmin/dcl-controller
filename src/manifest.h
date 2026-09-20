@@ -28,6 +28,7 @@
 
 #include <stdint.h>
 #include "engine.h"      /* OFF_* 偏移 (SHM 相对) */
+#include "memmap.h"
 
 /* kind: PC 侧据此选解析方式 (见 tools/mgmt.py) */
 #define MF_K_U32    0u   /* u32 数组 —— 直接十进制 */
@@ -90,15 +91,17 @@ static const ManifestEnt_t g_manifest[] = {
      *   与 rtc.c:105 的 PRER 不符 —— 见 rtc.h 的频率更正) */
 
     /* ── ⑤ 存储 / 黑匣子 (AXI —— 走只读窗才读得到) ── */
-    MF_ENTRY("SD_DIAG",   0x24000200u, 64u, MF_K_U32, 0u),
+    MF_ENTRY("SD_DIAG",   AXI_SD_DIAG,  64u, MF_K_U32, 0u),
     /*   SD 初始化/日志/吞吐诊断; [17]=台账快照刷新次数 */
-    MF_ENTRY("BB_DIAG",   0x24000300u, 64u, MF_K_U32, 0u),
+    MF_ENTRY("BB_DIAG",   AXI_BB_DIAG,  64u, MF_K_U32, 0u),
     /*   [36]映射表绑到几槽(应=60) [37]映射表 FNV 校验和 (与 PC 端对账) */
-    MF_ENTRY("SD_CFG",    0x24000400u, 16u, MF_K_U32, 0u),
+    MF_ENTRY("SD_CFG",    AXI_SD_CFG,   16u, MF_K_U32, 0u),
     /*   ★ 调试钩子配置字 (**只读可达; 写仍被拒** —— 一条帧不许改调试钩子) */
 
     /* ── ⑥ 为什么复位了 / 上一轮停在哪 (看门狗的故事全靠这条) ── */
-    MF_ENTRY("BOOT_AXI",  0x24000500u, 44u, MF_K_STRUCT, 0u),
+    MF_ENTRY("BOOT_AXI",  AXI_BOOT_REC, 44u, MF_K_STRUCT, 0u),
+    /* ★ 内存账本（栈水位 / SHM 边界 / 布局判据结果）—— 落在只读窗口内 ⇒ 协议可读 */
+    MF_ENTRY("MEM_STAT",  AXI_MEM_STAT, OFF_MEM_STAT_SZ / 4u, MF_K_U32, 0u),
     /*   [0]启动次数(跨复位单调) [1]"RCLK" 首次标记 [2]RCC_RSR 复位原因 [3]RCC_BDCR
      *   [4]**上一轮最后停在哪个 stage** [5]上一轮最后拍号
      *      ↑ 取自 [30]/[31] 的**活体镜像** (不是 g_stage —— 它在 .bss, 启动清零先于取证段执行,
