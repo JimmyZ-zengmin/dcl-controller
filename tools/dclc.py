@@ -179,6 +179,7 @@ MAX_LUT      = _cap("MAX_LUT")
 MB_NREG      = _cap("MB_NREG")          # 通信域寄存器数（原注释写"须三处同步"，现派生）
 MAX_SEQ_INST = _cap("MAX_SEQ_INST")
 MAX_SEQ_STEPS = _cap("MAX_SEQ_STEPS")
+DEPLOY_REQ_MAX = _cap("DEPLOY_REQ_MAX")   # ★ 单帧载荷上限（0x10）—— 由源码派生
 CAPACITY_SRC = "src/engine.h"           # 报错时告诉用户"这个上限是从哪读来的"
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -297,6 +298,9 @@ class Sym:
         self.routes = []     # 每项 route 参数字典
         self.state_next = 1  # state 槽从 1 起 (0 保留/非法)
         self._zero_w = None  # ★ 全程序共享的隐藏常量 0.0 (ABS/变量阈值组合用), 首次用时才建
+        self.lut = None      # ★ LUT 表（全程序**一张** —— 见 TABLE 语句的注释）
+        self.lut_name = None
+        self.lut_used = 0    # 有几个 LUT 路由在用这张表
         self.cur_period = 0  # 当前语句的 div 档 (PERIOD= 后缀设置, 缺省 0=每拍)
         # 顺序域 (Sequencer v0.2): 单实例, SEQ 块须文件尾
         self.seq = None          # dict: out_wire, div, steps[(cond_t,cond_i,thr,dwell,loop_last)]
@@ -553,8 +557,9 @@ def split_period(stmts):
     return out
 
 
-def compile_stmts(stmts):
+def compile_stmts(stmts, src_path=None):
     S = Sym()
+    S._src_path = src_path or '<inline>'
     stmts = split_period(stmts)
     # ★★★ 2026-09-17 预扫: 把**所有被引用的裸 wire 槽**先占住, 再开始分配。
     #   为什么必须"预扫"而不是"用到时才记账": 各语句处理器都是
@@ -801,6 +806,61 @@ def compile_stmts(stmts):
             S.add_route(SRC['WIRE'], wz, OP['ARITH'], wn, param_idx=p_sub, wire2=wx)
             S.add_route(SRC['WIRE'], wx, OP['ARITH'], ch, param_idx=p_max, wire2=wn)
             S.desc.append(f"ABS     {name} = wire[{ch}]  <- |{src}|  [2 路由组合: MAX(x, 0-x)]")
+        elif kw == 'TABLE':
+            # ★★★ 为什么是**全程序一张表**：引擎的 `prim_lut` 只接受数组首地址，
+            #   而 `OFF_LUT_DATA` 是**唯一**的 256×f32 区 ⇒ 多条 LUT 路由共享同一张表。
+            #   ⇒ 声明两次表 = 语义冲突，必须**编译期拒绝**（否则第二条会静默覆盖第一条）。
+            m = re.fullmatch(r'(\S+)\s*=\s*(.+)', body)
+            if not m:
+                raise SystemExit(f"语法错误 TABLE: {body}  (应为: TABLE <name> = v0, v1, ... 或 @file.csv)")
+            name, rhs = m.group(1), m.group(2).strip()
+            if S.lut is not None:
+                raise SystemExit(
+                    "错误: TABLE 只能声明**一次** —— 引擎只有一张 LUT 表(OFF_LUT_DATA 256×f32)，\n"
+                    "  两条 LUT 路由共享同一张表 ⇒ 第二张表会静默覆盖第一张。\n"
+                    "  ⇒ 若需要「两条不同曲线」，请把两条曲线**拼进同一张表**（用不同的索引区间）。")
+            if rhs.startswith('@'):
+                fp = rhs[1:]
+                if not os.path.isabs(fp):
+                    fp = os.path.join(os.path.dirname(os.path.abspath(S._src_path)), fp)
+                try:
+                    txt = io.open(fp, encoding='utf-8', errors='replace').read()
+                except OSError as e:
+                    raise SystemExit(f"错误: TABLE {name} 读不到文件 {fp} ({e})")
+                toks = [t for t in re.split(r'[\s,;]+', txt) if t]
+            else:
+                toks = [t.strip() for t in rhs.split(',') if t.strip()]
+            vals = [parse_num(t, 'TABLE %s 的第 %d 个点' % (name, i + 1))
+                    for i, t in enumerate(toks)]
+            if len(vals) < 2:
+                raise SystemExit(f"错误: TABLE {name} 至少要有 **2** 个点（线性插值需要两端）")
+            if len(vals) > MAX_LUT:
+                raise SystemExit(f"错误: TABLE {name} 有 {len(vals)} 个点，**板上限 {MAX_LUT}**"
+                                 f"（来源 {CAPACITY_SRC}）\n"
+                                 f"  ⇒ 可做: ① 减少采样点（插值是线性的，中间点可省）"
+                                 f"② 把多条曲线拼进一张表的不同索引区间")
+            S.lut = vals
+            S.lut_name = name
+            S.desc.append(f"TABLE   {name} = {len(vals)} 点  [将随 deploy 一起下发]")
+        elif kw == 'LUT':
+            # ★ 引擎只有一张表 ⇒ 用 LUT 的程序**必须**先声明 TABLE（否则编译期就拦下，
+            #   而不是等部署后才在板上表现为「表是零/是上一张」）。
+            m = re.fullmatch(r'(\S+)\s+FROM\s+(\S+)', body)
+            if not m:
+                raise SystemExit(f"语法错误 LUT: {body}  (应为: LUT <name> FROM <sig>)")
+            if S.lut is None:
+                raise SystemExit(
+                    "错误: 用了 LUT 但没有声明表 —— 引擎只有一张 LUT 表(256×f32)，\n"
+                    "  它必须由本程序携带（方案 A: 表随 deploy 走）。\n"
+                    "  ⇒ 写法: 先 `TABLE t = 0, 1, 4, 9, ...`，再 `LUT y FROM src`。\n"
+                    "  ★ 为什么不允许「用板上残留的表」: 那种程序在新板/复位后会静默给出错值。")
+            name, src = m.group(1), m.group(2)
+            ch = S.alloc_wire(name)
+            st, si = S.ref(src)
+            S.add_route(st, si, OP['LUT'], ch)          # prim_lut 不用 param/state ⇒ 都不占
+            S.lut_used += 1
+            S.desc.append(f"LUT     {name} = wire[{ch}]  <- 查表({src})  [表 {S.lut_name}，"
+                          f"索引 = src，越界夹到 0..{MAX_LUT - 2}]")
         elif kw == 'CONST':
             m = re.fullmatch(r'(\S+)\s*=\s*([^\s]+)', body)
             if not m:
@@ -1055,6 +1115,39 @@ def compile_stmts(stmts):
     return S
 
 
+# ---------- LUT 表段（方案 A：表随程序走）----------
+# ★ 常量**从源码派生**（不手抄）：段格式的权威源是 src/lut_seg.h。
+#   两边一旦不一致，症状是"表装了但内容错/被判 BAD"—— 所以这里读源头而不是复制。
+def _lut_consts():
+    h = _src_text(os.path.join(_R, "src", "lut_seg.h"))
+    magic = int(re.search(r"^#define\s+LUT_SEG_MAGIC\s+0x([0-9A-Fa-f]+)u?", h, re.M).group(1), 16)
+    hdr = _src_int(h, "LUT_SEG_HDR", "lut_seg.h")
+    return magic, hdr
+
+
+LUT_SEG_MAGIC, LUT_SEG_HDR = _lut_consts()
+LUT_SEG_LEN = LUT_SEG_HDR + MAX_LUT * 4          # 16 + 1024 = 1040
+
+
+def _fnv_words(buf):
+    """FNV-1a **按 32 位小端字** —— 与固件 `lu_fnv_words` 逐位同算法。
+    ★ 口径（字 vs 字节）必须一致：本项目的血证是"同一语义两处存放"。"""
+    h = 2166136261
+    for i in range(0, len(buf) - 3, 4):
+        w = int.from_bytes(buf[i:i + 4], "little")
+        h = ((h ^ w) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def pack_lut_segment(tbl, n_used):
+    """把表打成 LUT 段（含头部与校验）。tbl 长度 = n_used；其余 256 个点补 0.0。"""
+    assert 2 <= n_used <= MAX_LUT
+    body = b"".join(struct.pack("<f", tbl[i] if i < n_used else 0.0) for i in range(MAX_LUT))
+    seg = struct.pack("<III", LUT_SEG_MAGIC, LUT_SEG_LEN, n_used)
+    seg += struct.pack("<I", _fnv_words(body))
+    return seg + body
+
+
 # ---------- 打包与下发 ----------
 def pack_routes(routes):
     out = b''
@@ -1129,7 +1222,7 @@ def main():
         sys.exit(2)
 
     stmts = parse(text)
-    S = compile_stmts(stmts)
+    S = compile_stmts(stmts, src_path=path)
 
     print(f"=== dclc: {path} → {len(S.routes)} 路由 / {len(S.params)} 参数 ===")
     print(f"    容量（派生自 {CAPACITY_SRC}）: 路由 {MAX_ROUTES} · 参数 {MAX_PARAMS} · "
@@ -1151,6 +1244,21 @@ def main():
     dcl.send(0x13); time.sleep(0.3)
     payload = struct.pack('<HHH', len(S.routes), len(S.params), 0)
     payload += pack_routes(S.routes) + pack_params(S.params)
+    # ★★ LUT 表段：附在 body 之后（固件尾部顺序约定: [body][LUT][dev_bind]）
+    if S.lut is not None:
+        if S.lut_used == 0:
+            raise SystemExit("错误: 声明了 TABLE 却没有任何 LUT 语句用它 —— 多半是写错了\n"
+                             "  ⇒ 要么补上 `LUT <name> FROM <sig>`，要么删掉 TABLE。")
+        payload += pack_lut_segment(S.lut, len(S.lut))
+        print(f"  （已附 LUT 段：{len(S.lut)} 点 + {LUT_SEG_LEN} B 段，随本次 deploy 一起生效）")
+    # ★ 单帧上限：段会挤占载荷预算 ⇒ **在发送前**判定并给出可执行的建议
+    if len(payload) > DEPLOY_REQ_MAX:
+        raise SystemExit(
+            f"错误: 载荷 {len(payload)} B 超过**单帧上限 {DEPLOY_REQ_MAX} B**（0x10 DEPLOY）\n"
+            f"  构成: 6 + 路由 {len(S.routes)}×16 + 参数 {len(S.params)}×16"
+            + (f" + LUT 段 {LUT_SEG_LEN}" if S.lut is not None else "") + "\n"
+            "  ⇒ 可做: ① 减少路由条数（合并中间量）② 用程序包路径（0x45/46/47，上限 7680 B）"
+            "③ 若表很大但点很少，先精简采样点")
     sts, msg = dcl.send(0x10, payload)
     if sts != 'ACK':
         reason = msg.decode('utf-8', 'replace').strip() if isinstance(msg, (bytes, bytearray)) else ''

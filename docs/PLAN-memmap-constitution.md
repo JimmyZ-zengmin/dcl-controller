@@ -210,5 +210,8 @@ arm-none-eabi-size -A build/dcl_h723        # 工具链路径从 cmake/arm-none-
   老包无段 ⇒ 跳过（`DB_SEG_NONE` 已示范）。
 - **载荷余量**：`AXI_PROG_PAY` 7680 B，LUT 表 256×4 = 1024 B ⇒ 装得下（§1 实测）。
 - **已定的连带语义**：`0x13 RESET` 之后**表不回来**（与 routes 一致）。
-- **未做**：实现（含 `dclc` 生成 LUT 段 + 固件段解析 + 判据）。
-  ⇒ 登记为下一项可执行工作，**不再空悬**。
+- ✅ **已实现（2026-09-19）**：`src/lut_seg.{h,c}`（段解析/打包/原子生效 · `lut_seg_apply` 标 `DCL_ITCM`，因它在拍 ISR 的 reload 临界区被调用 —— 抓到它的是 `gate_isr_itcm.py`）·
+  `dclc` 新增 `TABLE` / `LUT` 语句 + 段打包（常量与 FNV **从 `src/lut_seg.h` 同源派生**）·
+  尾部顺序约定 `[body][LUT][dev_bind]`（dev_bind 永远最尾，**新段一律加在更前**）·
+  判据 `tools/exp_fb_lut_deploy.py` **20 项 0 FAIL / 1 SKIP**（在板四项挂 RIG-3）·
+  示例 `examples/h723_lut_demo.dcl` · 交付档指纹 `44ce8cbb…` → **`c2ca850b…`**（已同步基线）。

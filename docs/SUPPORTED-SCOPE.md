@@ -46,6 +46,8 @@ python tools/h723_dev_bind_test.py --port COMxx # 具名设备绑定表端到端
 
 ---
 
+| **`LUT` 查表（表随程序走）** | ✅ **2026-09-19 落地（方案 A）**：`TABLE t = v0, v1, …` + `LUT y FROM sig` ⇒ 表随本次 deploy **与路由同一次 reload 生效**，也随 SD 程序包持久化。段格式权威源 `src/lut_seg.h` | `python tools/exp_fb_lut_deploy.py`（离线 **20 项 0 FAIL**）|
+
 ### ★★★ 声明的时间量 = 跑出来的（2026-09-18 新增，G10）
 
 **可以依赖**：你在程序里写的**时间量**就是那段真实时间。判据里**不出现实现细节**，只问"声明的物理量实现了吗"。

@@ -22,11 +22,13 @@ echo "== 1) 重建默认档 =="
 #     ① 这里**显式传交付档的全部可粘性选项**（不靠默认值）;
 #     ② 构建后**比指纹**（下面 EXPECT_MD5）⇒ 与基线不符就**大声失败**, 不烧。
 DELIVERY_OPTS="-DDCL_TICK_US=100 -DDCL_BOOT_SEL=1 -DDCL_BOOT_SCAN_MODE=0 -DDCL_LOOP_RESET=1 -DDCL_STEP_RAMP_FIX=1"
-EXPECT_MD5="44ce8cbba089ae1a750398ec5ce5f248"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
+EXPECT_MD5="c2ca850bbb019166e3d2d0821b175574"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
 # 变更记录（每次改基线都必须写清"为什么"）:
 #   c7c366c1… → 6daa7e65…  阶段 2.1/2.2：顺序域清除语义 + 「走 N 步」两个拍号
 #   6daa7e65… → 44ce8cbb…  内存宪法 A+D 期：新增 src/mem_stat.c + 栈水位可观测量，
 #                          并在 manifest 里加 MEM_STAT 条目（.rodata +20 B）
+#   44ce8cbb… → c2ca850b…  LUT 方案 A：新增 src/lut_seg.c（表随 deploy 走）+ 1 KB pending 表
+#                          (.bss +1 KB ⇒ SHM 基址后移) + 0x48 尾部追加 LUT 段字段（104 → 112 B）
 # ★★★ 2026-09-18 第二次实测踩到（同一个机制的另一半）: 上面这行**忘更新**过一次 ——
 #   812b687（E-U）把它设成 c7c366c1…, 而**下一天 2.1/2.2 动了部署期代码**
 #   （顺序域清除 + `sub=16` 加两个拍号）⇒ hex 变成 6daa7e65…, 基线却还是旧的

@@ -309,6 +309,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/engine.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/mem_stat.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/lut_seg.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/clock.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/flash.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/persist.c

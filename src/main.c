@@ -81,6 +81,7 @@ static volatile uint32_t g_i2c_hold_until = 0u;
 #include "sd.h"
 #include "prog_store.h"   /* S5: DCL 程序持久化 (SD A/B 双副本 + 事务式上传) */
 #include "memmap.h"
+#include "lut_seg.h"
 
 #ifndef ISR_ITCM
 #define ISR_ITCM 1
@@ -171,6 +172,7 @@ OBS uint32_t g_tick_count  = 0;
 /* ★ GAP-11: 开机装载时"绑定表段"的处理结果（DB_SEG_NONE/OK/BAD）—— 必须可观测,
  *   否则"段坏了被拒绝"与"根本没有段"在外部看起来一样（本项目最恨的那种形态）。*/
 OBS uint32_t g_db_boot_seg  = 0;
+OBS uint32_t g_lut_boot_seg = 0;   /* ★ 2026-09-19: 最近一次装载对"LUT 表段"的处理（0=无段 1=已受理待生效 2=段坏被拒）—— 与 g_db_boot_seg 同款三态 */
 OBS uint32_t g_clock_hclk  = 0;
 OBS uint32_t g_isr_itcm    = ISR_ITCM;
 
@@ -1196,6 +1198,11 @@ ISR_PLACE void TIM2_IRQHandler(void)
          *   这个尖峰。这是"部署瞬间有一拍变长"的**已知且有界**代价, 不是抖动。 */
         if (SHM_U8(g_shm, OFF_CTRL_RELOAD)) {
             uint32_t tr0 = DWT_CYCCNT;
+            /* ★★ LUT 表与路由**同一个临界区**生效（方案 A 的核心承诺："程序生效"与"表生效"
+             *   同一时刻、同一原子性）。放在 reload **之前**：本拍就同时用上新表与新路由。
+             *   成本 = 一次标志读（无 pending 时）或一次 1 KB 拷贝（仅部署那一拍，与既有
+             *   memcpy 同性质、已计入 g_reload_cyc 的"部署瞬间有一拍变长"）。 */
+            lut_seg_apply(g_shm);
             engine_reload_active(g_shm);
             g_reload_cyc = DWT_CYCCNT - tr0;
             g_n_routes   = SHM_U16(g_shm, OFF_CTRL_N_ROUTES);   /* 扫描条数随新表走 */
@@ -1942,6 +1949,12 @@ static void h_deploy(const uint8_t *p, uint32_t n)
     const char *verr = prog_validate(p, n, &budget);
     if (verr) { g_deploy_nak++; nak(verr); return; }
     g_deploy_budget = budget;
+    /* ★ LUT 段：载荷尾部可能带 `LUTT` 段 ⇒ 校验通过后**立刻**解析进 pending，
+     *   等 ISR 在 reload 临界区与路由一起生效（见上面 OFF_CTRL_RELOAD 分支）。
+     *   ★ 必须在 eng_apply_program（它会置 RELOAD）**之前**调用 —— 否则 apply 看不到 pending，
+     *     表要等到下一次 reload 才生效（= "程序生效了但表还是旧的"这个静默中间态）。
+     *   三态语义与 dev_bind 一致：无段 = 正常（不碰表）· 段坏 = 明确拒绝该段（程序仍装载）。 */
+    (void)lut_seg_unpack(p, n);
     const uint8_t *d = p + 6;
     uint16_t nr = get16(p), np = get16(p + 2), ns = get16(p + 4);
 
@@ -3191,6 +3204,9 @@ static uint32_t prog_boot_load_apply(void)
          *   ★ 段坏 ⇒ `DB_SEG_BAD`：**拒绝该段但不影响程序**（绑定表不是程序正确性的必要条件），
          *     且它可观测（`DB_LOAD_BAD_N` / `DB_REJECT`）。 */
         g_db_boot_seg = dev_bind_unpack(pl, g_prog_payload_len);
+    /* ★ 表随程序回来（方案 A 的核心价值）：SD 程序包的载荷里也带 LUT 段（若有）⇒
+     *   开机装载后 pending 里有表，下一次 reload 临界区把它与路由一起写进 ACTIVE。 */
+    g_lut_boot_seg = lut_seg_unpack(pl, g_prog_payload_len);
     }
     return (uint32_t)prc;
 }
@@ -3241,6 +3257,7 @@ static void h_prog_status(void)
         put32(r + 84, (uint32_t)(pl[4] | ((uint16_t)pl[5] << 8) | ((uint32_t)pl[6] << 16) | ((uint32_t)pl[7] << 24)));
         put32(r + 88, (uint32_t)(pl[8] | ((uint16_t)pl[9] << 8) | ((uint32_t)pl[10] << 16) | ((uint32_t)pl[11] << 24)));
         put32(r + 92, (uint32_t)(pl[12] | ((uint16_t)pl[13] << 8) | ((uint32_t)pl[14] << 16) | ((uint32_t)pl[15] << 24)));
+        put32(r + 108, g_lut_boot_seg);   /* ★ LUT 表段处理结果（0=无段 1=已受理 2=段坏）*/
     }
     ack(r, 104);
 }
@@ -3577,6 +3594,11 @@ static void h_reset_w1(void)
      *     且症状是"板子不响应"（会把人引向接线/驱动方向）。 */
     s_frame_v2    = 0u;
     s_ack_v1_once = 0u;
+    /* ★ 2026-09-19: LUT 的 pending 表住在 .bss，而 `cold_start_reset()` 只清 SHM
+     *   ⇒ 不复位它的话，RESET 之后**下一次 reload 会把那张表又写回去**（"复位了却没复位干净"）。
+     *   这是"同一语义两处存放"的又一例：表的**生效副本**在 SHM（被清零），
+     *   **待生效副本**在 .bss（必须显式清）。 */
+    lut_seg_reset();
     g_force_clears++;            /* ★ 用同一计数证明 RESET 真的清过 force */
     /* ★ W3: RESET 清空了 N_SEQ 与整张 ctrl 块 → "已 arm"标记必须一起失效,
      *   否则下一次 START 会走"已 RUN 分支"(不清步号)—— 而步号此刻已经不存在了。
@@ -4138,6 +4160,7 @@ static void obs_anchor(void)
     sink ^= g_db_rej_n;                   /* ★ 第二轮审计指出漏登记（dev_bind.h 自述要求）→ 已补 */
     sink ^= g_db_load_ok_n;               sink ^= g_db_load_bad_n;   /* ★ GAP-11 装载结果 */
     sink ^= g_db_boot_seg;               sink ^= g_db_seg_len;
+    sink ^= g_lut_boot_seg;              sink ^= g_lut_seg_status;
     sink ^= g_frame_v2_n;                sink ^= (uint32_t)s_frame_v2;   /* ★ GAP-12 帧归属 */
     sink ^= g_bucket_ck;                  sink ^= g_bucket_zero_slots;
     sink ^= g_engine_gate;                sink ^= g_engine_sel;
