@@ -299,6 +299,10 @@ build.sh      构建（含 6 道闸门）
 | **完善计划与完成度**（阶段 1~4，每项带判据与证据）| [`docs/PLAN-completion-2026-09-18.md`](docs/PLAN-completion-2026-09-18.md) |
 | **③ 层表达力**：`OUTPUT … PERIOD=` / `ABS` / 变量阈值 / 数字文法 | [`docs/exp-EW-output-period.md`](docs/exp-EW-output-period.md) · [`docs/exp-EX-composed-blocks.md`](docs/exp-EX-composed-blocks.md) |
 | `LUT` 表归属 · 拍长缩放（耦合 #6）| [`docs/exp-EY-lut-provenance.md`](docs/exp-EY-lut-provenance.md) · [`docs/exp-EZ-exec-budget-scale.md`](docs/exp-EZ-exec-budget-scale.md) |
+| **做了哪些实验、用什么跑、结论是什么**（**生成物**，勿手改）| [`docs/EXP-INDEX.md`](docs/EXP-INDEX.md)（唯一源 `tools/exp_registry.py`）|
+| **内存怎么放、容量怎么定**（TCM 专文：性质匹配 + 配置期动态/运行期静态）| [`docs/MEMORY-LAYOUT.md`](docs/MEMORY-LAYOUT.md) §附 · [`docs/PLAN-memmap-constitution.md`](docs/PLAN-memmap-constitution.md) |
+| **架构强项与生命力**（外部坐标 + 可长出来的七条）| [`docs/ASSESS-architecture-vitality.md`](docs/ASSESS-architecture-vitality.md) |
+| **2026-09-18 这一天**（日程 + 成果 + 当天自查出的缺陷）| [`docs/DAY-2026-09-18.md`](docs/DAY-2026-09-18.md) |
 | 历史长篇（含逐日流水、铁律 0 血证）| [`docs/README-full-legacy.md`](docs/README-full-legacy.md) |
 
 ---

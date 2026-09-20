@@ -267,6 +267,26 @@ if [ -n "$PY_BIN" ]; then
     fi
 fi
 
+# ── ★★ 实验登记 + 文档死链闸门 (2026-09-19 接入 / 文档系统化) ──────────────
+# ★ 为什么必须有: 实测 docs/ 下 **114 份 .md**（比 src 的 58 个文件还多），其中 **24 份是孤儿**，
+#   而 README §十一「问题→权威源」只登记 12 行 —— 这就是"文档多了却没系统化"。
+#   两条**精确**判据（不放启发式，避免误报把闸门关掉）:
+#     D1 README §十一 的每个链接都必须存在（权威源表不能骗人）
+#     D2 §十一 只能登记 docs/ 下的路径
+#   另加: 实验登记表与 docs/EXP-INDEX.md 必须一致（工具/文档存在、状态在枚举里）。
+if [ -n "$PY_BIN" ]; then
+    echo
+    echo "── 实验登记 + 文档死链闸门 (exp_registry ⇄ EXP-INDEX · README §十一 链接) ──"
+    if ! "$PY_BIN" "$WIN_HERE/tools/exp_registry.py" --check; then
+        echo "★★ 实验登记闸门失败 ⇒ 拒绝通过（跑 --index 重新生成，或修登记表）。"
+        exit 1
+    fi
+    if ! "$PY_BIN" "$WIN_HERE/tools/doc_index.py" --check; then
+        echo "★★ 文档死链闸门失败 ⇒ 拒绝通过（README §十一 里指向了不存在的文件）。"
+        exit 1
+    fi
+fi
+
 # ── 打印**实际生效**的开关 (不是"我以为传了什么") ──
 echo
 echo "── 生效开关 (读自 CMakeCache) ──"

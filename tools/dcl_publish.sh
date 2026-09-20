@@ -44,6 +44,10 @@ done
 # ── 白名单：只发布这些顶层路径（其余一律不进公开树）──────────────────────
 KEEP='^(README\.md|build\.sh|CMakeLists\.txt|src/|tools/|docs/|examples/|ld/|startup/|cmake/)'
 
+# ── 白名单里的**例外**（未 review 的草稿/内部评估，暂不公开）──────────────────
+#   加一行的理由要写清；review 完删掉那一行即可（不需要改白名单）。
+EXCLUDE='^(docs/PITCH-project-candidates\.md|docs/PLAN-expansion-headroom\.md)'
+
 DEV_N="$(git ls-tree -r --name-only HEAD | wc -l)"   # ★ 必须在 read-tree 之前取（见下方诊断注释）
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
@@ -55,7 +59,9 @@ git ls-files -z | while IFS= read -r -d '' f; do
   case "$f" in
     */.gitkeep) ;;
   esac
-  if ! printf '%s' "$f" | grep -Eq "$KEEP"; then
+  if printf '%s' "$f" | grep -Eq "$EXCLUDE"; then
+    git update-index --force-remove -- "$f"      # 白名单里的例外（未 review 的草稿）
+  elif ! printf '%s' "$f" | grep -Eq "$KEEP"; then
     git update-index --force-remove -- "$f"
   fi
 done
