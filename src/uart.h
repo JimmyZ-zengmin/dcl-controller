@@ -31,6 +31,15 @@ void uart1_init(uint32_t pclk2_hz, uint32_t baud);
 /** @brief 轮询发送 n 字节, 返回时保证最后一字节**已完整移出**(等 TC) */
 void uart1_write(const uint8_t *p, uint32_t n);
 
+/* ★★★ 2026-09-22: TX 改成"入队 + 主循环尽量推"（原来逐字节死等 ⇒ 观测拖慢被测对象）。
+ * 主循环每圈调 `uart1_tx_pump()`；`uart1_tx_pending()` 暴露残余（可观测、可作判据）。
+ * ★ 队列**必须是线性的**（`uart1_write` 保证"下一条写入前先推完残余"）。
+ * ★ 大小只需 ≥ 一条最大应答 ⇒ 由 `main.c` 的 `_Static_assert(FRAME_TOTAL_MAX_V2 <= UART_TXQ_SZ)`
+ *   守住；帧上限哪天长大超过它，**构建就红**，不会静默截断。 */
+#define UART_TXQ_SZ  8192u
+void     uart1_tx_pump(void);
+uint32_t uart1_tx_pending(void);
+
 /** @brief 当前 BRR 值 (供外部核对波特率分频: 100MHz/115200 → 0x364) */
 uint32_t uart1_brr(void);
 

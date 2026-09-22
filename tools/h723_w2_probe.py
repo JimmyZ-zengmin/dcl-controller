@@ -81,6 +81,13 @@ W_DEFAULT   = 3
 V_FORCE1    = 7.5
 V_FORCE2    = 3.25
 SPIN_MS_DFL = 4      # 4ms ≈ 40 拍 @400MHz/100μs
+# ★★★ 2026-09-22: **PRE 步骤的独立时间窗**（不同于采样点的 `SPIN`）。
+#   为什么必须更长: `g_reinit=1` 只是登记，重填表要**主循环跑一圈**才执行，
+#   而主循环最长阻塞（SD 落盘）实测 **46.7 ms**（`SD_DIAG[60]` = 467 拍）
+#   ⇒ 4 ms 窗装不下 ⇒ 偶发 `表=0`（同固件连跑三次实测 14/0 · 14/0 · **12/2**）。
+#   ★ 判据的时间窗必须 ≥ 被测系统的最大阻塞时长。
+#   ★ 只加长这一步；A/B/C/D 的 `SPIN` 不动 —— 那些要看"跑 SPIN 之后"的状态。
+PRE_MS_DFL = 150     # ≈3× 最大阻塞(46.7ms)
 
 RESULTS = []
 
@@ -118,10 +125,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--w", type=int, default=W_DEFAULT)
     ap.add_argument("--spin", type=int, default=SPIN_MS_DFL)
+    # ★ 2026-09-22: PRE 步骤的独立窗（见 PRE_MS_DFL 的注释：它必须 ≥ 主循环最大阻塞）
+    ap.add_argument("--pre-ms", type=int, default=PRE_MS_DFL)
     args = ap.parse_args()
 
     W = args.w
     SPIN = args.spin
+    global PRE_MS
+    PRE_MS = args.pre_ms
 
     syms = nm_syms()
     need = ["g_shm", "g_eng_ticks", "g_table_profile", "g_reinit"]
@@ -188,7 +199,19 @@ def main():
     cs.append("write8  0x%08X 1" % A_RUN)       # 引擎 RUN
     cs.append("write32 0x%08X %d" % (syms["g_table_profile"], PROFILE_BENCH))
     cs.append("write32 0x%08X 1" % syms["g_reinit"])   # 主循环重填表
-    cs.append("go"); cs.append("sleep %d" % SPIN); cs.append("halt")
+    # ★★★ 2026-09-22 修: 这一段**必须用独立的长窗**，不能与采样点的 `SPIN` 同值。
+    #   根因（实测复现）: `g_reinit=1` 只是"登记"，**重填表要主循环跑一圈才执行**
+    #   （`main.c` 的 `if (g_reinit) { … engine_fill_tables(…) }` 在主循环后段）。
+    #   而 `SPIN` 默认 **4 ms**，主循环的**最长阻塞是 SD 落盘 46.7 ms**
+    #   （`SD_DIAG[60]` 实测 467 拍）⇒ **4 ms 窗装不下 46.7 ms 的阻塞** ⇒
+    #   主循环还没跑到那句就 `halt` 了 ⇒ PRE/T0' 报 `表=0`。
+    #   ★ 症状特征: **偶发**，而且**失败项每次都不同**（有时 PRE 表=0，有时 A 采样不稳）
+    #     —— 因为"卡在哪一段"是随机的。同固件连跑三次实测 **14/0 · 14/0 · 12/2**。
+    #   ★ 判据的时间窗必须 ≥ 被测系统的**最大阻塞时长** —— 这是 §〇 第 8/9 条那一族
+    #     （"判据的时序假设比被测对象更严 ⇒ 伪装成被测对象坏"）。
+    #   ★ 取值 150 ms ≈ 3× 最大阻塞；**只改这一步，采样点仍用 `SPIN`**
+    #     （A/B/C/D 要看的是"跑 SPIN 之后"的状态，不能一起加长）。
+    cs.append("go"); cs.append("sleep %d" % PRE_MS); cs.append("halt")
     snap("P0")                      # 上电默认态 (无 force)
 
     # ── A: 阳性对照 —— 不强制, wire[W] 必须稳定非零 (引擎在写它) ──

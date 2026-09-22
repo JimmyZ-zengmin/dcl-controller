@@ -22,7 +22,21 @@ echo "== 1) 重建默认档 =="
 #     ① 这里**显式传交付档的全部可粘性选项**（不靠默认值）;
 #     ② 构建后**比指纹**（下面 EXPECT_MD5）⇒ 与基线不符就**大声失败**, 不烧。
 DELIVERY_OPTS="-DDCL_TICK_US=100 -DDCL_BOOT_SEL=1 -DDCL_BOOT_SCAN_MODE=0 -DDCL_LOOP_RESET=1 -DDCL_STEP_RAMP_FIX=1"
-EXPECT_MD5="8d3caa76792097c57f30c013f64d6ce7"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
+EXPECT_MD5="8cf12db21f57a14e0cbd40d5bdc23d08"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
+# ★★ 2026-09-22 更新: 8d3caa76792097c57f30c013f64d6ce7 → 8cf12db21f57a14e0cbd40d5bdc23d08
+#    原因 = **TX 由"逐字节死等"改成"入队 + 每圈泵"**（治"观测改变被测对象"）:
+#      · `src/uart.c`: TX 线性队列（UART_TXQ_SZ=8192，定义在 uart.h）+ `uart1_write` 三段
+#        （推完残余 / 拷贝入队 / 尽量推不阻塞）+ `uart1_tx_pump()` + `uart1_tx_pending()`
+#      · `src/main.c`: 主循环**第一节**调 `uart1_tx_pump()`；
+#        新增 `_Static_assert(FRAME_TOTAL_MAX_V2 <= UART_TXQ_SZ)`（装不下 ⇒ 构建红）
+#      · `src/uart.h`: 导出 `UART_TXQ_SZ`（唯一源，供上面的断言）
+#    ★ 实测收益（同一个对照实验，判据能失败）:
+#        改前: 不读 sub=26 → 91.1 Hz ; 读 sub=26 → 60.4 Hz（掉 34 个百分点）
+#        改后: 不读 → 93.9 Hz ; 读 → 92.8 Hz（掉 1.1 个百分点）
+#      ⇒ **观察者效应基本消除**；协议探活 h723_proto 12 PASS / 0 FAIL
+#    ★ 回归: **12 套零回归**（唯一差异 w2_probe 已查清 = 它自身的**时间窗缺陷**:
+#        写 g_reinit 后只等 4 ms，而主循环最长阻塞(SD 落盘)是 46.7 ms ⇒ 偶发 表=0。
+#        已修: 新增 `--pre-ms`(默认 150) 只加长 PRE 那一步；修后连跑 5 次全 14/0）
 # ★★ 2026-09-22 更新: 4a6993bfbbde17d8ab4f48d63e51c245 → 8d3caa76792097c57f30c013f64d6ce7
 #    原因 = **新增"增量上传环" DELTA_RING**（`数据变化全量上传电脑记录`）:
 #      · `engine.h` : `OFF_DELTA_RING`（198 槽 × 16 B）+ 头 20 B，落在 SHM 尾部

@@ -1618,6 +1618,13 @@ static uint32_t       s_assy_last_tick = 0u;   /* 帧组装超时用: 最后一�
 static uint8_t        s_consumed_any  = 0u;   /* 本圈 proto_poll 是否消费过字节 */
 static uint8_t        s_txbuf[FRAME_TOTAL_MAX_V2];
 _Static_assert(FRAME_TOTAL_MAX_V2 >= FRAME_TOTAL_MAX, "v2 帧长必须 >= v1");
+/* ★★★ 2026-09-22: TX 队列必须**装得下一条最大应答**。
+ *   理由: `uart1_write` 改成"入队"后，队列满就只能**截断或等** —— 两者都坏。
+ *   这里把它变成**编译期不变式**：帧上限哪天长大到超过队列（`UART_TXQ_SZ`，定义在 uart.h），
+ *   构建立刻红，而不是运行期静默截断（那会发出一帧残缺的应答，比 NAK 难查得多）。
+ *   与 `s_txbuf` 那条断言同族："固定缓冲 + 更大的帧"这一族已栽过两次。 */
+_Static_assert(FRAME_TOTAL_MAX_V2 <= UART_TXQ_SZ,
+               "TX 队列装不下一帧 (改 uart.h 的 UART_TXQ_SZ)");
 static volatile uint32_t s_selftest_active = 0;
 
 OBS uint32_t g_uart_brr      = 0;    /* BRR 实测值 (100MHz/115200 → 0x3641) */
@@ -4784,6 +4791,14 @@ int main(void)
         /* ★★ 主循环进入标记 —— **必须放在本轮最前面** (在任何可能阻塞的调用之前),
          *   否则"第一轮就卡住"依然会被当成"还没进入"。见 g_loop_entered 的注释。 */
         g_loop_entered = 1u;
+
+        /* ★★★ 2026-09-22: **TX 泵**。放本轮第一节 —— 理由与 `g_loop_entered` 同族：
+         *   要在**任何可能阻塞的调用之前**把上一轮攒下的待发字节推出去。
+         *   背景（实测）：`uart1_write` 原来是逐字节死等 ⇒ 一次 1040 B 自旋 90 ms
+         *   ⇒ 主循环被卡 ⇒ **编码器采样从 91.1 Hz 掉到 60.4 Hz**（观测改变被测对象）。
+         *   改成"入队 + 每圈泵"后，这里每圈推若干字节，**不再有整段自旋**。
+         *   ★ 判据（能失败）：同样读 `sub=26`，编码器率应回到 **~91 Hz**（不再是 60 Hz）。*/
+        uart1_tx_pump();
 
         /* ★★★ 2026-09-21: 运动控制部分**已搬进拍内**（见 ISR 里的 step_service_motion/step_tick_isr）。
          *   主循环这里只保留两件：① 诊断核对（要与 DO 面**已写下去**的电平比，必须在这边）

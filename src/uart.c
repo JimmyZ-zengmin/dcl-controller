@@ -30,6 +30,17 @@
 
 static uint32_t  s_brr = 0;
 
+/* ══════════ TX 队列（2026-09-22）══════════
+ * ★ **线性缓冲，不是环形**：因为 `uart1_write` 保证"下一条写入前先把残余推完"
+ *   ⇒ 任意时刻待发数据一定是**连续的一段**，不需要绕回。
+ * ★ 大小 `UART_TXQ_SZ` 定义在 `uart.h`（**唯一源**）—— 因为 `main.c` 要用它做
+ *   `_Static_assert(FRAME_TOTAL_MAX_V2 <= UART_TXQ_SZ)`；把它埋在 .c 里就断言不了。
+ * ★ 8 KB 静态 RAM：DTCM 有 ~62 KB 余量（`MEM_STAT.headroom` 75 KB − 栈 0.9 KB − 余量下限 8 KB）。*/
+static uint8_t  s_txq[UART_TXQ_SZ];
+static uint32_t s_txq_pos = 0u;        /* 下一个要发的下标 */
+static uint32_t s_txq_len = 0u;        /* 还剩几个待发 */
+static uint32_t s_txq_trunc_n = 0u;    /* 被截断次数（应为 0；非 0 ⇒ 断言失效，可读回）*/
+
 /* 环形缓冲: 主循环排空。512B 足够 —— 主循环每轮只做几十条指令的事,
  * 而一字节要 86.8μs 才到。写满即丢弃并计数(不覆盖, 避免"看起来正常"的静默损坏)。 */
 /* ★★★ 2026-09-16: 512 → **4096**。
@@ -107,12 +118,58 @@ void uart1_init(uint32_t pclk2_hz, uint32_t baud)
 
 void uart1_write(const uint8_t *p, uint32_t n)
 {
-    for (uint32_t i = 0; i < n; i++) {
-        while (!(USART_ISR(USART1_BASE) & USART_ISR_TXE)) { }
-        USART_TDR(USART1_BASE) = p[i];
+    /* ★★★ 2026-09-22: **由"逐字节死等"改为"入队 + 尽量推"**。
+     *
+     * ## 为什么改（实测证据）
+     *   原实现逐字节 `while(!TXE)` 死等 + 结尾等 TC ⇒ CPU **100% 自旋**：
+     *   115200 下每字节 86.8 µs ⇒ 一次 1040 B（`sub=26` 的应答）**纯自旋 90 ms**。
+     *   而主循环正是编码器采样的调度者（`s_as_next = g_tick_count + as5600_period_now()`）
+     *   ⇒ **观测改变了被测对象**：对照实测（同台架、同 1500 Hz 运动）
+     *       不读 sub=26：编码器 **91.1 Hz**
+     *       读  sub=26：编码器 **60.4 Hz**   ← 掉 34%
+     *   ★ 违反项目铁律「观测不得改变被测对象」。
+     *
+     * ## 语义为什么不变
+     *   ① **先推完上一条的残余才允许覆盖缓冲** ⇒ 与原来"发完才返回"**在下一条到来时等价**，
+     *      只是"等待"被挪到了下一条，而**正常情况（主循环 `uart1_tx_pump()` 在两帧之间跑了）
+     *      残余早已推完 ⇒ 零等待**。
+     *   ② 全双工链路 ⇒ **不需要等 TC**：TXE=1 时上一字节已进移位寄存器、正在上线；
+     *      只有"发完就断电"才会缺尾巴，而协议是请求-应答，下一个字节总会接上。
+     *      （注释④那条"等 TC"对**半双工翻方向**和**一次性发完就停**才必要。）
+     *
+     * ## 背压
+     *   若上位机不等应答狂发 ⇒ ① 会**等**（真积压才发生）。不丢字节 —— 与
+     *   RX 侧"写满即丢弃并计数"的取舍**不同**，因为发送丢字节会**破坏已承诺的应答**。
+     */
+    while (s_txq_len > 0u) {                       /* ① 推完残余（正常情况这里立刻退出）*/
+        if ((USART_ISR(USART1_BASE) & USART_ISR_TXE) == 0u) { continue; }   /* 真积压: 等 */
+        USART_TDR(USART1_BASE) = s_txq[s_txq_pos++];
+        s_txq_len--;
     }
-    while (!(USART_ISR(USART1_BASE) & USART_ISR_TC)) { }   /* 等最后一字节出线 */
+    /* ② 入队（拷贝 ⇒ 调用者的缓冲不必常驻，`s_txbuf` 可被下一条复用）*/
+    if (n > UART_TXQ_SZ) { n = UART_TXQ_SZ; s_txq_trunc_n++; }   /* 断言已保证不会发生 */
+    for (uint32_t i = 0; i < n; i++) { s_txq[i] = p[i]; }
+    s_txq_pos = 0u;
+    s_txq_len = n;
+    uart1_tx_pump();                               /* ③ 尽量推，推不完就返回（不阻塞）*/
 }
+
+/* 主循环每圈调用：把待发字节尽量推出去。
+ * ★ 为什么放在主循环而不是 ISR：ISR 优先级低于 100 µs 拍（本文件①条），
+ *   在 ISR 里发字节会拉长 ISR；而主循环每圈有充足余量（一字节要 86.8 µs 才到）。
+ * ★ 为什么不做 TXE 中断：那要给 USART1 开 TXE 使能，而本驱动的 ISR 现在只处理 RX
+ *   （见 USART1_IRQHandler）；主循环轮询已经够 —— 而且**不改 ISR 就不动
+ *   "拍 ISR 优先级"那条不变量**。 */
+void uart1_tx_pump(void)
+{
+    while (s_txq_len > 0u) {
+        if ((USART_ISR(USART1_BASE) & USART_ISR_TXE) == 0u) { break; }
+        USART_TDR(USART1_BASE) = s_txq[s_txq_pos++];
+        s_txq_len--;
+    }
+}
+
+uint32_t uart1_tx_pending(void) { return s_txq_len; }
 
 uint32_t uart1_brr(void) { return s_brr; }
 
