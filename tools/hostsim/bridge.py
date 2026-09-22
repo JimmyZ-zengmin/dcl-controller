@@ -75,6 +75,7 @@ STATE = {
     "ok": False, "src": "-", "msg": "未启动",
     "t": 0.0, "raw": 0.0, "deg": 0.0, "revs": 0.0, "pos_mm": 0.0,
     "vel_mm_s": 0.0, "cmd_hz": 0.0, "cmd_mm_s": 0.0,
+    "cmd_eff_hz": 0.0, "cmd_eff_mm_s": 0.0,   # ★ 按运动源自适应的"命令"（曲线用这个）
     "ap_hz": 0.0, "ap_mm_s": 0.0,
     "mosrc": "-", "cmd_n": 0, "applied_n": 0, "rej_n": 0, "lim_rem": 0,
     "req_hz": 0.0, "src_mode": "-", "lim_ms": 0, "mismatch": False,
@@ -222,11 +223,20 @@ def run_live(port, pitch, hz):
             # ★★ "请求 vs 已应用"配对 —— §〇 第 6 条"设了就算"必错。
             #   下发了 A Hz、WIRE[64] 却是 0 ⇒ 命令**没到执行面**（源选错 / 未使能 / 被限时停）。
             #   把它算成一个能失败的布尔量送前端标红，而不是让用户盯着两个数自己对。
+            # ★★ "命令"这一列必须**按运动源自适应** —— 否则曲线会画一条假的平线：
+            #    · 程序面模式(mosrc=1)：命令 = `WIRE[12]`（③层程序写的），这是对的；
+            #    · 脚手架模式(mosrc=0)：`WIRE[12]` 是**残留值、没人维护**（实测恒为 6.0 Hz），
+            #      真正的命令是**本进程下发的 `req_hz`**（`/motion` 端点记的）。
+            #    2026-09-22 实测：脚手架跑 2000 Hz 时，"命令"曲线贴 0 平线，而实际在转
+            #    ⇒ 一张**看起来像"命令没跟上"的假图**。与 §〇 第 6 条同族：别读没人维护的槽。
             req = STATE.get("req_hz", 0.0)
+            cmd_eff = cmd if mosrc == 1 else req
             mis = bool(req > 1.0 and abs(ap - req) > max(1.0, req * 0.05))
             with LOCK:
                 STATE.update(t=t, raw=raw, deg=deg, revs=revs, pos_mm=pos,
                              vel_mm_s=vel, cmd_hz=cmd, cmd_mm_s=cmd / STEPS_PER_REV * pitch,
+                             cmd_eff_hz=cmd_eff,
+                             cmd_eff_mm_s=cmd_eff / STEPS_PER_REV * pitch,
                              ap_hz=ap, ap_mm_s=ap / STEPS_PER_REV * pitch,
                              mosrc=("program" if mosrc == 1 else "scaffold"),
                              cmd_n=cmd_n, applied_n=ap_n, rej_n=rej_n, lim_rem=lim_rem,
@@ -304,6 +314,7 @@ def run_csv(path, pitch, speed):
                 STATE.update(t=t_sim, raw=raw, deg=deg, revs=revs, pos_mm=revs * pitch,
                              vel_mm_s=(d_cnt / COUNTS_PER_REV * pitch / dt_s) if dt_s > 1e-9 else 0.0,
                              cmd_hz=cmd, cmd_mm_s=cmd / STEPS_PER_REV * pitch,
+                             cmd_eff_hz=cmd, cmd_eff_mm_s=cmd / STEPS_PER_REV * pitch,
                              ap_hz=0.0, ap_mm_s=0.0,
                              tick=int(tick), d_tick=d_tick, dt_s=dt_s,
                              rate=1.0 / dt_s if dt_s > 1e-9 else 0.0,
@@ -352,11 +363,15 @@ class H(BaseHTTPRequestHandler):
             src = q.get("src", "scaffold")
             lim = int(q.get("lim", 30000))     # ★ 默认 30 s 限时（安全网：忘了点停也会自己停）
             if on:
+                # ★ 斜坡(`sub=17`)**两条路都设** —— 它是**全局**的（固件注释原话：
+                #   "频率的写入口只有一个 step_set_rate ⇒ 脚手架 sub=1 与程序面 wire[12]
+                #    两条通路**同时受益**"）。原实现只在程序面路径设 ⇒ 脚手架模式下
+                #   **`slope` 参数被静默忽略**，而 JSON 里还回显 `"slope": 200`（ACK ≠ 生效）。
+                CMDQ.append(("pin", 17, int(slope)))
                 if src == "program":
-                    # 顺序照 README §4：enapol → 程序面 → 斜坡 → 峰值 → 使能
+                    # 顺序照 README §4：enapol → 程序面 → 峰值 → 使能
                     CMDQ.append(("pin", 5, 1))
                     CMDQ.append(("pin", 13, 1))
-                    CMDQ.append(("pin", 17, int(slope)))
                     CMDQ.append(("wire", 11, A))
                     CMDQ.append(("wire", 10, 1.0))
                 else:

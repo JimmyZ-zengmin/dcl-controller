@@ -21,13 +21,18 @@
   #chart { display:block; width:100%; height:120px }
   .lg { display:flex; gap:14px; font-size:11px; color:var(--mut); margin-top:6px }
   .sw { width:10px; height:3px; border-radius:2px; display:inline-block; margin-right:5px; vertical-align:middle }
-  #ctl { left:16px; bottom:16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap }
+  /* ★★ z-index 必须给：#ctl（左下）与 #bar（底部居中）在同一高度带，
+     而 #bar 在 DOM 里靠后 ⇒ 默认会**盖住"开跑"按钮**（实测：agent-browser 点 #go 完全无效，
+     手动调 /motion 却正常 ⇒ 后端没问题，是**点不到**）。 */
+  #ctl { left:16px; bottom:16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+         max-width:calc(100vw - 360px); z-index:20 }
   #ctl button { font:inherit; padding:5px 11px; border:1px solid var(--line);
                 background:#fff; border-radius:7px; cursor:pointer }
   #ctl button:hover { border-color:#aaa }
   #ctl input[type=number] { width:64px; font:inherit; padding:4px 6px;
                             border:1px solid var(--line); border-radius:6px }
-  #bar { position:fixed; left:50%; transform:translateX(-50%); bottom:18px;
+  /* ★ 原来放在 `left:50%`（底部居中）⇒ 与 #ctl 重叠（见上）。挪到右下：那里本来就空着。 */
+  #bar { position:fixed; right:16px; bottom:18px; z-index:10;
          background:#fff; border:1px solid var(--line); border-radius:8px;
          padding:6px 14px; color:var(--mut); font-size:12px }
   .warn { color:#A32D2D }
@@ -41,7 +46,7 @@
   <div class="row"><span>电机角度</span><b><span id="deg">0</span>°</b></div>
   <div class="row"><span>累计圈数</span><b><span id="revs">0</span></b></div>
   <div class="row"><span>累计行程</span><b><span id="pos">0</span> mm</b></div>
-  <div class="row"><span>请求频率</span><b><span id="cmd">0</span> Hz</b></div>
+  <div class="row"><span>命令频率</span><b><span id="cmd">0</span> Hz</b></div>
   <div class="row"><span>已应用频率</span><b><span id="ap">0</span> Hz</b></div>
   <div class="row"><span>命令线速</span><b><span id="cmv">0</span> mm/s</b></div>
   <div class="row"><span>实测线速 · 板</span><b><span id="apm">0</span> mm/s</b></div>
@@ -209,17 +214,22 @@ function drawChart(){
   const Y = v => h/2 - (v/mx) * (h/2 - 8);
   cx.strokeStyle='#e3e6e9'; cx.lineWidth=1;
   cx.beginPath(); cx.moveTo(0,h/2); cx.lineTo(w,h/2); cx.stroke();
-  const draw = (key, color) => {
-    cx.strokeStyle=color; cx.lineWidth=1.6; cx.beginPath();
+  const draw = (key, color, dash) => {
+    cx.strokeStyle=color; cx.lineWidth=1.6; cx.setLineDash(dash||[]); cx.beginPath();
     let first=true;
     for (const p of hist){
       if (p.t < t0) continue;
       const x=X(p.t), y=Y(p[key]);
       if (first){ cx.moveTo(x,y); first=false; } else cx.lineTo(x,y);
     }
-    cx.stroke();
+    cx.stroke(); cx.setLineDash([]);
   };
-  draw('cmd', '#BA7517'); draw('act', '#0F6E56');
+  // ★ 顺序与线型有讲究：原来 `cmd` 先画、`act` 后画 ⇒ 稳态下两者**完全重合**
+  //   （命令 2000 Hz ⇒ 10.16 mm/s；实测也 10.16）⇒ 命令那条被**整条盖住**，
+  //   而图例上两条都在 —— 看起来像"有一路没数据"。改成实测在下（实线）、
+  //   命令在上（**虚线**）⇒ 重合时也看得见两条，且"贴合"本身就是最好的证据。
+  draw('act', '#0F6E56');
+  draw('cmd', '#BA7517', [5,3]);
   cx.fillStyle='#888'; cx.font='10px system-ui';
   cx.fillText('±'+mx.toFixed(1)+' mm/s', 4, 11);
 }
@@ -245,12 +255,12 @@ function frame(){
     $('deg').textContent  = (st.deg).toFixed(1);
     $('revs').textContent = st.revs.toFixed(3);
     $('pos').textContent  = pos.toFixed(2);
-    $('cmd').textContent  = st.cmd_hz.toFixed(0);
+    $('cmd').textContent  = (st.cmd_eff_hz||0).toFixed(0);
     $('ap').textContent   = (st.ap_hz||0).toFixed(0);
     // ★ "请求 vs 已应用"不匹配就标红 —— 命令没到执行面（源选错/未使能/被限时停）
     $('ap').className     = st.mismatch ? 'warn' : '';
     $('cmd').className    = st.mismatch ? 'warn' : '';
-    $('cmv').textContent  = st.cmd_mm_s.toFixed(2);
+    $('cmv').textContent  = (st.cmd_eff_mm_s||0).toFixed(2);
     $('apm').textContent  = (st.ap_mm_s||0).toFixed(2);
     $('vel').textContent  = st.vel_mm_s.toFixed(2);
     $('dtick').textContent= (st.d_tick||0);
@@ -261,7 +271,7 @@ function frame(){
 
     // 曲线：★ "实测"用**板子口径**（已应用频率换算），位置域差分留作参考
     if (!paused){
-      hist.push({t: st.t, cmd: st.cmd_mm_s, act: (st.ap_mm_s||st.vel_mm_s)});
+      hist.push({t: st.t, cmd: (st.cmd_eff_mm_s||0), act: (st.ap_mm_s||st.vel_mm_s)});
       const tn = st.t - 12.5;
       while (hist.length && hist[0].t < tn) hist.shift();
     }
