@@ -25,6 +25,7 @@
  */
 #include "uart.h"
 #include "regs.h"
+#include "timebase.h"   /* tb_cyc()/TB_US() —— 限时 pump 用（见 UART_TX_PUMP_US）*/
 
 #define UART_ISR_PLACE  __attribute__((section(".itcm_text"), used))
 
@@ -162,8 +163,22 @@ void uart1_write(const uint8_t *p, uint32_t n)
  *   "拍 ISR 优先级"那条不变量**。 */
 void uart1_tx_pump(void)
 {
+    /* ★★★ 2026-09-22 第二次修：**限时推进**（见 `uart.h` 的 `UART_TX_PUMP_US`）。
+     *
+     * 第一版"只试一次"的实测缺陷：TXE 推完一字节要 86.8 µs 才再置位（115200）
+     * ⇒ 每圈只推 1 字节，而主循环 0.37 ms/圈 ⇒ **1040 B 要 385 ms**
+     * （实测 `sub=26` 拉满 64 条 = 230 ms，按线路时间只该 90 ms）
+     * ⇒ 消费能力 224 条/s < 产出 230 条/s ⇒ **`DELTA_RING` 被覆盖、drop 涨**。
+     * ⇒ 改成"最多待 PUMP_US 微秒"：一次推 ~11 字节、总耗时 ~35 ms，
+     *   而**单次阻塞仅 1 ms**（vs 原阻塞版 90 ms）。
+     */
+    uint32_t t0 = tb_cyc();
+    const uint32_t lim = TB_US(UART_TX_PUMP_US);
     while (s_txq_len > 0u) {
-        if ((USART_ISR(USART1_BASE) & USART_ISR_TXE) == 0u) { break; }
+        if ((USART_ISR(USART1_BASE) & USART_ISR_TXE) == 0u) {
+            if ((uint32_t)(tb_cyc() - t0) >= lim) { break; }   /* 到点让出，下一轮继续 */
+            continue;                                          /* 等 TXE（≤86.8 µs）*/
+        }
         USART_TDR(USART1_BASE) = s_txq[s_txq_pos++];
         s_txq_len--;
     }

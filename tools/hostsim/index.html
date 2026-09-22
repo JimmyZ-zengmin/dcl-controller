@@ -18,7 +18,12 @@
   .row span:first-child { color:var(--mut) }
   .row b { font-variant-numeric:tabular-nums; font-weight:600 }
   #chartbox { right:16px; top:16px; width:340px }
+  /* ★ 2026-09-22: 全分辨率波形面板（数据源 = /wave，每点 = 一次真实变化） */
+  #chart2box { right:16px; top:228px; width:340px }
   #chart { display:block; width:100%; height:120px }
+  /* ★ 2026-09-22: `#chart2` 必须**同样给 CSS** —— 漏了它 canvas 会退回属性尺寸(300×150)、
+     且 `display:inline` 会在底部留一条基线间隙；实测症状 = 面板空白（数据其实是有的）。 */
+  #chart2 { display:block; width:100%; height:120px }
   .lg { display:flex; gap:14px; font-size:11px; color:var(--mut); margin-top:6px }
   .sw { width:10px; height:3px; border-radius:2px; display:inline-block; margin-right:5px; vertical-align:middle }
   /* ★★ z-index 必须给：#ctl（左下）与 #bar（底部居中）在同一高度带，
@@ -36,6 +41,31 @@
          background:#fff; border:1px solid var(--line); border-radius:8px;
          padding:6px 14px; color:var(--mut); font-size:12px }
   .warn { color:#A32D2D }
+  /* ★★ 2026-09-22 层级面板：颜色必须**成对**给（绿=一致/停住；红=不一致/停不住）。
+     理由与判据纪律同族: 只有一个颜色时"没上色"既可能是"好"也可能是"没数据"。 */
+  .ok  { color:#0F6E56 }
+  .bad { color:#A32D2D; font-weight:600 }
+  #layers { border-top:1px solid #eceff2; margin-top:7px; padding-top:7px }
+  #layers .row span:first-child { color:#8a9099 }
+  #ctl select { font:inherit; padding:4px 6px; border:1px solid var(--line);
+                border-radius:6px; background:#fff }
+  /* ★ 急停必须**视觉上就与众不同** —— 它不该长得像"暂停显示"。 */
+  #ctl button#stp { border-color:#e3b4b4; background:#fdf3f3; color:#A32D2D;
+                    font-weight:600; padding:5px 14px }
+  #ctl button#stp:hover { background:#fbe9e9; border-color:#c88 }
+  /* ★★★ 下位机诊断面板（管理面）—— 2026-09-22
+     它承载"原来必须插 pyocd / 记住 mgmt.py 命令才能看"的东西。
+     数据源 = /state.mgmt（bridge 用 0x64 目录 + 0x22 按名字读 + mgmt.verdict 判读）。 */
+  #devbox { right:16px; top:442px; width:340px;
+            max-height:calc(100vh - 480px); overflow:auto }
+  #devbox .it { border-top:1px solid #f0f2f4; padding:4px 0 }
+  #devbox .it:first-child { border-top:0 }
+  #devbox .lit { display:block; color:#6b7280; font-size:11px; margin-left:9px;
+                 overflow-wrap:anywhere }
+  #devbox .ok  { color:#0F6E56 }
+  #devbox .bad { color:#A32D2D; font-weight:600 }
+  #devbox button { font:inherit; padding:2px 9px; border:1px solid var(--line);
+                   background:#fff; border-radius:5px; cursor:pointer }
 </style>
 </head>
 <body>
@@ -54,6 +84,26 @@
   <div class="row"><span>引擎</span><b><span id="run">-</span></b></div>
   <div class="row"><span>板子间隔</span><b><span id="dtick">0</span> 拍</b></div>
   <div class="row"><span>PC 采样率</span><b><span id="rate">0</span> Hz</b></div>
+  <div class="row"><span>事件率</span><b><span id="evr">0</span> 条/s</b></div>
+  <!-- ★ 位置点率（累积量口径）—— 这是"数据全不全"的**主判据**：
+       300 Hz 级别 = 每 ~3 拍一点（拍长 100 µs）。若它塌到几十 Hz ⇒ 中间丢过点。 -->
+  <div class="row"><span>位置点率</span><b><span id="ptrate">0</span> Hz</b></div>
+  <div class="row"><span>波形点</span><b><span id="wvn">0</span></b></div>
+
+  <!-- ══════════ ★★★ 层级与停机（2026-09-22）══════════
+       用户指正：「**你这里层级关系没处理好，并且上位机与板子之间做的不是很系统。**」
+       落点 = 把"**我以为的**"与"**板子实读的**"并列摆出来，并给出**一致性判据**。
+       实测反例（改造前）: `src_mode=scaffold` 而 `mosrc=program` —— 界面只显示前者，
+       于是人看到的是**错的**，而下一条命令就打在没人听的那条路上。
+       ★ 这就是 §〇 第 6 条（"设了就算"必错）在上位机侧的实例。 -->
+  <div id="layers">
+    <div class="row"><span>源 · 界面意图</span><b><span id="si">—</span></b></div>
+    <div class="row"><span>源 · 板子实读</span><b><span id="sd">—</span></b></div>
+    <div class="row"><span>层级一致</span><b><span id="sm">—</span></b></div>
+    <div class="row"><span>程序使能 wire[10]</span><b><span id="wen">—</span></b></div>
+    <div class="row"><span>程序请求 wire[12]</span><b><span id="wre">—</span></b></div>
+    <div class="row"><span>停机验证</span><b><span id="stopv">—</span></b></div>
+  </div>
 </div>
 
 <div class="panel" id="chartbox">
@@ -66,9 +116,42 @@
   </div>
 </div>
 
+<div class="panel" id="chart2box">
+  <h3 style="margin:0 0 6px;font-size:13px;font-weight:600">位置 · 全分辨率</h3>
+  <canvas id="chart2"></canvas>
+  <div class="lg">
+    <span><i class="sw" style="background:#534AB7"></i>编码器原始位置</span>
+    <span id="wavesub" style="margin-left:auto;color:#999">—</span>
+  </div>
+</div>
+
 <div class="panel" id="ctl">
+  <!-- ══════════ ★★★ 运动源必须**显式声明**（2026-09-22）══════════
+       板子上有**两条平行的运动通路**，而上位机原来**不知道自己在打哪条**：
+         · `program`  = ③层程序（DCL）: 上位机**只写程序的输入**
+                        （`wire[10]`=使能 / `wire[50]`=虚拟绝对位置），
+                        程序自己写 `wire[12..15]`。停机权威 = **`wire[10]=0`**。
+         · `scaffold` = 脚手架直控: `sub=1/2/3/4` 直接下频率/方向/使能/限时。
+                        停机权威 = **`sub=1 0` + `sub=6`**。
+       ★★ **两条路不能混用** —— 混用时的现象正是"点停后又跑"（用户实测）：
+          界面按脚手架去停（`sub=1 0`），而板子在程序面跑 ⇒ `sub=1` 没人在听，
+          `sub=6` 只停几拍，③层程序下一拍又把脉冲拉回来。
+       ⇒ 所以: **起跑要声明源；停止不声明源（`/stop` 两条都打）**。 -->
+  <label style="color:#666">运动源
+    <!-- ★★★ id 必须是 `msrc`，**不能叫 `src`** ——
+         HUD 的 `<h3>` 里已经有一个 `id="src"`（显示数据源 live/csv）。
+         `document.getElementById` 只返回**第一个**匹配 ⇒ 叫 `src` 的话
+         `$('src').value` 是 `undefined` ⇒ 请求变成 `/motion?src=undefined`
+         ⇒ 后端落到 `scaffold` 分支 ⇒ **运动源选择永远失效**，
+         而现象只是"层级源=scaffold"（看着像个小事），**语法与运行都毫无报错**。
+         ★ 与 `do_GET` 那次同族: **语法/运行都不报错的结构性缺陷**。 -->
+    <select id="msrc">
+      <option value="program">③层程序（DCL）</option>
+      <option value="scaffold">脚手架直控</option>
+    </select>
+  </label>
   <button id="go">▶ 开跑</button>
-  <button id="stp">■ 停</button>
+  <button id="stp" title="Esc / 空格 —— 两条路一起打，与运动源无关">■ 急停</button>
   <label style="color:#666">峰值 <input type="number" id="pk" value="3000" step="500" min="0"> Hz</label>
   <label style="color:#666">斜坡 <input type="number" id="sl" value="30000" step="5000" min="100"> Hz/s</label>
   <button id="pause">暂停显示</button>
@@ -77,13 +160,38 @@
   <label style="color:#666"><input type="checkbox" id="wrap" checked> 行程回绕</label>
 </div>
 
+<div class="panel" id="devbox">
+  <!-- ══════════ ★★★ 下位机诊断（管理面，2026-09-22）══════════
+       用户的要求：**"把曾经藏在代码里、需要 pyocd 看的任务，搬到上位机可以直接看到的地方。"**
+       ★ 板子本来就有这套能力（`manifest.h` 是"板内诊断资源目录"，协议口 0x64/0x22，
+         客户端 tools/mgmt.py），**只是从没接进网页** —— 而且它有个硬约束：
+         串口被 bridge 独占 ⇒ 那个命令行工具在 bridge 跑着时**根本连不上板子**
+         （实测报 `自动找板子失败`）⇒ 必须由 bridge 代理。
+       ★ 判读逻辑**不在前端重写**：bridge 直接调 mgmt.py 的 verdict()/layout_check()，
+         否则两份判读表会漂（而"两侧表漂了"正是这套机制的头号要防的事）。 -->
+  <h3 style="margin:0 0 6px;font-size:13px;font-weight:600">
+    下位机诊断 <span id="devn" style="font-weight:400;color:#666;font-size:11px"></span>
+  </h3>
+  <div id="devitems"><span style="color:#aaa;font-size:11px">等待管理面…</span></div>
+  <div class="lg" style="align-items:center">
+    <button id="devrefresh" title="立刻跑一轮（约 90 ms）">↻ 刷新</button>
+    <span id="devsub" style="margin-left:auto;color:#999">—</span>
+  </div>
+</div>
+
 <div id="bar">鼠标拖动旋转 · 滚轮缩放 · <span id="msg">等待数据…</span></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 // ══════════ 机构尺寸（mm 为单位，1 场景单位 = 1 mm）══════════
-const SCREW_R = 5, SCREW_LEN = 140, SCREW_X0 = -20;
-const TRAVEL = 100;                       // 虚拟行程（滑台可走的距离）
+const SCREW_R = 5, SCREW_LEN = 400, SCREW_X0 = -200;
+const TRAVEL = 360;                       // 虚拟行程（滑台可走的距离）
+// ★ 2026-09-22: 丝杆 140→400、行程 100→360（用户要"一个长的丝杆" + "后续拿来跑运动控制测数据"）。
+//   行程加长的理由: 1500 Hz 下 7.6 mm/s，原 100 mm 只要 13 s 就走完 ⇒ 测一段轨迹就出界。
+//   360 mm 约 47 s，够跑一段像样的加减速/正弦。
+//   ★★ 注意「虚拟行程」与「累计行程」是两回事: 前者决定滑台在 3D 里画到哪（到边可绕回），
+//      后者是**真值**（HUD 里的"累计行程"），永不绕回、永不丢 —— 那才是"记录当前位置"。
+
 const MOTOR_R = 28, MOTOR_LEN = 50;
 let PITCH = 8;                            // 丝杆导程 mm/rev（与 bridge 的 --pitch 一致）
 
@@ -100,8 +208,11 @@ const dl = new THREE.DirectionalLight(0xffffff, 0.72); dl.position.set(160, 260,
 const dl2 = new THREE.DirectionalLight(0xffffff, 0.28); dl2.position.set(-200, 80, -150); scene.add(dl2);
 
 // ── 自制轨道相机（省一个依赖，也避免 OrbitControls 版本对不上）──
-let camTheta = 0.62, camPhi = 1.06, camDist = 330;
-const camTarget = new THREE.Vector3(SCREW_X0 + SCREW_LEN/2 - 20, 0, 0);
+let camTheta = 0.62, camPhi = 1.06, camDist = 620;
+// ★ 2026-09-22: 丝杆加长到 400 ⇒ 相机必须拉远（否则只看得见中间一段）。
+//   目标点取丝杆中心，距离 330 → 620（≈1.5× 丝杆长，38° 视角下正好框住）。
+//   ★ 保留滚轮缩放（下面 camDist 的范围已放宽到 90~1600）。
+const camTarget = new THREE.Vector3(SCREW_X0 + SCREW_LEN/2, 0, 0);
 function updCam(){
   camPhi = Math.max(0.12, Math.min(Math.PI-0.12, camPhi));
   camera.position.set(
@@ -119,7 +230,7 @@ canvas.addEventListener('pointermove', e=>{
   px=e.clientX; py=e.clientY; updCam();
 });
 canvas.addEventListener('wheel', e=>{ e.preventDefault();
-  camDist = Math.max(110, Math.min(900, camDist*(1+Math.sign(e.deltaY)*0.10))); updCam(); }, {passive:false});
+  camDist = Math.max(90, Math.min(1600, camDist*(1+Math.sign(e.deltaY)*0.10))); updCam(); }, {passive:false});
 function resize(){
   const w=innerWidth, h=innerHeight;
   renderer.setSize(w,h,false); camera.aspect=w/h; camera.updateProjectionMatrix();
@@ -200,6 +311,13 @@ async function poll(){
 // ══════════ 图表 ══════════
 const chart = document.getElementById('chart');
 const cx = chart.getContext('2d');
+// ★ 全分辨率面板（数据源 /wave）
+const chart2 = document.getElementById('chart2');
+const cx2 = chart2.getContext('2d');
+// ★★★ 全分辨率位置序列（来自 /wave）—— 用户的判据：「演示可以低分辨率，计算必须全量」。
+//   与 hist[] 的区别: hist 是**12 Hz 抽样**（跟着 /state 走），wave.pts 是**每一次真实变化**
+//   （实测 d_tick_med=100 ⇒ 100 Hz）。两者都来自同一份事件流，所以不矛盾 —— 只是分辨率不同。
+let wave = { pts: [], t0: 0, d_tick_med: 0, n: 0 };
 function drawChart(){
   const w = chart.clientWidth, h = chart.clientHeight;
   if (chart.width !== w*2){ chart.width = w*2; chart.height = h*2; }
@@ -234,6 +352,86 @@ function drawChart(){
   cx.fillText('±'+mx.toFixed(1)+' mm/s', 4, 11);
 }
 
+// ★ /wave 每 500 ms 拉一次 —— 它承载 100 Hz 的数据，**不需要高频拉**：
+//   一次就带回最近 900 点（≈9 s）。这正是「低频拉取、高分辨率数据」的最优带宽利用。
+async function pollWave(){
+  try {
+    const r = await fetch("/wave", {cache:"no-store"});
+    const w = await r.json();
+    if (w && w.n){ wave = w; }
+  } catch(e) { /* 后端没起来时不报错，只是没数据 */ }
+  setTimeout(pollWave, 500);
+}
+
+function drawWave(){
+  const w = chart2.clientWidth, h = chart2.clientHeight;
+  if (chart2.width !== w*2){ chart2.width = w*2; chart2.height = h*2; }
+  cx2.setTransform(2,0,0,2,0,0);
+  cx2.clearRect(0,0,w,h);
+  cx2.fillStyle="#fbfbfc"; cx2.fillRect(0,0,w,h);
+  cx2.strokeStyle="#eef0f2"; cx2.lineWidth=1;
+  for (let i=1;i<4;i++){ const y=h*i/4; cx2.beginPath(); cx2.moveTo(0,y); cx2.lineTo(w,y); cx2.stroke(); }
+  const P = wave.pts || [];
+  if (P.length < 2){
+    cx2.fillStyle="#aaa"; cx2.font="11px system-ui";
+    cx2.fillText("等 /wave 数据…", 6, h/2);
+    return;
+  }
+  // x = 拍数（dt_tick），y = 位置 mm —— ★ 横轴是**板子的拍**，不是 PC 墙钟
+  let xmax = P[P.length-1][0] || 1;
+  let ymin = P[0][1], ymax = P[0][1];
+  for (const p of P){ if (p[1]<ymin) ymin=p[1]; if (p[1]>ymax) ymax=p[1]; }
+  const pad = (ymax-ymin)*0.12 || 0.01; ymin -= pad; ymax += pad;
+  const X = d => d/xmax*(w-6)+3, Y = v => h-4-(v-ymin)/(ymax-ymin)*(h-8);
+  cx2.strokeStyle="#534AB7"; cx2.lineWidth=1.2; cx2.beginPath();
+  P.forEach((p,i)=>{ const x=X(p[0]), y=Y(p[1]); i? cx2.lineTo(x,y) : cx2.moveTo(x,y); });
+  cx2.stroke();
+  cx2.fillStyle="#888"; cx2.font="10px system-ui";
+  cx2.fillText(ymin.toFixed(2)+" ~ "+ymax.toFixed(2)+" mm", 4, 11);
+  const sub = document.getElementById("wavesub");
+  // ★ 2026-09-22 口径修正：**率要用累积量口径**（点数 ÷ 总跨度），不能拿中位间隔反推 ——
+  //   实测同一份数据: 中位 22 拍（反推 454 Hz）而平均 32.8 拍（真值 305 Hz）
+  //   ⇒ 中位**高估 1.5 倍**（分位数不免疫长尾，见记忆 §〇 第 10 条）。
+  //   所以主显示是 `rate_pt`，中位/平均只作**抖动指示**留在括号里。
+  if (sub) sub.textContent = P.length + " 点 · " + (wave.rate_pt || 0).toFixed(0) + " Hz"
+      + "（Δtick 中位 " + (wave.d_tick_med || 0) + " / 均 " + (wave.d_tick_avg || 0).toFixed(0) + " 拍）";
+}
+
+// ══════════ ★★★ 下位机诊断（管理面）══════════
+// 数据源 = `/state` 的 `mgmt` 字段：bridge 读 0x64 目录 + 0x22 按名字读，
+// 再用 mgmt.py 的 verdict() 判读。★ 前端**只渲染，不判读** —— 两处判读必然漂。
+// ★ 用 document.getElementById（不用 `$`）—— 因为 `$` 这个 helper 定义在本段**之后**
+//   （`const` 有 TDZ，提前访问会抛 ReferenceError，而它只在那一段的第一行）。
+document.getElementById('devrefresh').onclick = () => fetch('/mgmtpoll', {cache:'no-store'});
+const esc = s => String(s == null ? '' : s).replace(/[<>&]/g, '');
+
+function drawDev(){
+  const box = document.getElementById('devitems');
+  const m = (st && st.mgmt) || null;
+  if (!m) return;
+  const items = m.items || [];
+  document.getElementById('devn').textContent =
+      '(' + (m.n_entries || 0) + ' 个可读区，本轮读了 ' + items.length + ')';
+  const sub = document.getElementById('devsub');
+  sub.textContent = m.err ? ('★ ' + m.err)
+      : (m.t ? ('更新于 ' + new Date(m.t * 1000).toLocaleTimeString()
+                + (items.some(x => x.bad)
+                   ? ' · ★ ' + items.filter(x => x.bad).length + ' 项异常' : ' · 全部正常'))
+             : '—');
+  sub.className = (m.err || items.some(x => x.bad)) ? 'bad' : '';
+  // ★ 只在内容变了才重建 DOM：`/state` 40 ms 一次，每帧重建会让滚动位置丢失/闪烁
+  const sig = JSON.stringify(items);
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+  box.innerHTML = items.length ? items.map(x =>
+      '<div class="it"><b class="' + (x.bad ? 'bad' : 'ok') + '">'
+      + (x.bad ? '★ ' : '✓ ') + esc(x.name) + '</b>'
+      + '<span class="lit">' + esc(x.head) + '</span>'
+      + (x.lines || []).slice(1, 3).map(l => '<span class="lit">' + esc(l) + '</span>').join('')
+      + '</div>').join('')
+    : '<span style="color:#aaa;font-size:11px">（管理面没返回条目）</span>';
+}
+
 // ══════════ 渲染循环 ══════════
 const $ = id => document.getElementById(id);
 let lastRaw = null, tw = 0;
@@ -265,9 +463,33 @@ function frame(){
     $('vel').textContent  = st.vel_mm_s.toFixed(2);
     $('dtick').textContent= (st.d_tick||0);
     $('rate').textContent = (st.rate||0).toFixed(1);
+    $('evr').textContent  = (st.evt_rate||0).toFixed(0);
+    $('ptrate').textContent = (wave.rate_pt||0).toFixed(0);
+    $('wvn').textContent  = (st.wave_n||0);
     $('run').textContent  = st.run ? 'RUN' : 'STOP';
-    $('src').textContent  = '(' + st.src + ' · ' + (st.src_rule||'?')
-                          + (st.src_mode && st.src_mode!=='-' ? ' · 源=' + st.src_mode : '') + ')';
+    $('src').textContent  = '(' + st.src + ' · ' + (st.src_rule||'?') + ')';
+
+    // ══════════ ★★★ 层级对账（2026-09-22）══════════
+    // 「界面意图」 vs 「板子实读」 —— ★ 必须**并列显示**。
+    // 改造前的实测反例: `src_mode=scaffold`（界面以为）而 `mosrc=program`（板子实际）
+    //   ⇒ 界面撒谎，而操作者据此下命令 ⇒ 打在没人听的路上。
+    $('si').textContent = (st.src_intent && st.src_intent !== '-') ? st.src_intent : '—';
+    $('sd').textContent = st.src_dev || '—';
+    const match = (st.src_match !== false);
+    $('sm').textContent = match ? '✓ 一致'
+                                : '✗ 不一致：界面以为 ' + st.src_intent + '，板子在 ' + st.src_dev;
+    $('sm').className = match ? 'ok' : 'bad';
+    // 程序面的两个可读环节 —— "停了又跑"能一眼定位到哪一环没关：
+    $('wen').textContent = (st.wire_ena === null || st.wire_ena === undefined)
+                         ? '—' : (+st.wire_ena).toFixed(2);
+    $('wen').className = (st.wire_ena !== null && st.wire_ena !== undefined && st.wire_ena > 0.5)
+                       ? 'ok' : '';
+    $('wre').textContent = (st.wire_req === null || st.wire_req === undefined)
+                         ? '—' : (+st.wire_req).toFixed(0) + ' Hz';
+    // 停机验证：null=没在验、true=停住、false=★ 停失败（能失败）
+    const so = st.stop_ok;
+    $('stopv').textContent = st.stop_msg || '—';
+    $('stopv').className = (so === false) ? 'bad' : (so === true ? 'ok' : '');
 
     // 曲线：★ "实测"用**板子口径**（已应用频率换算），位置域差分留作参考
     if (!paused){
@@ -277,17 +499,67 @@ function frame(){
     }
   }
   drawChart();
+  drawWave();
+  drawDev();
   renderer.render(scene, camera);
 }
 
 $('pause').onclick = e => { paused=!paused; e.target.textContent = paused?'继续显示':'暂停显示'; };
-$('zero').onclick  = () => { zeroOffset = st ? st.pos_mm : 0; hist.length=0; };
+// ★★★ 2026-09-22: 原来只改本地显示偏移（`zeroOffset`）—— **在 HIL 下这是空操作**：
+//   板子的 `wire[50]` 不知道，③层程序的目标坐标系也没动。实测后果：bridge 重启后
+//   PC 位置已累计 1921 mm 而起跑时目标仍是 0 ⇒ 误差 −1800 ⇒ 电机满速跑 95 秒。
+//   改为打 `/zero`：PC 绝对位置与板子 `wire[50]` **一起**归零（HIL 坐标原点对齐）。
+$('zero').onclick  = () => { zeroOffset = 0; hist.length = 0;
+                             fetch('/zero', {cache:'no-store'}).then(r=>r.json())
+                               .then(j => { $('msg').textContent = j.note || '已归零'; })
+                               .catch(()=>{}); };
 $('pitch').onchange = e => { PITCH = Math.max(0.5, parseFloat(e.target.value)||8); buildThread(); };
-// ★ 控制命令走 bridge 的命令队列（串口独占 ⇒ 必须同一个句柄发）
-$('go').onclick  = () => fetch('/motion?on=1&A=' + (+$('pk').value||3000) + '&slope=' + (+$('sl').value||30000));
-$('stp').onclick = () => fetch('/motion?on=0');
 
-resize(); updCam(); frame(); poll();
+// ══════════ ★★★ 控制（2026-09-22 层级改造）══════════
+// 控制命令走 bridge 的命令队列（串口独占 ⇒ 必须同一个句柄发）。
+//
+// ★★ 三条规矩（对应"上位机与板子之间做的不是很系统"的指正）：
+//   ① **起跑必须声明运动源** —— 否则可能打在没人听的那条路上（`ACK≠生效`）。
+//   ② **停止不许声明运动源** —— `/stop` 是**通用急停**，两条路一起打。
+//      这是"停机语义不能依赖当前运动源"的落点：人不需要先知道自己在哪条路上。
+//   ③ **停止 ≠ 请求已发** —— 后端会在 3.5 s 内**读回**并给出 `stop_ok`
+//      （HUD 的"停机验证"行）。这就是"发了命令"与"停下了"必须分开判。
+//
+// ★ 运动源选择持久化：刷新页面不该把人的选择重置回程序面/脚手架。
+//   ★ 元素 id 是 `msrc`（不是 `src` —— HUD 已占用 `src`，见上面的注释）。
+const SRC_KEY = 'hostsim.src';
+try { const v = localStorage.getItem(SRC_KEY); if (v) $('msrc').value = v; } catch(e){}
+$('msrc').onchange = e => { try { localStorage.setItem(SRC_KEY, e.target.value); } catch(e2){} };
+
+function stopAll(){
+  // ★ 急停：**不传 src** —— 与当前运动源无关
+  fetch('/stop', {cache:'no-store'}).then(r => r.json()).then(j => {
+    $('msg').textContent = '已发急停：' + (j.note || '');
+  }).catch(()=>{});
+}
+
+$('go').onclick = () => fetch('/motion?on=1'
+    + '&src=' + encodeURIComponent($('msrc').value)
+    + '&A='   + (+$('pk').value || 3000)
+    + '&slope=' + (+$('sl').value || 30000))
+  .then(r => r.json()).then(j => {
+    $('msg').textContent = '开跑：源=' + j.src + '，A=' + j.A + ' Hz';
+  }).catch(()=>{});
+
+$('stp').onclick = stopAll;
+
+// ★ 急停键盘通道 —— 手在键盘上时不该再去够鼠标。
+//   Esc 与空格都收；输入框里按空格不劫持（否则没法输数字）。
+addEventListener('keydown', e => {
+  const t = e.target, typing = t && (t.tagName === 'INPUT' || t.tagName === 'SELECT'
+                                     || t.tagName === 'TEXTAREA');
+  if (e.key === 'Escape' || (e.key === ' ' && !typing)){
+    e.preventDefault();
+    stopAll();
+  }
+});
+
+resize(); updCam(); frame(); poll(); pollWave();
 </script>
 </body>
 </html>

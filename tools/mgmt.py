@@ -94,8 +94,19 @@ FIELD_MAPS = {
         ("first", 7), ("last", 11), ("cats[0..15]", 12), ("prev_mark", 28),
         ("checksum", 29), ("live_stage", 30), ("live_tick", 31),
         ("hang_this", 32), ("hang_prev", 33),
-        ("looprst_this", 34), ("gapmax_this", 35), ("isr_ckpt", 40), ("isr_ckpt_prev", 41),
+        ("looprst_this", 34), ("gapmax_this", 35),
+        # ★★★ 2026-09-22 修：`looprst_prev/gapmax_prev`(36/37) 原来被排在
+        #   `isr_ckpt/isr_ckpt_prev`(40/41) **之后** ⇒ **偏移非递增** ⇒
+        #   `layout_check()` 的第一层（"本表自洽"）判 FAIL ⇒ `--read BOOT_AXI`
+        #   **拒绝解析**（只给原始字）。
+        #   ★ 发现路径值得记：这次不是靠"有人想起跑一下 mgmt.py"——而是把管理面
+        #     接进上位机网页后，**异常在网页上直接显示出来**（"★布局对账失败 ⇒ 拒绝解析"）。
+        #     也就是说：**这套"三层对账"抓到的是它自己**（第一层的设计意图正是
+        #     "挡『改了 parser 忘了改表』"），而把判据挪到人眼前才让它真的被发现。
+        #   ★ 代价说明：BOOT_AXI 是"复位归因"的唯一来源（`manifest.h` 说的
+        #     "看门狗的前置"）⇒ 它读不出，就问不出"**为什么复位了**"。
         ("looprst_prev", 36), ("gapmax_prev", 37),
+        ("isr_ckpt", 40), ("isr_ckpt_prev", 41),
     ],
 }
 

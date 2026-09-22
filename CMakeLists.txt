@@ -182,6 +182,20 @@ set(DCL_STEP_RAMP_FIX "1" CACHE STRING "斜坡 dt 修复 (1 按真实 dt=交付 
 #     step.c 的「拍↔秒·毫秒」换算。范围由 clock.h 三条断言守着(整除 1e6 / 整除 1000 / ARR≤16位)。
 set(DCL_TICK_US "100" CACHE STRING "拍长 (µs) —— 可用范围 1..327 且必须整除 1000 与 1000000")
 
+# ---- ★★★ TX 泵时间预算 (2026-09-22) ----
+#   为什么它需要成为**声明的**构建选项（而不是藏在 `src/uart.h` 里）:
+#     它直接决定**上传通路的吞吐**，而吞吐又决定 `DELTA_RING` 会不会丢条 ——
+#     也就是说它是"运动态能不能做到全量上传"的**唯一旋钮**，必须能做 A/B。
+#   ★ 前车之鉴（实测踩到）: 之前它只有 `#define`（后来补了 `#ifndef`），
+#     于是 `bash build.sh -DUART_TX_PUMP_US=10000` 会被 CMake 报
+#     `Manually-specified variables were not used by the project` —— **宏根本没进编译**，
+#     而构建照样成功、hex 照常产出。⇒ 现在补上 CACHE 声明 + 下面的 `-D` 转发。
+#   ★ 取值依据（实测）: 模型 `吞吐 = 线路率 × P/(P+C)`，实测解出 **C ≈ 1.21 ms**
+#     （主循环周期远大于标称 0.37 ms）⇒ P=1 ms 时有效吞吐只有 5.2 KB/s（线路 45%），
+#     P=10 ms 时约 10.3 KB/s（线路 90%）。★ P 越大吞吐越高但主循环单次阻塞越久
+#     （挂主循环的编码器采样率会被拖慢）⇒ **P 是"上传完整性 vs 采样率"的权衡点**。
+set(UART_TX_PUMP_US "10000" CACHE STRING "uart1_tx_pump() 每圈最多推进的微秒数 (>0)；见 src/uart.h")
+
 # ---- ★★★ 步进 ENA 极性 + 停止保持力矩 (2026-09-17, PLAN-device-config-v1 P0) ----
 #   起因: 现场"电机响但轴不动" = `g_step_ena_pol` 的**隐藏默认值**与实机接线相反,
 #         把「使能 / 失能 / 上电安全态」**三处同时弄反** (H723-MOTION-QUALITY-AUDIT §16)。
@@ -263,6 +277,7 @@ add_compile_options(
     -DDCL_DO_LATCH=${DCL_DO_LATCH}
     -DDCL_DO_MASK_UNION=${DCL_DO_MASK_UNION}
     -DDCL_STEP_RAMP_FIX=${DCL_STEP_RAMP_FIX}
+    -DUART_TX_PUMP_US=${UART_TX_PUMP_US}u
 -DCLK_TICK_US=${DCL_TICK_US}
     -DDCL_TIMEBASE=${DCL_TIMEBASE}
     -DDCL_STEP_ENA_POL=${DCL_STEP_ENA_POL}
