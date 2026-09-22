@@ -2570,6 +2570,10 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
          *   sub=14 = ★ 只读: 运动能力面状态 (源 / cmd_n / applied_n / rej_n / 已应用频率) 32B
          *   sub=15 arg=**走 N 个脉冲自停** (硬件计数; 0=取消; 需当前有脉冲在跑, 否则 NAK)
          *   sub=16 = ★ 只读: 脉冲计数状态 (count_en/goal/pulses/done/abort/rej) 32B
+         *   sub=26 arg=from_seq = ★★★ **读增量上传环** (data-change 全量上传的取数口)
+         *            ⇒ "每拍数据搬到上位机"的可行路径: 实测全量 60 通道 = 23.15 KB/s
+         *              (115200 的 201%, 吃不下)，而只传真在变的运动量 = 1.34 KB/s (12%)。
+         *              见 src/engine.h 的 `OFF_DELTA_RING` 与 src/blackbox.c 的 `delta_push`。
          * ★ 判据: 返回的是**实际**频率(由 ARR 反算), 不是请求值。
          * ★★★ 2026-09-17: sub=3 的 `ena(1)` 现在是 **fail-closed** —— ENA 极性未声明时
          *   **NAK(NAKRH_STEPPOL) 明确拒绝**, 而不是"ACK 但保持失能"(后者正是本次事故的形态:
@@ -2853,6 +2857,61 @@ static void h_pin_pattern(const uint8_t *p, uint32_t n)
             put32(r24 + 24, g_step_mismatch_ltick);
             put32(r24 + 28, do_mask_host());
             ack(r24, 32u);
+            return;
+        }
+        case 26u: {
+            /* ★★★ 2026-09-22: **读"增量上传环"**（`OFF_DELTA_RING`）——
+             *   "数据变化全量上传电脑"的取数口。设计依据 = `engine.h` 里那段实测带宽账：
+             *   全量传 60 通道要 23.15 KB/s（115200 的 201%，吃不下），而只传真在变的
+             *   运动量只要 **1.34 KB/s（12%）** —— 差别在 **AI 三路的 620 Hz 采样噪声**
+             *   被掩码滤掉（那是测量噪声，不是状态）。
+             *
+             *   arg = `from_seq`：上位机上次读到的序号。
+             *   ★ 为什么**不**在板子侧维护读游标: 那会让"上位机重启/断线"丢掉窗口；
+             *     用 `from_seq` 则**无状态、可断点续传** —— 上位机只要记住自己读到哪。
+             *
+             *   应答: +0 count(u8) +1 flags(u8, bit0=发生覆盖) +2 pad
+             *         +4 w_now(u32) +8 from(u32) +12 dropped(u32)
+             *         +16.. count × 16 B，与环内条目**逐字节相同**: tick/seq/ch/值位型
+             */
+            volatile const uint32_t *dh = (volatile const uint32_t *)(g_shm + OFF_DELTA_HDR);
+            uint32_t dw   = dh[0];                       /* 写计数（= 总条数）*/
+            uint32_t dfrom = (uint32_t)arg;
+            uint32_t ddrop = 0u;
+            /* ★ 无符号减法天然处理 32 位回绕（本项目既有范式）。 */
+            if ((dw - dfrom) > DELTA_SLOTS) {
+                ddrop = (dw - dfrom) - DELTA_SLOTS;
+                dfrom = dw - DELTA_SLOTS;
+                SHM_U32(g_shm, OFF_DELTA_DROP) += ddrop;  /* ★ 累计丢包：可读回核对，不静默 */
+            }
+            {
+                uint32_t dav = dw - dfrom;
+                uint32_t dn  = (dav > DELTA_READ_MAX) ? DELTA_READ_MAX : dav;
+                /* ★ static（不是栈上）: 1040 B 会吃掉可观的栈 —— 同 `0x22` 的 `static r[1024]`。
+                 *   本项目对"ISR/协议路径上的大局部数组"有过血证（栈越界 28 B 静默写坏调用者）。*/
+                static uint8_t r26[16u + DELTA_READ_MAX * DELTA_SLOT_SZ];
+                uint32_t di;
+                r26[0] = (uint8_t)dn;
+                r26[1] = (ddrop != 0u) ? 1u : 0u;
+                r26[2] = 0u; r26[3] = 0u;
+                put32(r26 +  4, dw);
+                put32(r26 +  8, dfrom);
+                put32(r26 + 12, SHM_U32(g_shm, OFF_DELTA_DROP));
+                for (di = 0u; di < dn; di++) {
+                    volatile const uint32_t *dsrc =
+                        (volatile const uint32_t *)(g_shm + OFF_DELTA_RING)
+                        + ((dfrom + di) % DELTA_SLOTS) * (DELTA_SLOT_SZ / 4u);
+                    /* ★ 指针名避开 `d`：本文件 L3113 另有 `uint8_t d[4]`，而"应答缓冲区
+                     *   越界闸门"按**变量名**归属 ⇒ 同名会让它把两边算成一个，报出
+                     *   "d[4] 写到 16 字节"的**假越界**（2026-09-22 实测撞到）。 */
+                    uint8_t *dst = r26 + 16u + di * DELTA_SLOT_SZ;
+                    put32(dst +  0, dsrc[0]);   /* tick */
+                    put32(dst +  4, dsrc[1]);   /* seq  */
+                    put32(dst +  8, dsrc[2]);   /* 映射槽号 */
+                    put32(dst + 12, dsrc[3]);   /* 值位型 */
+                }
+                ack(r26, 16u + dn * DELTA_SLOT_SZ);
+            }
             return;
         }
         default: break;

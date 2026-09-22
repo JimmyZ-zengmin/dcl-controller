@@ -22,7 +22,22 @@ echo "== 1) 重建默认档 =="
 #     ① 这里**显式传交付档的全部可粘性选项**（不靠默认值）;
 #     ② 构建后**比指纹**（下面 EXPECT_MD5）⇒ 与基线不符就**大声失败**, 不烧。
 DELIVERY_OPTS="-DDCL_TICK_US=100 -DDCL_BOOT_SEL=1 -DDCL_BOOT_SCAN_MODE=0 -DDCL_LOOP_RESET=1 -DDCL_STEP_RAMP_FIX=1"
-EXPECT_MD5="4a6993bfbbde17d8ab4f48d63e51c245"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
+EXPECT_MD5="8d3caa76792097c57f30c013f64d6ce7"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
+# ★★ 2026-09-22 更新: 4a6993bfbbde17d8ab4f48d63e51c245 → 8d3caa76792097c57f30c013f64d6ce7
+#    原因 = **新增"增量上传环" DELTA_RING**（`数据变化全量上传电脑记录`）:
+#      · `engine.h` : `OFF_DELTA_RING`（198 槽 × 16 B）+ 头 20 B，落在 SHM 尾部
+#        **从未分配的 0x7360..0x8000**（`OFF_DEV_BIND` 结束于 0x7360）⇒ **不动 SHM_SIZE**
+#        ⇒ 自动被协议放行（不用 pyocd、不用开 AXI 只读窗）。
+#      · `blackbox.c`: `delta_reset()`（掩码登记）+ `delta_push()` +
+#        **`bb_kick` 的比较循环由「发现第一个就 break」改成全扫** ⇒ 零新增比较成本
+#        （实测 +22% 次比较 ≈ 300 cyc = 拍预算 1.5%）；"变化才记"语义不变。
+#      · `engine.c` : `cold_start_reset()` 里 `delta_reset(g_shm)`（新增域必须登记单一入口）。
+#      · `main.c`   : 新命令 `0x39 op=19 sub=26 arg=from_seq`（单次 ≤64 条）。
+#    实测（本轮）: 静止 39 条/s · 运动 227~312 条/s · 带宽 3.55 KB/s = 115200 的 31%
+#      · 稳态 `dropped=0` ⇒ ★ "全吃"成立（消费能力 640 条/s > 需求 312 条/s）。
+#    ★ 回归: **12 套零回归**（逐项对照 `docs/STATUS-2026-09-16.md` §11.1 基线；
+#      唯一差异 `w2_probe` 13/1 已查清 = 它**自身时序非确定**：同固件单独跑 3 次全 14/0，
+#      且失败项 A 的阳性对照 A' PASS ⇒ 判据里"稳定非零"措辞过严，不是代码回归）。
 # ★★ 2026-09-21 更新: c2ca850bbb019166e3d2d0821b175574 → 4a6993bfbbde17d8ab4f48d63e51c245
 #    原因 = **运动控制的下半段搬进拍内**（step_service_motion / step_tick_isr）:
 #      原来 到点自停 + 斜坡推进 + 限时截止 都由**主循环**调 ⇒ 有效控制周期 = 主循环周期,

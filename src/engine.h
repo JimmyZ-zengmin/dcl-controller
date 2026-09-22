@@ -844,6 +844,84 @@ _Static_assert(OFF_WDT_STAT + OFF_WDT_STAT_SZ <= OFF_PERSIST_STAT,
 _Static_assert(OFF_PERSIST_STAT + OFF_PERSIST_STAT_SZ <= SHM_SIZE,
                "SHM: PERSIST_STAT 越出 SHM 末尾");
 
+/* ══════════ 增量上传环 DELTA_RING (2026-09-22) ══════════
+ *
+ * ## 它解决什么
+ * "把每拍的数据搬到上位机"在**带宽上不可能**（10 kHz × 8 通道 = 320 KB/s，
+ * 而 115200 只有 11.5 KB/s ⇒ 差 28 倍）。但**实测发现**：被上传的量里
+ * **绝大多数拍根本没变** —— 实测（2026-09-22，运动中 1200 Hz，dump 环分析）：
+ *     60 通道里 **52 个从不变化**；变化的集中在
+ *       SENSOR[8..10]（AI 三路 ADC 噪声）**620 Hz/路**  ← ★ 这是噪声，不是状态
+ *       SENSOR[0/1]（编码器 raw/deg）**91.5 Hz**      ← 与 `g_as_period_ticks=100` 吻合
+ *       SENSOR[2]（HIL 反馈）38.6 Hz
+ *   ⇒ **"全量传 60 通道"要 23.15 KB/s（115200 的 201%，吃不下）；
+ *      而"只传真正在变的运动量"只要 1.34 KB/s（12%，余量 8 倍）。**
+ *
+ * ## 为什么必须是"板子侧缓冲"而不是"上位机轮询"
+ * 上位机轮询的物理上限 ≈ 100 Hz（实测 `0x22` 读 1 字往返 10.0 ms，且 96.5% 是固定开销）。
+ * 而被测变化率是 130 Hz（编码器 91.5 + HIL 38.6）⇒ **轮询率 < 变化率 ⇒ 一定丢**。
+ * ⇒ 板子必须有缓冲，上位机低频来拉。
+ *
+ * ## 结构（★ **定长 16 B/条**，不做变长 —— 变长会让环回绕处理复杂化）
+ *     一条 = 4 字:  [0] tick   [1] seq   [2] 通道号(ch)  [3] 值(float 的 u32 位型)
+ *   ★ 为什么"一次只记一个通道"而不是"打包同 tick 的多个": 定长 ⇒ 回绕、游标、
+ *     PC 解析全部不用管变长；实测**平均每条只变 1.43 个通道** ⇒ 多记几条代价很小。
+ *   ★ 同一拍的多个通道 ⇒ **写多条同 tick 的记录**（seq 递增），PC 端按 tick 合并即可。
+ *
+ * ## 容量（★ 用 SHM 尾部**从未分配**的 3232 B，不动 SHM_SIZE）
+ *     OFF_DEV_BIND(0x7300) + SZ(0x60) = 0x7360 ⇒ 0x7360..0x8000 = 3232 B 空着
+ *     198 条 × 16 B = 3168 B ⇒ 环 0x7360..0x7FC0，头 20 B ⇒ 0x7FD4 ≤ 0x8000 ✓
+ *   ★ 覆盖窗口 = 198 / 变化率。排除 AI 三路后 ≈ 2046-1860 = 186 条/s ⇒ **1.06 s**
+ *     而上位机 10 Hz 轮询每次消费 ≈ 0.1 s ⇒ **10 倍余量**。
+ *   ★★ 若把掩码清成"全量"（含 AI 噪声）⇒ 2046 条/s ⇒ 窗口掉到 **97 ms**，
+ *      且上位机 10 Hz 时环一定被覆盖 ⇒ **`drop` 计数会涨**（可观测，不静默）。
+ *
+ * ## 归属（不变量 M5）
+ *   owner = `blackbox.c` —— 它本来就有"与上一条已写出记录逐项比"的循环，
+ *   生产者**复用那个循环**（零新增比较成本）。其它文件只能 include 本头。
+ *
+ * ## 登记（本项目纪律：新增 SHM 域必须进 `cold_start_reset()`）
+ *   见 engine.c 的 `cold_start_reset()`。
+ */
+#define OFF_DELTA_RING      0x7360u
+#define DELTA_SLOT_SZ       16u                    /* 4 字 */
+#define DELTA_SLOTS         198u
+#define OFF_DELTA_RING_SZ   (DELTA_SLOT_SZ * DELTA_SLOTS)     /* 3168 B */
+#define OFF_DELTA_HDR       (OFF_DELTA_RING + OFF_DELTA_RING_SZ)   /* 0x7FC0 */
+
+#define OFF_DELTA_W         (OFF_DELTA_HDR +  0u)  /* u32 写计数(单调) = 生产者的"总条数" */
+#define OFF_DELTA_TICK      (OFF_DELTA_HDR +  4u)  /* u32 最后一条的 tick */
+#define OFF_DELTA_DROP      (OFF_DELTA_HDR +  8u)  /* u32 ★ 因"环满且消费者没跟上"而丢的条数 */
+#define OFF_DELTA_MASK      (OFF_DELTA_HDR + 12u)  /* u32 上传掩码 低 32 槽 (1=上传) */
+#define OFF_DELTA_MASK_HI   (OFF_DELTA_HDR + 16u)  /* u32 上传掩码 高 28 槽 */
+#define OFF_DELTA_HDR_SZ    20u
+#define OFF_DELTA_SZ        20u                    /* 头 20 B（环本体已含在 OFF_DELTA_RING_SZ）*/
+
+_Static_assert(OFF_DELTA_RING >= OFF_DEV_BIND + OFF_DEV_BIND_SZ,
+               "SHM: DELTA_RING 与设备绑定表重叠");
+_Static_assert(OFF_DELTA_HDR + OFF_DELTA_HDR_SZ <= SHM_SIZE,
+               "SHM: DELTA_RING 越出 SHM 末尾");
+_Static_assert(OFF_DELTA_RING % 4u == 0u && OFF_DELTA_HDR % 4u == 0u,
+               "SHM: DELTA_RING 需 4 字节对齐");
+
+/* 掩码默认值：**排除 AI 三路 (映射槽 8/9/10) 与它的镜像 WIRE[9] (槽 25)**。
+ * ★ 理由：那三路是 ADC 采样噪声（实测 620 Hz/路），**不是状态**；把它们当"数据"传，
+ *   会把整个环的窗口从 1.06 s 压到 97 ms。★ 掩码是 SHM 里可读可见的量，
+ *   而且 `drop` 计数会让"改成全量后开始丢"变成**可观测**的事实。 */
+#define DELTA_MASK_DEF_LO   (~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 25)))
+#define DELTA_MASK_DEF_HI   0x0FFFFFFFu
+
+/* 通道掩码里有多少位 (60 槽 ⇒ 低 32 + 高 28) */
+#define DELTA_MASK_N        60u
+
+/* ★ 单次读的条数上限。取 64 的理由是**传输时间是瓶颈而不是缓冲区**：
+ *     payload 上限 6150 B 本可装 383 条，但 TX 仍是**阻塞发送**（"每拍一字节的 TX 环"
+ *     还没做，见 PLAN）⇒ 64×16+16 = 1040 B ⇒ 阻塞 ≈90 ms；若拉满环（198 条）要 275 ms，
+ *     会明显卡主循环。⇒ 用 64 换主循环的平滑。
+ *   ★ 消费能力核算: 一次往返 ≈ 10 ms(请求) + 90 ms(发送) = 100 ms ⇒ 10 Hz
+ *     ⇒ 640 条/s，而实测变化率 ≈186 条/s（掩码滤掉 AI 三路后）⇒ **余量 3.4 倍**。 */
+#define DELTA_READ_MAX      64u
+
 
 /* ══════════ 路由条目 (16B packed) —— 与 S3 逐字节相同 ══════════ */
 typedef struct __attribute__((packed, aligned(4))) {

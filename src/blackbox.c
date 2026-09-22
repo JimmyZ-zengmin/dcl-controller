@@ -18,6 +18,7 @@
 #include "regs.h"
 #include "faultlog.h"   /* 台账: 既作为记录流的两列(BB_MAP_SEG_FAULT), 也进日志头快照 */
 #include "memmap.h"
+#include <stddef.h>     /* NULL（本文件此前没用到，2026-09-22 的 delta_reset 引入） */
 
 /* ── MDMA ch1 寄存器 (ch_n 基址 = MDMA_BASE + 0x40×(n+1); ch1 = +0x80) ── */
 #define BB_M        0x52000080u   /* MDMA ch1 寄存器组基址 (ch0=+0x40, 间距 0x40) */
@@ -303,11 +304,54 @@ void bb_init(uint8_t *shm_base)
     bb_kick(0);
 }
 
+/* ══════════ 增量上传环 (DELTA_RING) —— 生产者 (2026-09-22) ══════════
+ * 设计依据与结构见 engine.h 里 `OFF_DELTA_RING` 的长注释（实测带宽账：
+ * 全量 60 通道 = 23.15 KB/s 吃不下；只传真在变的运动量 = 1.34 KB/s 余量 8 倍）。
+ * ★ 归属: 本文件。★ 登记: `cold_start_reset()` 调 `delta_reset()`。
+ */
+
+/** 冷启动登记：只写**掩码默认值**（环体/游标交给 memset）。
+ *  ★ 为什么掩码要显式写: 默认值"排除 AI 三路 + WIRE[9]"是一条**判断**（那是采样
+ *    噪声不是状态），必须让它在代码里可见、可被协议读回核对，而不是靠"注释里写着"。 */
+DCL_ITCM void delta_reset(uint8_t *shm)
+{
+    if (shm == NULL) { return; }
+    SHM_U32(shm, OFF_DELTA_MASK)    = DELTA_MASK_DEF_LO;
+    SHM_U32(shm, OFF_DELTA_MASK_HI) = DELTA_MASK_DEF_HI;
+}
+
+/** 把"第 `ch` 个映射槽变成了 `bits`"推成一条增量记录。
+ *  @return 1 = 写了；0 = 被掩码滤掉（那一路不上传）。
+ *  ★ 无锁 SPSC：生产者只增 `hdr[0]`（写计数），且**最后写它** ⇒ 读者只采信
+ *    "序号 < 计数" 的条目。与 `OFF_EXEC_RING` 同一套约定。 */
+/* ★ 注意: `DCL_ITCM` 含 `noinline` ⇒ **不能同时写 `inline`**（会报
+ *   `-Werror=attributes`）。它必须住 ITCM 是因为 `bb_kick` 属 ISR 调用树
+ *   （见 itcm.h 与 gpio/isr 闸门）。 */
+DCL_ITCM static uint32_t delta_push(uint32_t tick, uint32_t ch, uint32_t bits)
+{
+    volatile uint32_t *hdr = (volatile uint32_t *)(s_bb_shm + OFF_DELTA_HDR);
+    /* hdr[3]=掩码低 32 槽  hdr[4]=掩码高 28 槽 */
+    if (ch < 32u) { if (((hdr[3] >> ch) & 1u) == 0u) { return 0u; } }
+    else          { if (((hdr[4] >> (ch - 32u)) & 1u) == 0u) { return 0u; } }
+    {
+        uint32_t w = hdr[0];
+        volatile uint32_t *s = (volatile uint32_t *)(s_bb_shm + OFF_DELTA_RING)
+                             + (w % DELTA_SLOTS) * (DELTA_SLOT_SZ / 4u);
+        s[0] = tick;      /* 是哪一拍 */
+        s[1] = w;         /* 序号（单调，读者用它算"落后多少/丢了没有"）*/
+        s[2] = ch;        /* 哪个映射槽 */
+        s[3] = bits;      /* 变成什么（值的位型，不解释 —— 解释权在 PC 的映射表）*/
+        hdr[1] = tick;
+        __asm__ volatile("dsb" ::: "memory");
+        hdr[0] = w + 1u;  /* ★ 最后写 ⇒ 读者无需加锁 */
+    }
+    return 1u;
+}
+
 DCL_ITCM void bb_kick(uint32_t tick)
 {
     int samp;
     if (!s_bb_ready || !s_bb_shm) return;
-
     s_bb_kicks++;
     /* ★ 自观测闸门: 前 3 次 + 每 1024 次采样。成本 ~100 cyc/次被采样拍, 可忽略。 */
     samp = (s_bb_kicks <= 3u) || ((s_bb_kicks & 0x3FFu) == 0u);
@@ -342,8 +386,19 @@ DCL_ITCM void bb_kick(uint32_t tick)
      * ★ 比较范围 = 映射表里的 60 个槽 (不是"全部 256 通道"): 映射外的通道
      *   **根本不记** —— 这是"选择", 不是"近似"。 */
     {   uint32_t i, chg = 0u;
+        /* ★★ 2026-09-22: 由"发现第一个变化就 break"改为**全扫**，顺手把每个变化的
+         *   通道推一条增量记录（`delta_push`）—— 让"每拍的变化"能被上位机低频拉走。
+         *   ★ 代价实测约 +22% 次比较（≈300 cyc = 拍预算 20000 的 **1.5%**）：
+         *     原来平均 ≈ 0.81×60 + 0.19×3 ≈ 49 次（81% 的拍没变化，跑完整 60 次），
+         *     现在恒 60 次。**几乎免费。**
+         *   ★ 语义**不变**：`chg` 仍只表示"这一拍有没有任何通道变过"。
+         *   ★ `s_bb_have_prev` 门: 第一条记录没有"上一条"可比 ⇒ 不推增量
+         *     （否则会把全部 60 个通道当成一次"变化"推出去）。 */
         for (i = 0; i < BB_MAP_N; i++) {
-            if (snap[4 + i] != s_prev[i]) { chg = 1u; break; }
+            if (snap[4 + i] != s_prev[i]) {
+                chg = 1u;
+                if (s_bb_have_prev != 0u) { (void)delta_push(tick, i, snap[4 + i]); }
+            }
         }
         if (chg == 0u && snap[3] == s_prev_ctrl && s_bb_have_prev != 0u) {
             s_bb_skipped++;

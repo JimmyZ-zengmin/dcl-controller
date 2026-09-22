@@ -130,6 +130,11 @@ uint32_t bb_write_idx(void);
 uint32_t bb_slots_produced(void);   /* 已产出的快照条数 (单调) */
 uint32_t bb_tick_last(void);           /* 最近一次写入的 tick (诊断) */
 
+/* ★★ 增量上传环 (DELTA_RING, 2026-09-22) 的冷启动登记入口 —— 见 engine.h 的长注释。
+ *   ★ 必须在 `cold_start_reset()` 里被调用（本项目"新增域必须登记到单一入口"的纪律）。
+ *   ★ 它只写**掩码默认值**（排除 AI 三路的采样噪声）；环体与游标交给那次 memset。 */
+void delta_reset(uint8_t *shm_base);
+
 /* ★ 当前生效的通道映射 (60 项), 供 sd.c 写进日志头 ⇒ 数据自描述 */
 const uint32_t *bb_map(void);
 uint32_t bb_map_sum(const uint32_t *map);   /* 映射表校验和 (两端同一算法) */

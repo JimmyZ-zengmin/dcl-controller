@@ -32,6 +32,7 @@
 #include "faultlog.h"   /* 统一故障台账: cold_start_reset 是本域的登记入口 */
 #include "i2c_sm.h"     /* G6-3: I2C 事务区 (OFF_I2C_XACT) 的登记入口 */
 #include "dev_bind.h"   /* G6-4: 具名设备绑定表 (OFF_DEV_BIND) 的登记入口 */
+#include "blackbox.h"   /* DELTA_RING (增量上传环) 的登记入口 */
 
 /* ITCM 段属性 (阶段 3 的分档调度也住在热路径上) */
 #define ATTR_ITCM __attribute__((section(".itcm_text"), noinline))
@@ -129,6 +130,14 @@ void cold_start_reset(void)
      *   ★ 它同时是"表校验和不符 ⇒ 整表不生效"的必要前提: 若 RESET 后 magic 丢了
      *     而条目还在, 上位机就会按"没有这个区"去解释, 反而掩盖了真状态。 */
     dev_bind_reset(g_shm);
+    /* ★★★ 2026-09-22: **增量上传环 (OFF_DELTA_RING) 登记**。
+     *   动机: "每拍数据搬到上位机"在带宽上不可能（10 kHz × 8 通道 = 320 KB/s，
+     *   而 115200 只有 11.5 KB/s）；但实测"变化才传"只要 **1.34 KB/s**（余量 8 倍）。
+     *   本域是那个"变化流"的缓冲，供上位机低频拉走 —— 见 `engine.h` 的实测账。
+     *   ★ 登记动作 = 写掩码默认值（排除 AI 三路的 620 Hz 采样噪声）。
+     *     不登记的话 memset 后掩码全 0 ⇒ **一个通道都传不出去**，而且从外面看
+     *     只是"环是空的"，分不清"没有变化"还是"被全滤掉了"。 */
+    delta_reset(g_shm);
 }
 
 /* ══════════ 栈边界哨兵 (设防) ══════════
