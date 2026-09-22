@@ -1,4 +1,5 @@
 #include "step.h"
+#include "itcm.h"   /* ★ DCL_ITCM —— step_tick_isr 进拍内需要 */
 #include <stddef.h>
 #include "regs.h"
 #include "clock.h"
@@ -254,7 +255,7 @@ static void drive_ena(uint32_t energized)
  *      · 已声明 ⇒ 由按轴策略 `stop_hold` 决定（1 = 保持力矩 ⇒ 通电）
  *   ★ 这一条把"上电态"从"极性顺带决定"里**解耦**出来：
  *     垂直轴去使能 = 掉力滑车 ⇒ 必须能"停脉冲但保力矩"。 */
-static void apply_rest_ena(void)
+DCL_ITCM static void apply_rest_ena(void)
 {
     if (g_step_ena_pol_set == 0u) { g_step_ena = 0u; drive_opto(1u); return; }
     uint32_t en = g_step_stop_hold ? 1u : 0u;
@@ -309,7 +310,7 @@ void step_init(uint8_t *base)
  *      ★ 不关 `CC1E`、不写 `EGR.UG` ⇒ **既不切断脉冲，也不多产生更新事件**
  *        （后者会污染"走 N 个脉冲"的硬件计数 `TIM4_CNT`）
  * ══════════════════════════════════════════════════════════════════════════ */
-static void step_rate_apply(uint32_t hz)
+DCL_ITCM static void step_rate_apply(uint32_t hz)
 {
     if (hz == 0u) {
         TIM_CCER(TIM3) &= ~TIM_CCER_CC1E;         /* 停脉冲 */
@@ -333,7 +334,7 @@ static void step_rate_apply(uint32_t hz)
 
 /** @brief **斜坡专用**：只改预装载寄存器（`ARPE`/`OC1PE` ⇒ 下个更新事件生效）。
  *  ★★ `hz==0` 时退回完整路径（要真的关掉 `CC1E` 才能停）。 */
-static void step_rate_apply_light(uint32_t hz)
+DCL_ITCM static void step_rate_apply_light(uint32_t hz)
 {
     if (hz == 0u) { step_rate_apply(0u); return; }
     uint32_t arr1 = STEP_TIMCLK_HZ / hz;
@@ -357,7 +358,7 @@ static void step_rate_apply_light(uint32_t hz)
 /* ★★★ 加减速（斜坡限幅）：**所有**频率写入口都经过这里 ⇒ 两条通路（脚手架 `sub=1` /
  *   程序面 `wire[12]`）**同时**获得限幅。斜坡**关**（默认 0）或**要求停**（hz==0）
  *   ⇒ 立即生效 —— 停必须是立即的（安全语义），不能"慢慢降到 0"。 */
-void step_set_rate(uint32_t hz)
+DCL_ITCM void step_set_rate(uint32_t hz)
 {
     g_step_rate_cmd = hz;
     if (g_step_ramp_hz_s == 0u || hz == 0u) {
@@ -368,7 +369,7 @@ void step_set_rate(uint32_t hz)
     /* 斜坡开且 hz!=0 ⇒ 只记目标，由 `step_tick` 每个主循环推进一步 */
 }
 
-void step_set_dir(uint32_t dir) { g_step_dir = dir ? 1u : 0u; act_bits(STEP_DIR_ACT, g_step_dir); }
+DCL_ITCM void step_set_dir(uint32_t dir) { g_step_dir = dir ? 1u : 0u; act_bits(STEP_DIR_ACT, g_step_dir); }
 
 /** @brief 设斜坡斜率（Hz/s）。**0 = 关**（立即生效到目标）—— 默认就是 0。
  *  ★ 打开后**立即把输出对齐到当前硬件频率**，避免"上一段的残留"被当成爬坡起点。 */
@@ -391,7 +392,7 @@ void step_set_ramp(uint32_t hz_per_s)
  *   为什么必须"拒绝"而不是"用一个默认极性"：本次事故的形态就是
  *   "**看起来接受了, 其实跑错**"(无报错、只有值是错的) —— 那是三者里最坏的一种。
  *   ★ en=0（去使能）**永远允许**：拒绝一个停机请求没有任何安全收益。 */
-uint32_t step_set_ena(uint32_t en)
+DCL_ITCM uint32_t step_set_ena(uint32_t en)
 {
     if (en != 0u && g_step_ena_pol_set == 0u) {
         g_step_ena = 0u;
@@ -433,7 +434,7 @@ void step_set_stop_hold(uint32_t hold)
     if (g_step_rate_hz == 0u) { apply_rest_ena(); }   /* 正在静止 ⇒ 立即生效 */
 }
 
-void step_set_deadline_ms(uint32_t ms)
+DCL_ITCM void step_set_deadline_ms(uint32_t ms)
 {
     g_step_deadline_tick = ms;      /* 存"剩余毫秒"; step_tick 按拍差递减 */
     s_dl_acc = 0u;                  /* ★ 余数清零: 否则上一段的 ≤9 拍会漏进新限时 */
@@ -447,7 +448,7 @@ void step_set_deadline_ms(uint32_t ms)
  *       `stop_hold=1` ⇒ **保持力矩**（只停脉冲，驱动器继续通电）
  *       `stop_hold=0` ⇒ 物理去使能（省热；仅水平轴且已评估时用）
  *   ★ 与极性无关的硬保证始终是 **`CC1E=0`（无脉冲）** —— 没有脉冲电机就不会转。 */
-void step_stop_safe(void)
+DCL_ITCM void step_stop_safe(void)
 {
     step_set_rate(0u);
     apply_rest_ena();
@@ -459,10 +460,10 @@ void step_stop_safe(void)
  *   主循环一圈的耗时并不固定 (AS5600 轮询、协议、黑匣子都不等长),
  *   "数调用次数"会把截止时间拉长到无法预期 (实测 AS5600 轮询让 10ms 慢成 10.75ms)。
  *   ★ 拍差是硬件时基, 与主循环快慢无关 ⇒ 5 秒就是 5 秒。 */
-void step_tick(uint32_t tick_now)
+/* ★ 主循环调用（**只做诊断**）：控制部分已搬进拍内，见 `step_tick_isr`。
+ *   ★ 为什么诊断留主循环：它要与 DO 面**已经写下去的**电平比 —— 拍内同序时可能还没写。 */
+void step_diag_tick(uint32_t tick_now)
 {
-    static uint32_t s_last = 0u;
-
     /* ══════════════════════════════════════════════════════════════════════
      * ★★★ "指令 vs 引脚实读" 核对 —— 对齐成熟运动控制的 `SVON` 输出 + `RDY` 输入，
      *     以及 PLCopen `MC_Power` 的"请求使能后**等 Statusword 到位**"。
@@ -498,6 +499,29 @@ void step_tick(uint32_t tick_now)
             s_prev_bad = 0u;
         }
     }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★★★ 拍内调用（2026-09-21）—— 运动控制的下半段：到点自停 / 斜坡推进 / 限时截止
+ *
+ * ## 为什么必须进拍（这是"有效控制周期"的缺口）
+ *   这三件事原来由**主循环**调用 ⇒ **有效控制周期 = 主循环周期**，而不是拍长。
+ *   实测（上机，`0x39 op=19` 的 `+64`）: `g_step_dt_max` = **387 拍 = 38.7 ms**，
+ *   而拍长只有 **100 µs** ⇒ **387×**。
+ *   ⇒ 后果：`wire[]` 里的闭环输出最多要等 38.7 ms 才落到 TIM3。
+ *     项目自己查明的"**控制周期 ⇒ 极限环**"机制，其周期量取的就是这个值，不是 100 µs。
+ *
+ * ## 进拍后的额外收益
+ *   每拍被调一次 ⇒ `dt` **恒为 1** ⇒ 斜坡与限时都变成**精确的拍计数**；
+ *   主循环抖动不再进入时间量（`s_dl_acc` 余数累加器仍在，但不再承重）。
+ *
+ * ## 与 `IO_IN_ISR` 的关系
+ *   复用既有的 A/B 开关（`IO_IN_ISR=0` = 改前行为：全部由主循环驱动）。
+ *   不新增开关 —— 语义本来就是"**I/O 驱动位置**"。
+ * ══════════════════════════════════════════════════════════════════════════ */
+DCL_ITCM void step_tick_isr(uint32_t tick_now)
+{
+    static uint32_t s_last = 0u;
 
     /* ═══ ★★★ "走 N 个脉冲"到点自停 ═══
      * 判据 = **硬件计数器** `TIM4_CNT`（不是估算）⇒ "实际走了多少"永远可读回。
@@ -608,12 +632,12 @@ void step_tick(uint32_t tick_now)
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /* ★ 运动请求住在 **WIRE** 而不是 ACTUATOR —— 理由见 step.h（③层的输出面只有 `wire[]`）。 */
-static float wire_get(uint32_t idx)
+DCL_ITCM static float wire_get(uint32_t idx)
 {
     if (s_base == NULL) { return 0.0f; }
     return *(volatile float *)(s_base + OFF_WIRE_MAP + idx * 4u);
 }
-static void wire_set(uint32_t idx, float v)
+DCL_ITCM static void wire_set(uint32_t idx, float v)
 {
     if (s_base == NULL) { return; }
     *(volatile float *)(s_base + OFF_WIRE_MAP + idx * 4u) = v;
@@ -655,7 +679,7 @@ uint32_t step_motion_src(void) { return g_motion_src; }
  *     （本项目铁律："为可解释性加的计数会顺手抓住静默故障"）。
  *   · 镜像槽（16/17）**每次刷新**（不是只在变化时）—— 否则限时到期自动停脉冲后镜像会陈旧。
  *   · 顺序：**先方向/使能，再频率**（让驱动器先进入确定状态再起脉冲）。 */
-void step_service_motion(void)
+DCL_ITCM void step_service_motion(void)
 {
     if (g_motion_src != STEP_MOT_SRC_PROGRAM) { return; }
 

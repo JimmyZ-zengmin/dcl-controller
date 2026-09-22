@@ -727,14 +727,34 @@ CRC16-CCITT: poly 0x1021, init 0xFFFF, MSB-first
 
 ## 8.5 周期与节流总表
 
-| 任务 | 节流 | 驱动 |
+> ★★ **2026-09-21 大修**：本表原来把 `ai/di/hil_tick` 写在主循环（**那是 `IO_IN_ISR=0`
+> 的对照档行为，不是交付档**），并且**完全漏了 `step_*`** —— 而 `step_*` 恰恰是全表唯一
+> 真正把"控制路径"留在主循环的东西（有效控制周期实测 **38.7 ms** 而不是 100 µs）。
+> ⇒ 本次逐行按 `src/main.c` 的实际调用点重写。
+
+| 任务 | 节流 | 驱动 | 备注 |
+|---|---|---|---|
+| `engine` 扫描 + `engine_seq_tick` + `engine_force_apply` | 每拍（内部按 div/phase 门） | **ISR**（gate && RUN 门内） | 分档是"**每拍查桶表**"，不是"每 N 拍触发" |
+| `mb_tick` | **每拍无条件** | **ISR**（**门之外**） | |
+| `HEARTBEAT++` | **每拍无条件** | **ISR**（门之外） | |
+| `di_poll` / `adc_poll_reclaim` / `adc_poll_kick` | 每拍（内部自节流） | **ISR**（输入段） | ★ `IO_IN_ISR=0` 时退回主循环的 `di_tick`/`ai_tick`（对照档） |
+| `hil_out_poll` | 每拍 | **ISR**（输出段） | ★ 同上；对照档退回 `hil_tick` |
+| **`step_service_motion`**（运动下发） | **每拍**（值不变则早退） | **ISR** ★ **2026-09-21 新增** | 原来在主循环 ⇒ 有效控制周期 38.7 ms |
+| **`step_tick_isr`**（到点自停 / 斜坡推进 / 限时截止） | **每拍** | **ISR** ★ **2026-09-21 新增** | 进拍后 `dt` 恒为 1 ⇒ 斜坡/限时变精确拍计数 |
+| **`step_diag_tick`**（PE9 指令 vs 引脚实读） | 每轮 | **主循环** | **诊断量**，且必须与 DO 面**已写下去**的电平比 |
+| `proto_poll` / `macro_tick` | 内部自节流 | **主循环** | 协议/慢动作 |
+| `mb_refresh_hold` | `g_tick_count % 100 == 0` | 主循环 | |
+| PER-段计时镜像 / 自动落盘裁决 / `g_reinit` | 每轮 | 主循环 | |
+
+★★ **判据（本次改动的 A/B，上机实测）**：
+`0x39 op=19` 应答的 `+64` = `g_step_dt_max`（`step_tick` 见过的主循环最大间隔，单位=拍）
+
+| 构建 | `g_step_dt_max` | 含义 |
 |---|---|---|
-| `engine` 扫描 + `engine_seq_tick` + `engine_force_apply` | 每拍（内部按 div/phase 门） | **ISR**（gate && RUN 门内） |
-| `mb_tick` | **每拍无条件** | **ISR**（**门之外**） |
-| `HEARTBEAT++` | **每拍无条件** | **ISR**（门之外） |
-| `proto_poll` / `macro_tick` / `ai_tick` / `di_tick` / `hil_tick` | 内部自节流（10ms 级） | **主循环**（每轮无条件调用，未到间隔即早退） |
-| `mb_refresh_hold` | `g_tick_count % 100 == 0` | 主循环 |
-| PER-段计时镜像 / 自动落盘裁决 / `g_reinit` | 每轮 | 主循环 |
+| `-DDCL_IO_IN_ISR=0`（对照 = 改前） | **387 拍 = 38.7 ms** | 运动通路的有效控制周期 |
+| `-DDCL_IO_IN_ISR=1`（**交付**） | **1 拍 = 100 µs** | `dt` 恒为 1 ⇒ 确实每拍在跑 |
+
+⇒ **387× 改善。** 详见 `docs/CHANGELOG-tick-motion-path.md`。
 
 ---
 

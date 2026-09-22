@@ -22,7 +22,16 @@ echo "== 1) 重建默认档 =="
 #     ① 这里**显式传交付档的全部可粘性选项**（不靠默认值）;
 #     ② 构建后**比指纹**（下面 EXPECT_MD5）⇒ 与基线不符就**大声失败**, 不烧。
 DELIVERY_OPTS="-DDCL_TICK_US=100 -DDCL_BOOT_SEL=1 -DDCL_BOOT_SCAN_MODE=0 -DDCL_LOOP_RESET=1 -DDCL_STEP_RAMP_FIX=1"
-EXPECT_MD5="c2ca850bbb019166e3d2d0821b175574"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
+EXPECT_MD5="4a6993bfbbde17d8ab4f48d63e51c245"     # ★ 100 µs 交付档基线（改部署期代码必然更新）
+# ★★ 2026-09-21 更新: c2ca850bbb019166e3d2d0821b175574 → 4a6993bfbbde17d8ab4f48d63e51c245
+#    原因 = **运动控制的下半段搬进拍内**（step_service_motion / step_tick_isr）:
+#      原来 到点自停 + 斜坡推进 + 限时截止 都由**主循环**调 ⇒ 有效控制周期 = 主循环周期,
+#      实测 `g_step_dt_max` = 387 拍 = 38.7 ms,而拍长只有 100 µs（387×）。
+#      搬进拍内后实测 `g_step_dt_max` = **1 拍**（dt 恒为 1 ⇒ 确实每拍在跑）。
+#    伴随改动: `src/step.c` 新增 `DCL_ITCM` 标记 10 处（闭包由 gate_isr_itcm.py 自动抓出:
+#      它先报 apply_rest_ena / step_rate_apply 两个落在 flash,补上即过）。
+#      ITCM 占用 13 636 → 15 276 B,到向量表仍余 75.1%。
+#    A/B: 复用既有 `-DDCL_IO_IN_ISR=0`（对照档 = 改前行为，运动也由主循环驱动）。
 # 变更记录（每次改基线都必须写清"为什么"）:
 #   c7c366c1… → 6daa7e65…  阶段 2.1/2.2：顺序域清除语义 + 「走 N 步」两个拍号
 #   6daa7e65… → 44ce8cbb…  内存宪法 A+D 期：新增 src/mem_stat.c + 栈水位可观测量，

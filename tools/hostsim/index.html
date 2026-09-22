@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>运动可视化 —— 电机 → 丝杆 → 滑台</title>
+<style>
+  :root { --fg:#222; --mut:#666; --line:#d8d8d8; --bg:#eef0f2;
+          --acc:#185FA5; --cmd:#BA7517; --act:#0F6E56; }
+  * { box-sizing:border-box }
+  html,body { margin:0; height:100%; overflow:hidden;
+              font:13px/1.5 system-ui,"Segoe UI","Microsoft YaHei",sans-serif; color:var(--fg) }
+  #c { position:fixed; inset:0; display:block }
+  .panel { position:fixed; background:#fff; border:1px solid var(--line);
+           border-radius:10px; padding:12px 14px; box-shadow:0 1px 3px rgba(0,0,0,.06) }
+  #hud { left:16px; top:16px; min-width:236px }
+  #hud h3 { margin:0 0 8px; font-size:13px; font-weight:600 }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:2px 0 }
+  .row span:first-child { color:var(--mut) }
+  .row b { font-variant-numeric:tabular-nums; font-weight:600 }
+  #chartbox { right:16px; top:16px; width:340px }
+  #chart { display:block; width:100%; height:120px }
+  .lg { display:flex; gap:14px; font-size:11px; color:var(--mut); margin-top:6px }
+  .sw { width:10px; height:3px; border-radius:2px; display:inline-block; margin-right:5px; vertical-align:middle }
+  #ctl { left:16px; bottom:16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap }
+  #ctl button { font:inherit; padding:5px 11px; border:1px solid var(--line);
+                background:#fff; border-radius:7px; cursor:pointer }
+  #ctl button:hover { border-color:#aaa }
+  #ctl input[type=number] { width:64px; font:inherit; padding:4px 6px;
+                            border:1px solid var(--line); border-radius:6px }
+  #bar { position:fixed; left:50%; transform:translateX(-50%); bottom:18px;
+         background:#fff; border:1px solid var(--line); border-radius:8px;
+         padding:6px 14px; color:var(--mut); font-size:12px }
+  .warn { color:#A32D2D }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="panel" id="hud">
+  <h3>运动状态 <span id="src" style="font-weight:400;color:#666;font-size:11px"></span></h3>
+  <div class="row"><span>电机角度</span><b><span id="deg">0</span>°</b></div>
+  <div class="row"><span>累计圈数</span><b><span id="revs">0</span></b></div>
+  <div class="row"><span>累计行程</span><b><span id="pos">0</span> mm</b></div>
+  <div class="row"><span>请求频率</span><b><span id="cmd">0</span> Hz</b></div>
+  <div class="row"><span>已应用频率</span><b><span id="ap">0</span> Hz</b></div>
+  <div class="row"><span>命令线速</span><b><span id="cmv">0</span> mm/s</b></div>
+  <div class="row"><span>实测线速 · 板</span><b><span id="apm">0</span> mm/s</b></div>
+  <div class="row"><span>实测线速 · 位</span><b><span id="vel">0</span> mm/s</b></div>
+  <div class="row"><span>引擎</span><b><span id="run">-</span></b></div>
+  <div class="row"><span>板子间隔</span><b><span id="dtick">0</span> 拍</b></div>
+  <div class="row"><span>PC 采样率</span><b><span id="rate">0</span> Hz</b></div>
+</div>
+
+<div class="panel" id="chartbox">
+  <h3 style="margin:0 0 6px;font-size:13px;font-weight:600">线速度</h3>
+  <canvas id="chart"></canvas>
+  <div class="lg">
+    <span><i class="sw" style="background:#BA7517"></i>命令</span>
+    <span><i class="sw" style="background:#0F6E56"></i>实测</span>
+    <span style="margin-left:auto">窗口 12 s</span>
+  </div>
+</div>
+
+<div class="panel" id="ctl">
+  <button id="go">▶ 开跑</button>
+  <button id="stp">■ 停</button>
+  <label style="color:#666">峰值 <input type="number" id="pk" value="3000" step="500" min="0"> Hz</label>
+  <label style="color:#666">斜坡 <input type="number" id="sl" value="30000" step="5000" min="100"> Hz/s</label>
+  <button id="pause">暂停显示</button>
+  <button id="zero">行程归零</button>
+  <label style="color:#666">导程 <input type="number" id="pitch" value="8" step="0.5" min="0.5"> mm/rev</label>
+  <label style="color:#666"><input type="checkbox" id="wrap" checked> 行程回绕</label>
+</div>
+
+<div id="bar">鼠标拖动旋转 · 滚轮缩放 · <span id="msg">等待数据…</span></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ══════════ 机构尺寸（mm 为单位，1 场景单位 = 1 mm）══════════
+const SCREW_R = 5, SCREW_LEN = 140, SCREW_X0 = -20;
+const TRAVEL = 100;                       // 虚拟行程（滑台可走的距离）
+const MOTOR_R = 28, MOTOR_LEN = 50;
+let PITCH = 8;                            // 丝杆导程 mm/rev（与 bridge 的 --pitch 一致）
+
+// ══════════ 场景 ══════════
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xeef0f2);
+const camera = new THREE.PerspectiveCamera(38, 1, 1, 4000);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.72));
+const dl = new THREE.DirectionalLight(0xffffff, 0.72); dl.position.set(160, 260, 200); scene.add(dl);
+const dl2 = new THREE.DirectionalLight(0xffffff, 0.28); dl2.position.set(-200, 80, -150); scene.add(dl2);
+
+// ── 自制轨道相机（省一个依赖，也避免 OrbitControls 版本对不上）──
+let camTheta = 0.62, camPhi = 1.06, camDist = 330;
+const camTarget = new THREE.Vector3(SCREW_X0 + SCREW_LEN/2 - 20, 0, 0);
+function updCam(){
+  camPhi = Math.max(0.12, Math.min(Math.PI-0.12, camPhi));
+  camera.position.set(
+    camTarget.x + camDist*Math.sin(camPhi)*Math.cos(camTheta),
+    camTarget.y + camDist*Math.cos(camPhi),
+    camTarget.z + camDist*Math.sin(camPhi)*Math.sin(camTheta));
+  camera.lookAt(camTarget);
+}
+let drag=false, px=0, py=0;
+canvas.addEventListener('pointerdown', e=>{drag=true; px=e.clientX; py=e.clientY; canvas.setPointerCapture(e.pointerId);});
+canvas.addEventListener('pointerup',   e=>{drag=false;});
+canvas.addEventListener('pointermove', e=>{
+  if(!drag) return;
+  camTheta -= (e.clientX-px)*0.008; camPhi -= (e.clientY-py)*0.008;
+  px=e.clientX; py=e.clientY; updCam();
+});
+canvas.addEventListener('wheel', e=>{ e.preventDefault();
+  camDist = Math.max(110, Math.min(900, camDist*(1+Math.sign(e.deltaY)*0.10))); updCam(); }, {passive:false});
+function resize(){
+  const w=innerWidth, h=innerHeight;
+  renderer.setSize(w,h,false); camera.aspect=w/h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+
+// ══════════ 材质 ══════════
+const M = {
+  body : new THREE.MeshLambertMaterial({color:0x5a626d}),
+  metal: new THREE.MeshLambertMaterial({color:0xa8b0b8}),
+  screw: new THREE.MeshLambertMaterial({color:0xc3c9cf}),
+  thrd : new THREE.MeshLambertMaterial({color:0x8d959d}),
+  car  : new THREE.MeshLambertMaterial({color:0x185FA5}),
+  rail : new THREE.MeshLambertMaterial({color:0xd4d8dc}),
+  mark : new THREE.MeshLambertMaterial({color:0xD85A30}),
+};
+
+// ── 电机（外壳 + 转轴 + 一个红色标记，用来"看见"它在转）──
+const motor = new THREE.Group();
+motor.position.x = SCREW_X0 - 46;
+const mbody = new THREE.Mesh(new THREE.CylinderGeometry(MOTOR_R, MOTOR_R, MOTOR_LEN, 40), M.body);
+mbody.rotation.z = Math.PI/2; motor.add(mbody);
+const shaft = new THREE.Mesh(new THREE.CylinderGeometry(6, 6, 22, 24), M.metal);
+shaft.rotation.z = Math.PI/2; shaft.position.x = MOTOR_LEN/2 + 11; motor.add(shaft);
+const markG = new THREE.Group(); markG.position.x = MOTOR_LEN/2 + 11;
+const mark = new THREE.Mesh(new THREE.BoxGeometry(22, 2.2, 2.2), M.mark);
+mark.position.y = 4.2; markG.add(mark); motor.add(markG);
+scene.add(motor);
+
+// ── 丝杆：圆柱 + 螺旋线（螺旋跟着一起转，所以"转"看得出来）──
+const screwG = new THREE.Group(); screwG.position.x = SCREW_X0 + SCREW_LEN/2; scene.add(screwG);
+const screwBody = new THREE.Mesh(new THREE.CylinderGeometry(SCREW_R, SCREW_R, SCREW_LEN, 36), M.screw);
+screwBody.rotation.z = Math.PI/2; screwG.add(screwBody);
+let threadMesh = null;
+function buildThread(){
+  if (threadMesh){ screwG.remove(threadMesh); threadMesh.geometry.dispose(); }
+  const turns = SCREW_LEN / PITCH;
+  const pts = [];
+  const N = Math.max(200, Math.round(turns*24));
+  for (let i=0;i<=N;i++){
+    const t=i/N, a=t*turns*Math.PI*2;
+    pts.push(new THREE.Vector3(t*SCREW_LEN - SCREW_LEN/2, Math.cos(a)*SCREW_R, Math.sin(a)*SCREW_R));
+  }
+  const curve = new THREE.CatmullRomCurve3(pts);
+  threadMesh = new THREE.Mesh(new THREE.TubeGeometry(curve, N, 0.7, 6, false), M.thrd);
+  screwG.add(threadMesh);
+}
+buildThread();
+
+// ── 滑台（螺母）+ 导轨 ──
+const rail = new THREE.Mesh(new THREE.BoxGeometry(SCREW_LEN+30, 4, 26), M.rail);
+rail.position.set(SCREW_X0 + SCREW_LEN/2, -SCREW_R-9, 0); scene.add(rail);
+const car = new THREE.Mesh(new THREE.BoxGeometry(26, 20, 30), M.car);
+scene.add(car);
+
+// ── 地面网格 ──
+const grid = new THREE.GridHelper(600, 30, 0xcfd4d9, 0xdfe3e7);
+grid.position.y = -MOTOR_R - 12; scene.add(grid);
+
+// ══════════ 数据 ══════════
+let st = null, paused=false, zeroOffset=0, lastPos=0;
+const hist = [];                 // {t, cmd, act}
+
+async function poll(){
+  if (paused){ setTimeout(poll, 120); return; }
+  try {
+    const r = await fetch('/state', {cache:'no-store'});
+    st = await r.json();
+    document.getElementById('msg').textContent = st.msg || '';
+    document.getElementById('msg').className = st.ok ? '' : 'warn';
+  } catch(e){
+    document.getElementById('msg').textContent = '连不上 bridge 进程';
+    document.getElementById('msg').className = 'warn';
+  }
+  setTimeout(poll, 40);
+}
+
+// ══════════ 图表 ══════════
+const chart = document.getElementById('chart');
+const cx = chart.getContext('2d');
+function drawChart(){
+  const w = chart.clientWidth, h = chart.clientHeight;
+  if (chart.width !== w*2){ chart.width = w*2; chart.height = h*2; }
+  cx.setTransform(2,0,0,2,0,0);
+  cx.clearRect(0,0,w,h);
+  const WIN = 12;                         // 秒
+  const now = hist.length ? hist[hist.length-1].t : 0;
+  const t0 = now - WIN;
+  let mx = 0.5;
+  for (const p of hist){ if (p.t>=t0){ mx = Math.max(mx, Math.abs(p.cmd), Math.abs(p.act)); } }
+  const X = t => (t - t0)/WIN * w;
+  const Y = v => h/2 - (v/mx) * (h/2 - 8);
+  cx.strokeStyle='#e3e6e9'; cx.lineWidth=1;
+  cx.beginPath(); cx.moveTo(0,h/2); cx.lineTo(w,h/2); cx.stroke();
+  const draw = (key, color) => {
+    cx.strokeStyle=color; cx.lineWidth=1.6; cx.beginPath();
+    let first=true;
+    for (const p of hist){
+      if (p.t < t0) continue;
+      const x=X(p.t), y=Y(p[key]);
+      if (first){ cx.moveTo(x,y); first=false; } else cx.lineTo(x,y);
+    }
+    cx.stroke();
+  };
+  draw('cmd', '#BA7517'); draw('act', '#0F6E56');
+  cx.fillStyle='#888'; cx.font='10px system-ui';
+  cx.fillText('±'+mx.toFixed(1)+' mm/s', 4, 11);
+}
+
+// ══════════ 渲染循环 ══════════
+const $ = id => document.getElementById(id);
+let lastRaw = null, tw = 0;
+function frame(){
+  requestAnimationFrame(frame);
+  if (st && st.ok){
+    // 电机与丝杆转角：由累计圈数算（与方向一致）
+    const ang = st.revs * Math.PI*2;
+    markG.rotation.x = -ang;
+    screwG.rotation.x = -ang;
+
+    // 滑台位置
+    let pos = st.pos_mm - zeroOffset;
+    const wrapOn = $('wrap').checked;
+    let vis = wrapOn ? ((pos % TRAVEL) + TRAVEL) % TRAVEL : Math.max(0, Math.min(TRAVEL, pos));
+    car.position.set(SCREW_X0 + 10 + vis, -SCREW_R + 6, 0);
+
+    // HUD
+    $('deg').textContent  = (st.deg).toFixed(1);
+    $('revs').textContent = st.revs.toFixed(3);
+    $('pos').textContent  = pos.toFixed(2);
+    $('cmd').textContent  = st.cmd_hz.toFixed(0);
+    $('ap').textContent   = (st.ap_hz||0).toFixed(0);
+    // ★ "请求 vs 已应用"不匹配就标红 —— 命令没到执行面（源选错/未使能/被限时停）
+    $('ap').className     = st.mismatch ? 'warn' : '';
+    $('cmd').className    = st.mismatch ? 'warn' : '';
+    $('cmv').textContent  = st.cmd_mm_s.toFixed(2);
+    $('apm').textContent  = (st.ap_mm_s||0).toFixed(2);
+    $('vel').textContent  = st.vel_mm_s.toFixed(2);
+    $('dtick').textContent= (st.d_tick||0);
+    $('rate').textContent = (st.rate||0).toFixed(1);
+    $('run').textContent  = st.run ? 'RUN' : 'STOP';
+    $('src').textContent  = '(' + st.src + ' · ' + (st.src_rule||'?')
+                          + (st.src_mode && st.src_mode!=='-' ? ' · 源=' + st.src_mode : '') + ')';
+
+    // 曲线：★ "实测"用**板子口径**（已应用频率换算），位置域差分留作参考
+    if (!paused){
+      hist.push({t: st.t, cmd: st.cmd_mm_s, act: (st.ap_mm_s||st.vel_mm_s)});
+      const tn = st.t - 12.5;
+      while (hist.length && hist[0].t < tn) hist.shift();
+    }
+  }
+  drawChart();
+  renderer.render(scene, camera);
+}
+
+$('pause').onclick = e => { paused=!paused; e.target.textContent = paused?'继续显示':'暂停显示'; };
+$('zero').onclick  = () => { zeroOffset = st ? st.pos_mm : 0; hist.length=0; };
+$('pitch').onchange = e => { PITCH = Math.max(0.5, parseFloat(e.target.value)||8); buildThread(); };
+// ★ 控制命令走 bridge 的命令队列（串口独占 ⇒ 必须同一个句柄发）
+$('go').onclick  = () => fetch('/motion?on=1&A=' + (+$('pk').value||3000) + '&slope=' + (+$('sl').value||30000));
+$('stp').onclick = () => fetch('/motion?on=0');
+
+resize(); updCam(); frame(); poll();
+</script>
+</body>
+</html>

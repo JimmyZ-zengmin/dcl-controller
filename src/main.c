@@ -1435,6 +1435,17 @@ ISR_PLACE void TIM2_IRQHandler(void)
         ISR_CKPT(4);  /* ④ mb_tick 之后 */
         hil_out_poll(g_shm, g_tick_count);
         ISR_CKPT(5);  /* ⑤ **hil_out_poll 之后** (上一轮实测卡在 ④→⑤ 之间 ⇒ 细分) */
+#if IO_IN_ISR
+        /* ★★★ 2026-09-21: 运动控制的下半段搬进拍内。
+         *   动机（实测）：它原来由主循环调 ⇒ **有效控制周期 = 主循环周期**，
+         *   `g_step_dt_max` = **387 拍 = 38.7 ms**（拍长只有 100 µs）。
+         *   位置：**在 engine 之后**（读到的 wire[] 是本拍新值）、
+         *         **在 do_poll 之前**（`step_set_ena` 写 ACTUATOR[9]，
+         *          而 do_poll 读 ACTUATOR → GPIOE_ODR ⇒ 顺序反了 ENA 要等下一拍到引脚）。
+         *   ★ 与 hil_out_poll 共享 TIM3_CH1 ⇒ 放在它**之后**，运动面优先（它是主应用）。 */
+        step_service_motion();
+        step_tick_isr(g_tick_count);
+#endif
         do_poll(g_shm, g_tick_count);
         ISR_CKPT(6);  /* ⑥ do_poll 之后 */        /* ★ P3-A: DO 输出面 ACTUATOR → GPIOE (BSRR 原子写) */
 
@@ -4715,8 +4726,16 @@ int main(void)
          *   否则"第一轮就卡住"依然会被当成"还没进入"。见 g_loop_entered 的注释。 */
         g_loop_entered = 1u;
 
-        step_tick(g_tick_count);        /* 限时截止 (只做一次比较, 极短) */
-        step_service_motion();          /* ★ 运动能力面(程序面): 只在槽值变化时动作 —— 见 step.h */
+        /* ★★★ 2026-09-21: 运动控制部分**已搬进拍内**（见 ISR 里的 step_service_motion/step_tick_isr）。
+         *   主循环这里只保留两件：① 诊断核对（要与 DO 面**已写下去**的电平比，必须在这边）
+         *   ② **对照档**（`IO_IN_ISR=0` = 改前行为：运动也由主循环驱动）。
+         *   ⇒ 判据：`IO_IN_ISR=1` 时 `g_step_dt_max` 应 **= 1**（每拍一次，dt 恒 1）；
+         *           `IO_IN_ISR=0` 时应回到 ~387（主循环周期）。 */
+        step_diag_tick(g_tick_count);
+#if !IO_IN_ISR
+        step_service_motion();          /* ★ 对照档: 改前行为 —— 主循环驱动的运动面 */
+        step_tick_isr(g_tick_count);    /* ★ 对照档: 改前行为 —— 限时/斜坡/到点都在主循环 */
+#endif
 
         /* ══════════ ★★ I2C 的三件服务性工作 —— **必须在循环顶层**（每圈都跑）══════════
          * ★ 教训（本回合刚踩）: 这三句最初被我写在下面 as5600 的那个 `每 100 拍` 分支里

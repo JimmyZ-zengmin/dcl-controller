@@ -22,8 +22,12 @@
 #   · 判据看"有没有出现新的失败模式"，不是"PASS 数不低于某值"
 # 用法: bash build/_full_regress.sh   → 结果落 /tmp/full_regress.log
 set -u
-cd "$(dirname "$0")/.."
+# ★★★ 2026-09-21 修（本项目 §5.38 那一族）: `export PATH` 必须**在任何外部命令之前**。
+#   原顺序是 `cd "$(dirname "$0")/.."` 在前 ⇒ 本机 bash 起来时 PATH 为空 ⇒
+#   `dirname: command not found` ⇒ **脚本独立跑直接挂**；而"从别的 shell 里跑"却没事
+#   （PATH 是继承来的）⇒ 症状是"只有按某种方式跑才失败"，极难归因。
 export PATH="/usr/bin:/bin:/mingw64/bin:/c/Windows/System32:$PATH"
+cd "$(dirname "$0")/.."
 # ★★★ 2026-09-17: 默认口**自动找 CH340**，而不是硬编码 COM21 ——
 #   USB 重插/换口是常态（今天两次踩到：板子从 COM21 变成 COM22，
 #   于是所有命令发到不存在的口 ⇒ `0x49` 失败 ⇒ 前置闸门判"无效"早退，

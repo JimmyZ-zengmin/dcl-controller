@@ -51,7 +51,15 @@
 #define STEP_RC_ENAPOL_UNSET  1u   /* ★ fail-closed: ENA 极性未声明 ⇒ 拒绝使能，且保持物理失能 */
 
 void     step_init(uint8_t *base);
-void     step_tick(uint32_t tick_now);    /* 主循环调用: 限时截止 + "指令 vs 引脚实读"核对 */
+/* ★★ 2026-09-21 拆分：**控制部分进拍内**，诊断部分留主循环。
+ *   `step_tick_isr`  = 到点自停 + 斜坡推进 + 限时截止   → 由 **拍 ISR** 每拍调用
+ *   `step_diag_tick` = "指令 vs 引脚实读"(PE9) 不一致核对 → 由 **主循环**调用
+ *   ★ 动机（实测）：拆之前这三件事都由主循环调 ⇒ **有效控制周期 = 主循环周期**，
+ *     实测 `g_step_dt_max` = **387 拍 = 38.7 ms**，而拍长 100 µs ⇒ 387×。
+ *   ★ 进拍后每拍一次 ⇒ `dt` 恒为 1 ⇒ 斜坡/限时变成精确拍计数。
+ *   ★ A/B：复用既有 `IO_IN_ISR`（0 = 改前行为：全部主循环驱动）。 */
+void     step_tick_isr(uint32_t tick_now);   /* ★ 拍内调用（控制） */
+void     step_diag_tick(uint32_t tick_now);  /* ★ 主循环调用（诊断） */
 
 void     step_set_rate(uint32_t hz);      /* 0 = 停脉冲 */
 void     step_set_dir(uint32_t dir);
